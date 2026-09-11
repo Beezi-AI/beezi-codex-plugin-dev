@@ -147,11 +147,12 @@ test('a dev build produces the dev namespace, not a second staging one', (t) => 
   }).suffix, '-dev');
 });
 
-test('a local build gets its own namespace and NO updateManifestUrl key', (t) => {
-  // The local variant is built on the machine that runs it and is never published, so there is no
-  // manifest to compare itself against. The key is OMITTED rather than written empty: an empty
-  // string would fail resolveEnvironment's absolute-URL check, and the variant would then refuse
-  // to name a root at all. Absent is the only form the reader treats as "no update check".
+test('a HAND-BUILT local gets its own namespace and NO updateManifestUrl key', (t) => {
+  // A local built by hand stays on the machine that built it, so there is no published copy to
+  // compare itself against. The key is OMITTED rather than written empty: an empty string would
+  // fail resolveEnvironment's absolute-URL check, and the variant would then refuse to name a root
+  // at all. Absent is the only form the reader treats as "no update check". The dev pipeline step
+  // also publishes a `local` variant, and that one DOES carry the key - the test below.
   const built = build(t, {
     env: 'local',
     apiBase: 'http://localhost:5001/api',
@@ -172,6 +173,31 @@ test('a local build gets its own namespace and NO updateManifestUrl key', (t) =>
   assert.equal(resolved.suffix, '-local');
   assert.equal(resolved.apiBase, 'http://localhost:5001/api');
   assert.equal(resolved.updateManifestUrl, null, "lib/update-check.mjs skips on 'no-manifest'");
+});
+
+test('a PUBLISHED local keeps its updateManifestUrl, like every other published variant', (t) => {
+  // The dev pipeline step builds `local` with a real Build.BuildId and the internal repo, and
+  // publishes it beside beezi-dev, so developers working on the Beezi API can install a
+  // loopback-pointed plugin without building one. Once it is published it must self-update like
+  // any other variant: the key has to survive into env.json and out of resolveEnvironment.
+  const built = build(t, {
+    env: 'local',
+    apiBase: 'http://localhost:5001/api',
+    buildId: '4242',
+    updateManifestUrl: 'https://raw.githubusercontent.com/acme/internal/main/plugins/beezi-local/.codex-plugin/plugin.json',
+  });
+  assert.equal(built.plugin.version, '0.7.0-local.4242');
+  assert.deepEqual(Object.keys(built.envJson), ['name', 'apiBase', 'updateManifestUrl']);
+
+  const resolved = environment.resolveEnvironment({
+    envJson: { present: true, value: built.envJson }, env: {},
+  });
+  assert.equal(resolved.error, undefined);
+  assert.equal(resolved.suffix, '-local');
+  assert.equal(
+    resolved.updateManifestUrl,
+    'https://raw.githubusercontent.com/acme/internal/main/plugins/beezi-local/.codex-plugin/plugin.json',
+  );
 });
 
 test('a manifest with no interface block is left alone rather than crashing the build', (t) => {
@@ -200,12 +226,15 @@ test('the shell validates its arguments before anything is copied', () => {
   );
   assert.match(text, /update-repo '\$UPDATE_REPO' must be exactly owner\/name/);
 
-  // `local` has no pipeline step to hold its api-base, so this shell IS the record of the
-  // address a local build talks to. Asserted literally: a developer who has to retype the URL will
-  // sooner or later retype it wrong, and nothing downstream would notice.
+  // This shell IS the record of the address a local build talks to - the dev pipeline step that
+  // publishes `local` passes an EMPTY api-base precisely so the URL is not repeated in the YAML.
+  // Asserted literally: a developer who has to retype the URL will sooner or later retype it
+  // wrong, and nothing downstream would notice.
   assert.match(text, /^LOCAL_API_BASE="http:\/\/localhost:5001\/api"$/m);
+  // `:-`, not `-`: an EMPTY api-base must fall through to LOCAL_API_BASE too, or the pipeline
+  // could not pass a build-id and an update-repo positionally without also naming the URL.
   assert.match(text, /API_BASE="\$\{2:-\$LOCAL_API_BASE\}"/, 'local defaults its api-base');
-  assert.match(text, /BUILD_ID="\$\{3:-0\}"/, 'local defaults its build-id: it is never published');
+  assert.match(text, /BUILD_ID="\$\{3:-0\}"/, 'a hand-built local defaults its build-id');
   // Every PUBLISHED env must still state both - a silent default there would ship a variant
   // pointed somewhere nobody chose.
   assert.match(text, /API_BASE="\$\{2:\?api-base is required\}"/);

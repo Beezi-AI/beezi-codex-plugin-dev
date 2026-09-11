@@ -190,6 +190,39 @@ test("a sibling variant's entry survives — the regression that matters", (t) =
   assert.equal(back.plugins[1].source.path, './plugins/beezi-staging');
 });
 
+test('beezi-local joins dev and staging rather than displacing either', (t) => {
+  // The dev pipeline step publishes beezi-dev and then beezi-local in ONE job, back to back
+  // against the same branch. The second run re-fetches the tip the first just pushed, so the
+  // listing it upserts into already holds beezi-dev - and a staging publish from another branch
+  // may have left its own entry there too. Three entries is therefore the real steady state, not
+  // the pair the fixtures above assume.
+  const dev = {
+    name: 'beezi-dev',
+    source: { source: 'local', path: './plugins/beezi-dev' },
+    policy: { installation: 'AVAILABLE', authentication: 'ON_INSTALL' },
+    category: 'Productivity',
+  };
+  const staging = Object.assign({}, dev, {
+    name: 'beezi-staging',
+    source: { source: 'local', path: './plugins/beezi-staging' },
+  });
+  const published = {
+    name: 'beezi-internal',
+    interface: { displayName: 'Beezi (internal)' },
+    plugins: [dev, staging],
+  };
+
+  const doc = JSON.parse(runUpsert(bench(t, {
+    published,
+    plugin: { name: 'beezi-local', version: '0.7.0-local.4242' },
+  })).out);
+
+  assert.deepEqual(doc.plugins.map((p) => p.name), ['beezi-dev', 'beezi-staging', 'beezi-local']);
+  assert.deepEqual(doc.plugins[0], dev, 'the entry published seconds earlier is untouched');
+  assert.deepEqual(doc.plugins[1], staging);
+  assert.equal(doc.plugins[2].source.path, './plugins/beezi-local');
+});
+
 test('a source marketplace with no beezi entry aborts rather than guessing', (t) => {
   const source = { name: 'beezi', interface: { displayName: 'Beezi' }, plugins: [] };
   const res = runUpsert(bench(t, { source }));
