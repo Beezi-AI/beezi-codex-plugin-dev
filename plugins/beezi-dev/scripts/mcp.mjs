@@ -1,0 +1,92 @@
+// Stdio entry for the Beezi MCP server: Codex runs this instead of
+// connecting to the portal directly, so the stored sign-in credentials
+// authenticate MCP too — no separate OAuth prompt. Logic in lib/mcp-bridge.mjs.
+import readline from 'readline';
+import { createBridge } from '../lib/mcp-bridge.mjs';
+import { exitClean } from '../lib/shutdown.mjs';
+import { orDefault } from '../lib/compat.mjs';
+
+// stdout on a pipe is asynchronous, so a forced exit drops whatever is still buffered — including
+// the response we waited for the in-flight work below to produce. Keeping only the newest write's
+// flush promise is enough: stream writes complete in order, so awaiting the last implies the rest.
+let flushed = Promise.resolve();
+const write = (line) => {
+  flushed = new Promise((resolve) => process.stdout.write(`${line}\n`, resolve));
+};
+
+const bridge = createBridge({ write });
+const rl = readline.createInterface({ input: process.stdin, terminal: false });
+
+// Handling is async — a tool call can be a whole browser sign-in — so exiting the moment stdin
+// ends would drop whatever is still in flight and swallow its response. Track the outstanding
+// work and leave only once it has settled.
+const inFlight = new Set();
+let stdinClosed = false;
+let leaving = false;
+let watcher = null;
+
+async function maybeExit() {
+  if (leaving || !stdinClosed || inFlight.size > 0) return;
+  leaving = true;
+  // BEFORE the flush and the exit, so no tick fires into a process that is tearing down and the
+  // election lock is released rather than left for the next watcher's stale-takeover path. The
+  // tick timer is CLEARED here, never unref'd (G-10-2): an unref'd timer in a process whose only
+  // other handle is stdin is precisely the bug test/mcp-bridge-timers.test.mjs locks out.
+  if (watcher) {
+    try { watcher.stop(); } catch { /* best-effort */ }
+    watcher = null;
+  }
+  await flushed;
+  // exitClean, not process.exit: undici's keep-alive handles trip a libuv assertion on Windows
+  // when the process is torn down while they are still open.
+  await exitClean(0);
+}
+
+// ── The rollout watcher (G-1-1, Branch A) — OFF unless explicitly opted in ───────────────────
+//
+// The literal below is `WATCHER_ENV_VAR` from lib/rollout-watcher.mjs, which is the authority on
+// what counts as "on" (`1`/`true`/`yes`/`on`/`enabled`). It is repeated here for ONE reason: this
+// check runs before the dynamic import, so an un-opted machine never loads the watcher's module
+// graph — checkpoint, session-audit, coverage and the lock primitive — at all. Anything else about
+// the decision belongs in startWatcher(), and test/watcher-optin.test.mjs asserts the two names
+// cannot drift.
+//
+// `.mcp.json` now forwards BEEZI_CODEX_WATCHER, so this gate is the only one left: the production
+// cutover it was sequenced behind has shipped (G-1-2, R1). Default still OFF — a machine gets a
+// watcher when it asks for one. What is gone is the second lock that made asking impossible.
+//
+// The plan's release order puts delivery automation after the production cutover and its guarded
+// migration (2026-09-10-codex-gap-closure-plan.md, "Release order"), so shipping this opt-in is the
+// requirement, not a precaution.
+if (process.env.BEEZI_CODEX_WATCHER) {
+  // Dynamic, and its failure is swallowed: analytics must never be the reason ticket drafting
+  // stops working, and this file's stdout belongs to JSON-RPC — a stray write corrupts the stream.
+  // Each tick rechecks migration before pruning or capturing, including after a refusal.
+  import('../lib/rollout-watcher.mjs')
+    .then((mod) => {
+      if (!mod) return;
+      // stdin may already have closed while the module was loading; starting a tick loop into a
+      // process that is on its way out would leave the election lock held by a corpse.
+      if (leaving || stdinClosed) return;
+      watcher = mod.startWatcher();
+    })
+    .catch((error) => process.stderr.write(`[beezi-mcp] watcher: ${orDefault((error || {}).message, error)}\n`));
+}
+
+rl.on('line', (line) => {
+  // A throw anywhere in handling must not escape as an unhandled rejection — Node makes those
+  // fatal, and staying up for the whole session is this server's entire job.
+  const work = bridge
+    .handleLine(line)
+    .catch((error) => process.stderr.write(`[beezi-mcp] ${orDefault((error || {}).message, error)}\n`))
+    .finally(() => {
+      inFlight.delete(work);
+      void maybeExit();
+    });
+  inFlight.add(work);
+});
+
+rl.on('close', () => {
+  stdinClosed = true;
+  void maybeExit();
+});

@@ -1,0 +1,85 @@
+---
+name: analytics-hooks
+description: Install, repair, remove, or check Beezi's Codex analytics hooks. Use when the user wants to start (or stop) reporting per-branch token analytics to Beezi, asks why their Beezi analytics are empty, or after a Beezi plugin upgrade.
+---
+
+# Beezi: analytics hooks
+
+Codex does not load hooks bundled inside a plugin — its `plugin_hooks` feature is `removed`, so an
+installed plugin contributes nothing to the hook engine. Beezi's lifecycle hooks are therefore
+written into the user-level registry `~/.codex/hooks.json` by the script below, and **must then be
+trusted once by the user**.
+
+## Finding the script
+
+This file is at `<plugin-root>/skills/analytics-hooks/SKILL.md`, so the script is at
+`<plugin-root>/scripts/hooks.mjs`. Use the absolute path. Run exactly one command per request; do
+not read or inspect any other files.
+
+## Commands
+
+| The user wants | Do |
+| --- | --- |
+| to know the current state, or asks why analytics are empty | call the **`beezi_status` tool** |
+| to start reporting, or to repair a broken/stale install | `node "<plugin-root>/scripts/hooks.mjs" install` |
+| to stop reporting | `node "<plugin-root>/scripts/hooks.mjs" uninstall` |
+
+Prefer `beezi_status` for any read-only question: it reports the hook state *and* the link state,
+and answering "why is nothing tracked?" needs both. `node "<plugin-root>/scripts/hooks.mjs" status`
+gives the hook half only, and exists for terminal use.
+
+If the request is ambiguous, check status first — it changes nothing.
+
+## After installing: the trust step
+
+`install` only writes the registry. **Codex will not run a hook it has not been shown**, so tell the
+user, clearly and every time:
+
+> Run `/hooks` in Codex, review the Beezi entries, and trust them.
+
+There is no non-interactive way to grant that trust — do not try to bypass it, and do not claim
+analytics are working until the user confirms they have done it. Trust is recorded against each
+hook's **hash**, so this has to be repeated after any change to the hooks, including a plugin
+upgrade.
+
+**A plugin upgrade always needs this doing again.** Each registry entry carries the absolute path
+of the plugin version's hook script in its `arguments`, so an upgrade moves the scripts out from
+under them: `status` reports `stale`, and the machine reports nothing until the user runs `install`
+and re-trusts. Tell them both halves — re-installing without re-trusting leaves them exactly as
+stuck.
+
+## Reading the status output
+
+- **installed** — every event's entry points at this plugin version's scripts. If analytics still
+  are not arriving, the likely cause is the missing trust step above, or that the machine is not
+  linked (see the `me` and `login` skills).
+- **absent** — nothing installed yet. Run `install`.
+- **stale** — a plugin upgrade moved the scripts and the registry entries still point at the old
+  version (or they are the launcher-style entries an older plugin wrote). Run `install`, then
+  re-trust via `/hooks`.
+- **partial** — an incomplete install. Run `install`.
+
+## What the hooks do
+
+One entry per lifecycle event: `SessionStart`, `PostToolUse`, `Stop`, and — for tracking spawned
+subagents — `SubagentStart` and `SubagentStop`. `install` and `status` both print the list back, so
+check `/hooks` against what the script named rather than against a count.
+
+The two subagent hooks only record which agent ran and when. A subagent's *usage* is billed by the
+parent session's own checkpoint, which finds subagent rollouts itself. So if the user trusts only
+some of the entries, subagent tokens are still reported; what is lost is the agent's task name and
+its exact span on the session timeline.
+
+## Scope of what is written
+
+`install` writes `~/.codex/hooks.json` only. Each entry runs `node` from PATH with the hook
+script's absolute path in `arguments` — no launcher scripts are written any more, and `install`
+sweeps away the `~/.beezi-codex/hooks/` launchers an older plugin version left. It **merges**:
+any hooks the user configured themselves keep their place and content. `uninstall` removes only
+Beezi's entries, and deletes the registry file only if Beezi's entries were the only thing in it.
+Report this if the user is worried about their own hooks.
+
+## Reporting without hooks
+
+If the user does not want to install hooks, analytics can still be captured on demand — the `track`
+skill checkpoints the current branch and needs no hooks at all.

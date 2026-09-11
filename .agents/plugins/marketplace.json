@@ -1,0 +1,20 @@
+{
+  "name": "beezi-internal",
+  "interface": {
+    "displayName": "Beezi (internal)"
+  },
+  "plugins": [
+    {
+      "name": "beezi-dev",
+      "source": {
+        "source": "local",
+        "path": "./plugins/beezi-dev"
+      },
+      "policy": {
+        "installation": "AVAILABLE",
+        "authentication": "ON_INSTALL"
+      },
+      "category": "Productivity"
+    }
+  ]
+}
