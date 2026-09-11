@@ -1,0 +1,13 @@
+{
+  "name": "beezi",
+  "version": "0.7.0-local.5185",
+  "private": true,
+  "type": "module",
+  "description": "Beezi analytics + ticket-drafting plugin for Codex.",
+  "engines": {
+    "node": ">=13.2"
+  },
+  "scripts": {
+    "test": "node --test --import ./tools/hermetic-env.mjs"
+  }
+}
