@@ -55,7 +55,11 @@ links the machine but never reads the plan.
 node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via login
 ```
 
-It reads only the plan label from `~/.codex/auth.json`. No token is read and none leaves the machine.
+It asks Codex itself which account it is signed in as (a short-lived `codex app-server` child
+process), and falls back to the plan label in `~/.codex/auth.json`. It may take a few seconds the
+first time. No token is read and none leaves the machine — only the plan label, the account id and
+the address. When a plan is captured the line ends with `via=app-server` or `via=auth-json`, naming
+which one answered; the other outcomes below print their own message instead.
 Report its one-line output verbatim, then decide:
 
 **Stop here** — the plan is settled, say so and finish — when the output either
@@ -170,13 +174,15 @@ re-links this machine without unlinking it first.
 node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via refresh
 ```
 
-Re-reads the ChatGPT plan tier from `~/.codex/auth.json`. Only the plan label is read and stored —
-no token leaves the machine. Report its one-line output verbatim.
+Re-reads the ChatGPT plan tier: it asks Codex itself first (a short-lived `codex app-server` child
+process, which may take a few seconds), then falls back to `~/.codex/auth.json`. Only the plan
+label, the account id and the address are read and stored — no token leaves the machine. Report its
+one-line output verbatim.
 
 If it cannot name a plan, do not stop there: fall through to **step 3** of the login flow above and
 ask the user their tier. Telling them "your subscription info was not found" and leaving it is what
 strands a machine with no plan indefinitely — and for an Enterprise or Edu account, whose tier is
-often absent from `auth.json`, asking is the only way it will ever be recorded.
+often absent, asking is the only way it will ever be recorded.
 
 **One case has a better fix than asking.** If Beezi reported that the user's *Codex sign-in expired*
 on some date, the plan cannot be read because the stored ChatGPT token is stale — not because the
@@ -185,7 +191,7 @@ automatically on their next session with nothing more to answer. Offer step 3 on
 if they would rather not, or if signing in again does not clear it.
 
 Note that session start now captures the plan by itself whenever it can, so reaching this command at
-all usually means `auth.json` does not name one and the answer has to come from the user.
+all usually means neither Codex nor `auth.json` named one and the answer has to come from the user.
 
 ## Checking the link
 

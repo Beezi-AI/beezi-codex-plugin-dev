@@ -1,6 +1,10 @@
 import { BillingSource, normalizePlan, canonicalPlan, CHATGPT_PLANS } from './billing.mjs';
 import { resolveSource as _resolveSource } from './billing-config.mjs';
 import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
+import {
+  readAccountViaAppServer as _readAccountViaAppServer,
+  mergeAccounts,
+} from './codex-app-server.mjs';
 import { UserError } from './friendly-error.mjs';
 import { orDefault } from './compat.mjs';
 
@@ -17,6 +21,45 @@ function safeField(value) {
     throw new UserError('Refusing a suspicious value (looks token-like). Nothing written.');
   }
   return s;
+}
+
+// The identity billing.json carries alongside the plan. Same bounds the two DTOs state
+// (@MaxLength 64 on accountUuid, 320 on email); an oversized value is DROPPED, never truncated —
+// a truncated uuid names a DIFFERENT account.
+//
+// It is persisted at all because tier 1 is the only source of an account id on a machine whose
+// credentials never touch auth.json, and the probe runs at most weekly. Without a home in
+// billing.json the id would exist for exactly the one session that spawned the probe.
+const MAX_ACCOUNT_ID = 64;
+const MAX_ACCOUNT_EMAIL = 320;
+
+function boundedLabel(value, max) {
+  if (value === null || value === undefined) return null;
+  const s = String(value).trim();
+  if (s === '' || s.length > max) return null;
+  return s;
+}
+
+// A capture that learned no identity must not ERASE the one already recorded: the self-report path
+// (`--plan`) never knows an account id, and it rewrites the whole config.
+//
+// `authType` is carried the same way, and it is LOAD-BEARING rather than informational: it is step
+// 4b of the source ladder (billing-config.mjs), the only thing that resolves a machine whose
+// credentials never touch ~/.codex/auth.json. Dropped on a rewrite, such a machine falls back to
+// `unknown` on its next session and the plan it just captured stops travelling on its reports.
+// Only `chatgpt` and `apikey` are recorded; anything else is not an auth mode the ladder speaks.
+const AUTH_TYPES = Object.freeze(['chatgpt', 'apikey']);
+
+function identityFields(args, existingConfig) {
+  const existing = orDefault(existingConfig, {});
+  const authType = boundedLabel(args.authType, 16);
+  return {
+    accountId: orDefault(boundedLabel(args.accountId, MAX_ACCOUNT_ID), orDefault(existing.accountId, null)),
+    email: orDefault(boundedLabel(args.email, MAX_ACCOUNT_EMAIL), orDefault(existing.email, null)),
+    authType: AUTH_TYPES.indexOf(authType) === -1
+      ? orDefault(existing.authType, null)
+      : authType,
+  };
 }
 
 export function parseArgs(argv) {
@@ -87,6 +130,7 @@ export function buildConfig(args, env = process.env, now = new Date(), existingC
       capturedAt: now.toISOString(),
       capturedBy: orDefault(safeField(args.via), 'manual'),
       selfReported: true,
+      ...identityFields(args, existingConfig),
     };
   }
   const subscriptionType = safeField(args.subscriptionType);
@@ -108,6 +152,7 @@ export function buildConfig(args, env = process.env, now = new Date(), existingC
     credentialsExpiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
     capturedAt: now.toISOString(),
     capturedBy: via,
+    ...identityFields(args, existingConfig),
   };
 }
 
@@ -121,7 +166,20 @@ export function shouldKeepExisting(freshConfig, existingConfig) {
     && existingConfig.plan !== 'unknown';
 }
 
-// Read the ChatGPT plan out of ~/.codex/auth.json and build the config to persist.
+// Read the ChatGPT plan and account id, and build the config to persist.
+//
+// THREE TIERS, in order, because no single one covers every machine:
+//
+//   1. `codex app-server` — ask Codex itself (lib/codex-app-server.mjs). Live, and it works on a
+//      machine whose credentials never touch auth.json because Codex kept them in the OS keychain
+//      or only in its own memory. Costs one short-lived subprocess, bounded by a timeout.
+//   2. ~/.codex/auth.json — the id_token decode (lib/codex-account.mjs). Kept, not replaced: the
+//      app-server command documents itself as `[experimental]`, and this tier costs one small read.
+//   3. The user's own answer — skills/login/SKILL.md step 3, unchanged. Reached only when neither
+//      tier above named a plan, and recorded as `selfReported` so nothing here overwrites it.
+//
+// The tiers meet in mergeAccounts, which produces ONE account object shaped exactly like tier 2's,
+// so every consumer below this line is unchanged.
 //
 // Shared by the SessionStart hook and scripts/billing-capture.mjs deliberately: both do this, and
 // when the expiry rule below lived in only one of them, the nudge it produces sent the user
@@ -140,14 +198,35 @@ export function shouldKeepExisting(freshConfig, existingConfig) {
 // caller that has already resolved an environment can hand its own over (G-10-1 L3);
 // runSessionStart does, and scripts/billing-capture.mjs deliberately takes the default.
 //
-// Returns { config, reason }; `config` is null unless there is something to write.
+// ASYNC because tier 1 is a subprocess. Both callers already await it; nothing on the checkpoint
+// hot path calls this, so no hot path grew a spawn — see the gate at lib/session-start.mjs.
+//
+// Returns { config, reason, tier }; `config` is null unless there is something to write.
 // reason ∈ no-account | kept-self-reported | expired-claim | captured.
-export function captureFromCodexAccount({
+// tier ∈ app-server | auth-json | none — WHICH TIER ANSWERED. Named `tier`, not `source`: the
+// config's own `source` is the billing source, and one field name for two meanings is how this
+// repo's single-definition invariants got written in the first place.
+export async function captureFromCodexAccount({
   via, existing = null, env = process.env, now = new Date(), deps = {},
 } = {}) {
   const readCodexAccount = deps.readCodexAccount || _readCodexAccount;
-  const account = readCodexAccount();
-  if (!account || !account.plan) return { config: null, reason: 'no-account' };
+  const probeAppServer = deps.readAccountViaAppServer || _readAccountViaAppServer;
+
+  // Tier 1. Never allowed to throw or hang the caller: readAccountViaAppServer returns a typed
+  // failure for every outcome it knows, and the catch covers the ones it does not.
+  let live = null;
+  try {
+    live = await probeAppServer({ env: env, timeoutMs: deps.appServerTimeoutMs });
+  } catch { live = null; }
+
+  // Tier 2, read unconditionally: it carries `hasStoredApiKey`, which tier 1 does not report and
+  // which billing-config.mjs step 4 genuinely needs (see the signals note below).
+  let fileAccount = null;
+  try { fileAccount = readCodexAccount(); } catch { fileAccount = null; }
+
+  const account = mergeAccounts(live, fileAccount);
+  if (!account || !account.plan) return { config: null, reason: 'no-account', tier: 'none' };
+  const tier = account.live === true ? 'app-server' : 'auth-json';
 
   // Step 4 of the source ladder is answered from the account we ALREADY read, rather than letting
   // resolveSource open ~/.codex/auth.json a second time (G-10-1 L1). Beyond hermeticity that is one
@@ -171,12 +250,26 @@ export function captureFromCodexAccount({
     readCodexAuthSignals: deps.readCodexAuthSignals || function () { return signals; },
   };
 
-  const claimExpired = typeof account.expiresAt === 'number' && account.expiresAt <= now.getTime();
+  // THE EXPIRED-CLAIM RULE IS A TIER-2 RULE ONLY. It exists because the plan in auth.json is a
+  // snapshot that rots in place — measured, a token three days expired still asserted `free` with
+  // a subscription window six weeks past. A live app-server answer cannot rot, and mergeAccounts
+  // gives it `expiresAt: null` for exactly that reason; applying the rule to it would downgrade a
+  // correct `plus` to `unknown`, leave the config stale, and re-nudge the user every session.
+  const claimExpired = account.live !== true
+    && typeof account.expiresAt === 'number'
+    && account.expiresAt <= now.getTime();
   const config = buildConfig(
     {
       subscriptionType: claimExpired ? null : account.subscriptionType,
       rateLimitTier: null,
       expiresAt: account.expiresAt,
+      // Persisted with the plan so the account id survives between probes. An expired claim still
+      // names the right account — only its PLAN label is untrustworthy.
+      accountId: account.accountId,
+      email: account.email,
+      // ONLY from a live reading. From tier 2 it would be a copy of a file the ladder already reads
+      // at step 4 — no new information, and a value that would outlive the file it came from.
+      authType: account.live === true ? account.authMode : null,
       via,
     },
     env,
@@ -184,6 +277,8 @@ export function captureFromCodexAccount({
     existing,
     resolveDeps,
   );
-  if (shouldKeepExisting(config, existing)) return { config: null, reason: 'kept-self-reported' };
-  return { config, reason: claimExpired ? 'expired-claim' : 'captured' };
+  if (shouldKeepExisting(config, existing)) {
+    return { config: null, reason: 'kept-self-reported', tier: tier };
+  }
+  return { config, reason: claimExpired ? 'expired-claim' : 'captured', tier: tier };
 }

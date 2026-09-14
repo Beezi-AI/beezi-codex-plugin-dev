@@ -31,6 +31,31 @@ export function isStale(config, now = Date.now(), staleMs = STALE_MS) {
   return now - capturedAt > staleMs;
 }
 
+// Should this machine spend a `codex app-server` probe now? (lib/session-start.mjs's gate.)
+//
+// A SEPARATE PREDICATE FROM isStale, because isStale answers a different question: it asks whether
+// a SUBSCRIPTION machine's plan has gone stale, and returns false for every other source — including
+// `unknown`, which is exactly the machine that has never been able to name its plan. Gating the
+// probe on isStale alone would mean a machine with no ~/.codex/auth.json never probes, never
+// captures, and is nudged about it forever.
+//
+// Bounded the same way in both branches (weekly, via capturedAt), so the subprocess stays rare.
+// `deps.isStale` is honoured rather than closed over: runSessionStart threads its own isStale
+// through every other billing call, and a predicate that quietly used the module's would make that
+// seam stop working exactly where the cost of being wrong is a subprocess.
+export function shouldProbeAccount(config, source, now = Date.now(), deps = {}) {
+  const staleImpl = orDefault(deps.isStale, isStale);
+  const staleMs = orDefault(deps.staleMs, STALE_MS);
+  // A plan the user answered by hand always wins; we do not even look.
+  if ((config || {}).selfReported === true) return false;
+  if (source === BillingSource.SUBSCRIPTION) return staleImpl(config, now, staleMs);
+  // An api-key or third-party machine bills no subscription: there is no plan to go and find.
+  if (source !== BillingSource.UNKNOWN) return false;
+  const capturedAt = Date.parse(orDefault((config || {}).capturedAt, ''));
+  if (Number.isNaN(capturedAt)) return true;
+  return now - capturedAt > staleMs;
+}
+
 // The report payload keys for the subscription plan, or {} when not applicable.
 export function subscriptionReportFields(billingSource, config) {
   if (billingSource !== BillingSource.SUBSCRIPTION || !config) return {};
@@ -116,6 +141,25 @@ export function resolveSource(config, env = process.env, deps = {}) {
   if ((signals || {}).authMode === 'apikey') return BillingSource.OPENAI_API_KEY;
   if ((signals || {}).authMode === 'chatgpt') return BillingSource.SUBSCRIPTION;
   if (signals && signals.hasStoredApiKey) return BillingSource.OPENAI_API_KEY;
+
+  // 4b. What CODEX ITSELF last told us, recorded by the `codex app-server` probe
+  // (lib/codex-app-server.mjs → lib/billing-capture.mjs). Ranked immediately below auth.json and
+  // above self-report because it is observed rather than claimed — but it is a RECORDING, and
+  // auth.json is live, so anything that file says outranks it.
+  //
+  // WITHOUT THIS STEP THE WHOLE APP-SERVER TIER IS DEAD ON THE MACHINE IT EXISTS FOR. A machine
+  // whose credentials live in the OS keychain has no auth.json, so steps 1-4 all decline and the
+  // ladder answers `unknown`. Session start then skips the capture (it is gated on `subscription`),
+  // and a plan captured by hand through the login skill is overwritten back to `unknown` by
+  // syncBillingSource on the very next session — so the user captures a plan and watches it revert.
+  // IT GOES STALE, AND IT IS BOUNDED AT A WEEK. Nothing expires this recording in place, so a
+  // machine that moves to an API key held only in the keychain keeps resolving as `subscription`
+  // until `capturedAt` ages past STALE_MS — at which point isStale() is true, shouldProbeAccount()
+  // fires, and mergeAccounts lets the live auth type overwrite it. Same bound every other staleness
+  // rule here uses; it is why the live answer, not the recorded one, wins that field.
+  const observed = config && typeof config.authType === 'string' ? config.authType : null;
+  if (observed === 'apikey') return BillingSource.OPENAI_API_KEY;
+  if (observed === 'chatgpt') return BillingSource.SUBSCRIPTION;
 
   // 5. Weakest evidence, deliberately last: what the user told us at sign-in. It is the only thing
   // that works on a machine exposing no observable signal at all — but it is unverifiable

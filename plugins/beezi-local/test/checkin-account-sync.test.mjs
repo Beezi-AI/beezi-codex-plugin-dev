@@ -470,3 +470,35 @@ test('a fetch answering with no status is a refusal, not a success', async () =>
   assert.deepEqual(res, { synced: false, status: null, reason: 'rejected' });
   assert.equal(writeJsonImpl.calls.length, 0);
 });
+
+// ─── identity precedence: billing.json before ~/.codex/auth.json ──────────────────────────────
+// billing.json is the only place a `codex app-server` identity is ever written down. On a machine
+// whose credentials live in the OS keychain, auth.json names no account at all, and the probe that
+// does runs at most weekly — so reading auth.json first would report no account id on every session
+// except the one that happened to probe. Same precedence as lib/account-identity.mjs.
+
+test('the check-in prefers the account id recorded in billing.json', () => {
+  const payload = buildAccountSyncPayload({
+    config: { subscriptionType: 'plus', accountId: 'live-uuid', email: 'live@example.com' },
+    account: { accountId: 'stale-uuid', email: 'stale@example.com' },
+  });
+  assert.equal(payload.accountUuid, 'live-uuid');
+  assert.equal(payload.email, 'live@example.com');
+});
+
+test('the check-in falls back to auth.json when billing.json knows no identity', () => {
+  const payload = buildAccountSyncPayload({
+    config: { subscriptionType: 'plus' },
+    account: { accountId: 'from-auth-json', email: 'auth@example.com' },
+  });
+  assert.equal(payload.accountUuid, 'from-auth-json');
+  assert.equal(payload.email, 'auth@example.com');
+});
+
+test('an oversized recorded uuid falls through rather than naming a different account', () => {
+  const payload = buildAccountSyncPayload({
+    config: { subscriptionType: 'plus', accountId: 'x'.repeat(65) },
+    account: { accountId: 'from-auth-json' },
+  });
+  assert.equal(payload.accountUuid, 'from-auth-json');
+});

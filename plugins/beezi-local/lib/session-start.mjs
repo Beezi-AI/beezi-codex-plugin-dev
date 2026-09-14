@@ -29,10 +29,12 @@ import {
   resolveSource as _resolveSource,
   syncBillingSource,
   isStale as _isStale,
+  shouldProbeAccount as _shouldProbeAccount,
 } from './billing-config.mjs';
 import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
 import { orDefault } from './compat.mjs';
 import { captureFromCodexAccount } from './billing-capture.mjs';
+import { readAccountViaAppServer as _readAccountViaAppServer } from './codex-app-server.mjs';
 import { syncAccountIfNeeded as _syncAccountIfNeeded } from './account-sync.mjs';
 
 // Resume guard: create cursor=0 ONLY if absent; never reset an existing session's cursor.
@@ -138,6 +140,15 @@ async function isTokenRejected(token, fetchImpl) {
   return (who || {}).valid === false;
 }
 
+// How long the SessionStart hook will wait on `codex app-server` before falling through to the
+// auth.json decode. The hook's own budget is 10s and already covers a queue flush and a repo probe.
+// MEASURED on Windows with codex-cli 0.154.0: 2929ms cold, ~1050ms warm — the launch is the slow
+// part (an npm .cmd shim → node → the platform binary), not the protocol. A 3s bound would have cut
+// the cold run off and quietly dropped every first probe on a machine like that.
+//
+// Shorter than the module's own default: this one is spent inside a hook budget, at most weekly.
+const APP_SERVER_TIMEOUT_MS = 5000;
+
 // Returns an optional systemMessage string (or null). Never throws for expected failures.
 export async function runSessionStart(input, deps = {}) {
   const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
@@ -147,7 +158,12 @@ export async function runSessionStart(input, deps = {}) {
   const readBillingConfig = orDefault(deps.readBillingConfig, _readBillingConfig);
   const writeBillingConfig = orDefault(deps.writeBillingConfig, _writeBillingConfig);
   const isStale = orDefault(deps.isStale, _isStale);
+  const shouldProbeAccount = orDefault(deps.shouldProbeAccount, _shouldProbeAccount);
   const readCodexAccount = orDefault(deps.readCodexAccount, _readCodexAccount);
+  // Tier 1 of the plan/account ladder. Threaded like every other reader on this path: a bare call
+  // would SPAWN A REAL `codex app-server` from the test suite, which tools/hermetic-env.mjs records
+  // as an escape to the developer's own ~/.codex.
+  const readAccountViaAppServer = orDefault(deps.readAccountViaAppServer, _readAccountViaAppServer);
   const syncAccount = orDefault(deps.syncAccount, _syncAccountIfNeeded);
   // Threaded rather than read inside the ladder: step 1 of resolveSource is an environment lookup
   // (billing-config.mjs:101-102) and a caller with a resolved environment must be able to hand it
@@ -257,26 +273,58 @@ export async function runSessionStart(input, deps = {}) {
     // The reading and the expired-claim rule live in lib/billing-capture.mjs, shared with
     // scripts/billing-capture.mjs so the two cannot disagree about what an expired claim means.
     //
-    // Cost when it runs: one stat, one small read of ~/.codex/auth.json, a base64url decode of the
-    // id_token payload, and at most one 0600 write. No network, no subprocess. No token is read.
-    if (billingSource === BillingSource.SUBSCRIPTION
-        && (billingConfig || {}).selfReported !== true
-        && isStale(billingConfig)) {
+    // Cost when it runs: ONE SHORT-LIVED `codex app-server` SUBPROCESS (tier 1, bounded by
+    // APP_SERVER_TIMEOUT_MS below), one stat, one small read of ~/.codex/auth.json, a base64url
+    // decode of the id_token payload, and at most one 0600 write. No network. No token is read.
+    //
+    // The subprocess is why this gate matters more than it used to. shouldProbeAccount still bounds
+    // the work to ~weekly — but the cost behind it is now a process launch rather than a file read,
+    // so nothing may move this call out from under the gate, and nothing on the checkpoint hot path
+    // may call captureFromCodexAccount at all.
+    //
+    // It is shouldProbeAccount rather than the old `SUBSCRIPTION && !selfReported && isStale`
+    // because THAT TRIO EXCLUDED THE MACHINE TIER 1 EXISTS FOR. With credentials in the OS keychain
+    // there is no ~/.codex/auth.json, so the ladder answers `unknown`, `isStale` returns false for
+    // every non-subscription source, and the capture that would have resolved it never ran.
+    if (shouldProbeAccount(billingConfig, billingSource, Date.now(), { isStale })) {
       // `resolveSource` and `env` travel with it (G-10-1 L1/L3). Without them the capture reached
       // billing-capture.mjs's MODULE-LEVEL resolveSource and the real process.env, so the inner
       // resolution could contradict the outer one on the line above — a machine resolved here as
       // `subscription` could still have its plan fields dropped by a second, unseen resolution
       // reading a different environment and a different auth.json.
-      const { config } = captureFromCodexAccount({
+      const { config } = await captureFromCodexAccount({
         via: 'session-start',
         existing: billingConfig,
         env: env,
-        deps: { readCodexAccount, resolveSource },
+        deps: {
+          readCodexAccount,
+          resolveSource,
+          readAccountViaAppServer,
+          // Shorter than the module default: this sits inside the hook's 10s budget alongside a
+          // queue flush and a repo probe, and a machine with no `codex` on its PATH must fall
+          // through to tier 2 quickly rather than spending the budget proving it.
+          appServerTimeoutMs: APP_SERVER_TIMEOUT_MS,
+        },
       });
       if (config) {
         writeBillingConfig(config);
         billingConfig = config;
         billingCaptured = true;
+        // RE-RESOLVE on the config we just wrote. The capture can teach the ladder something it
+        // did not know a moment ago — step 4b reads the `authType` only a live app-server reading
+        // can record — and on a machine with no auth.json that is the difference between
+        // `subscription` and `unknown`. Left un-resolved, the nudge below would tell a machine that
+        // just captured `plus` that its billing cannot be determined, and the realignment above
+        // would have written `unknown` over the source the capture had earned.
+        const resolved = resolveSource(billingConfig, env);
+        if (resolved !== billingSource) {
+          billingSource = resolved;
+          const realigned = syncBillingSource(billingConfig, resolved);
+          if (realigned) {
+            writeBillingConfig(realigned);
+            billingConfig = realigned;
+          }
+        }
       }
     }
   } catch { /* best-effort */ }

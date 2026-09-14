@@ -39,6 +39,12 @@ function router({ whoami: whoamiRes = () => ok({ email: 'a@b.c' }), repos = () =
   return { fetchImpl, calls };
 }
 
+// Tier 1 of the plan ladder is a SUBPROCESS. Unstubbed it spawns a real `codex app-server` against
+// the developer's Codex install — and against the fixture CODEX_HOME, whose temp dir the running
+// child then holds open, so the fixture's own cleanup fails with EPERM on Windows. `unavailable` is
+// what a machine with no Codex CLI answers, so the tests keep exercising the auth.json tier.
+const noAppServer = async () => ({ ok: false, reason: 'unavailable' });
+
 // Defaults that keep the billing nudge out of the way unless a test asks for it. resolveSource is
 // the real seam — a resolved api-key source carries no plan, so nothing is stale and nothing nudges.
 const quietBilling = {
@@ -49,6 +55,8 @@ const quietBilling = {
   // Always stubbed: unstubbed it reads the real ~/.codex/auth.json and the suite's result would
   // depend on whether the machine running it happens to be signed in to ChatGPT.
   readCodexAccount: () => null,
+  // Tier 1 of the same ladder — see noAppServer above.
+  readAccountViaAppServer: noAppServer,
 };
 
 const noGit = () => { throw new Error('not a git repository'); };
@@ -224,6 +232,7 @@ test('a stale subscription plan the account cannot name is nudged about', async 
       readBillingConfig: () => ({ source: 'subscription' }),
       writeBillingConfig: () => {},
       isStale: () => true,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => null, // auth.json says nothing — the auto-capture cannot help
     },
   );
@@ -252,6 +261,7 @@ test('a stale plan is captured from auth.json without asking anyone', async (t) 
       // sees a fresh config and stays quiet. Stubbing it would assert nothing about that.
       readBillingConfig: () => ({ version: 1, source: 'subscription' }),
       writeBillingConfig: (c) => written.push(c),
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'pro', plan: 'pro', expiresAt: null }),
     },
   );
@@ -282,6 +292,7 @@ test('the capture follows the session-start resolution, not a second one of its 
       resolveSource: () => 'subscription',
       readBillingConfig: () => ({ version: 1, source: 'subscription' }),
       writeBillingConfig: (c) => written.push(c),
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'plus', plan: 'plus', expiresAt: null }),
     },
   );
@@ -305,6 +316,7 @@ test('ChatGPT Go is a real plan, not "unknown"', async (t) => {
       resolveSource: () => 'subscription',
       readBillingConfig: () => ({ version: 1, source: 'subscription' }),
       writeBillingConfig: (c) => written.push(c),
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'go', plan: 'go', expiresAt: null }),
     },
   );
@@ -326,6 +338,7 @@ test('auto-capture never overrides a plan the user reported by hand', async (t) 
       readBillingConfig: () => ({ version: 1, source: 'subscription', plan: 'team', selfReported: true }),
       writeBillingConfig: () => {},
       isStale: () => true,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => { read += 1; return { plan: 'plus', subscriptionType: 'plus' }; },
       // The counter now has a second, legitimate consumer: the account check-in reads the same
       // file for accountUuid/email on every session. Stub it out so this stays a statement about
@@ -353,6 +366,7 @@ test('auto-capture leaves an api-key machine alone', async (t) => {
       readBillingConfig: () => ({ version: 1, source: 'openai_api_key' }),
       writeBillingConfig: () => {},
       isStale: () => true,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => { read += 1; return { plan: 'pro', subscriptionType: 'pro' }; },
       // Scoped to the auto-capture — see the self-reported test above. The check-in reading this
       // file is not a stamping: billing.json's null subscriptionType is already the ladder's
@@ -377,6 +391,7 @@ test('auto-capture does not re-read auth.json when the plan is fresh', async (t)
       readBillingConfig: () => ({ version: 1, source: 'subscription', plan: 'pro' }),
       writeBillingConfig: () => {},
       isStale: () => false,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => { read += 1; return { plan: 'pro', subscriptionType: 'pro' }; },
       // Scoped to the auto-capture — see the self-reported test above.
       syncAccount: async () => ({ synced: false }),
@@ -397,6 +412,7 @@ test('a throwing readCodexAccount does not break session start', async (t) => {
       resolveSource: () => 'subscription',
       readBillingConfig: () => ({ version: 1, source: 'subscription' }),
       writeBillingConfig: () => {},
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => { throw new Error('unreadable'); },
     },
   );
@@ -506,6 +522,7 @@ test('an expired plan claim records the expiry but not the stale plan label', as
       resolveSource: () => 'subscription',
       readBillingConfig: () => ({ version: 1, source: 'subscription' }),
       writeBillingConfig: (c) => written.push(c),
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: expiredAccount(expiresAt),
     },
   );
@@ -536,6 +553,7 @@ test('an expired claim stays stale, so the next session start re-reads auth.json
       readBillingConfig: () => afterExpired,
       writeBillingConfig: (c) => written.push(c),
       // The token has since been refreshed and now names a real, still-valid plan.
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'pro', plan: 'pro', expiresAt: Date.now() + 86_400_000 }),
     },
   );
@@ -557,6 +575,7 @@ test('a plan claim with no expiry at all is still captured', async (t) => {
       resolveSource: () => 'subscription',
       readBillingConfig: () => ({ version: 1, source: 'subscription' }),
       writeBillingConfig: (c) => written.push(c),
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'team', plan: 'team', expiresAt: null }),
     },
   );
@@ -626,6 +645,7 @@ test('the check-in gets the hook OWN fetch and account reader, never the module 
       fetchImpl,
       gitImpl: noGit,
       ...quietBilling,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount,
       syncAccount: sync,
     },
@@ -665,6 +685,7 @@ test('the check-in reads the billing config the hook already resolved', async (t
       readBillingConfig: () => stored,
       writeBillingConfig: () => {},
       isStale: () => false,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => null,
       syncAccount: sync,
     },
@@ -688,6 +709,7 @@ test('a billing read that throws leaves the check-in with no config, not a stale
       readBillingConfig: () => { throw new Error('EACCES'); },
       writeBillingConfig: () => {},
       isStale: () => false,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => null,
       syncAccount: sync,
     },
@@ -711,6 +733,7 @@ test('a plan captured this run FORCES the check-in, so it is reported without wa
       resolveSource: () => 'subscription',
       readBillingConfig: () => ({ version: 1, source: 'subscription' }),
       writeBillingConfig: () => {},
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => ({ authMode: 'chatgpt', subscriptionType: 'pro', plan: 'pro', expiresAt: null }),
       syncAccount: sync,
     },
@@ -747,6 +770,7 @@ test('realigning billing.json is not a capture, so it does not force', async (t)
       readBillingConfig: () => ({ version: 1, source: 'subscription', plan: 'plus' }),
       writeBillingConfig: () => {},
       isStale: () => false,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => null,
       syncAccount: sync,
     },
@@ -784,9 +808,108 @@ test('a check-in that throws does not swallow the billing nudge either', async (
       readBillingConfig: () => null,
       writeBillingConfig: () => {},
       isStale: () => false,
+      readAccountViaAppServer: noAppServer,
       readCodexAccount: () => null,
       syncAccount: async () => { throw new Error('boom'); },
     },
   );
   assert.match(message, /cannot determine how this machine bills Codex/);
+});
+
+// ─── the machine the app-server tier exists for ───────────────────────────────────────────────
+// Codex kept this machine's credentials in the OS keychain, so there is NO ~/.codex/auth.json. The
+// source ladder has nothing to read and answers `unknown`. Before the probe gate was widened and
+// step 4b was added, that machine could never capture a plan: session start skipped the capture
+// (gated on `subscription`), and a plan captured by hand was overwritten back to `unknown` on the
+// very next session.
+const liveAppServer = async () => ({
+  ok: true,
+  reason: 'ok',
+  authType: 'chatgpt',
+  plan: 'plus',
+  subscriptionType: 'plus',
+  accountId: 'eb76c91d-9f94-4807-99aa-ed350b779ecd',
+  email: 'live@example.com',
+});
+
+test('a machine with no auth.json captures its plan from the app server', async (t) => {
+  withCodexAuth(t, null); // no auth.json at all
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const written = [];
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      // The REAL ladder and the REAL gate, deliberately: they are what this asserts.
+      readBillingConfig: () => null,
+      writeBillingConfig: (c) => written.push(c),
+      readAccountViaAppServer: liveAppServer,
+      readCodexAccount: () => null,
+      syncAccount: async () => ({ synced: false }),
+    },
+  );
+  const captured = written.find((c) => c.capturedBy === 'session-start');
+  assert.ok(captured, 'the probe ran and its answer was written');
+  assert.equal(captured.plan, 'plus');
+  assert.equal(captured.source, 'subscription', 'resolved from what Codex itself said');
+  assert.equal(captured.authType, 'chatgpt', 'recorded so the NEXT session resolves the same way');
+  assert.equal(captured.accountId, 'eb76c91d-9f94-4807-99aa-ed350b779ecd');
+  assert.equal(message, null, 'and the machine is not nudged about a plan it just captured');
+});
+
+test('the plan captured on such a machine survives the next session', async (t) => {
+  withCodexAuth(t, null);
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const written = [];
+  // What the run above wrote, fed back in as the existing config.
+  const existing = {
+    version: 1,
+    source: 'subscription',
+    subscriptionType: 'plus',
+    plan: 'plus',
+    capturedAt: new Date().toISOString(),
+    capturedBy: 'session-start',
+    authType: 'chatgpt',
+  };
+  const message = await runSessionStart(
+    { session_id: 's2', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      readBillingConfig: () => existing,
+      writeBillingConfig: (c) => written.push(c),
+      // The probe must NOT run again — the plan is fresh.
+      readAccountViaAppServer: async () => { throw new Error('the probe must not run'); },
+      readCodexAccount: () => null,
+      syncAccount: async () => ({ synced: false }),
+    },
+  );
+  const reverted = written.find((c) => c.source === 'unknown');
+  assert.equal(reverted, undefined, 'syncBillingSource must not overwrite the captured source');
+  assert.equal(message, null, 'and no nudge — the machine knows what it bills');
+});
+
+test('a machine that neither Codex nor auth.json can name is still nudged, not guessed at', async (t) => {
+  withCodexAuth(t, null);
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const message = await runSessionStart(
+    { session_id: 's3', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      readBillingConfig: () => null,
+      writeBillingConfig: () => {},
+      readAccountViaAppServer: async () => ({ ok: false, reason: 'no-credentials' }),
+      readCodexAccount: () => null,
+      syncAccount: async () => ({ synced: false }),
+    },
+  );
+  assert.match(message, /cannot determine how this machine bills/);
 });

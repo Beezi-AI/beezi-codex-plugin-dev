@@ -300,18 +300,36 @@ export function withCodexAuth(t, auth = { auth_mode: 'chatgpt' }) {
 }
 
 /**
- * The same fixture for a synchronous callback, where there is no `t` to hang cleanup off.
+ * The same fixture for a callback with no `t` to hang cleanup off.
+ *
+ * ASYNC-AWARE, and it has to be: the billing capture became async when `codex app-server` was added
+ * as its first tier. With a plain try/finally the cleanup runs at the first await — CODEX_HOME is
+ * restored and the sandbox deleted while the callback is still reading from it, so the test silently
+ * resolves against the developer's real ~/.codex instead of the fixture.
  */
 export function underCodexAuth(auth, fn) {
   const dir = fs.mkdtempSync(path.join(state.tmpRoot, 'beezi-codexauth-'));
   if (auth != null) fs.writeFileSync(path.join(dir, 'auth.json'), JSON.stringify(auth));
   const prev = process.env.CODEX_HOME;
   process.env.CODEX_HOME = dir;
-  try {
-    return fn(dir);
-  } finally {
+  const restore = () => {
     if (prev === undefined) delete process.env.CODEX_HOME;
     else process.env.CODEX_HOME = prev;
     fs.rmSync(dir, { recursive: true, force: true });
+  };
+  let result;
+  try {
+    result = fn(dir);
+  } catch (error) {
+    restore();
+    throw error;
   }
+  if (result !== null && result !== undefined && typeof result.then === 'function') {
+    return result.then(
+      (value) => { restore(); return value; },
+      (error) => { restore(); throw error; },
+    );
+  }
+  restore();
+  return result;
 }

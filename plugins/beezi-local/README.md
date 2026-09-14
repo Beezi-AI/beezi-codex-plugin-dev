@@ -166,19 +166,62 @@ precedence order:
    stale login lingers on disk but an error that fired cannot lie.)
 4. `~/.codex/auth.json`: `auth_mode` first (the field Codex itself uses to pick a credential), then
    the mere presence of a stored key. **Presence only — no key or token is ever read or returned.**
-5. What the user said at sign-in (`selfReported`), including an `api_key` answer for someone who
+5. What **Codex itself** last said, recorded in `billing.json` as `authType` by the `codex
+   app-server` probe below. Observed rather than claimed, so it outranks a self-report — but it is a
+   recording and `auth.json` is live, so anything that file says outranks it. Without this step the
+   probe is pointless on the machine it exists for: with credentials in the OS keychain there is no
+   `auth.json`, steps 1-4 all decline, and a captured plan would be overwritten back to `unknown` on
+   the next session.
+6. What the user said at sign-in (`selfReported`), including an `api_key` answer for someone who
    bills pay-as-you-go and has no ChatGPT tier to name.
-6. Otherwise **`unknown`**, reported honestly rather than guessed.
+7. Otherwise **`unknown`**, reported honestly rather than guessed.
 
 `billing.json`'s own `source` is never an input to the next resolution — it records the last one,
 so a switch made outside our sight cannot keep asserting itself. Session start realigns it to the
 resolved source without touching `capturedAt` (that timestamp tracks the *plan*, and bumping it
 would hide a plan going stale).
 
-The plan tier itself lives in the `id_token`'s `https://api.openai.com/auth` claim
-(`chatgpt_plan_type`). We decode that JWT claim locally to capture `free` / `plus` / `pro_5x` /
-`pro_20x` / `go` / `team` / `business` / `enterprise` / `edu` — **no token ever leaves the machine**, only the
-plan-tier string. API-key billing carries no plan.
+### The plan and account id: three tiers
+
+The plan tier and the ChatGPT account id are resolved in three tiers, in order. Only the plan label
+and the account id are ever captured — **no token ever leaves the machine**, and none is read.
+
+1. **`codex app-server`** (`lib/codex-app-server.mjs`) — ask Codex itself. A short-lived child
+   process speaking line-delimited JSON-RPC on stdin/stdout: `initialize`, the `initialized`
+   notification, then `account/read` (`{ account: { type, email, planType } }`) and
+   `account/rateLimits/read`. Both calls are made because **`account/read` carries no account id** —
+   measured against codex-cli 0.154.0; only the rate-limit answer does. Neither starts a
+   conversation or a model turn.
+
+   This tier exists because auth.json is not where every machine's credentials live: Codex may hold
+   them in the OS keychain or only in its own memory, and such a machine has no plan in auth.json at
+   all. It is live, so it cannot go stale in place the way tier 2 does. The command is documented as
+   experimental, which is why tier 2 is kept rather than replaced.
+
+   It runs **only** behind `shouldProbeAccount()` at session start — weekly for a machine whose
+   plan has gone stale, and weekly for one the ladder still calls `unknown`, never for an api-key or
+   third-party machine, never over a self-reported plan — and on `billing-capture.mjs --from-codex`.
+   Nothing on the checkpoint hot path spawns it. Measured cost
+   on Windows: 2929ms cold, ~1050ms warm; bounded at 5s inside the hook and 6s otherwise, and a
+   machine with no `codex` on its PATH falls through immediately.
+
+2. **`~/.codex/auth.json`** — the `id_token`'s `https://api.openai.com/auth` claim
+   (`chatgpt_plan_type`), decoded locally without signature verification, for `free` / `plus` /
+   `pro_5x` / `pro_20x` / `go` / `team` / `business` / `enterprise` / `edu`.
+
+   This tier is a **snapshot that rots in place**: measured on a real machine, an `id_token` that
+   expired three days earlier still asserted `chatgpt_plan_type: "free"` with a subscription window
+   six weeks past. So an expired claim keeps its *expiry* and drops its *label* — it records
+   `plan: 'unknown'`, which leaves the config stale and brings the next session start back to it.
+   **That rule applies to this tier only.** A tier-1 reading is live and carries no expiry; applying
+   the rule to it would downgrade a correct plan to `unknown` and re-nudge the user forever.
+
+3. **The user's own answer** — `/beezi:login` step 3, recorded as `selfReported`, which nothing
+   automatic overwrites. Reached only when neither tier above named a plan.
+
+The account id and email are persisted into `billing.json` alongside the plan, and read back from
+there first (`lib/account-identity.mjs`, and the account check-in). Without that the id would exist
+only for the one session that happened to run the probe. API-key billing carries no plan.
 
 Codex's own tier names are folded onto those labels (`CODEX_PLAN_ALIASES` in `lib/billing.mjs`),
 because the wire vocabulary is not the pricing vocabulary. The load-bearing case is the 2026-04-09
@@ -206,6 +249,8 @@ distinctly from the Claude Code plugin.
 | `BEEZI_CODEX_HOME` | `~/.beezi-codex` | Queue / state / credentials |
 | `CODEX_HOME` | `~/.codex` | Rollout transcripts, auth store |
 | `BEEZI_CODEX_WATCHER` | unset (off) | `1`/`true`/`yes`/`on` starts the rollout watcher in the MCP server |
+| `BEEZI_CODEX_APP_SERVER` | unset (on) | `0`/`false`/`off`/`no` skips the `codex app-server` plan probe entirely |
+| `BEEZI_CODEX_CLI` | `codex` | Path to the Codex CLI, for a machine where it is not on the hook process's PATH |
 
 Only these are declared in `.mcp.json`, so only these reach the MCP server process. A sandboxed
 shell command may not inherit `BEEZI_API_URL` when the server did — which is why every link
