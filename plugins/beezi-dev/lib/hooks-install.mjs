@@ -64,8 +64,8 @@ export const HOOK_TIMEOUT_SEC = 10;
 // The interpreter for every hook entry: bare `node`, resolved from the hook's PATH at spawn time.
 // Deliberately not process.execPath — an absolute interpreter path goes stale the moment the user
 // upgrades Node (nvm and installers both move the directory), which is exactly how the previous
-// launcher design kept ending up in the `stale` state. The script path travels in `arguments`, so
-// nothing here depends on how Codex would split a composite command string.
+// launcher design kept ending up in the `stale` state. Codex command hooks execute a command
+// string, so the script path is quoted below as part of that string.
 export const HOOK_COMMAND = 'node';
 
 // Older plugin versions wrote per-event launcher scripts (`beezi-<script>.cmd` / `.sh`) into
@@ -97,24 +97,34 @@ export function hookOwner() {
   return UNSUFFIXED_OWNER + environment.envSuffix();
 }
 
-// How a named variant tags its handlers: an extra element of `arguments`.
+// How a named variant tags its handlers: an inert flag appended to the command string.
 //
 // DELIBERATELY NOT A NEW JSON KEY. R1 refuses unverified extensions to Codex's schemas, and the
 // hook registry is read by the same engine as the marketplace: a key its loader rejects could take
-// the whole entry with it. `arguments` is already a declared string array handed to `node`, so an
-// extra element is data, not schema — and none of the five hook scripts reads process.argv
+// the whole entry with it. A command argument is data, not schema, and none of the five hook
+// scripts reads process.argv
 // (session-start, checkpoint, subagent-start, subagent-stop, stop), so the tag is inert at runtime
 // while being exact, machine-readable, and immune to a label the user reworded.
 const OWNER_FLAG = '--beezi-owner=';
 
-// THE UNSUFFIXED BUILD WRITES NO TAG. Its entries stay byte-identical to what ships today, so an
-// existing install is not rewritten and does not have to be re-trusted through `/hooks` — and
+// THE UNSUFFIXED BUILD WRITES NO TAG. Production ownership remains implicit, and
 // "absent means production" matches env.json's own convention in lib/paths.mjs. It also makes R1's
 // "recognise legacy unsuffixed entries only in the unsuffixed migration path" fall out by
 // construction: an untagged, unlabelled legacy entry can only ever resolve to 'beezi'.
-function ownerArguments(scriptPath, owner) {
-  if (owner === UNSUFFIXED_OWNER) return [scriptPath];
-  return [scriptPath, OWNER_FLAG + owner];
+function quoteCommandArgument(value) {
+  const text = String(value);
+  // Windows paths cannot contain a double quote. On POSIX, escape the characters that retain
+  // special meaning inside double quotes so a plugin path remains one literal argument.
+  if (process.platform === 'win32') return '"' + text.replace(/"/g, '\\"') + '"';
+  return '"' + text.replace(/([\\$"\x60])/g, '\\$1') + '"';
+}
+
+// Codex 0.154.0 on Windows accepts `arguments` in hooks.json but does not pass them to command
+// hooks. Keep the interpreter PATH-resolved, but put the complete invocation in `command`.
+export function hookCommand(scriptPath, owner = hookOwner()) {
+  const parts = [HOOK_COMMAND, quoteCommandArgument(scriptPath)];
+  if (owner !== UNSUFFIXED_OWNER) parts.push(OWNER_FLAG + owner);
+  return parts.join(' ');
 }
 
 /** 'Beezi analytics' for production, 'Beezi analytics (staging)' for a named variant. */
@@ -140,12 +150,43 @@ function ownerFromLabel(label) {
   return null;
 }
 
-/** The owner tag a named variant wrote into `arguments`, or null. */
+/** The owner tag a named variant wrote into the legacy `arguments` array, or null. */
 function ownerFromArguments(handler) {
   if (!Array.isArray(handler.arguments)) return null;
   for (let i = 1; i < handler.arguments.length; i += 1) {
     const arg = String(handler.arguments[i]);
     if (arg.indexOf(OWNER_FLAG) === 0) return arg.slice(OWNER_FLAG.length);
+  }
+  return null;
+}
+
+function ownerFromCommand(handler) {
+  const command = handler && typeof handler.command === 'string' ? handler.command : '';
+  const match = /(?:^|\s)--beezi-owner=([A-Za-z0-9_-]+)(?:\s|$)/.exec(command);
+  return match ? match[1] : null;
+}
+
+// Read both the corrected composite-command form and the broken 0.8.x `arguments` form so install
+// and uninstall can migrate existing entries without losing ownership information.
+function handlerScript(handler) {
+  if (!handler || typeof handler !== 'object') return null;
+  if (Array.isArray(handler.arguments) && handler.arguments.length) {
+    return String(handler.arguments[0]);
+  }
+  const command = typeof handler.command === 'string' ? handler.command : '';
+  const prefix = HOOK_COMMAND + ' "';
+  if (command.indexOf(prefix) !== 0) return null;
+  let script = '';
+  for (let i = prefix.length; i < command.length; i += 1) {
+    const char = command[i];
+    if (char === '"') return script;
+    if (process.platform !== 'win32' && char === '\\' && i + 1 < command.length
+      && '\\$"`'.indexOf(command[i + 1]) !== -1) {
+      script += command[i + 1];
+      i += 1;
+    } else {
+      script += char;
+    }
   }
   return null;
 }
@@ -166,11 +207,14 @@ function handlerOwner(handler, launcherDir) {
   const tagged = ownerFromArguments(handler);
   if (tagged !== null) return tagged;
 
+  const commandTagged = ownerFromCommand(handler);
+  if (commandTagged !== null) return commandTagged;
+
   const labelled = ownerFromLabel(handler.statusMessage);
   if (labelled !== null) return labelled;
 
-  if (Array.isArray(handler.arguments) && handler.arguments.length) {
-    const script = String(handler.arguments[0]);
+  const script = handlerScript(handler);
+  if (script !== null) {
     // Ours by construction: <...beezi...>/scripts/<one of SCRIPT_NAMES>. Both anchors are
     // needed — a user's own checkpoint.mjs may share the name, and a beezi-flavoured path alone
     // (say, a repo checkout with "beezi" in it) is not proof either.
@@ -200,6 +244,75 @@ function isOwnedHandler(handler, owner, launcherDir) {
   return handlerOwner(handler, launcherDir) === owner;
 }
 
+// ── dead entries ────────────────────────────────────────────────────────────
+//
+// `~/.codex/hooks.json` outlives the install that wrote it. A registered entry whose target file
+// is gone is not inert: Codex still spawns it every session, the spawn fails, and the whole event
+// is reported as `hook: <Event> Failed`. Measured on a live machine — three launcher-style entries
+// left behind by a pre-launcherless production install, pointing into a `~/.beezi-codex/hooks`
+// directory that no longer exists. Run through cmd.exe that is exactly
+// `The system cannot find the path specified.` and exit 1, on SessionStart, PostToolUse and Stop,
+// for every session on that machine, while `hooksStatus()` reported `installed` — because it is
+// owner-scoped and the orphans belonged to a DIFFERENT owner.
+//
+// The scan below is deliberately READ-ONLY and deliberately NOT owner-scoped. Reporting across
+// owners is safe; removing across owners is not, and the one-owner-per-mutation rule above stays
+// exactly as it is. The repair is the owning variant's own `uninstall`, which already handles it
+// correctly — the defect was never that the removal could not be done, only that nothing said it
+// needed doing.
+
+/**
+ * The filesystem path a handler actually spawns, or null when it names none.
+ *
+ * Current-format entries keep `node` PATH-resolved and quote the script inside `command`, so the
+ * script is the thing to check. Legacy launcher entries put only the launcher path in
+ * `command`/`commandWindows`.
+ */
+function handlerTarget(handler) {
+  if (!handler || typeof handler !== 'object') return null;
+  const script = handlerScript(handler);
+  if (script !== null) return script;
+  const command = typeof handler.command === 'string' ? handler.command : handler.commandWindows;
+  if (typeof command !== 'string' || command === '') return null;
+  // A single-token command (`node`, `pwsh`) is resolved from the hook's PATH at spawn time and is
+  // not a path this process can check. Only a command that names a directory is stat-able.
+  if (command.indexOf('/') === -1 && command.indexOf('\\') === -1) return null;
+  return command;
+}
+
+/**
+ * Every Beezi-recognised handler in a registry whose target file is missing, across ALL owners.
+ *
+ * The recogniser is `handlerOwner`, so an entry is only ever claimed by the same three anchors the
+ * mutations use. One consequence is worth stating plainly rather than discovering later: the
+ * launcher-dir anchor compares against the CALLER's `launcherDir`, which is namespaced per
+ * environment, so a legacy production launcher is invisible to a beezi-local process through that
+ * anchor and is caught by its `statusMessage` label instead. A user who reworded the label of a
+ * sibling variant's dead launcher entry gets no report of it. Accepted: the label is the only
+ * cross-owner anchor that exists, and widening the recogniser to "any path with beezi in it" would
+ * start claiming entries that are not ours.
+ */
+export function brokenBeeziEntries(registry, launcherDir = hookLauncherDir()) {
+  const out = [];
+  const source = registry && registry.hooks && typeof registry.hooks === 'object' ? registry.hooks : {};
+  const owners = knownOwners();
+  for (const [event, groups] of Object.entries(source)) {
+    if (!Array.isArray(groups)) continue;
+    for (const group of groups) {
+      if (!group || !Array.isArray(group.hooks)) continue;
+      for (const handler of group.hooks) {
+        const owner = handlerOwner(handler, launcherDir);
+        if (owner === null || owners.indexOf(owner) === -1) continue;
+        const target = handlerTarget(handler);
+        if (target === null) continue;
+        if (fs.existsSync(target)) continue;
+        out.push({ event, owner, target });
+      }
+    }
+  }
+  return out;
+}
+
 // This module sits in <pluginRoot>/lib, so its own location is the single source of truth for where
 // the plugin's scripts are — no caller has to rediscover the layout.
 const DEFAULT_SCRIPTS_DIR = path.join(
@@ -212,6 +325,13 @@ const DEFAULT_SCRIPTS_DIR = path.join(
 // the plugin root, so a relative `scripts/hooks.mjs` resolves to nothing.
 export function installCommand(scriptsDir = DEFAULT_SCRIPTS_DIR) {
   return `node "${path.join(scriptsDir, 'hooks.mjs')}" install`;
+}
+
+// The same, for the read-only action. Derived rather than hand-written for the reason above: a
+// message that reaches the MCP tool is read by a model that will try to RUN what it is given, and
+// a relative path — or worse, a `<plugin>` placeholder — resolves to nothing from the user's cwd.
+export function statusCommand(scriptsDir = DEFAULT_SCRIPTS_DIR) {
+  return `node "${path.join(scriptsDir, 'hooks.mjs')}" status`;
 }
 
 // The `{ hooks: { <Event>: [ { matcher, hooks: [handler] } ] } }` fragment for Beezi's events.
@@ -227,8 +347,7 @@ export function buildHookEntries({ scriptsDir = DEFAULT_SCRIPTS_DIR, owner = hoo
         hooks: [
           {
             type: 'command',
-            command: HOOK_COMMAND,
-            arguments: ownerArguments(path.join(scriptsDir, script), owner),
+            command: hookCommand(path.join(scriptsDir, script), owner),
             statusMessage: ownerLabel(owner),
             timeout: HOOK_TIMEOUT_SEC,
           },
@@ -313,18 +432,76 @@ function writeRegistry(hooksFile, registry) {
   fs.writeFileSync(hooksFile, `${JSON.stringify(registry, null, 2)}\n`, 'utf-8');
 }
 
+/**
+ * Is this a launcher entry from a pre-launcherless install whose file is gone?
+ *
+ * THE ONE CROSS-OWNER REMOVAL THIS MODULE ALLOWS, and it is narrow on purpose. Three independent
+ * facts have to hold before an entry qualifies, and together they make "it might still be a live
+ * sibling's" impossible rather than unlikely:
+ *
+ *   1. Legacy FORM — its command is not one of the composite commands parsed by handlerScript(),
+ *      so nothing currently installable can be mistaken for one.
+ *   2. Our SHAPE — `<home>/.beezi-codex[-env]/hooks/beezi-<name>`. All three segments are checked,
+ *      so a user's own `~/bin/beezi-notify.sh` is not ours and is not touched.
+ *   3. DEAD — the file is missing. A sibling variant that still works has a file there; an entry
+ *      that fails its spawn on every session has nothing left to protect.
+ *
+ * The owner-scoping rule above is therefore intact in substance: this removes only entries that no
+ * owner can still be using. It is done at install time because install is the moment a user is
+ * already accepting a registry rewrite and a re-trust — sweeping here costs them nothing extra,
+ * and it is what turns "your status now names the orphans" into "the next install clears them".
+ */
+function isDeadLegacyLauncher(handler) {
+  if (!handler || typeof handler !== 'object') return false;
+  if (Array.isArray(handler.arguments) && handler.arguments.length) return false;
+  if (handlerScript(handler) !== null) return false;
+
+  const command = typeof handler.command === 'string' ? handler.command : handler.commandWindows;
+  if (typeof command !== 'string' || command === '') return false;
+  if (!path.basename(command).startsWith(LAUNCHER_PREFIX)) return false;
+
+  const dir = path.dirname(command);
+  if (path.basename(dir) !== 'hooks') return false;
+
+  // `.beezi-codex` for the unsuffixed build, `.beezi-codex-<env>` for a named variant — the exact
+  // set lib/paths.mjs beeziCodexHome() can produce. A BEEZI_CODEX_HOME override renames the root,
+  // so an entry written under one is simply not swept; it is still reported by brokenBeeziEntries.
+  const root = path.basename(path.dirname(dir));
+  if (root !== '.beezi-codex' && root.indexOf('.beezi-codex-') !== 0) return false;
+
+  return !fs.existsSync(command);
+}
+
+/** Drop every dead legacy launcher from a registry, leaving everything else exactly where it is. */
+export function removeDeadLegacyLaunchers(existing) {
+  const source = existing ? existing.hooks : null;
+  if (!source || typeof source !== 'object') return existing || {};
+  const hooks = {};
+  for (const [event, groups] of Object.entries(source)) {
+    if (!Array.isArray(groups)) { hooks[event] = groups; continue; }
+    const kept = [];
+    for (const group of groups) {
+      if (!group || !Array.isArray(group.hooks)) { kept.push(group); continue; }
+      const handlers = group.hooks.filter((h) => !isDeadLegacyLauncher(h));
+      if (handlers.length) kept.push({ ...group, hooks: handlers });
+    }
+    if (kept.length) hooks[event] = kept;
+  }
+  return { ...existing, hooks };
+}
+
 export function installHooks({
   scriptsDir = DEFAULT_SCRIPTS_DIR,
   hooksFile = codexHooksFile(),
   launcherDir = hookLauncherDir(),
   owner = hookOwner(),
 } = {}) {
-  writeRegistry(hooksFile, mergeHooks(
+  writeRegistry(hooksFile, removeDeadLegacyLaunchers(mergeHooks(
     readRegistry(hooksFile),
     buildHookEntries({ scriptsDir, owner }),
     launcherDir,
     owner,
-  ));
+  )));
 
   // Launchers are no longer written; sweep away the ones an older version left. The directory is
   // hookLauncherDir(), which is namespaced per environment, so it is exclusively THIS variant's by
@@ -389,11 +566,12 @@ export function hooksStatus({
     }
     if (!handlers.length) { missingEvents.push(event); continue; }
     registered.push(event);
-    // Current means new-format and pointing at this plugin version's script. A legacy
-    // launcher-style entry has no `arguments` and fails this check, which is what routes old
+    // Current means new-format and pointing at this plugin version's script. A legacy launcher or
+    // the broken node-plus-arguments form fails this check, which is what routes old
     // installs through `stale` → "run install to repair" → migration.
     const expected = path.join(scriptsDir, script);
-    const current = handlers.some((h) => Array.isArray(h.arguments) && h.arguments[0] === expected);
+    const expectedCommand = hookCommand(expected, owner);
+    const current = handlers.some((h) => h.command === expectedCommand && !('arguments' in h));
     if (!current) staleEvents.push(event);
   }
 
@@ -404,5 +582,10 @@ export function hooksStatus({
   else if (!registered.length) state = 'absent';
   else state = 'partial';
 
-  return { hooksFile, owner, state, complete, registered, missingEvents, staleEvents };
+  // Reported alongside `state`, never folded into it. `state` answers "is THIS owner's install
+  // usable"; `broken` answers "is anything in this registry failing every session", which a
+  // healthy install of ours does not preclude — that gap is the whole reason this scan exists.
+  const broken = brokenBeeziEntries(registry, launcherDir);
+
+  return { hooksFile, owner, state, complete, registered, missingEvents, staleEvents, broken };
 }

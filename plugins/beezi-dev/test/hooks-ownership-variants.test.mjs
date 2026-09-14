@@ -7,6 +7,7 @@ import {
   BEEZI_HOOKS,
   BEEZI_STATUS_MESSAGE,
   buildHookEntries,
+  hookCommand,
   hookOwner,
   hooksStatus,
   installHooks,
@@ -94,31 +95,34 @@ test('hookOwner() is the plugin name, and the unsuffixed build resolves to it', 
   assert.equal(hookOwner(), PROD);
 });
 
-test('the unsuffixed build writes exactly the entry that ships today — no tag, no relabel', () => {
+test('the unsuffixed build writes a composite command with no owner tag or relabel', () => {
   // Load-bearing: a changed entry is an entry Codex asks the user to re-trust through /hooks.
-  // Existing installs must not be churned by a feature that only concerns variants.
+  // Production keeps its historical implicit owner even though this bug fix changes the command.
   const scriptsDir = variantScriptsDir('/r', PROD);
   const entries = buildHookEntries({ scriptsDir, owner: PROD });
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = entries[event][0].hooks[0];
-    assert.deepEqual(handler.arguments, [path.join(scriptsDir, script)], 'no owner tag on production');
+    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), PROD));
+    assert.ok(!('arguments' in handler), 'no separate arguments on production');
     assert.equal(handler.statusMessage, BEEZI_STATUS_MESSAGE);
   }
 });
 
-test('a named variant tags its arguments and namespaces the label', () => {
+test('a named variant tags its command and namespaces the label', () => {
   const scriptsDir = variantScriptsDir('/r', STAGING);
   const entries = buildHookEntries({ scriptsDir, owner: STAGING });
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = entries[event][0].hooks[0];
-    assert.deepEqual(handler.arguments, [path.join(scriptsDir, script), '--beezi-owner=beezi-staging']);
+    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), STAGING));
+    assert.match(handler.command, / --beezi-owner=beezi-staging$/);
+    assert.ok(!('arguments' in handler));
     // Visible in /hooks, so two installed variants are distinguishable while being reviewed —
     // the same reason the variant builder namespaces interface.displayName.
     assert.equal(handler.statusMessage, 'Beezi analytics (staging)');
   }
   const dev = buildHookEntries({ scriptsDir: variantScriptsDir('/r', DEV), owner: DEV });
   assert.equal(dev.Stop[0].hooks[0].statusMessage, 'Beezi analytics (dev)');
-  assert.equal(dev.Stop[0].hooks[0].arguments[1], '--beezi-owner=beezi-dev');
+  assert.match(dev.Stop[0].hooks[0].command, / --beezi-owner=beezi-dev$/);
 });
 
 test('install prod then staging: both variants are registered, neither stripped the other', (t) => {
@@ -200,7 +204,7 @@ test('uninstalling prod keeps staging — the reverse order of the same claim', 
   const registry = readRegistry(hooksFile);
   for (const { event } of BEEZI_HOOKS) {
     const handler = registry.hooks[event][0].hooks[0];
-    assert.equal(handler.arguments[1], '--beezi-owner=beezi-staging');
+    assert.match(handler.command, / --beezi-owner=beezi-staging$/);
   }
   assert.deepEqual(registry.hooks.PreCompact[0].hooks, [USER_HOOK]);
 });
@@ -248,7 +252,7 @@ test("a variant's entry is claimed by its tag even after the user rewords the la
   const registry = readRegistry(hooksFile);
   for (const { event } of BEEZI_HOOKS) {
     assert.equal(registry.hooks[event].length, 1);
-    assert.equal(registry.hooks[event][0].hooks[0].arguments[1], '--beezi-owner=beezi-staging');
+    assert.match(registry.hooks[event][0].hooks[0].command, / --beezi-owner=beezi-staging$/);
   }
 });
 
@@ -278,9 +282,10 @@ test('legacy unsuffixed entries are recognised only by the unsuffixed owner', (t
   assert.equal(hooksStatus(opts(PROD)).state, 'stale');
   installHooks(opts(PROD));
   const registry = readRegistry(hooksFile);
-  for (const { event } of BEEZI_HOOKS) {
+  for (const { event, script } of BEEZI_HOOKS) {
     assert.equal(registry.hooks[event].length, 1, 'converted in place, not duplicated');
-    assert.equal(registry.hooks[event][0].hooks[0].command, 'node');
+    assert.equal(registry.hooks[event][0].hooks[0].command,
+      hookCommand(path.join(opts(PROD).scriptsDir, script), PROD));
   }
 });
 
@@ -298,8 +303,9 @@ test("a staging install does not adopt production's untagged current-format entr
   const after = readRegistry(hooksFile);
   for (const { event, script } of BEEZI_HOOKS) {
     assert.equal(after.hooks[event].length, 2);
-    assert.deepEqual(after.hooks[event][0].hooks[0].arguments,
-      [path.join(opts(PROD).scriptsDir, script)], "prod's entry is unchanged, byte for byte");
+    assert.equal(after.hooks[event][0].hooks[0].command,
+      hookCommand(path.join(opts(PROD).scriptsDir, script), PROD),
+      "prod's entry is unchanged, byte for byte");
   }
 });
 

@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { beeziCodexHome, codexSessionsDir, queueDir, stateDir } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
+import { scanRecords } from './session-name-codex.mjs';
 import { orDefault } from './compat.mjs';
 
 // Codex writes one rollout transcript per session at
@@ -135,26 +136,29 @@ const TRAILING_UUID_RE = /-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-f
 // than the null id this exists to prevent. On a normal rollout the two are equal, so the
 // preference is invisible there; it also matches lib/transcript-index-codex.mjs, which has always
 // read `id` alone.
+//
+// The read is a bounded STREAM, not a fixed head slice. It used to copy 8KB and parse whatever
+// came back, which never worked on a real machine: session_meta is dominated by
+// `base_instructions`, first lines on this corpus crossed 8KB in 2026-02 and reach 48KB, and
+// lib/session-name-codex.mjs:120-126 measures ~37KB for the record once dynamic_tools is counted.
+// A slice that stops mid-line hands JSON.parse an unterminated string, so the file read as "no
+// session_meta at all" and dropped out of the cwd scan — silently, because the parse failure and a
+// missing file collapse into the same null. It was masked on any machine with working hooks, where
+// findRolloutBySessionState answers first.
+//
+// scanRecords is the single definition of "read records off a rollout" (it chunks at 256KB with a
+// streaming decoder and carries a partial trailing line forward), so there is no second cap here to
+// drift out of step with reality. 512KB matches what lib/transcript-index-codex.mjs:48 passes for
+// the same one-record head read; its own default is 2MB.
+const META_SCAN_BYTES = 512 * 1024;
+
 function rolloutMeta(transcriptPath) {
-  let content;
-  try {
-    const fd = fs.openSync(transcriptPath, 'r');
-    try {
-      const buf = Buffer.alloc(Math.min(fs.fstatSync(fd).size, 8192));
-      fs.readSync(fd, buf, 0, buf.length, 0);
-      content = buf.toString('utf-8');
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return null;
-  }
-  const firstLine = content.split('\n', 1)[0];
-  let rec;
-  try {
-    rec = JSON.parse(firstLine);
-  } catch {
-    return null;
+  let rec = null;
+  // One record is all this needs, and scanRecords is a generator — the loop breaks before a second
+  // chunk is ever read on all but a pathological file.
+  for (const first of scanRecords(transcriptPath, { maxBytes: META_SCAN_BYTES })) {
+    rec = first;
+    break;
   }
   if (!rec || rec.type !== 'session_meta' || !rec.payload) return null;
   const p = rec.payload;

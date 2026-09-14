@@ -169,6 +169,57 @@ test('a session_meta id of the literal "null" is not a session id', () => {
   });
 });
 
+// ─── the session_meta record is far larger than any fixed head slice ───────
+//
+// A real rollout's first line is dominated by `base_instructions`. Measured across 231 local
+// rollouts: first lines crossed 8KB in 2026-02 and the largest is 48KB, and
+// lib/session-name-codex.mjs:120-126 records ~37KB for session_meta alone once dynamic_tools is
+// counted. A head read that stops mid-line leaves JSON.parse with an unterminated string, so the
+// record reads as "no session_meta at all" and the file drops out of the cwd scan entirely.
+//
+// These fixtures MUST use writeUnnamedRollout. With a `rollout-<ISO>-<uuid>.jsonl` name the
+// filename regex recovers the id on its own, so a sessionId assertion would pass with the bug
+// present — a green test pinning nothing.
+function oversizedMeta(kib, over) {
+  return {
+    type: 'session_meta',
+    payload: Object.assign(
+      { id: SID, cwd: '/my/repo', base_instructions: 'x'.repeat(kib * 1024) },
+      over || {},
+    ),
+  };
+}
+
+test('resolveTranscriptByCwd reads a session_meta larger than 8KB', () => {
+  withCodexHome((home) => {
+    const file = writeUnnamedRollout(home, 'rollout-big-preamble.jsonl', [oversizedMeta(18)]);
+    const r = resolveTranscriptByCwd('/my/repo');
+    assert.notEqual(r, null, 'the rollout drops out of the cwd scan when the record cannot parse');
+    assert.equal(r.transcriptPath, file);
+    assert.equal(r.sessionId, SID, 'the id comes off the record the filename could not name');
+  });
+});
+
+// 48KB is the largest first line measured on a real machine. A "generous" fixed cap that merely
+// clears the 18KB case above would still be wrong for files already on disk.
+test('resolveTranscriptByCwd reads a session_meta at the largest size seen in the wild', () => {
+  withCodexHome((home) => {
+    const file = writeUnnamedRollout(home, 'rollout-huge-preamble.jsonl', [oversizedMeta(48)]);
+    const r = resolveTranscriptByCwd('/my/repo');
+    assert.notEqual(r, null);
+    assert.equal(r.transcriptPath, file);
+    assert.equal(r.sessionId, SID);
+  });
+});
+
+// The second route into the same record read: a hook that supplied a path but no usable id.
+test('resolveCodexTranscript names an oversized rollout from its record', () => {
+  withCodexHome((home) => {
+    const file = writeUnnamedRollout(home, 'rollout-big-hook-path.jsonl', [oversizedMeta(18)]);
+    assert.equal(resolveCodexTranscript({ transcript_path: file }).sessionId, SID);
+  });
+});
+
 test('resolveCodexTranscript names a hook-provided path the hook did not name', () => {
   withCodexHome((home) => {
     const file = writeUnnamedRollout(home, 'rollout-hook-path.jsonl', [
