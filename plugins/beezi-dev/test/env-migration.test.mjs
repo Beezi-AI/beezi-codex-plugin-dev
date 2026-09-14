@@ -59,11 +59,12 @@ const productionCredential = JSON.stringify({
 });
 
 const LOCAL_API_ORIGIN = 'http://localhost:5001';
+const CLERK_DEV_ORIGIN = 'https://poetic-lionfish-63.clerk.accounts.dev';
 const localCredential = JSON.stringify({
   access_token: 'at-local',
   refresh_token: 'rt-local',
   client_id: 'c1',
-  token_endpoint: `${LOCAL_API_ORIGIN}/oauth/token`,
+  token_endpoint: `${CLERK_DEV_ORIGIN}/oauth/token`,
   beezi_env: 'local',
 });
 
@@ -91,19 +92,34 @@ test('classify — a root already bound to this environment is left alone', () =
   assert.equal(r.verdict, 'ok');
 });
 
-test('classify — a local credential matching its bound variant is left alone', () => {
+test('classify — a local credential from an external OAuth issuer is left alone', () => {
   const facts = {
     env: 'local',
     binding: { env: 'local', apiOrigin: LOCAL_API_ORIGIN },
     apiOrigin: LOCAL_API_ORIGIN,
     hasData: true,
     issuer: 'unknown',
-    credentialOrigin: LOCAL_API_ORIGIN,
+    credentialOrigin: CLERK_DEV_ORIGIN,
     credentialEnv: 'local',
   };
   assert.equal(classifyRoot(facts).verdict, 'ok');
-  assert.equal(classifyRoot({ ...facts, credentialOrigin: 'http://localhost:5002' }).reason, 'conflicting-evidence');
+  // The token endpoint no longer has to match the API origin: an external issuer is normal.
+  assert.equal(classifyRoot({ ...facts, credentialOrigin: 'http://localhost:5002' }).verdict, 'ok');
+  assert.equal(classifyRoot({ ...facts, credentialOrigin: null }).reason, 'conflicting-evidence');
   assert.equal(classifyRoot({ ...facts, credentialEnv: 'dev' }).reason, 'conflicting-evidence');
+});
+
+test('classify — a dev credential from an external OAuth issuer is left alone', () => {
+  const facts = {
+    env: 'dev',
+    binding: { env: 'dev', apiOrigin: 'https://dev-api.beezi.example' },
+    apiOrigin: 'https://dev-api.beezi.example',
+    hasData: true,
+    issuer: 'unknown',
+    credentialOrigin: CLERK_DEV_ORIGIN,
+    credentialEnv: 'dev',
+  };
+  assert.equal(classifyRoot(facts).verdict, 'ok');
 });
 
 test('classify — a root bound to ANOTHER environment blocks, it does not re-migrate', () => {
