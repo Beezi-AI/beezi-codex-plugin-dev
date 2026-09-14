@@ -8,6 +8,7 @@ import {
   BEEZI_STATUS_MESSAGE,
   HOOK_COMMAND,
   buildHookEntries,
+  hookCommand,
   hooksStatus,
   installHooks,
   mergeHooks,
@@ -41,6 +42,25 @@ function legacyInstall(hooksFile, launcherDir) {
   fs.writeFileSync(hooksFile, JSON.stringify({ hooks }, null, 2));
 }
 
+// The 0.8.x shape Codex accepted but did not execute correctly on Windows: it launched bare Node
+// and did not pass the separate arguments array through to the command hook.
+function brokenArgumentsInstall(hooksFile, scriptsDir) {
+  const hooks = {};
+  for (const { event, script } of BEEZI_HOOKS) {
+    hooks[event] = [{
+      matcher: '.*',
+      hooks: [{
+        type: 'command',
+        command: 'node',
+        arguments: [path.join(scriptsDir, script)],
+        statusMessage: BEEZI_STATUS_MESSAGE,
+        timeout: 10,
+      }],
+    }];
+  }
+  fs.writeFileSync(hooksFile, JSON.stringify({ hooks }, null, 2));
+}
+
 test('the registered event set is exactly the five Beezi hooks', () => {
   // SessionEnd stays out by choice: Stop already runs the identical checkpoint at every turn end,
   // so registering it would only cost the user another entry to review and trust.
@@ -48,16 +68,16 @@ test('the registered event set is exactly the five Beezi hooks', () => {
     ['SessionStart', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop']);
 });
 
-test('buildHookEntries puts the interpreter in command and the script path in arguments', () => {
+test('buildHookEntries puts the complete invocation in command', () => {
   const scriptsDir = path.join('/p', 'beezi', 'scripts');
   const entries = buildHookEntries({ scriptsDir });
   assert.deepEqual(Object.keys(entries).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = entries[event][0].hooks[0];
     assert.equal(handler.type, 'command');
-    assert.equal(handler.command, HOOK_COMMAND);
+    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), 'beezi'));
     assert.equal(HOOK_COMMAND, 'node', 'interpreter comes from PATH, never an absolute path');
-    assert.deepEqual(handler.arguments, [path.join(scriptsDir, script)]);
+    assert.ok(!('arguments' in handler), 'Codex 0.154.0 does not pass this field to command hooks');
     assert.equal(handler.statusMessage, BEEZI_STATUS_MESSAGE);
     assert.ok(!('commandWindows' in handler), 'one command works on every platform');
   }
@@ -117,8 +137,8 @@ test('installHooks writes a readable registry, then uninstall reverses it', () =
   assert.deepEqual(Object.keys(written.hooks).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = written.hooks[event][0].hooks[0];
-    assert.equal(handler.command, 'node');
-    assert.deepEqual(handler.arguments, [path.join(scriptsDir, script)]);
+    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), 'beezi'));
+    assert.ok(!('arguments' in handler));
   }
   assert.ok(fs.readFileSync(hooksFile, 'utf-8').includes('\n  '), 'registry stays hand-reviewable');
 
@@ -211,7 +231,7 @@ test('an entry whose label the user reworded is still recognised as ours', () =>
   for (const groups of Object.values(edited.hooks)) groups[0].hooks[0].statusMessage = 'my analytics';
   fs.writeFileSync(hooksFile, JSON.stringify(edited));
 
-  // Ownership falls back to the script path in `arguments`, so re-install stays idempotent…
+  // Ownership falls back to the script path in `command`, so re-install stays idempotent.
   installHooks({ scriptsDir, hooksFile, launcherDir });
   assert.equal(JSON.parse(fs.readFileSync(hooksFile, 'utf-8')).hooks.Stop.length, 1);
 
@@ -279,6 +299,28 @@ test('hooksStatus reports a legacy launcher-style install as stale', () => {
   assert.equal(status.staleEvents.length, BEEZI_HOOKS.length);
 });
 
+test('hooksStatus reports broken node-plus-arguments entries as stale and install migrates them', () => {
+  const root = tmpdir();
+  const hooksFile = path.join(root, 'hooks.json');
+  const launcherDir = path.join(root, 'l');
+  const scriptsDir = beeziScriptsDir(root);
+  brokenArgumentsInstall(hooksFile, scriptsDir);
+
+  const before = hooksStatus({ scriptsDir, hooksFile, launcherDir });
+  assert.equal(before.state, 'stale');
+  assert.equal(before.staleEvents.length, BEEZI_HOOKS.length);
+
+  installHooks({ scriptsDir, hooksFile, launcherDir });
+  const registry = JSON.parse(fs.readFileSync(hooksFile, 'utf-8'));
+  for (const { event, script } of BEEZI_HOOKS) {
+    assert.equal(registry.hooks[event].length, 1, 'broken entry replaced, not duplicated');
+    const handler = registry.hooks[event][0].hooks[0];
+    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), 'beezi'));
+    assert.ok(!('arguments' in handler));
+  }
+  assert.equal(hooksStatus({ scriptsDir, hooksFile, launcherDir }).state, 'installed');
+});
+
 test('installHooks converts a legacy install and removes the launcher directory', () => {
   const root = tmpdir();
   const hooksFile = path.join(root, 'hooks.json');
@@ -292,8 +334,8 @@ test('installHooks converts a legacy install and removes the launcher directory'
   for (const { event, script } of BEEZI_HOOKS) {
     assert.equal(written.hooks[event].length, 1, 'old entry replaced, not duplicated');
     const handler = written.hooks[event][0].hooks[0];
-    assert.equal(handler.command, 'node');
-    assert.deepEqual(handler.arguments, [path.join(scriptsDir, script)]);
+    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), 'beezi'));
+    assert.ok(!('arguments' in handler));
   }
   assert.ok(!fs.existsSync(launcherDir), 'old launcher directory is swept away');
   assert.equal(hooksStatus({ scriptsDir, hooksFile, launcherDir }).state, 'installed');

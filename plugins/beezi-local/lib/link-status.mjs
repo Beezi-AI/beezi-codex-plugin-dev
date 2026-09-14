@@ -2,7 +2,7 @@ import { apiBase } from './config.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { getAuthentication as _getAuthentication } from './token.mjs';
 import { whoami as _whoami } from './whoami.mjs';
-import { hooksStatus as _hooksStatus, installCommand } from './hooks-install.mjs';
+import { hooksStatus as _hooksStatus, installCommand, statusCommand } from './hooks-install.mjs';
 
 // One answer to "is this machine linked, and is it reporting?".
 //
@@ -54,14 +54,42 @@ export async function linkStatus(deps = {}) {
 }
 
 // Never let a hook-registry read break a link check — the two are independent failures.
+//
+// `broken` rides along with `state` because the two answer different questions and a machine can
+// be in the worst combination of both: `state: 'installed'` while other entries in the same
+// registry fail on every session. That combination is not hypothetical — it is the one measured on
+// a live machine, and it is why this reader cannot go on returning `state` alone.
 function hooks(deps) {
   const read = deps.hooksStatus || _hooksStatus;
   try {
     const s = read();
-    return { state: s.state, registered: s.registered };
+    return { state: s.state, registered: s.registered, broken: s.broken || [] };
   } catch {
-    return { state: 'unknown', registered: [] };
+    return { state: 'unknown', registered: [], broken: [] };
   }
+}
+
+/**
+ * The one sentence about dead registry entries, or null.
+ *
+ * Separate from the `state` switch below because it is ORTHOGONAL to it: a dead entry fails its
+ * spawn whether or not this machine is linked, and whether or not OUR OWN hooks are healthy. The
+ * `installed` branch used to be the end of the conversation, which is exactly how a user could be
+ * told "hooks are installed, trust them" while three entries had been failing every session for
+ * weeks.
+ */
+function describeBrokenHooks(status) {
+  const broken = status.hooks && status.hooks.broken ? status.hooks.broken : [];
+  if (!broken.length) return null;
+
+  const events = [];
+  for (const entry of broken) {
+    if (events.indexOf(entry.event) === -1) events.push(entry.event);
+  }
+  const plural = broken.length === 1 ? 'entry points' : 'entries point';
+  return `Separately: ${broken.length} registered hook ${plural} at a file that no longer exists`
+    + ` (${events.join(', ')}), so Codex reports those events as failed on every session.`
+    + ` Run ${statusCommand()} for the paths and the repair.`;
 }
 
 // The single phrasing of each outcome, so the MCP tool, the CLI script and the session banner
@@ -81,29 +109,39 @@ export function describeLink(status) {
 }
 
 // Analytics need both halves: a link and trusted hooks. Returns null when there is nothing to say.
+//
+// Every branch runs its verdict through `withBroken`, so the dead-entry warning reaches the MCP
+// tool, the CLI and the session banner by construction rather than by three call sites remembering
+// to ask — the same reason the phrasings live here in the first place.
 export function describeReporting(status) {
+  const dead = describeBrokenHooks(status);
+  const withBroken = (line) => {
+    if (!dead) return line;
+    return line ? `${line} ${dead}` : dead;
+  };
+
   if (status.state === LinkState.NOT_LINKED) {
-    return 'Analytics are NOT being reported — this machine is not linked.';
+    return withBroken('Analytics are NOT being reported — this machine is not linked.');
   }
   if (status.state === LinkState.REVOKED) {
-    return 'Analytics are NOT being reported — this machine’s link was revoked.';
+    return withBroken('Analytics are NOT being reported — this machine’s link was revoked.');
   }
   // Unreachable says nothing about the link itself: the credentials may be perfectly good and the
   // hooks may be reporting fine from a process that can see the API. Claiming "not linked" here is
   // what made a status check and the sign-in tool look like they disagreed.
   if (status.state === LinkState.UNREACHABLE) {
-    return 'Could not verify the link, so whether analytics are reporting is unknown. Queued reports are retried automatically once the API is reachable.';
+    return withBroken('Could not verify the link, so whether analytics are reporting is unknown. Queued reports are retried automatically once the API is reachable.');
   }
   switch (status.hooks.state) {
     case 'installed':
-      return 'Analytics hooks are installed. If nothing is arriving, run /hooks in Codex and trust the Beezi entries — Codex will not run a hook it has not been shown.';
+      return withBroken('Analytics hooks are installed. If nothing is arriving, run /hooks in Codex and trust the Beezi entries — Codex will not run a hook it has not been shown.');
     case 'absent':
-      return `Analytics are NOT being reported: the hooks are not installed. Run ${installCommand()}, then run /hooks in Codex and trust them.`;
+      return withBroken(`Analytics are NOT being reported: the hooks are not installed. Run ${installCommand()}, then run /hooks in Codex and trust them.`);
     case 'stale':
-      return `Analytics are NOT being reported: the hooks point at an older plugin version. Run ${installCommand()}, then re-trust via /hooks.`;
+      return withBroken(`Analytics are NOT being reported: the hooks point at an older plugin version. Run ${installCommand()}, then re-trust via /hooks.`);
     case 'partial':
-      return `Analytics may not be reported: the hook install is incomplete. Run ${installCommand()}, then re-trust via /hooks.`;
+      return withBroken(`Analytics may not be reported: the hook install is incomplete. Run ${installCommand()}, then re-trust via /hooks.`);
     default:
-      return null;
+      return withBroken(null);
   }
 }

@@ -43,7 +43,7 @@ Codex loads a plugin's `skills/` and `.mcp.json`, but **not** its `hooks.json` �
 it `$P`:
 
 ```bash
-node "$P/scripts/hooks.mjs" install   # writes ~/.codex/hooks.json (each entry runs `node` with the script path in `arguments`)
+node "$P/scripts/hooks.mjs" install   # writes ~/.codex/hooks.json (each entry contains the complete Node invocation)
 ```
 
 Then, inside Codex, run `/hooks` — review the Beezi entries and trust **all** of them. There is one
@@ -286,7 +286,7 @@ Measured against Codex CLI 0.137.0 on Windows.
   falling back to the file store log in again. Anything still queued under `~/.beezi` is not sent,
   and re-reporting after the move is harmless — the server dedups by `segmentId`. Hook launchers an
   older plugin version wrote are no longer used at all; `hooks.mjs install` rewrites the registry to
-  `node`-plus-`arguments` entries (re-trust via `/hooks`) and deletes the old launcher directory.
+  complete command entries (re-trust via `/hooks`) and deletes the old launcher directory.
 - **The keyring entry was renamed — sign in once more.** This plugin now owns the OS keyring entry
   `beezi-codex`; it previously shared `beezi-analytics` with the Claude Code plugin, where the two
   fought over refreshed tokens and over logout. A machine linked before the rename reads as *not
@@ -314,7 +314,7 @@ Measured against Codex CLI 0.137.0 on Windows.
 - **Plugin-root variable.** For hooks, Codex exports `PLUGIN_ROOT` and `PLUGIN_DATA`, plus
   `CLAUDE_PLUGIN_ROOT` / `CLAUDE_PLUGIN_DATA` for compatibility. `CODEX_PLUGIN_ROOT` does not exist.
   The installer does not rely on any of them — it resolves the plugin from its own module path and
-  writes each script's absolute path into the registry entry's `arguments`.
+  writes each script's quoted absolute path into the registry entry's `command`.
 - **Codex's native MCP OAuth is not usable here.** `codex mcp login` and the `AuthRequired`
   handshake only apply to `streamable_http` servers; a stdio server reports
   `authStatus: "unsupported"`. Switching transports would authenticate drafting into Codex's own

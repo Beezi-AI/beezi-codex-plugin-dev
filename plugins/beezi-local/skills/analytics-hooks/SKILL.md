@@ -43,7 +43,7 @@ hook's **hash**, so this has to be repeated after any change to the hooks, inclu
 upgrade.
 
 **A plugin upgrade always needs this doing again.** Each registry entry carries the absolute path
-of the plugin version's hook script in its `arguments`, so an upgrade moves the scripts out from
+of the plugin version's hook script in its `command`, so an upgrade moves the scripts out from
 under them: `status` reports `stale`, and the machine reports nothing until the user runs `install`
 and re-trusts. Tell them both halves — re-installing without re-trusting leaves them exactly as
 stuck.
@@ -73,7 +73,7 @@ its exact span on the session timeline.
 ## Scope of what is written
 
 `install` writes `~/.codex/hooks.json` only. Each entry runs `node` from PATH with the hook
-script's absolute path in `arguments` — no launcher scripts are written any more, and `install`
+script's quoted absolute path in `command` — no launcher scripts are written any more, and `install`
 sweeps away the `~/.beezi-codex/hooks/` launchers an older plugin version left. It **merges**:
 any hooks the user configured themselves keep their place and content. `uninstall` removes only
 Beezi's entries, and deletes the registry file only if Beezi's entries were the only thing in it.
