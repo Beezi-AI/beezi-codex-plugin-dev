@@ -142,9 +142,22 @@ function resolveSubscriptionType(config, account, nowMs) {
 export function buildAccountSyncPayload({ config = null, account = null, now = Date.now() } = {}) {
   const nowMs = now;
   const payload = {};
-  const accountUuid = bounded(account === null ? null : account.accountId, MAX_ACCOUNT_UUID);
+  // billing.json first, ~/.codex/auth.json second — the same precedence lib/account-identity.mjs
+  // states, and for the same reason: the config is the only place a `codex app-server` identity is
+  // written down, and on a keychain-only machine auth.json names no account at all.
+  const field = (source, key, max) => bounded(
+    source === null || source === undefined ? null : source[key],
+    max,
+  );
+  const accountUuid = orDefault(
+    field(config, 'accountId', MAX_ACCOUNT_UUID),
+    field(account, 'accountId', MAX_ACCOUNT_UUID),
+  );
   if (accountUuid !== null) payload.accountUuid = accountUuid;
-  const email = bounded(account === null ? null : account.email, MAX_ACCOUNT_EMAIL);
+  const email = orDefault(
+    field(config, 'email', MAX_ACCOUNT_EMAIL),
+    field(account, 'email', MAX_ACCOUNT_EMAIL),
+  );
   if (email !== null) payload.email = email;
   const subscriptionType = resolveSubscriptionType(config, account, nowMs);
   if (subscriptionType !== null) payload.subscriptionType = subscriptionType;

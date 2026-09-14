@@ -21,13 +21,17 @@ async function main() {
   const existing = readBillingConfig();
 
   let config;
+  // Which tier answered, appended to the confirmation line so a support question can tell a live
+  // reading from a decoded snapshot without re-running anything. Empty on the self-report path.
+  let capturedVia = '';
   if (parsed.fromCodex) {
-    // --from-codex: read the non-secret ChatGPT plan claim from ~/.codex/auth.json ourselves,
-    // deterministically. No tokens are read/returned; the model does not supply any values. Shared
-    // with the SessionStart hook so both apply the same rule to an expired claim.
-    const captured = captureFromCodexAccount({ via: parsed.via, existing });
+    // --from-codex: ask Codex itself which account it is signed in as (`codex app-server`), and
+    // fall back to the non-secret plan claim in ~/.codex/auth.json. Deterministic; no tokens are
+    // read or returned and the model supplies no values. Shared with the SessionStart hook so both
+    // apply the same rule to an expired claim.
+    const captured = await captureFromCodexAccount({ via: parsed.via, existing });
     if (captured.reason === 'no-account') {
-      console.log('Beezi: no ChatGPT subscription info found in ~/.codex/auth.json — nothing captured.');
+      console.log('Beezi: Codex named no ChatGPT account — nothing captured. Run `codex login` if you meant to be signed in.');
       process.exit(0);
     }
     if (captured.reason === 'kept-self-reported') {
@@ -43,12 +47,13 @@ async function main() {
       process.exit(0);
     }
     config = captured.config;
+    capturedVia = ` via=${orDefault(captured.tier, 'auth-json')}`;
   } else {
     config = buildConfig(parsed, process.env, new Date(), existing);
   }
 
   writeBillingConfig(config);
-  console.log(`✓ Beezi billing captured: source=${config.source} plan=${orDefault(config.plan, 'n/a')}.`);
+  console.log(`✓ Beezi billing captured: source=${config.source} plan=${orDefault(config.plan, 'n/a')}${capturedVia}.`);
   // Tell Beezi about the plan we just recorded, FORCED (G-2-1). Force is load-bearing here for the
   // same reason it is at login: the plan may have changed while the accountUuid and email did not,
   // and on a machine whose billing.json already named a plan the payload can be byte-identical to

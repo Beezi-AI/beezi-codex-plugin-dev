@@ -238,6 +238,10 @@ test('every subprocess call site in lib/ is behind an injectable seam, and no te
     // performLogin is itself the injected unit (mcp-bridge.test.mjs:226-239); nothing in the suite
     // enters launch()/openBrowser, which is the only spawn site.
     'lib/login.mjs': /deps\.startLoopback/,
+    // deps.spawn || _spawn (codex-app-server.mjs) — the `codex app-server` probe. Unseamed it
+    // would launch a REAL Codex against the developer's own ~/.codex from any test that reaches
+    // captureFromCodexAccount, so every caller of it in the suite injects this.
+    'lib/codex-app-server.mjs': /deps\.spawn/,
   };
   for (const [name, src] of sources('lib')) {
     if (!/from\s*['"](?:node:)?child_process['"]/.test(src)) continue;
