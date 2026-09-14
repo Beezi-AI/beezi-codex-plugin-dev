@@ -58,6 +58,15 @@ const productionCredential = JSON.stringify({
   token_endpoint: `${PRODUCTION_API_ORIGIN}/oauth/token`,
 });
 
+const LOCAL_API_ORIGIN = 'http://localhost:5001';
+const localCredential = JSON.stringify({
+  access_token: 'at-local',
+  refresh_token: 'rt-local',
+  client_id: 'c1',
+  token_endpoint: `${LOCAL_API_ORIGIN}/oauth/token`,
+  beezi_env: 'local',
+});
+
 /** Deps that keep the migration inside two temp directories and off the real keyring. */
 function depsFor(source, destination, { credential = null, onDelete = null } = {}) {
   const store = { credential };
@@ -80,6 +89,21 @@ function depsFor(source, destination, { credential = null, onDelete = null } = {
 test('classify — a root already bound to this environment is left alone', () => {
   const r = classifyRoot({ env: '', binding: { env: '', apiOrigin: PRODUCTION_API_ORIGIN }, hasData: true, issuer: 'production' });
   assert.equal(r.verdict, 'ok');
+});
+
+test('classify — a local credential matching its bound variant is left alone', () => {
+  const facts = {
+    env: 'local',
+    binding: { env: 'local', apiOrigin: LOCAL_API_ORIGIN },
+    apiOrigin: LOCAL_API_ORIGIN,
+    hasData: true,
+    issuer: 'unknown',
+    credentialOrigin: LOCAL_API_ORIGIN,
+    credentialEnv: 'local',
+  };
+  assert.equal(classifyRoot(facts).verdict, 'ok');
+  assert.equal(classifyRoot({ ...facts, credentialOrigin: 'http://localhost:5002' }).reason, 'conflicting-evidence');
+  assert.equal(classifyRoot({ ...facts, credentialEnv: 'dev' }).reason, 'conflicting-evidence');
 });
 
 test('classify — a root bound to ANOTHER environment blocks, it does not re-migrate', () => {
@@ -334,6 +358,24 @@ test('migration — a variant build binds its own root and never looks for a leg
   assert.equal(credentialReads, 1);
   assert.equal(readBinding({ home: () => source }), null);
   assert.ok(fs.existsSync(path.join(source, 'queue', 'seg-1.json')));
+});
+
+test('migration — a local variant remains usable after login stores its stamped credential', (t) => {
+  const source = sandbox(t, 'src-local-linked');
+  fs.writeFileSync(path.join(source, 'environment.json'), JSON.stringify({
+    version: 1,
+    env: 'local',
+    apiOrigin: LOCAL_API_ORIGIN,
+  }));
+
+  const result = ensureEnvironmentMigrated({
+    env: 'local',
+    apiOrigin: LOCAL_API_ORIGIN,
+    home: () => source,
+    readRawCredential: () => localCredential,
+  });
+
+  assert.equal(result.status, 'ok');
 });
 
 test('migration — a root bound to staging refuses to serve a production build', (t) => {

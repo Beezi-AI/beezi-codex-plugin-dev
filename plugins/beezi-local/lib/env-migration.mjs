@@ -172,8 +172,17 @@ export function classifyRoot(facts) {
 
   if (binding && typeof binding === 'object' && typeof binding.env === 'string') {
     if (binding.env === env) {
+      // The cutover classifier can identify only the two API origins the public plugin has
+      // shipped. Dev and local credentials therefore have issuer='unknown', but a named
+      // variant still carries two independent pieces of exact evidence: the credential's
+      // environment stamp and its token endpoint origin. Accept that pair when both match the
+      // active build and its bound root. Restricting this exception to `dev` made a local login
+      // work once, then blocked every later operation as soon as it stored a `local` credential.
+      const matchingNamedCredential = env !== ''
+        && f.credentialOrigin === api
+        && f.credentialEnv === env;
       if (binding.apiOrigin !== api || (f.issuer !== 'unlinked' && f.issuer !== expected
-        && !(env === 'dev' && f.credentialOrigin === api && f.credentialEnv === env))) {
+        && !matchingNamedCredential)) {
         return { verdict: 'blocked', reason: 'conflicting-evidence' };
       }
       return { verdict: 'ok' };
