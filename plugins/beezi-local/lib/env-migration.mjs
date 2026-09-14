@@ -174,12 +174,14 @@ export function classifyRoot(facts) {
     if (binding.env === env) {
       // The cutover classifier can identify only the two API origins the public plugin has
       // shipped. Dev and local credentials therefore have issuer='unknown', but a named
-      // variant still carries two independent pieces of exact evidence: the credential's
-      // environment stamp and its token endpoint origin. Accept that pair when both match the
-      // active build and its bound root. Restricting this exception to `dev` made a local login
-      // work once, then blocked every later operation as soon as it stored a `local` credential.
+      // variant still carries exact environment evidence in the credential stamp written by
+      // setCredentials(). The token endpoint only has to be PRESENT, not to match the API:
+      // OAuth discovery legitimately puts it on an external issuer such as Clerk, so comparing
+      // it with the Beezi API origin made a fresh local login block every later operation.
+      // The root's own origin is still verified independently by the `binding.apiOrigin !== api`
+      // test below, so the credential is only ever asked for its environment.
       const matchingNamedCredential = env !== ''
-        && f.credentialOrigin === api
+        && typeof f.credentialOrigin === 'string'
         && f.credentialEnv === env;
       if (binding.apiOrigin !== api || (f.issuer !== 'unlinked' && f.issuer !== expected
         && !matchingNamedCredential)) {
