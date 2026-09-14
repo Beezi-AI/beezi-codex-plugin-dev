@@ -1,6 +1,6 @@
 ---
 name: login
-description: Link this machine to Beezi, unlink it, or refresh the captured ChatGPT plan. Use when the user wants to log in / sign in / connect to Beezi, log out, or when a Beezi tool reports that the machine is not linked. For "am I linked?" use the `me` skill instead.
+description: Link this machine to Beezi, or refresh the captured ChatGPT plan. Use when the user wants to log in / sign in / connect to Beezi, switch Beezi accounts, or when a Beezi tool reports that the machine is not linked. For "am I linked?" use the `me` skill; to sign out use the `logout` skill.
 ---
 
 # Beezi: login
@@ -160,12 +160,9 @@ finalizes; a finalized pull cannot be re-opened.
 
 ## Logging out
 
-```
-node "<plugin-root>/scripts/logout.mjs"
-```
-
-Unlinks this machine. Confirm with the user first — it is not what someone asking to "switch
-accounts" usually wants; logging in again re-links without needing this.
+That is the `logout` skill. Do not run `logout.mjs` from here — signing out has its own outcomes to
+relay, and it is not what someone asking to "switch accounts" usually wants: logging in again
+re-links this machine without unlinking it first.
 
 ## Refreshing the captured plan
 

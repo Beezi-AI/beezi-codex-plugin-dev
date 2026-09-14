@@ -69,8 +69,8 @@ exist.
 
 | Skill | Covers |
 | --- | --- |
-| `create-ticket` | Draft and file a ticket on your board or in Beezi |
-| `login` | Link / unlink this machine, refresh the captured plan |
+| `login` | Link this machine, refresh the captured plan |
+| `logout` | Unlink this machine and drop its stored credentials |
 | `me` | Is this machine linked, as whom, and are the hooks installed |
 | `analytics-hooks` | Install, repair, remove, or check the analytics hooks |
 | `track` | Checkpoint the current branch now, without hooks |
