@@ -49,6 +49,22 @@ function variantLauncherDir(root, owner) {
   return path.join(root, owner === PROD ? '.beezi-codex' : `.beezi-codex-${owner.slice('beezi-'.length)}`, 'hooks');
 }
 
+/**
+ * Materialise a variant's five hook scripts on disk.
+ *
+ * Not decoration: install sweeps registry entries whose target file is MISSING, across owners, so
+ * a variant whose scripts were never written would read as abandoned and be cleared by the next
+ * variant's install. An installed variant has its scripts — that is what "installed" means — and a
+ * bench that skips this is testing a machine that cannot exist.
+ */
+function materialise(o) {
+  fs.mkdirSync(o.scriptsDir, { recursive: true });
+  for (const { script } of BEEZI_HOOKS) {
+    fs.writeFileSync(path.join(o.scriptsDir, script), '// stub\n');
+  }
+  return o;
+}
+
 const USER_HOOK = { type: 'command', command: '/usr/local/bin/audit' };
 
 function withUserHook(hooksFile) {
@@ -80,7 +96,7 @@ function bench(t) {
   t.after(() => { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ } });
   const hooksFile = path.join(root, '.codex', 'hooks.json');
   fs.mkdirSync(path.dirname(hooksFile), { recursive: true });
-  const opts = (owner, version) => ({
+  const opts = (owner, version) => materialise({
     scriptsDir: variantScriptsDir(root, owner, version),
     launcherDir: variantLauncherDir(root, owner),
     hooksFile,

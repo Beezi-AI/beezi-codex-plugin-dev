@@ -4,13 +4,19 @@ import { createBridge, mcpUrl, LOGIN_TOOL, STATUS_TOOL, LOCAL_TOOLS } from '../l
 
 const URL_UNDER_TEST = 'https://api.test/api/mcp';
 
+// The bridge repairs the hook registry on a linked machine's first message. Stubbed by default so
+// a unit test of the message loop does no filesystem work; the heal itself is tested below.
+const NO_REPAIR = { repaired: false, before: 'installed', state: 'installed', swept: [] };
+
 // Each entry in `responses` answers one fetch, in order; an Error entry rejects.
-function bridgeWith({ responses = [], token = 'tok' } = {}) {
+function bridgeWith({ responses = [], token = 'tok', ensureHooks = () => NO_REPAIR } = {}) {
   const calls = [];
   const out = [];
+  const heals = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
     getAccessToken: async () => token,
+    ensureHooks: () => { heals.push(1); return ensureHooks(); },
     fetchImpl: async (url, init) => {
       calls.push({ url, headers: init.headers, body: JSON.parse(init.body) });
       const next = responses.shift();
@@ -21,7 +27,7 @@ function bridgeWith({ responses = [], token = 'tok' } = {}) {
     logError: () => {},
     timeoutMs: 1000,
   });
-  return { bridge, calls, out };
+  return { bridge, calls, out, heals };
 }
 
 function jsonRes(body, { status = 200, headers = {} } = {}) {
@@ -411,6 +417,68 @@ test('beezi_status reports the link, the API it checked, and the analytics half'
   // And it explains why analytics are empty instead of leaving the user to guess.
   assert.match(text, /NOT being reported/i);
   assert.match(text, /hooks are not installed/i);
+});
+
+// ── the bridge repairs the hooks nobody else can ────────────────────────────
+//
+// A stale hook entry points at the previous plugin version's script, so Codex's spawn fails and
+// session-start.mjs never runs: the hooks cannot repair themselves. This process can — it is
+// spawned every session, needs no trust, and is alive before any hook would have been.
+
+test('a linked machine has its hooks repaired on the first message, once', async () => {
+  const { bridge, heals } = bridgeWith({
+    responses: [jsonRes(INIT_RESULT), jsonRes(CALL_RESULT)],
+  });
+
+  await bridge.handleMessage(INIT);
+  await bridge.handleMessage(CALL);
+
+  // Once per process: nothing about the registry changes mid-session, and a needless rewrite would
+  // revoke the trust the user granted.
+  assert.equal(heals.length, 1);
+});
+
+test('an unlinked machine gets no hook entries written on its behalf', async () => {
+  const { bridge, heals } = bridgeWith({ token: null });
+  await bridge.handleMessage(INIT);
+  await bridge.handleMessage(CALL);
+  assert.equal(heals.length, 0);
+});
+
+test('a repair the bridge performed is reported by beezi_status, with the trust step', async () => {
+  const out = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    url: URL_UNDER_TEST,
+    getAccessToken: async () => 'tok',
+    fetchImpl: async () => { throw new Error('must not reach the network'); },
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    ensureHooks: () => ({ repaired: true, before: 'stale', state: 'installed', swept: [{ event: 'Stop' }] }),
+    linkStatus: async () => ({
+      state: 'linked', account: 'Dev', apiBase: 'http://localhost:5001/api',
+      hooks: { state: 'installed', registered: ['Stop'], broken: [] },
+    }),
+  });
+
+  await bridge.handleMessage({ jsonrpc: '2.0', id: 7, method: 'tools/call', params: { name: STATUS_TOOL.name } });
+
+  const text = out[0].result.content[0].text;
+  assert.match(text, /repaired the analytics hooks automatically/);
+  assert.match(text, /1 dead entry from an older install was removed/);
+  // The one half that cannot be automated is the one half the user is asked for.
+  assert.match(text, /\/hooks/);
+});
+
+test('a hook repair that throws never reaches the client', async () => {
+  const { bridge, out } = bridgeWith({
+    responses: [jsonRes(INIT_RESULT)],
+    ensureHooks: () => { throw new Error('registry is not writable'); },
+  });
+
+  await bridge.handleMessage(INIT);
+
+  assert.equal(out.length, 1);
+  assert.deepEqual(out[0], INIT_RESULT);
 });
 
 test('beezi_status answers on an unlinked machine too', async () => {

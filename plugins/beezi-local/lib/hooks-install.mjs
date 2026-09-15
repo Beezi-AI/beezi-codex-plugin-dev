@@ -5,6 +5,7 @@ import { codexHooksFile, hookLauncherDir, environment } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
 import { UserError } from './friendly-error.mjs';
 import { removeFileSync, removeDirSync } from './compat.mjs';
+import { withLock, sharedLock } from './single-instance-lock.mjs';
 
 // Codex does not load hooks bundled inside a plugin — the `plugin_hooks` feature is `removed`, and
 // an installed plugin contributes zero entries to the engine's `hooks/list`. Only `skills/` and
@@ -435,7 +436,7 @@ function writeRegistry(hooksFile, registry) {
 /**
  * Is this a launcher entry from a pre-launcherless install whose file is gone?
  *
- * THE ONE CROSS-OWNER REMOVAL THIS MODULE ALLOWS, and it is narrow on purpose. Three independent
+ * The SHAPE-anchored half of the dead-entry sweep, and it is narrow on purpose. Three independent
  * facts have to hold before an entry qualifies, and together they make "it might still be a live
  * sibling's" impossible rather than unlikely:
  *
@@ -446,10 +447,8 @@ function writeRegistry(hooksFile, registry) {
  *   3. DEAD — the file is missing. A sibling variant that still works has a file there; an entry
  *      that fails its spawn on every session has nothing left to protect.
  *
- * The owner-scoping rule above is therefore intact in substance: this removes only entries that no
- * owner can still be using. It is done at install time because install is the moment a user is
- * already accepting a registry rewrite and a re-trust — sweeping here costs them nothing extra,
- * and it is what turns "your status now names the orphans" into "the next install clears them".
+ * It survives alongside the owner-anchored half below because it needs no label and no tag: a
+ * sibling's dead launcher whose `statusMessage` the user reworded is recognised by shape alone.
  */
 function isDeadLegacyLauncher(handler) {
   if (!handler || typeof handler !== 'object') return false;
@@ -472,8 +471,39 @@ function isDeadLegacyLauncher(handler) {
   return !fs.existsSync(command);
 }
 
-/** Drop every dead legacy launcher from a registry, leaving everything else exactly where it is. */
-export function removeDeadLegacyLaunchers(existing) {
+/**
+ * Is this a Beezi-recognised entry whose target file is gone, whoever installed it?
+ *
+ * THE CROSS-OWNER REMOVAL THIS MODULE ALLOWS, widened from launchers alone to every form we write.
+ * The recogniser is `handlerOwner`, the same three anchors every mutation uses, so a user's own
+ * hook is never claimed; `handlerTarget` returns null for a PATH-resolved interpreter, so a
+ * `command: 'node'` entry naming no path is never stat-ed and never swept.
+ *
+ * DEAD is what makes the cross-owner reach sound. The one-owner-per-mutation rule protects a
+ * sibling variant that still works — and a sibling that still works has its file on disk. An entry
+ * whose file is missing is not inert: Codex spawns it every session, the spawn fails, and the whole
+ * event is reported as `hook: <Event> Failed`. It belongs to no working install, so removing it
+ * cannot break one, and leaving it breaks every session on the machine.
+ *
+ * This is what removes the "go and run that variant's uninstall by hand" instruction: the variant
+ * that left the orphans is usually the one the user has already deleted, so it is not there to run.
+ *
+ * And the one false positive left is self-correcting. `fs.existsSync` also answers false for a path
+ * this process cannot stat, so a live sibling could in principle be swept — but that sibling's own
+ * MCP server calls ensureHooks() at the start of its next session and puts its entries straight
+ * back. The worst case is one re-trust, not a variant that stops reporting.
+ */
+function isDeadBeeziEntry(handler, launcherDir) {
+  if (isDeadLegacyLauncher(handler)) return true;
+  const owner = handlerOwner(handler, launcherDir);
+  if (owner === null || knownOwners().indexOf(owner) === -1) return false;
+  const target = handlerTarget(handler);
+  if (target === null) return false;
+  return !fs.existsSync(target);
+}
+
+/** Drop every dead Beezi entry from a registry, leaving everything else exactly where it is. */
+export function removeDeadBeeziEntries(existing, launcherDir = hookLauncherDir()) {
   const source = existing ? existing.hooks : null;
   if (!source || typeof source !== 'object') return existing || {};
   const hooks = {};
@@ -482,12 +512,34 @@ export function removeDeadLegacyLaunchers(existing) {
     const kept = [];
     for (const group of groups) {
       if (!group || !Array.isArray(group.hooks)) { kept.push(group); continue; }
-      const handlers = group.hooks.filter((h) => !isDeadLegacyLauncher(h));
+      const handlers = group.hooks.filter((h) => !isDeadBeeziEntry(h, launcherDir));
       if (handlers.length) kept.push({ ...group, hooks: handlers });
     }
     if (kept.length) hooks[event] = kept;
   }
   return { ...existing, hooks };
+}
+
+// ── the registry lock ───────────────────────────────────────────────────────
+//
+// `~/.codex/hooks.json` is shared state and every mutation below is a read-modify-write, so R3's
+// rule applies: one writer at a time, through lib/single-instance-lock.mjs. This used to be a rare
+// hand-run command where a race was theoretical; ensureHooks() now fires from the MCP server of
+// every session and from login, and two Codex windows opened together are exactly two interleaved
+// rewrites of the same file — one of which would silently lose the other's entries.
+//
+// Contention DEFERS rather than waits. The work is idempotent and self-healing: whoever holds the
+// lock is writing the same entries this process would have written, so skipping is not a failure,
+// and the next session re-checks anyway.
+//
+// NEVER CALL FROM INSIDE A session: OR shared: SECTION. This is a rank-3 `shared` lock, and
+// acquireLock refuses — `{ ok: false }`, not a wait — when a lock of equal or finer rank is already
+// held. A caller that holds one would silently get `skipped: true` and no install. Today's callers
+// (the MCP bridge, login, me, the hooks script) hold nothing.
+const HOOKS_REGISTRY_LOCK = 'codex-hooks';
+
+function withRegistry(fn) {
+  return withLock(sharedLock(HOOKS_REGISTRY_LOCK), {}, fn);
 }
 
 export function installHooks({
@@ -496,19 +548,29 @@ export function installHooks({
   launcherDir = hookLauncherDir(),
   owner = hookOwner(),
 } = {}) {
-  writeRegistry(hooksFile, removeDeadLegacyLaunchers(mergeHooks(
-    readRegistry(hooksFile),
-    buildHookEntries({ scriptsDir, owner }),
-    launcherDir,
-    owner,
-  )));
+  const run = withRegistry(() => {
+    const existing = readRegistry(hooksFile);
+    const before = brokenBeeziEntries(existing, launcherDir);
+    // The sweep runs BEFORE the merge, never after. Afterwards it would stat the entries this very
+    // call just wrote and delete them all if the scripts dir is not on disk — an install that
+    // silently produces an empty registry.
+    writeRegistry(hooksFile, mergeHooks(
+      removeDeadBeeziEntries(existing, launcherDir),
+      buildHookEntries({ scriptsDir, owner }),
+      launcherDir,
+      owner,
+    ));
 
-  // Launchers are no longer written; sweep away the ones an older version left. The directory is
-  // hookLauncherDir(), which is namespaced per environment, so it is exclusively THIS variant's by
-  // construction and removing it wholesale cannot reach a sibling's.
-  removeDirSync(launcherDir);
+    // Launchers are no longer written; sweep away the ones an older version left. The directory is
+    // hookLauncherDir(), which is namespaced per environment, so it is exclusively THIS variant's by
+    // construction and removing it wholesale cannot reach a sibling's.
+    removeDirSync(launcherDir);
+    return before;
+  });
 
-  return { hooksFile, owner, events: BEEZI_EVENTS };
+  // `swept` is what the sweep actually cleared, computed from the registry as it was BEFORE the
+  // write, so a caller can name the orphans it removed rather than the ones it left.
+  return { hooksFile, owner, events: BEEZI_EVENTS, swept: run.skipped ? [] : run.value, skipped: !!run.skipped };
 }
 
 export function uninstallHooks({
@@ -516,23 +578,58 @@ export function uninstallHooks({
   launcherDir = hookLauncherDir(),
   owner = hookOwner(),
 } = {}) {
-  const existing = readJson(hooksFile, null);
-  const removed = beeziEvents(existing, launcherDir, owner).length > 0;
-  if (existing) {
-    const stripped = removeBeeziHooks(existing, launcherDir, owner);
-    // If THIS OWNER's entries were the only reason this registry existed, take the file with them —
-    // leaving an empty `{"hooks":{}}` behind would misreport as "the user configured hooks". A
-    // sibling variant's entries survive removeBeeziHooks, so `hooks` is not empty and the file is
-    // kept: uninstalling one variant must never delete the other's registry.
-    const empty = Object.keys(stripped.hooks || {}).length === 0 && Object.keys(stripped).every((k) => k === 'hooks');
-    if (empty) {
-      removeFileSync(hooksFile);
-    } else {
-      writeRegistry(hooksFile, stripped);
+  const run = withRegistry(() => {
+    const existing = readJson(hooksFile, null);
+    const removed = beeziEvents(existing, launcherDir, owner).length > 0;
+    if (existing) {
+      const stripped = removeBeeziHooks(existing, launcherDir, owner);
+      // If THIS OWNER's entries were the only reason this registry existed, take the file with them —
+      // leaving an empty `{"hooks":{}}` behind would misreport as "the user configured hooks". A
+      // sibling variant's entries survive removeBeeziHooks, so `hooks` is not empty and the file is
+      // kept: uninstalling one variant must never delete the other's registry.
+      const empty = Object.keys(stripped.hooks || {}).length === 0 && Object.keys(stripped).every((k) => k === 'hooks');
+      if (empty) {
+        removeFileSync(hooksFile);
+      } else {
+        writeRegistry(hooksFile, stripped);
+      }
     }
+    removeDirSync(launcherDir);
+    return removed;
+  });
+  return { hooksFile, owner, removed: run.skipped ? false : run.value, skipped: !!run.skipped };
+}
+
+/**
+ * Bring the hooks to a working state WITHOUT asking the user to run anything.
+ *
+ * The one entry point every caller that merely *noticed* a bad install should use. Until this
+ * existed, login, the MCP status tool and the skill all did the same thing: read the state, decide
+ * it was `stale`, and print an install command for the user to run by hand — a step the user has no
+ * way to get wrong and no reason to be handed. An upgrade moves the plugin's scripts out from under
+ * the registry on its own, so "stale" is the NORMAL state after every upgrade, not an accident.
+ *
+ * Idempotent by refusing to write when there is nothing to fix, and that refusal is load-bearing
+ * rather than an optimisation: Codex keys hook trust to each entry's HASH, so a pointless rewrite
+ * of identical entries would revoke the trust the user has already granted. `installed` with no
+ * dead entries is therefore a hard no-op.
+ *
+ * What it cannot do is grant the trust — there is no non-interactive way to, and `repaired: true`
+ * is precisely the signal a caller needs to tell the user to run `/hooks` once.
+ */
+export function ensureHooks(options = {}) {
+  const before = hooksStatus(options);
+  const dead = before.broken.length > 0;
+  if (before.state === 'installed' && !dead) {
+    return { repaired: false, before: before.state, state: before.state, swept: [], status: before };
   }
-  removeDirSync(launcherDir);
-  return { hooksFile, owner, removed };
+
+  const result = installHooks(options);
+  if (result.skipped) {
+    return { repaired: false, before: before.state, state: before.state, swept: [], status: before, skipped: true };
+  }
+  const after = hooksStatus(options);
+  return { repaired: true, before: before.state, state: after.state, swept: result.swept, status: after };
 }
 
 // Is the current install complete and pointing at scripts the current plugin version actually has?

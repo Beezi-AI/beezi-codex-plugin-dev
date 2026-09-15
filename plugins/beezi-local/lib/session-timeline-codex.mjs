@@ -1,5 +1,6 @@
 import { fetchCompat } from './fetch-compat.mjs';
 import fs from 'fs';
+import { timelineWaits, isBackgroundNotification, isTimelineUserPrompt } from './timeline-waits-codex.mjs';
 import { IDLE_GAP_SEC } from './timing.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
@@ -15,8 +16,8 @@ import { orDefault } from './compat.mjs';
 // mode); `break` by a gap long enough to mean the session was abandoned and resumed rather than
 // waited on. Both are new *values* on the existing `state` key — `periods[].state` and
 // `plan_events[].type` are @MaxLength(50) bounded strings on the server, deliberately not enums,
-// so a newer plugin adding a state cannot 400 the whole ingest. No new payload key is added here,
-// and none may be: an unknown key is the failure mode that drops a whole segment.
+// so a newer plugin adding a state cannot 400 the whole ingest. waiting_subtype is the optional
+// field shared with Claude: plan_approval / question_answer / command_approval / next_instruction.
 //
 // `subagents` does NOT come from the transcript. Codex writes a subagent as its own top-level rollout
 // under ~/.codex/sessions (`thread_source: "subagent"`), and this session's transcript records
@@ -57,13 +58,14 @@ function parseTranscript(transcriptPath) {
 }
 
 function tsOf(rec) {
-  return rec && rec.timestamp ? new Date(rec.timestamp).getTime() : null;
+  const ms = rec && rec.timestamp ? new Date(rec.timestamp).getTime() : NaN;
+  return Number.isFinite(ms) ? ms : null;
 }
 
-// A genuine user turn-start. Codex writes the real prompt as an `event_msg` of type `user_message`;
+// A genuine user turn-start: legacy user_message or modern item_completed/UserMessage.
 // the injected AGENTS.md / user-instructions preamble is a `response_item` message and is ignored.
 function isRealUserPrompt(rec) {
-  return (rec || {}).type === 'event_msg' && (rec.payload || {}).type === 'user_message';
+  return isTimelineUserPrompt(rec);
 }
 
 // Esc. Codex records it as `event_msg/turn_aborted` — 79 occurrences locally, `reason:'interrupted'`
@@ -109,6 +111,7 @@ function collaborationModeOf(rec) {
 }
 
 function buildPeriods(records) {
+  const waits = timelineWaits(records);
   const anchors = [];
   // 'default' rather than null: a session whose build predates collaboration_mode must read as
   // working, exactly as it did before, not as an unknown third thing.
@@ -130,7 +133,8 @@ function buildPeriods(records) {
     // never reorder the chain, and it stays correct if Codex ever routes an abort through
     // `user_message`. Measured today: 0 of 79 aborts arrive as `user_message`, so this is a guard,
     // not a reclassification.
-    anchors.push({ ts: ms, isPrompt: isRealUserPrompt(rec) && !isInterrupt(rec), mode: currentMode });
+    anchors.push({ ts: ms, isPrompt: isRealUserPrompt(rec) && !isInterrupt(rec),
+      isBackground: isBackgroundNotification(rec), mode: currentMode });
   }
   anchors.sort((a, b) => a.ts - b.ts);
 
@@ -141,14 +145,19 @@ function buildPeriods(records) {
     if (cur.ts <= prev.ts) continue;
     const gapMs = cur.ts - prev.ts;
     let state;
+    let subtype = null;
+    const wait = waits.get(cur.ts);
     // The order IS the contract; every branch below outranks the ones after it.
-    // `break` first, above even a real prompt: a human returning after 29 hours abandoned the
+    // Explicit background waits first, as in Claude. Then break, above even a real prompt:
+    // a human returning after 29 hours abandoned the
     // session and resumed it, they were not being waited on. Put it after the prompt check and
     // that 29 hours inflates "time waiting on the human" — the exact metric `break` exists to
     // deflate. `>=` (not `>`) so the threshold itself is a break.
-    if (gapMs >= BREAK_GAP_SEC * 1000) state = STATE.BREAK;
-    else if (cur.isPrompt) state = STATE.WAITING_USER;
-    else if (gapMs > IDLE_GAP_SEC * 1000) state = STATE.IDLE;
+    if (cur.isBackground || (wait && wait.state === STATE.IDLE)) state = STATE.IDLE;
+    else if (gapMs >= BREAK_GAP_SEC * 1000) state = STATE.BREAK;
+    else if (wait) { state = wait.state; subtype = wait.subtype; }
+    else if (cur.isPrompt) { state = STATE.WAITING_USER; subtype = 'next_instruction'; }
+    else if (gapMs >= IDLE_GAP_SEC * 1000) state = STATE.IDLE;
     // Planning last, below idle and waiting_user deliberately: a five-minute silence inside plan
     // mode is still idle, and a plan sitting unapproved is the human's time, not more planning.
     // Same rank as session-timeline.mjs:502-503.
@@ -156,13 +165,14 @@ function buildPeriods(records) {
     else state = STATE.WORKING;
 
     const last = merged[merged.length - 1];
-    if (last && last.state === state) last.endMs = cur.ts;
-    else merged.push({ state, startMs: prev.ts, endMs: cur.ts });
+    if (last && last.state === state && last.subtype === subtype) last.endMs = cur.ts;
+    else merged.push({ state, subtype, startMs: prev.ts, endMs: cur.ts });
   }
   return merged.map((m) => ({
     state: m.state,
     started_at: new Date(m.startMs).toISOString(),
     ended_at: new Date(m.endMs).toISOString(),
+    ...(m.subtype ? { waiting_subtype: m.subtype } : {}),
   }));
 }
 

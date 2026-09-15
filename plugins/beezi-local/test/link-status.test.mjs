@@ -118,9 +118,13 @@ test('a healthy machine is still told about dead entries it does not own', async
   assert.match(text, /hooks are installed/i);
   assert.match(text, /2 registered hook entries point at a file that no longer exists/);
   assert.match(text, /SessionStart, Stop/);
-  // The repair has to be runnable from the user's cwd, which is their repo, not the plugin root —
-  // this message reaches the beezi_status MCP tool, whose reader will try to run what it is told.
-  assert.match(text, /Run node "[^"]*hooks\.mjs" status/);
+  // The repair is ours to do, not the user's to run — every surface that reads this heals the
+  // install before it reports. What is still quoted is the read-only path listing, and it has to be
+  // runnable from the user's cwd (their repo, not the plugin root): this message reaches the
+  // beezi_status MCP tool, whose reader will try to run what it is told.
+  assert.match(text, /removed automatically/);
+  assert.match(text, /node "[^"]*hooks\.mjs" status/);
+  assert.doesNotMatch(text, /Run node "[^"]*hooks\.mjs" install/);
   assert.doesNotMatch(text, /<plugin>/);
 });
 

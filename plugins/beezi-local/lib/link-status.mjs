@@ -2,7 +2,7 @@ import { apiBase } from './config.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { getAuthentication as _getAuthentication } from './token.mjs';
 import { whoami as _whoami } from './whoami.mjs';
-import { hooksStatus as _hooksStatus, installCommand, statusCommand } from './hooks-install.mjs';
+import { hooksStatus as _hooksStatus, statusCommand } from './hooks-install.mjs';
 
 // One answer to "is this machine linked, and is it reporting?".
 //
@@ -89,7 +89,8 @@ function describeBrokenHooks(status) {
   const plural = broken.length === 1 ? 'entry points' : 'entries point';
   return `Separately: ${broken.length} registered hook ${plural} at a file that no longer exists`
     + ` (${events.join(', ')}), so Codex reports those events as failed on every session.`
-    + ` Run ${statusCommand()} for the paths and the repair.`;
+    + ` These are removed automatically the next time the hooks are installed or repaired;`
+    + ` ${statusCommand()} lists the paths.`;
 }
 
 // The single phrasing of each outcome, so the MCP tool, the CLI script and the session banner
@@ -135,12 +136,16 @@ export function describeReporting(status) {
   switch (status.hooks.state) {
     case 'installed':
       return withBroken('Analytics hooks are installed. If nothing is arriving, run /hooks in Codex and trust the Beezi entries — Codex will not run a hook it has not been shown.');
+    // The three unhealthy states name no command for the user to run. Every surface that reads
+    // this — the MCP status tool, the `me` script, the session banner — repairs the install itself
+    // before it reports, so quoting `installCommand()` here would hand the user a step that has
+    // already been taken. What is left is the trust step, which genuinely cannot be automated.
     case 'absent':
-      return withBroken(`Analytics are NOT being reported: the hooks are not installed. Run ${installCommand()}, then run /hooks in Codex and trust them.`);
+      return withBroken(`Analytics are NOT being reported: the hooks are not installed. Beezi installs them for you — then run /hooks in Codex and trust the Beezi entries.`);
     case 'stale':
-      return withBroken(`Analytics are NOT being reported: the hooks point at an older plugin version. Run ${installCommand()}, then re-trust via /hooks.`);
+      return withBroken('Analytics are NOT being reported: the hooks point at an older plugin version. Beezi repairs them for you — then re-trust via /hooks.');
     case 'partial':
-      return withBroken(`Analytics may not be reported: the hook install is incomplete. Run ${installCommand()}, then re-trust via /hooks.`);
+      return withBroken('Analytics may not be reported: the hook install is incomplete. Beezi repairs it for you — then re-trust via /hooks.');
     default:
       return withBroken(null);
   }

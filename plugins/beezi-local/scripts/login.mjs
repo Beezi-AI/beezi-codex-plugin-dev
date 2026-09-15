@@ -1,7 +1,7 @@
 import { performLogin } from '../lib/login.mjs';
 import path from 'path';
 import url from 'url';
-import { hooksStatus, installCommand, TRUST_STEP } from '../lib/hooks-install.mjs';
+import { ensureHooks, TRUST_STEP } from '../lib/hooks-install.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
 
@@ -31,27 +31,35 @@ function onStep(step) {
 }
 
 // Linking is only half of setup: Codex refuses to load hooks bundled in a plugin, so nothing is
-// reported until the hooks are installed into ~/.codex/hooks.json and trusted once. Say so here
-// rather than leaving the user with a linked machine that silently sends nothing. This runs after
-// the credentials are stored, so a failure here must never fail the login.
+// reported until the hooks are installed into ~/.codex/hooks.json and trusted once.
+//
+// So install them HERE, rather than printing the command and leaving the user to run it. Signing in
+// is an unambiguous "I want my analytics reported" — there is no version of this flow where the
+// answer to "install the hooks?" is no, and the step the user was being handed is one they can only
+// get wrong by forgetting it. ensureHooks() is a no-op on a healthy install, so a repeat login does
+// not rewrite the registry and does not revoke trust.
+//
+// This runs after the credentials are stored, so a failure here must never fail the login.
 function reportHookStep() {
-  let status = null;
+  let result = null;
   try {
-    status = hooksStatus();
+    result = ensureHooks();
   } catch {
     return;
   }
-  if (status.state === 'installed') {
+  if (result.skipped) {
+    console.log('  Another Beezi process is updating the hook registry; it will be current in a moment.');
+    return;
+  }
+  if (!result.repaired) {
     console.log(`  Analytics hooks are installed. If nothing arrives, ${TRUST_STEP}.`);
     return;
   }
-  console.log('\nOne more step to start reporting analytics:');
-  console.log(
-    status.state === 'absent'
-      ? `  1. ${installCommand()}`
-      : `  1. ${installCommand()}   (the current install needs repair)`,
-  );
-  console.log(`  2. ${TRUST_STEP}.`);
+  console.log(result.before === 'absent'
+    ? '\n  Analytics hooks installed for you.'
+    : `\n  Analytics hooks repaired for you (they were ${result.before}).`);
+  // The one thing that cannot be done for them: Codex has no non-interactive way to grant trust.
+  console.log(`  One step left — ${TRUST_STEP}.`);
 }
 
 // R1 names login first among the things the guard precedes, and for the sharpest reason: a
