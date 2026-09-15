@@ -30,6 +30,12 @@ async function main() {
   if (result.reason === 'no-token') {
     fail('Beezi: this machine is not linked. Sign in to Beezi first (the login skill).');
   }
+  if (result.reason === 'account-registration-failed') {
+    fail(
+      `Beezi: your current ChatGPT account could not be registered (${orDefault(result.lastError, 'unknown error')}). ` +
+        'No history was uploaded or finalized. Run the Beezi login skill again to retry.',
+    );
+  }
 
   // The run lock (G-8-3 / R3). These three come back with `scanned === 0` because nothing was
   // scanned, so without them the summary below would tell the user this machine has no past Codex
