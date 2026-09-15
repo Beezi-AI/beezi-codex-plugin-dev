@@ -20,6 +20,34 @@ function authFileWith(payload, authMode = 'chatgpt') {
 
 const AUTH_CLAIM = 'https://api.openai.com/auth';
 
+test('reads the account ID from the claim, falling back to tokens.account_id, without leaking tokens', () => {
+  const claimed = readCodexAccount({
+    exists: () => true,
+    readFile: () => JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+      account_id: 'token-account', access_token: 'SECRET', refresh_token: 'SECRET',
+      id_token: jwt({ [AUTH_CLAIM]: { chatgpt_account_id: 'claim-account' } }),
+    } }),
+  });
+  assert.equal(claimed.accountId, 'claim-account');
+  assert.doesNotMatch(JSON.stringify(claimed), /SECRET/);
+
+  const undecodable = readCodexAccount({
+    exists: () => true,
+    readFile: () => JSON.stringify({ auth_mode: 'chatgpt', tokens: {
+      account_id: 'token-account', id_token: 'invalid', access_token: 'SECRET', refresh_token: 'SECRET',
+    } }),
+  });
+  assert.equal(undecodable.accountId, 'token-account');
+  assert.doesNotMatch(JSON.stringify(undecodable), /SECRET/);
+});
+
+test('keeps the account ID even when the subscription has expired', () => {
+  const account = readCodexAccount(authFileWith({
+    exp: 1, [AUTH_CLAIM]: { chatgpt_account_id: 'claim-account', chatgpt_plan_type: 'plus' },
+  }));
+  assert.equal(account.accountId, 'claim-account');
+});
+
 test('extracts the ChatGPT plan and subscription expiry from the id_token', () => {
   const deps = authFileWith({
     exp: 1893456000,

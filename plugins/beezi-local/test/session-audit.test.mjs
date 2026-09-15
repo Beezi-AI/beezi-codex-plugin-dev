@@ -76,6 +76,9 @@ function makeDeps(overrides = {}) {
     // Stubbed: the real ones read this machine's ~/.beezi-codex and ~/.codex trees.
     resolveTranscriptByCwdImpl: () => null,
     readStateImpl: () => null,
+    readCodexAccountImpl: () => null,
+    readBillingConfigImpl: () => null,
+    postJsonImpl: async () => ({ ok: true, status: 200, json: async () => ({ accountLinked: true }) }),
     readTrackingStateImpl: () => null,
     markBackfillCompletedImpl: () => events.push('mark-completed'),
     completeBackfillImpl: async () => {
@@ -105,6 +108,150 @@ function makeDeps(overrides = {}) {
   };
   return { deps, events, saved, ledger };
 }
+
+test('backfill stamps every historical report with one current subscription account snapshot', async () => {
+  const flush = fakeFlush();
+  let reads = 0;
+  const registrations = [];
+  const { deps } = makeDeps({
+    listRollouts: () => [rollout('s1'), rollout('s2')],
+    readCodexAccountImpl: () => ({
+      authMode: 'chatgpt', accountId: `current-${++reads}`, subscriptionType: 'plus', expiresAt: 99_000_000,
+    }),
+    postJsonImpl: async (url, token, body) => {
+      registrations.push({ url, token, body });
+      return { ok: true, status: 200, json: async () => ({ status: 'stored', accountLinked: true }) };
+    },
+    runCheckpointImpl: async (input, _deps, options) => {
+      options.sink({ ...report(input.session_id), account_uuid: 'old-account' });
+      options.sink({ ...report(input.session_id), segmentId: `${input.session_id}:child:0-1`, is_subagent: true });
+      return checkpointResult();
+    },
+    flushBackfillChunksImpl: flush.impl,
+  });
+  await runAudit(deps);
+  const reports = flush.calls.flatMap((call) => call.groups.flatMap((group) => group.reports));
+  assert.equal(reads, 1);
+  assert.equal(registrations.length, 1);
+  assert.match(registrations[0].url, /\/me\/cli-agent\/account$/);
+  assert.deepEqual(registrations[0].body, { accountUuid: 'current-1', subscriptionType: 'plus' });
+  assert.equal(Object.hasOwn(registrations[0].body, 'subscriptionPlan'), false);
+  assert.equal(reports.length, 4);
+  for (const payload of reports) assert.equal(payload.account_uuid, 'current-1');
+});
+
+test('account registration failure leaves history untouched and a later run retries it', async () => {
+  const events = [];
+  let registrationAttempts = 0;
+  const make = () => makeDeps({
+    readCodexAccountImpl: () => ({
+      authMode: 'chatgpt', accountId: 'current-account', subscriptionType: 'plus', expiresAt: 1,
+    }),
+    postJsonImpl: async (_url, _token, body) => {
+      events.push(['register', body]);
+      registrationAttempts += 1;
+      if (registrationAttempts === 1) {
+        return { ok: true, status: 200, json: async () => ({ status: 'stored', accountLinked: false }) };
+      }
+      return { ok: true, status: 200, json: async () => ({ accountLinked: true }) };
+    },
+    runCheckpointImpl: async (input, _deps, options) => {
+      events.push(['checkpoint', input.session_id]);
+      options.sink(report(input.session_id));
+      return checkpointResult();
+    },
+    flushBackfillChunksImpl: async (groups) => {
+      events.push(['flush', groups[0].reports[0].account_uuid]);
+      return flushResult({
+        stored: 1,
+        bySession: new Map([['s1', { status: BackfillSessionStatus.ACCEPTED, reason: null }]]),
+      });
+    },
+    completeBackfillImpl: async () => {
+      events.push(['complete']);
+      return { completed: true, code: null };
+    },
+  }).deps;
+
+  const failed = await runAudit(make());
+  assert.equal(failed.reason, 'account-registration-failed');
+  assert.equal(failed.lastError, 'account was not linked');
+  assert.deepEqual(events, [['register', { accountUuid: 'current-account' }]]);
+
+  const retried = await runAudit(make());
+  assert.equal(retried.finalized, true);
+  assert.deepEqual(events.slice(1).map(([name]) => name), ['register', 'checkpoint', 'flush', 'complete']);
+  assert.equal(events[1][1].subscriptionType, undefined); // expired plan is not registered
+  assert.equal(events[3][1], 'current-account');
+});
+
+test('account registration renews a rejected credential and uses the fresh token thereafter', async () => {
+  const calls = [];
+  let tokenReads = 0;
+  const { deps } = makeDeps({
+    getAccessToken: async (_deps, options = {}) => {
+      tokenReads += 1;
+      calls.push(['token', options.forceRefresh === true]);
+      return options.forceRefresh ? 'fresh-token' : 'stale-token';
+    },
+    readCodexAccountImpl: () => ({ authMode: 'chatgpt', accountId: 'current-account' }),
+    postJsonImpl: async (_url, token) => {
+      calls.push(['register', token]);
+      return token === 'stale-token'
+        ? { ok: false, status: 401, json: async () => ({}) }
+        : { ok: true, status: 200, json: async () => ({ accountLinked: true }) };
+    },
+    flushBackfillChunksImpl: async (groups, token) => {
+      calls.push(['flush', token]);
+      return flushResult({
+        stored: 1,
+        bySession: new Map([[groups[0].sessionId, {
+          status: BackfillSessionStatus.ACCEPTED, reason: null,
+        }]]),
+      });
+    },
+    completeBackfillImpl: async (token) => {
+      calls.push(['complete', token]);
+      return { completed: true, code: null };
+    },
+  });
+  const result = await runAudit(deps);
+  assert.equal(result.finalized, true);
+  assert.equal(tokenReads, 2);
+  assert.deepEqual(calls, [
+    ['token', false],
+    ['register', 'stale-token'],
+    ['token', true],
+    ['register', 'fresh-token'],
+    ['flush', 'fresh-token'],
+    ['complete', 'fresh-token'],
+  ]);
+});
+
+test('dry-run annotates planned reports without registering the account', async () => {
+  let registrations = 0;
+  const flush = fakeFlush();
+  const { deps } = makeDeps({
+    readCodexAccountImpl: () => ({ authMode: 'chatgpt', accountId: 'dry-account' }),
+    postJsonImpl: async () => { registrations += 1; throw new Error('must not post'); },
+    flushBackfillChunksImpl: flush.impl,
+  });
+  const result = await runAudit(deps, { dryRun: true });
+  assert.equal(registrations, 0);
+  assert.equal(result.plannedReports, 1);
+  assert.equal(flush.calls.length, 0);
+});
+
+test('backfill still uploads when subscription identity is unavailable', async () => {
+  for (const read of [() => null, () => { throw new Error('unreadable'); },
+    () => ({ authMode: 'chatgpt', accountId: null, email: null })]) {
+    const flush = fakeFlush();
+    const { deps } = makeDeps({ readCodexAccountImpl: read, flushBackfillChunksImpl: flush.impl });
+    await runAudit(deps);
+    assert.equal(flush.calls.length, 1);
+    assert.equal(Object.hasOwn(flush.calls[0].groups[0].reports[0], 'account_uuid'), false);
+  }
+});
 
 // ─── parseArgs ──────────────────────────────────────────────────────────────
 

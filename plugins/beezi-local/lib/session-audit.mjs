@@ -1,8 +1,13 @@
 import { fetchCompat } from './fetch-compat.mjs';
+import { apiBase } from './config.mjs';
+import { postJson as _postJson } from './http.mjs';
 import fs from 'fs';
 import path from 'path';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { runCheckpoint as _runCheckpoint, flushQueue as _flushQueue } from './checkpoint.mjs';
+import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
+import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
+import { buildAccountSyncPayload, accountSyncPath } from './account-sync.mjs';
 import { listAllRollouts as _listAllRollouts } from './transcript-index-codex.mjs';
 import { acquireLock as _acquireLock, runLock, locksDir, inspectLock } from './single-instance-lock.mjs';
 import {
@@ -354,11 +359,14 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const loadCoverage = orDefault(deps.loadCoverageCheckpointsImpl, _loadCoverageCheckpoints);
   const saveCoverage = orDefault(deps.saveCoverageCheckpointsImpl, _saveCoverageCheckpoints);
   const flushQueue = orDefault(deps.flushQueueImpl, _flushQueue);
+  const postJson = orDefault(deps.postJsonImpl, _postJson);
+  const readCodexAccount = orDefault(deps.readCodexAccountImpl, _readCodexAccount);
+  const readBillingConfig = orDefault(deps.readBillingConfigImpl, _readBillingConfig);
 
   const syncMode = options.mode === SYNC_MODE;
   const result = emptyAuditResult(options);
 
-  const token = await getAccessToken().catch(() => null);
+  let token = await getAccessToken().catch(() => null);
   if (!token) {
     result.reason = 'no-token';
     return result;
@@ -536,6 +544,51 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     for (const entry of eligible) candidates.push(entry);
   }
   result.candidates = candidates.length;
+
+  // Historical reports can only resolve their account foreign key after this account has been
+  // registered for the linked tenant. One snapshot serves both the registration and every report,
+  // so an auth refresh cannot split attribution during a long import. The body is the same
+  // check-in shape lib/account-sync.mjs sends (billing.json first, ~/.codex/auth.json second),
+  // but unlike the best-effort check-in the reply is verified: history is not uploaded against
+  // an account the server did not link.
+  let account = null;
+  try { account = readCodexAccount(); } catch { /* best-effort */ }
+  let billingConfig = null;
+  try { billingConfig = readBillingConfig(); } catch { /* best-effort */ }
+  const registration = buildAccountSyncPayload({ config: billingConfig, account, now: now() });
+  const accountUuid = orDefault(registration.accountUuid, null);
+  const subscriptionIdentity = accountUuid ? { account_uuid: accountUuid } : {};
+
+  if (accountUuid && !options.dryRun) {
+    const register = (bearer) => postJson(
+      `${apiBase()}${accountSyncPath()}`,
+      bearer,
+      registration,
+      { fetchImpl, timeoutMs: AUDIT_TIMEOUT_MS },
+    );
+
+    let response;
+    try {
+      response = await register(token);
+      if (response.status === 401) {
+        const renewed = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
+        if (renewed) {
+          token = renewed;
+          response = await register(token);
+        }
+      }
+      const reply = response.ok ? await response.json().catch(() => null) : null;
+      if (!response.ok || !reply || reply.accountLinked !== true) {
+        result.reason = 'account-registration-failed';
+        result.lastError = response.ok ? 'account was not linked' : `HTTP ${response.status}`;
+        return result;
+      }
+    } catch {
+      result.reason = 'account-registration-failed';
+      result.lastError = 'network';
+      return result;
+    }
+  }
 
   const finalize = async () => {
     if (!shouldFinalize(result, options)) return;
@@ -761,7 +814,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         },
         { getAccessToken: async () => token, fetchImpl, recoveryPermit: lockHandle.token },
         {
-          sink: (payload) => reports.push(payload),
+          sink: (payload) => reports.push({ ...payload, ...subscriptionIdentity }),
           skipFlush: true,
           collectSessionErrors: true,
           persistState: false,

@@ -279,6 +279,12 @@ Pro split: the $200 tier kept the name `pro` and became 20×, and the new $100 5
 `prolite`. Anything left unmapped normalizes to `unknown`, which never settles — so the
 "refresh your plan" nudge would fire on every session with no way for the user to end it.
 
+New or unfinished historical backfills register and snapshot the current ChatGPT account before
+upload, then attach its `account_uuid` to every imported report, including subagent reports. This
+attributes history to the account active during the import; it does not reconstruct the plan or
+account that was active when each session ran. If no subscription account ID is available, the
+reports are sent without one.
+
 **Known limitation:** Codex's third-party providers are configured in `~/.codex/config.toml`
 (`model_provider` / `env_key`), invisible to the environment. Parsing it would need a TOML
 dependency and this plugin ships none, so `third_party` is only reachable via a self-report, and a
