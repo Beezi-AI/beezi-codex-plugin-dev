@@ -116,11 +116,6 @@ test('skill — "everything is already uploaded" is documented as a success, not
   assert.match(skill, /do not re-run hoping for a different answer/);
 });
 
-test('skill — "still active" sessions are never to be forced', () => {
-  assert.match(skill, /still active/);
-  assert.match(skill, /Never offer to force them/);
-});
-
 test('skill — the coverage-unknown notice is relayed, not treated as an error', () => {
   assert.match(skill, /could not reach Beezi to check what it already has/);
   assert.match(skill, /not an error and nothing was\s+lost or duplicated/);
@@ -151,7 +146,6 @@ test('skill — every outcome the script can print is documented', () => {
     ['everything is already uploaded', /everything is already uploaded/],
     ['were left for a ', /were left for a later run/],
     ['could not reach Beezi to check', /could not reach Beezi to check/],
-    ['still active', /still active/],
     ['does not line up', /does not line up/],
     ['was not re-checked', /sub-agent activity was not re-checked/],
     ['audit-only plan', /audit-only plan/],

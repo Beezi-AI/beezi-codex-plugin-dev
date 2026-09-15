@@ -134,9 +134,7 @@ async function main() {
       + 'later run. Details below; run sync again afterwards.',
     );
   } else if (result.sessionsImported === 0) {
-    const bits = [];
-    if (result.active > 0) bits.push(`${result.active} still active — they upload themselves`);
-    console.log(`✓ Beezi: everything is already uploaded${bits.length ? ` (${bits.join(', ')})` : ''}.`);
+    console.log('✓ Beezi: everything is already uploaded.');
   } else {
     console.log(
       `✓ Beezi: uploaded ${plural(result.sessionsImported, 'session')} `
@@ -146,9 +144,6 @@ async function main() {
 
   if (result.pendingDrained > 0) {
     console.log(`  ${plural(result.pendingDrained, 'saved report')} were delivered before the check.`);
-  }
-  if (result.active > 0 && result.candidates > 0) {
-    console.log(`  ${result.active} still active — they are open in another window and upload themselves.`);
   }
   // Deferred history, split by cause, because the two causes need different follow-up.
   if (result.deferredGap > 0) {
