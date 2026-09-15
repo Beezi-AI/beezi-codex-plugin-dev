@@ -68,6 +68,44 @@ Leaving any entry untrusted fails silently — an untrusted hook simply does not
 reports it. Skipping `SubagentStart` / `SubagentStop`, for example, still bills subagent tokens (the
 parent's checkpoint does that) but loses every spawned agent's name and its span on the timeline.
 
+## Updating
+
+The plugin checks whether it is out of date, but never updates itself. At session start it compares
+its own version — the one in its `.codex-plugin/plugin.json` — against the `version` in the
+`.codex-plugin/plugin.json` published at the manifest URL this build was stamped with. That URL is
+baked in per build (`env.json`'s `updateManifestUrl`), so a variant only ever measures itself against
+its own channel; a manifest naming a different plugin is ignored rather than treated as an update.
+The check rides the `SessionStart` hook, so it only ever fires on a machine whose hooks are
+[installed and trusted](#analytics-needs-the-hooks-installed-and-trusted) — leave that entry
+untrusted and the update notice never appears, with nothing to say so.
+
+The check runs **at most once an hour** and gives up after 1.5 s. An offline machine, a build with no
+manifest URL, and a manifest that cannot be parsed are all silent — the check never fails a hook and
+never nags about itself. Between checks a known-behind result is answered from the remembered
+reading, so upgrading clears the notice immediately rather than an hour later.
+
+When a newer version is published it prints one line:
+
+> Beezi: version `<latest>` is published; this machine runs `<current>`. Run
+> `codex plugin marketplace upgrade`, then start a new Codex thread to apply it. (Installed from a
+> local clone? Pull it instead: `marketplace upgrade` only refreshes Git marketplaces.)
+
+Three things about that command are deliberate:
+
+- **There is no `codex plugin update`.** `codex plugin` offers `add | list | marketplace | remove`,
+  and refreshing the marketplace is the whole upgrade — Codex picks the newer build up from the
+  refreshed snapshot, so there is nothing to re-add afterwards.
+- **No marketplace name is passed.** `codex plugin marketplace upgrade beezi` fails with
+  "marketplace `beezi` is not configured as a Git marketplace" whenever the marketplace is in the
+  plugin cache but absent from `config.toml` — the state a clone install leaves behind. The bare form
+  upgrades every configured Git marketplace and cannot hit that.
+- **A new Codex thread is required.** Skills and the MCP server are loaded once per thread, so the
+  running session keeps the old build until it is restarted.
+
+Then **re-trust the hooks**: the upgrade moves the hook scripts, so the entries are rewritten and
+Codex's hash-keyed trust no longer matches. The rewrite happens for you; granting trust again in
+`/hooks` does not — see "Analytics needs the hooks installed and trusted" above.
+
 ## Entry points
 
 Codex has no per-plugin slash commands ([openai/codex#13893](https://github.com/openai/codex/issues/13893)),
@@ -258,15 +296,22 @@ distinctly from the Claude Code plugin.
 | --- | --- | --- |
 | `BEEZI_API_URL` | `https://beezi-api-prod.azurewebsites.net/api` | Beezi API base |
 | `BEEZI_MCP_URL` | `<BEEZI_API_URL>/mcp` | MCP endpoint |
+| `BEEZI_ENV` | unset (production) | `dev`/`staging`/`local` selects the namespace: data root, keyring entry, hook owner |
 | `BEEZI_CODEX_HOME` | `~/.beezi-codex` | Queue / state / credentials |
 | `CODEX_HOME` | `~/.codex` | Rollout transcripts, auth store |
-| `BEEZI_CODEX_WATCHER` | unset (off) | `1`/`true`/`yes`/`on` starts the rollout watcher in the MCP server |
+| `BEEZI_CODEX_WATCHER` | unset (off) | `1`/`true`/`yes`/`on`/`enabled` starts the rollout watcher in the MCP server |
 | `BEEZI_CODEX_APP_SERVER` | unset (on) | `0`/`false`/`off`/`no` skips the `codex app-server` plan probe entirely |
 | `BEEZI_CODEX_CLI` | `codex` | Path to the Codex CLI, for a machine where it is not on the hook process's PATH |
+| `OPENAI_API_KEY` | unset | Not ours — read only as billing evidence: an exported key means the machine bills per token |
+| `BEEZI_DEBUG` | unset | Any value makes the CLI scripts print the raw error text instead of the friendly one |
 
-Only these are declared in `.mcp.json`, so only these reach the MCP server process. A sandboxed
-shell command may not inherit `BEEZI_API_URL` when the server did — which is why every link
-answer reports the `apiBase` it was computed against.
+Every row above except `BEEZI_DEBUG` is declared in `.mcp.json`'s `env_vars`, which is an
+allowlist: only what is named there reaches the MCP server process. `BEEZI_DEBUG` is deliberately
+left out — it only steers what the CLI scripts print, and the MCP server's stdout belongs to
+JSON-RPC. Anything that steers billing or the endpoint has to be on the list, or the server and the
+hooks answer the same question differently and neither reports it. A sandboxed shell command may
+not inherit `BEEZI_API_URL` when the server did — which is why every link answer reports the
+`apiBase` it was computed against.
 
 `BEEZI_CODEX_WATCHER` is the opt-in for analytics that do not depend on hooks being trusted: with
 it set, the MCP server periodically reads the rollouts Codex has already written and checkpoints
@@ -306,15 +351,32 @@ node scripts/migrate-env.mjs --rollback   # undo a completed migration
 
 ## Tests
 
-Zero runtime dependencies. Run the suite:
+Zero runtime dependencies. Run the suite from this directory:
 
 ```bash
-node --test
+npm test
+```
+
+The `--import ./tools/hermetic-env.mjs` that `npm test` passes is mandatory, not a convenience:
+it redirects every root the plugin can resolve into a per-process sandbox, scrubs the env vars that
+steer billing and endpoint choice, and fails the process if a test escapes to the real home. A test
+file run bare reads your own `~/.codex` and `~/.beezi-codex`, so a single file goes:
+
+```bash
+node --test --import ./tools/hermetic-env.mjs test/credentials.test.mjs
+```
+
+Two gates run before any commit that touches `lib/` or `scripts/`, because both must keep parsing
+and running on the Node 13.2 floor:
+
+```bash
+node --test --import ./tools/hermetic-env.mjs test/compat-syntax.test.mjs  # the banned-syntax scan
+node tools/verify-minimum-runtime.cjs                                      # parses and imports every module
 ```
 
 ## Notes / known caveats
 
-Measured against Codex CLI 0.137.0 on Windows.
+Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
 
 - **Plugin-bundled hooks do not load.** `codex features list` reports `plugin_hooks` as `removed`,
   and an installed plugin contributes nothing to the engine's hook registry. Hence `hooks.mjs
@@ -371,9 +433,9 @@ Measured against Codex CLI 0.137.0 on Windows.
   whatever happened since the last checkpoint is not delivered by the hooks alone — it waits for a
   later checkpoint of that session, or for the `track` skill.
 - **Plugin-root variable.** For hooks, Codex exports `PLUGIN_ROOT` and `PLUGIN_DATA`, plus
-  `CLAUDE_PLUGIN_ROOT` / `CLAUDE_PLUGIN_DATA` for compatibility. `CODEX_PLUGIN_ROOT` does not exist.
-  The installer does not rely on any of them — it resolves the plugin from its own module path and
-  writes each script's quoted absolute path into the registry entry's `command`.
+  `CLAUDE_PLUGIN_ROOT` / `CLAUDE_PLUGIN_DATA` for compatibility. The installer does not rely on any
+  of them — it resolves the plugin from its own module path and writes each script's quoted absolute
+  path into the registry entry's `command`.
 - **Codex's native MCP OAuth is not usable here.** `codex mcp login` and the `AuthRequired`
   handshake only apply to `streamable_http` servers; a stdio server reports
   `authStatus: "unsupported"`. Switching transports would authenticate drafting into Codex's own

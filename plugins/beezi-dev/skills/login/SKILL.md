@@ -7,10 +7,8 @@ description: Link this machine to Beezi, or refresh the captured ChatGPT plan. U
 
 ## Finding the scripts
 
-Every command below runs a script under the plugin's `scripts/` directory. That directory is two
-levels above this `SKILL.md` — this file is at `<plugin-root>/skills/login/SKILL.md`, so the
-scripts are at `<plugin-root>/scripts/`. Use the absolute path; `codex plugin list` also prints the
-plugin root for `beezi` if you need to confirm it.
+This file is at `<plugin-root>/skills/login/SKILL.md`, so every script below is at
+`<plugin-root>/scripts/` — use the absolute path.
 
 Run each command exactly as written. Do not read, open, or inspect any other files, and never echo
 a token or the contents of the credentials file.

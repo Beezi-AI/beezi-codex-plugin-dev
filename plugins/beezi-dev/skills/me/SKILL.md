@@ -15,9 +15,7 @@ all from the process that actually holds the credentials.
 
 Do **not** answer this from a script if the tool is available. The MCP server inherits
 `BEEZI_API_URL` and the credential store from Codex; a shell command may not, so the two can
-disagree — a script reporting "not linked" while the server reports "linked as …" means exactly
-that, not that the link is broken. If they disagree, trust the tool and say the script ran with a
-different environment.
+disagree. If they do, trust the tool and say the script ran with a different environment.
 
 If the tool is not available, this file is at `<plugin-root>/skills/me/SKILL.md`, so the fallback
 script is:
@@ -26,8 +24,7 @@ script is:
 node "<plugin-root>/scripts/me.mjs"
 ```
 
-Report the output verbatim. Do not read, open, or inspect any other files, and never echo a token
-or the contents of the credentials file.
+Report the output verbatim, and never echo a token or the contents of the credentials file.
 
 ## Reading the answer
 
@@ -67,8 +64,6 @@ automatically once the API is reachable. The `analytics-hooks` skill covers the 
 
 ## What this answer does not cover
 
-Neither line says anything about **crash reporting** — whether the plugin may report its own
-failures. That is a separate setting, off by default, never implied by being linked, and stored
-only on this machine. If the user asks about crash reports, error reporting, diagnostics or
-telemetry, or wants either turned on or off, use the `telemetry` skill. Do not answer it from here
-and do not guess the setting; a link verdict is not a consent verdict.
+Neither line says anything about **crash reporting** — a separate local setting, off by default and
+never implied by being linked. Send any question about crash reports, error reporting, diagnostics
+or telemetry to the `telemetry` skill rather than guessing: a link verdict is not a consent verdict.

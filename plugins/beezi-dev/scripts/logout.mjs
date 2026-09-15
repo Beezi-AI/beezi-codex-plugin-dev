@@ -55,8 +55,6 @@ async function revokeAtAuthServer(creds) {
 }
 
 async function main() {
-  // R1: no upload, no drain and no credential work while the data root is mid-cutover or its
-  // environment cannot be established. cliMayProceed() prints the reason it refuses.
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   const creds = await getCredentials().catch(() => null);
   if (!creds) {

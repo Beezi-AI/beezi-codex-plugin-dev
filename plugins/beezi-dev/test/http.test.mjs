@@ -1,15 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { postJson, getJson } from '../lib/http.mjs';
-
-// Fetch that never answers unless aborted — the failure mode that matters here. Node's fetch has
-// no default timeout, so an unbounded call against a server that accepts the connection and then
-// goes quiet hangs for the life of the process.
-const hangingFetch = () => (url, opts) =>
-  new Promise((_, reject) => {
-    opts?.signal?.addEventListener('abort', () =>
-      reject(Object.assign(new Error('This operation was aborted'), { name: 'AbortError' })));
-  });
+import { hangingFetch } from '../tools/suite-fixtures.mjs';
 
 test('getJson — bounded: a server that never answers rejects instead of hanging', async () => {
   await assert.rejects(

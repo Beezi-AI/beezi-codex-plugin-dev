@@ -80,7 +80,8 @@ const LAUNCHER_PREFIX = 'beezi-';
 // `~/.beezi-codex<suffix>` is — every installed variant merges into the same file. Until this block
 // existed, one recogniser matched any variant's handler by the shared status message or by a
 // `beezi`-flavoured script path, so installing beezi-staging stripped beezi's entries and vice
-// versa (R1 reproduced it). Every mutation below is now scoped to ONE owner.
+// versa (R1 reproduced it). Every mutation below is now scoped to ONE owner. R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // The owner is the variant's plugin name: 'beezi' | 'beezi-dev' | 'beezi-staging' — the same string
 // the variant builder writes into `.codex-plugin/plugin.json` `name`, so the identity a user sees
@@ -108,10 +109,6 @@ export function hookOwner() {
 // while being exact, machine-readable, and immune to a label the user reworded.
 const OWNER_FLAG = '--beezi-owner=';
 
-// THE UNSUFFIXED BUILD WRITES NO TAG. Production ownership remains implicit, and
-// "absent means production" matches env.json's own convention in lib/paths.mjs. It also makes R1's
-// "recognise legacy unsuffixed entries only in the unsuffixed migration path" fall out by
-// construction: an untagged, unlabelled legacy entry can only ever resolve to 'beezi'.
 function quoteCommandArgument(value) {
   const text = String(value);
   // Windows paths cannot contain a double quote. On POSIX, escape the characters that retain
@@ -122,6 +119,11 @@ function quoteCommandArgument(value) {
 
 // Codex 0.154.0 on Windows accepts `arguments` in hooks.json but does not pass them to command
 // hooks. Keep the interpreter PATH-resolved, but put the complete invocation in `command`.
+//
+// THE UNSUFFIXED BUILD WRITES NO TAG. Production ownership remains implicit, and "absent means
+// production" matches env.json's own convention in lib/paths.mjs. It also makes R1's "recognise
+// legacy unsuffixed entries only in the unsuffixed migration path" fall out by construction: an
+// untagged, unlabelled legacy entry can only ever resolve to 'beezi'.
 export function hookCommand(scriptPath, owner = hookOwner()) {
   const parts = [HOOK_COMMAND, quoteCommandArgument(scriptPath)];
   if (owner !== UNSUFFIXED_OWNER) parts.push(OWNER_FLAG + owner);
@@ -247,14 +249,12 @@ function isOwnedHandler(handler, owner, launcherDir) {
 
 // ── dead entries ────────────────────────────────────────────────────────────
 //
-// `~/.codex/hooks.json` outlives the install that wrote it. A registered entry whose target file
-// is gone is not inert: Codex still spawns it every session, the spawn fails, and the whole event
-// is reported as `hook: <Event> Failed`. Measured on a live machine — three launcher-style entries
-// left behind by a pre-launcherless production install, pointing into a `~/.beezi-codex/hooks`
-// directory that no longer exists. Run through cmd.exe that is exactly
-// `The system cannot find the path specified.` and exit 1, on SessionStart, PostToolUse and Stop,
-// for every session on that machine, while `hooksStatus()` reported `installed` — because it is
-// owner-scoped and the orphans belonged to a DIFFERENT owner.
+// `~/.codex/hooks.json` outlives the install that wrote it, and a dead entry is not inert —
+// `isDeadBeeziEntry` below states why. Measured on a live machine: three launcher-style entries left
+// by a pre-launcherless production install, pointing into a `~/.beezi-codex/hooks` directory that no
+// longer exists. Through cmd.exe that is exactly `The system cannot find the path specified.` and
+// exit 1, on SessionStart, PostToolUse and Stop, for every session on that machine, while
+// `hooksStatus()` reported `installed` — it is owner-scoped and the orphans had a DIFFERENT owner.
 //
 // The scan below is deliberately READ-ONLY and deliberately NOT owner-scoped. Reporting across
 // owners is safe; removing across owners is not, and the one-owner-per-mutation rule above stays
@@ -321,16 +321,10 @@ const DEFAULT_SCRIPTS_DIR = path.join(
   'scripts',
 );
 
-// The exact command that installs the hooks, absolute and copy-pasteable. Every message that asks
-// the user to install has to quote this one: their cwd is the repository they are working in, not
-// the plugin root, so a relative `scripts/hooks.mjs` resolves to nothing.
-export function installCommand(scriptsDir = DEFAULT_SCRIPTS_DIR) {
-  return `node "${path.join(scriptsDir, 'hooks.mjs')}" install`;
-}
-
-// The same, for the read-only action. Derived rather than hand-written for the reason above: a
-// message that reaches the MCP tool is read by a model that will try to RUN what it is given, and
-// a relative path — or worse, a `<plugin>` placeholder — resolves to nothing from the user's cwd.
+// The exact command for the read-only action, absolute and copy-pasteable. Derived rather than
+// hand-written: a message that reaches the MCP tool is read by a model that will try to RUN what it
+// is given, and a relative path — or worse, a `<plugin>` placeholder — resolves to nothing from the
+// user's cwd, which is the repository they are working in, not the plugin root.
 export function statusCommand(scriptsDir = DEFAULT_SCRIPTS_DIR) {
   return `node "${path.join(scriptsDir, 'hooks.mjs')}" status`;
 }
@@ -436,16 +430,14 @@ function writeRegistry(hooksFile, registry) {
 /**
  * Is this a launcher entry from a pre-launcherless install whose file is gone?
  *
- * The SHAPE-anchored half of the dead-entry sweep, and it is narrow on purpose. Three independent
- * facts have to hold before an entry qualifies, and together they make "it might still be a live
- * sibling's" impossible rather than unlikely:
+ * The SHAPE-anchored half of the dead-entry sweep, and it is narrow on purpose. Past the legacy-form
+ * check below, two facts have to hold, and together they make "it might still be a live sibling's"
+ * impossible rather than unlikely:
  *
- *   1. Legacy FORM — its command is not one of the composite commands parsed by handlerScript(),
- *      so nothing currently installable can be mistaken for one.
- *   2. Our SHAPE — `<home>/.beezi-codex[-env]/hooks/beezi-<name>`. All three segments are checked,
- *      so a user's own `~/bin/beezi-notify.sh` is not ours and is not touched.
- *   3. DEAD — the file is missing. A sibling variant that still works has a file there; an entry
- *      that fails its spawn on every session has nothing left to protect.
+ *   * Our SHAPE — `<home>/.beezi-codex[-env]/hooks/beezi-<name>`. All three segments are checked,
+ *     so a user's own `~/bin/beezi-notify.sh` is not ours and is not touched.
+ *   * DEAD — the file is missing. A sibling variant that still works has a file there; an entry
+ *     that fails its spawn on every session has nothing left to protect.
  *
  * It survives alongside the owner-anchored half below because it needs no label and no tag: a
  * sibling's dead launcher whose `statusMessage` the user reworded is recognised by shape alone.
@@ -603,11 +595,9 @@ export function uninstallHooks({
 /**
  * Bring the hooks to a working state WITHOUT asking the user to run anything.
  *
- * The one entry point every caller that merely *noticed* a bad install should use. Until this
- * existed, login, the MCP status tool and the skill all did the same thing: read the state, decide
- * it was `stale`, and print an install command for the user to run by hand — a step the user has no
- * way to get wrong and no reason to be handed. An upgrade moves the plugin's scripts out from under
- * the registry on its own, so "stale" is the NORMAL state after every upgrade, not an accident.
+ * The one entry point every caller that merely *noticed* a bad install should use, instead of
+ * printing an install command for the user to run by hand. An upgrade moves the plugin's scripts out
+ * from under the registry on its own, so "stale" is the NORMAL state after one, not an accident.
  *
  * Idempotent by refusing to write when there is nothing to fix, and that refusal is load-bearing
  * rather than an optimisation: Codex keys hook trust to each entry's HASH, so a pointless rewrite

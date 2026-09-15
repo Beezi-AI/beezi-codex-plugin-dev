@@ -44,8 +44,8 @@ skip exactly the old half-uploaded sessions this command is for; `--force` has n
 past on this path. If the user pushes for a flag, say the command takes none.
 
 The scan reads every rollout under `~/.codex/sessions/`, so it can take a few minutes on a machine
-with a lot of history and it prints progress as it goes. Let it finish. Do not read, open, or
-inspect any other files. Report the output verbatim. Never echo a token.
+with a lot of history and it prints progress as it goes. Let it finish. Report the output verbatim.
+Never echo a token.
 
 ## What the output means
 

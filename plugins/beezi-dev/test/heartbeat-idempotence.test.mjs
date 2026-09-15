@@ -1,12 +1,12 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { stateDir } from '../lib/paths.mjs';
 import { acquireLock, forgetHeldLocks, sessionLock } from '../lib/single-instance-lock.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // THE MONEY QUESTION (G-3-2): a mid-turn heartbeat and the turn-end checkpoint that follows it
@@ -38,18 +38,7 @@ import { acquireLock, forgetHeldLocks, sessionLock } from '../lib/single-instanc
 
 afterEach(() => forgetHeldLocks());
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-heartbeat-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    forgetHeldLocks();
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, { prefix: 'beezi-heartbeat-', beforeCleanup: forgetHeldLocks });
 
 const at = (sec) => new Date(Date.UTC(2026, 0, 1, 0, 0, sec)).toISOString();
 

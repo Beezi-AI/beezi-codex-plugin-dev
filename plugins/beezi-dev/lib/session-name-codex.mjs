@@ -256,17 +256,10 @@ function isPreamble(text) {
   return PREAMBLE_SHAPES.some((re) => re.test(text));
 }
 
-// The catch-all, applied to text clean() has already redacted (see sanitizeSessionName above, which
-// is how every caller should reach it). The path rule below is still not redundant: a name that
-// redacts down to nothing but markers is no name at all, and refusing it is what sends the caller
-// back to a real source.
-//
 // session_name is POSTed to the server and is the reason queue files are written 0600: it carries
 // prompt text. An older resolver shipped 21 of 182 local sessions named "<environment_context>
 // <cwd>C:\Users\<name>…" — the user's home path, shell and timezone left the machine.
 //
-// Reject anything still shaped like injected context. A name that is nothing but a redaction is no
-// name at all, so that goes too.
 // The single gate every reported name goes through: redact first, then refuse what is left if it is
 // not a name. Exported because isSafeSessionName ALONE is not enough for a caller holding untrusted
 // text — it rejects a name that is nothing but a path, but happily passes one with a path buried in
@@ -277,6 +270,10 @@ export function sanitizeSessionName(text) {
   return isSafeSessionName(name) ? name : null;
 }
 
+// The catch-all, applied to text clean() has already redacted — sanitizeSessionName above is how
+// every caller should reach it. Not redundant after redaction: a name that redacts down to nothing
+// but markers, or that is still shaped like injected context, is no name at all, and refusing it is
+// what sends the caller back to a real source.
 export function isSafeSessionName(text) {
   if (!text || typeof text !== 'string') return false;
   if (/^</.test(text)) return false; // any XML-ish injected block

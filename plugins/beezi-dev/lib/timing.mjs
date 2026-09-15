@@ -12,33 +12,32 @@ export const IDLE_GAP_SEC = 300;
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // THE MID-TURN HEARTBEAT (G-3-2)
 // ─────────────────────────────────────────────────────────────────────────────────────────────
-// A Codex turn can run for hours with no Stop and no git boundary, and until one of those arrives
-// nothing is checkpointed: no token segments, no timeline, no rate-limit drain, no cursor advance.
-// If the terminal is closed mid-turn, Stop never fires and the whole turn is lost. This bounds
-// that wait by riding the PostToolUse hook that is ALREADY registered for every tool
-// (lib/hooks-install.mjs sets MATCH_ALL = '.*'), so it costs no new hook entry, no registry write
-// and no second /hooks trust step — which, given Codex's trust gate, is the expensive part.
+// A Codex turn can run for hours with no Stop and no git boundary, and until one arrives nothing is
+// checkpointed: no token segments, no timeline, no rate-limit drain, no cursor advance. Close the
+// terminal mid-turn and the whole turn is lost. This bounds that wait by riding the PostToolUse hook
+// ALREADY registered for every tool (lib/hooks-install.mjs sets MATCH_ALL = '.*'), so it costs no
+// new hook entry, no registry write and no second /hooks trust step — the expensive part, given
+// Codex's trust gate.
 //
-// WHY THIS LIVES IN timing.mjs AND NOT IN checkpoint.mjs. The gate runs on EVERY tool call, and
-// the checkpoint engine pulls ~28 modules that all but one firing in a hundred discards. Measured
-// on this machine, cold process, Node v24.11.1: importing lib/checkpoint.mjs costs 139 ms;
-// importing this module's whole closure (paths + fs-store + compat, all four node builtins deep)
-// costs 25 ms. The gated path must stay at roughly bare node startup or the heartbeat becomes a
-// per-tool-call stall, which is the exact failure this row must not ship. Keeping it beside
-// IDLE_GAP_SEC also keeps every wall-clock threshold this plugin owns in one file.
+// WHY IT LIVES IN timing.mjs AND NOT IN checkpoint.mjs: the gate runs on EVERY tool call, and the
+// checkpoint engine pulls ~28 modules that all but one firing in a hundred discards. Measured on
+// this machine, cold process, Node v24.11.1: importing lib/checkpoint.mjs costs 139 ms; importing
+// this module's whole closure (paths + fs-store + compat, all four node builtins deep) costs 25 ms.
+// The gated path must stay at roughly bare node startup or the heartbeat becomes a per-tool-call
+// stall. Keeping it beside IDLE_GAP_SEC also keeps every wall-clock threshold in one file.
 
 export const HEARTBEAT_INTERVAL_MS = 15 * 60 * 1000;
 
 // safeFileName because `session_id` arrives on a hook payload and this becomes a path segment.
 //
 // THE EXTENSION IS LOAD-BEARING, and `.json` in particular is forbidden here. state/ is enumerated
-// by three other readers — findRolloutBySessionState filters `.json` and then parses the match
+// by three other readers — findRolloutBySessionState filters `.json` and parses the match
 // (lib/transcript-codex.mjs), poisonedStateEntries derives a session id from `<id>.json` and
-// `<id>.agents` filenames, and pruneStale sweeps everything by mtime. A marker wearing `.json`
-// would be an empty file handed to a JSON parser, and a filename minted into a session id — G-3-1
-// again, in the directory G-3-1 was about. `<id>.agents` (lib/subagent-state.mjs) is the precedent
-// for a third shape living here; test/heartbeat-wiring.test.mjs pins that all three readers ignore
-// this one and that prune still reclaims it.
+// `<id>.agents` filenames, and pruneStale sweeps by mtime. A marker wearing `.json` would be an
+// empty file handed to a JSON parser, and a filename minted into a session id — G-3-1 again, in the
+// directory G-3-1 was about. `<id>.agents` (lib/subagent-state.mjs) is the precedent for a third
+// shape here; test/heartbeat-wiring.test.mjs pins that all three readers ignore this one and that
+// prune still reclaims it.
 function markerFile(sessionId) {
   return path.join(stateDir(), `${safeFileName(sessionId)}.heartbeat`);
 }

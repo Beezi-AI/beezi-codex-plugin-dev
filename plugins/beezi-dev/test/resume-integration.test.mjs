@@ -1,28 +1,18 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { runSessionStart } from '../lib/session-start.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // End-to-end over a real temp data root: session start → checkpoint → resume. The property under
 // test is that a resumed session never re-reports work it already billed. Everything else in the
 // engine is idempotent by segmentId; the cursor is the one piece of state that, if reset, silently
 // doubles a user's numbers.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-resume-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-resume-');
 
 const SESSION = 'resume-1';
 const WORK = '/repo';

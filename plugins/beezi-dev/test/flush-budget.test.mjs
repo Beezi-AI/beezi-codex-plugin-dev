@@ -1,30 +1,27 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { flushQueue, HOOK_BUDGET_MS } from '../lib/checkpoint.mjs';
 import { HOOK_TIMEOUT_SEC } from '../lib/hooks-install.mjs';
 import { queueDir } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // Codex kills a hook at its registered timeout and reports the kill as a failed hook. The queue
 // flush is a serial loop with a per-request bound but no overall one, so N pending reports against
 // a stalled API cost N × the per-request timeout: six queued reports measured 24.9s against a 10s
 // budget. The reports that landed before the kill were tracked, which is why this surfaced as
 // "hook exited with code 1" *and* working analytics.
+
+// tmpHome() also seeds `files` queued segments, so a test starts from a queue of known depth.
+// That seeding stays here rather than moving into the shared fixture: it needs queueDir() from
+// lib/, and the fixtures module deliberately imports nothing from the code under test.
 function tmpHome(t, files) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-flush-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
+  const dir = sandboxHome(t, 'beezi-flush-');
   fs.mkdirSync(queueDir(), { recursive: true });
   for (let i = 0; i < files; i += 1) {
     fs.writeFileSync(path.join(queueDir(), `seg-${i}.json`), JSON.stringify({ segmentId: `s:${i}` }));
   }
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
   return dir;
 }
 

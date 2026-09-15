@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   startWatcher, scanPass, WATCHER_ENV_VAR, TICK_MS, ELECTION_LEASE_MS,
@@ -10,6 +9,7 @@ import {
   acquireLock, electionLock, lockRank, locksDir, forgetHeldLocks, LOCK_ORDER,
 } from '../lib/single-instance-lock.mjs';
 import { createBridge } from '../lib/mcp-bridge.mjs';
+import { makeMachine as sandboxMachine, uuid } from '../tools/suite-fixtures.mjs';
 
 // R3's half of G-1-1: the election lock, and the two things it is NOT.
 //
@@ -21,25 +21,7 @@ import { createBridge } from '../lib/mcp-bridge.mjs';
 // a global election excludes only other watchers. And a 'lock-order' refusal is NOT a busy lock —
 // it is a defect in this process's own acquisition sequence that will fail identically forever.
 
-function makeMachine(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-elect-home-'));
-  const codex = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-elect-codex-'));
-  const before = { home: process.env.BEEZI_CODEX_HOME, codex: process.env.CODEX_HOME };
-  process.env.BEEZI_CODEX_HOME = home;
-  process.env.CODEX_HOME = codex;
-  t.after(() => {
-    forgetHeldLocks();
-    if (before.home === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = before.home;
-    if (before.codex === undefined) delete process.env.CODEX_HOME;
-    else process.env.CODEX_HOME = before.codex;
-    fs.rmSync(home, { recursive: true, force: true });
-    fs.rmSync(codex, { recursive: true, force: true });
-  });
-  return { home, codex, sessionsDir: path.join(codex, 'sessions') };
-}
-
-const uuid = (n) => `${String(n).padStart(8, '0')}-2222-3333-4444-555555555555`;
+const makeMachine = (t) => sandboxMachine(t, { prefix: 'watcher-elect-', beforeCleanup: forgetHeldLocks });
 
 function writeRollout(machine, id) {
   const dir = path.join(machine.sessionsDir, '2026', '09', '10');

@@ -1,7 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   fetchCoverage,
@@ -19,6 +18,7 @@ import {
 } from '../lib/session-coverage.mjs';
 import { stateDir, queueDir } from '../lib/paths.mjs';
 import { pruneStale } from '../lib/prune.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // G-3-3 / R2. Three separate contracts live in this module and each one is a place a naive
 // implementation double-bills the user:
@@ -28,17 +28,7 @@ import { pruneStale } from '../lib/prune.mjs';
 //   3. decideReplay: a coverage answer of 0 is AMBIGUOUS, because the server's number is a
 //      contiguous prefix and stored rows can sit past a gap.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cov-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-cov-');
 
 const ok = (body) => ({ status: 200, json: async () => body });
 

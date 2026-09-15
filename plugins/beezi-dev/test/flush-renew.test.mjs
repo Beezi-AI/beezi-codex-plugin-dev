@@ -1,27 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { flushQueue } from '../lib/checkpoint.mjs';
 import { queueDir } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // A 401 during the flush is usually an access token that expired between the checkpoint's
 // getAccessToken() and this loop — expires_at is only ever this client's estimate. Treating it as
 // a permanent rejection deleted queued reports the server never actually judged.
+
+// tmpHome() also seeds `files` queued segments, so a test starts from a queue of known depth.
+// That seeding stays here rather than moving into the shared fixture: it needs queueDir() from
+// lib/, and the fixtures module deliberately imports nothing from the code under test.
 function tmpHome(t, files) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-renew-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
+  const dir = sandboxHome(t, 'beezi-renew-');
   fs.mkdirSync(queueDir(), { recursive: true });
   for (let i = 0; i < files; i += 1) {
     fs.writeFileSync(path.join(queueDir(), `seg-${i}.json`), JSON.stringify({ segmentId: `s:${i}` }));
   }
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
   return dir;
 }
 

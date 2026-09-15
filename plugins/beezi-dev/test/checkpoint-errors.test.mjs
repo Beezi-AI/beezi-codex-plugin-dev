@@ -1,23 +1,13 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { stateDir } from '../lib/paths.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cperr-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-cperr-');
 
 const readState = (id) =>
   JSON.parse(fs.readFileSync(path.join(stateDir(), `${id}.json`), 'utf-8'));

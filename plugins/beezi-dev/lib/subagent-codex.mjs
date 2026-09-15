@@ -2,7 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { codexSessionsDir } from './paths.mjs';
 import { scanRecords } from './session-name-codex.mjs';
-import { ROLLOUT_RE } from './transcript-codex.mjs';
+import { ROLLOUT_HEAD_BYTES, ROLLOUT_RE } from './transcript-codex.mjs';
 import { orDefault } from './compat.mjs';
 
 // Codex writes a subagent to its OWN top-level rollout under ~/.codex/sessions, not nested under the
@@ -23,7 +23,7 @@ import { orDefault } from './compat.mjs';
 
 // The replay burst is written in one go: measured spans are 63-99ms, and the gap to the agent's
 // first genuine record is 2.4-11.3s. 500ms sits with ~5x margin on both sides.
-export const FORK_BURST_MS = 500;
+const FORK_BURST_MS = 500;
 // Measured prefixes on the current format are 14-22 records. The cap bounds the search; overrunning
 // it is treated as "this file is not the shape we know", never as "there is no prefix".
 export const MAX_FORK_PREFIX_RECORDS = 64;
@@ -31,6 +31,9 @@ export const MAX_FORK_PREFIX_RECORDS = 64;
 // Enough head to cover the prefix comfortably — measured prefixes are 76-79KB, dominated by two
 // copies of `base_instructions` plus a permissions message, and they do NOT grow with parent
 // history.
+//
+// This is the MANY-record default, for the fork-boundary scan. The one-record reads below pass
+// ROLLOUT_HEAD_BYTES (512KB, lib/transcript-codex.mjs) instead; the two are not interchangeable.
 const HEAD_BYTES = 2 * 1024 * 1024;
 // The boundary search never looks past MAX_FORK_PREFIX_RECORDS, so reading more can only be waste.
 const HEAD_RECORDS = MAX_FORK_PREFIX_RECORDS;
@@ -198,7 +201,7 @@ export function findSubagentRollouts(sessionId, { sinceMs = null, sessionsDir = 
       }
       reads += 1;
       // Only the first record — the session_meta — is needed to answer "is this ours?".
-      const identity = subagentIdentityFrom(readRolloutHead(full, { maxBytes: 512 * 1024, maxRecords: 1 }));
+      const identity = subagentIdentityFrom(readRolloutHead(full, { maxBytes: ROLLOUT_HEAD_BYTES, maxRecords: 1 }));
       if (!identity) continue;
       // A file that claims to be its own session's subagent is a one-node cycle in the spawn graph.
       // The session's own rollout is already billed as the parent, so keeping it here would bill the
@@ -222,7 +225,7 @@ export function findSubagentRollouts(sessionId, { sinceMs = null, sessionsDir = 
 
 // The wall-clock start of a rollout, from its session_meta. Used to bound the sweep above.
 export function rolloutStartedAt(transcriptPath) {
-  const [first] = readRolloutHead(transcriptPath, { maxBytes: 512 * 1024, maxRecords: 1 });
+  const [first] = readRolloutHead(transcriptPath, { maxBytes: ROLLOUT_HEAD_BYTES, maxRecords: 1 });
   return first ? tsOf(first) : null;
 }
 

@@ -1,8 +1,6 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
-import path from 'node:path';
 
 import {
   loadLedger,
@@ -21,6 +19,7 @@ import {
   markLinked,
 } from '../lib/tracking.mjs';
 import { auditLedgerFile, trackingStateFile } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 import {
   acquireLock,
   forgetHeldLocks,
@@ -42,18 +41,7 @@ import {
 
 afterEach(() => forgetHeldLocks());
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-lockshared-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    forgetHeldLocks();
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, { prefix: 'beezi-lockshared-', beforeCleanup: forgetHeldLocks });
 
 function heldElsewhere(target) {
   const got = acquireLock(target, { leaseMs: 60_000 }, { pid: () => 999_999 });

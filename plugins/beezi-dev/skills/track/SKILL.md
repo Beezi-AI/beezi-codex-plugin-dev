@@ -19,8 +19,8 @@ working directory is how it finds the repo, the branch, and this session's trans
 node "<plugin-root>/scripts/track.mjs"
 ```
 
-Do not read, open, or inspect any other files. Report the output verbatim — the success line, or
-the error if the repo or branch does not qualify. Never echo a token.
+Report the output verbatim — the success line, or the error if the repo or branch does not qualify.
+Never echo a token.
 
 ## What the output means
 
@@ -50,8 +50,6 @@ and this manual step stops being necessary.
 
 ## When to suggest `sync` instead
 
-This skill only ever saves **the session it is run from**. It cannot repair a period that is already
-missing from the user's analytics — sessions that ran while the hooks were untrusted or stale after
-an upgrade, or on a machine that was offline. That is the `sync` skill's job: it asks Beezi how far
-each past session reaches and uploads only the rest. Reach for it whenever the user says analytics
-are missing for work they have already finished, rather than re-running this one.
+This skill only ever saves **the session it is run from**. History that is already missing — sessions
+that ran while the hooks were untrusted, stale after an upgrade, or offline — is the `sync` skill's
+job, and is not a reason to re-run this one.

@@ -24,8 +24,6 @@ function healHooks() {
 }
 
 async function main() {
-  // R1: no upload, no drain and no credential work while the data root is mid-cutover or its
-  // environment cannot be established. cliMayProceed() prints the reason it refuses.
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   const status = await linkStatus();
   // Repaired AFTER the link check, so the state the user is left in is the one being described:

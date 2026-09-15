@@ -15,11 +15,11 @@ if (input.stop_hook_active === true) process.exit(0);
 // What this hook uniquely contributes: `agent_transcript_path`, which is authoritative and saves the
 // parent a directory scan, and `agent_type`, which exists ONLY on the hook payload — the rollout
 // itself carries a nickname and a role, never the task name the model chose.
-// Async IIFE rather than top-level await (Node 14.8+): the guards above stay synchronous, and the
-// catch mirrors what a rejected top-level await did — print the error and exit non-zero.
+// Async IIFE, not top-level await: top-level await is Node 14.8+, past this plugin's 13.2 floor
+// and banned by the gate. The catch below is what a rejected top-level await did.
 (async () => {
-  // R1: identity is written into the data root, so it waits on the same guard as every other
-  // writer. Dynamic, like the module below it, to keep this hook at bare node startup.
+  // Identity is written into the data root, so it waits on lib/env-guard.mjs like every other
+  // writer. Imported dynamically, like the module below it, to keep this hook at bare node startup.
   const { hookMayProceed } = await import('../lib/env-guard.mjs');
   if (!hookMayProceed()) return exitClean(0);
   const { writeAgent } = await import('../lib/subagent-state.mjs');

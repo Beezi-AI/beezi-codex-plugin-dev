@@ -31,8 +31,7 @@ node "<plugin-root>/skills/telemetry/telemetry.mjs" on
 node "<plugin-root>/skills/telemetry/telemetry.mjs" off
 ```
 
-Report the output verbatim. Do not read, open, or inspect any other files, and never edit the
-stored answer by hand.
+Report the output verbatim, and never edit the stored answer by hand.
 
 **Only run `on` or `off` when the user has actually said which one they want.** A request to
 "check", "show", or "what is this" is the no-argument form. Consent is the user's to give: never
@@ -61,15 +60,14 @@ question.
 
 ## What is collected, if the user asks
 
-A report is structured fields only: which failure it was (one of a short fixed list of codes),
-which plugin file and line it happened in, the error class and error code, an HTTP status when
-there was one, the plugin / Node / OS / architecture versions, and how many times it repeated.
+**The command's own output is the answer — relay it rather than composing one from memory, and do
+not read the plugin's source.** The no-argument form prints the full list whenever it puts the
+question for the first time, and whenever reporting is already ON.
 
-It **cannot** carry code, prompts, file contents, any path outside the plugin, repository or branch
-names, error messages, stack text, tokens or credentials. That is not a filter that strips them —
-the record has no field that could hold them in the first place.
-
-Answer from this section. Do not go and read the plugin's source to compose an answer.
+In the two states that do not print it — turned off, or asked and never answered — say only this: a
+report is structured fields only, and it cannot carry code, prompts, file contents, paths outside
+the plugin, repository or branch names, error messages, stack text or credentials. That is not a
+filter that strips them; the record has no field that could hold them.
 
 ## The default, and what "never answering" means
 

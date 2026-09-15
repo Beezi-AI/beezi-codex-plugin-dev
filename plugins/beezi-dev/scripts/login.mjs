@@ -1,5 +1,4 @@
 import { performLogin } from '../lib/login.mjs';
-import path from 'path';
 import url from 'url';
 import { ensureHooks, TRUST_STEP } from '../lib/hooks-install.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
@@ -64,8 +63,8 @@ function reportHookStep() {
 
 // R1 names login first among the things the guard precedes, and for the sharpest reason: a
 // production sign-in on a machine whose queue was captured against staging is the exact sequence
-// that flushes one tenant's segments to another. The migration therefore happens BEFORE the
-// browser opens, not after the token lands.
+// that flushes one tenant's segments to another. The migration therefore happens BEFORE the browser
+// opens, not after the token lands. R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 if (!cliMayProceed()) process.exit(1);
 
 performLogin({ onStep })

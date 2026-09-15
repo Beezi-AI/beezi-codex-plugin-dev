@@ -27,6 +27,7 @@ import {
   wasUnreadable,
   markComplete,
   isComplete,
+  ledgerDelivered,
 } from './audit-ledger.mjs';
 import {
   flushBackfillChunks as _flushBackfillChunks,
@@ -81,7 +82,8 @@ export const SYNC_MODE = 'sync';
 // ONE run lock for BOTH modes, deliberately sharing a name: an import and a repair pass replaying
 // the same machine's rollouts at the same time would hand the server two differently-partitioned
 // copies of the same lines. R3 puts the backfill's one-time seal under a run lock; the repair pass
-// has no seal but the same overlap hazard, so it takes the same lock.
+// has no seal but the same overlap hazard, so it takes the same lock. R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
 export const HISTORY_RUN_LOCK = 'backfill';
 
 // Rank 1 (run). NOT a session lock: session locks are rank 2 and the checkpoint transaction takes
@@ -161,23 +163,6 @@ function liveCursorOf(sessionId, deps) {
   const read = orDefault(deps.readStateImpl, (id) => readJson(path.join(stateDir(), `${id}.json`), null));
   const state = read(sessionId);
   return Number.isInteger((state || {}).cursor) && state.cursor > 0 ? state.cursor : 0;
-}
-
-function hasLiveCursor(sessionId, deps) {
-  return liveCursorOf(sessionId, deps) > 0;
-}
-
-// The ledger's outcome for a session, as EVIDENCE rather than as a verdict. R2's whole point is
-// that ledger membership does not prove coverage — but a recorded ACCEPTED/PARTIAL delivery does
-// contradict a coverage answer of "nothing stored", and that contradiction is what tells a
-// mid-session gap apart from a session that never landed. A REJECTED entry is deliberately NOT
-// delivery: an unconnected repository that is later connected must replay in full.
-function ledgerDelivered(ledger, sessionId) {
-  const sessions = (ledger || {}).sessions;
-  if (!sessions || typeof sessions !== 'object') return false;
-  const entry = sessions[sessionId];
-  if (!entry || typeof entry !== 'object') return false;
-  return entry.outcome === BackfillSessionStatus.ACCEPTED || entry.outcome === BackfillSessionStatus.PARTIAL;
 }
 
 // Run `worker` over `items` with at most `limit` in flight.
@@ -500,7 +485,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // Keyring machines have no credentials-file mtime to fall back on, so a pre-stamp link
     // leaves linkCutoffMs null there — the persisted cursor is the remaining evidence that live
     // tracking already owns this session (it survives 14 days before pruneStale takes it).
-    if (!syncMode && liveMode && linkCutoffMs == null && hasLiveCursor(entry.sessionId, deps)) {
+    if (!syncMode && liveMode && linkCutoffMs == null && liveCursorOf(entry.sessionId, deps) > 0) {
       result.liveTracked += 1;
       continue;
     }
@@ -559,7 +544,6 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // sealing on top of that would close the one-time pull over sessions nobody uploaded.
     const owned = lockHandle.verify();
     if (!owned.ok) {
-      result.halt = orDefault(result.halt, null);
       result.lastError = `history run lock ${owned.reason} — the pull was not sealed`;
       return;
     }

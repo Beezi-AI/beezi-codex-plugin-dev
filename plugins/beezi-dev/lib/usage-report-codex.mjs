@@ -16,10 +16,10 @@ import {
 // This is the one place a spread would be actively wrong. `drainRateLimitSnapshots` hands its own
 // deps straight through to usageIdentityFields, and there `now` is a CLOCK FUNCTION
 // (`orDefault(deps.now, Date.now)`, used for the drain deadline) while resolveSource's `now` is an
-// EPOCH NUMBER (billing-config.mjs:98). Passing the function through would make every
-// evidence-freshness comparison `now - ms` NaN and silently discard an hours-old API-key stamp —
-// the same trap checkpoint.mjs:350-356 spells out at its own call site. So `now` travels only when
-// it is already a number, and nothing the ladder does not name travels at all.
+// EPOCH NUMBER (`resolveSource` in billing-config.mjs). Passing the function through would make
+// every evidence-freshness comparison `now - ms` NaN and silently discard an hours-old API-key
+// stamp — the same trap `runCheckpoint` in checkpoint.mjs spells out at its own call site. So `now`
+// travels only when it is already a number, and nothing the ladder does not name travels at all.
 function billingDepsFrom(deps) {
   const out = {};
   if (deps.readCodexAuthSignals != null) out.readCodexAuthSignals = deps.readCodexAuthSignals;
@@ -31,7 +31,8 @@ function billingDepsFrom(deps) {
 // resolveSource does not open ~/.codex/auth.json a second time (G-10-1 L1). A null account is the
 // same two cases readCodexAuthSignals answers with its `none` — file absent, or unparseable — so
 // synthesizing `none` for it is exact rather than a guess. `hasStoredApiKey` is carried because
-// auth_mode is null under a ChatGPT sign-in, which makes billing-config.mjs:118 reachable.
+// auth_mode is null under a ChatGPT sign-in, which makes `resolveSource`'s stored-key rung in
+// billing-config.mjs reachable.
 function signalsFromAccount(account) {
   if (account == null) return { authMode: null, hasStoredApiKey: false };
   return {
@@ -88,7 +89,7 @@ export function usageIdentityFields(deps = {}) {
   // flow exists to catch and which happened here without anyone running refresh.
   //
   // Below a SELF-REPORTED plan, always: a tier the user typed by hand is the one thing the ladder
-  // must never overwrite (billing-config.mjs:25-27, session-start.mjs:221).
+  // must never overwrite (`isStale` and `shouldProbeAccount`, both in billing-config.mjs).
   //
   // Gated on a SUBSCRIPTION resolution for the same reason every other plan field is: on an api-key
   // or third-party machine there is no subscription plan to state, and stamping one would be a
@@ -102,8 +103,8 @@ export function usageIdentityFields(deps = {}) {
     try { observed = readObservedPlan(); } catch (e) { observed = null; }
     const observedPlan = observed == null ? null : observed.plan;
     if (observedPlan != null && observedPlan !== 'unknown') {
-      // The PAIR moves together. On Codex the subscription type IS the plan tier
-      // (billing.mjs:104-108), so leaving billing.json's `plus` beside a rollout's `free` would put
+      // The PAIR moves together. On Codex the subscription type IS the plan tier (`normalizePlan`
+      // in lib/billing.mjs), so leaving billing.json's `plus` beside a rollout's `free` would put
       // two different tiers in one row. Whichever source wins the plan owns the type.
       fields = { ...fields, subscription_plan: observedPlan, subscription_type: observedPlan };
     }
@@ -201,13 +202,10 @@ export async function drainRateLimitSnapshots(token, deps = {}) {
   if (posted > 0) clearPending(pending.slice(0, posted));
   // Rows still on disk when the drain stopped, WHATEVER stopped it. `pending.length - posted` is
   // exact on every path because a non-success breaks immediately, so `posted` is always the index
-  // the loop stopped at. It used to be counted only on the deadline path, which reported
-  // `deferred: 0` for a queue stalled behind a rejection — the one case where the number matters
-  // most, since a non-2xx keeps the failed row AND its whole tail (REVIEW §R4). `reason` names
-  // which of the three it was, so a caller can tell "still working through a backlog" from "stuck".
-  //
-  // The remaining half of G-8-8 is checkpoint.mjs:537, which discards this result entirely: it needs
-  // to assign it and put `rateLimits: { posted, deferred }` on runCheckpoint's return. That file has
-  // a different owner; nothing here can surface the count on its own.
+  // the loop stopped at. It used to be counted only on the deadline path, which reported `deferred:
+  // 0` for a queue stalled behind a rejection — the one case where the number matters most, since a
+  // non-2xx keeps the failed row AND its whole tail (REVIEW §R4). `reason` names which of the three
+  // it was, so a caller can tell "still working through a backlog" from "stuck". R-numbers cite
+  // docs/plans/2026-09-10-sections/REVIEW.md.
   return { posted: posted, deferred: pending.length - posted, reason: orDefault(stopped, 'drained') };
 }

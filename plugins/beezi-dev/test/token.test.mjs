@@ -5,6 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { getAccessToken } from '../lib/token.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 import {
   DIAGNOSTIC_CODES,
   diagnosticsDir,
@@ -12,17 +13,7 @@ import {
   grantConsent,
 } from '../lib/diagnostics.mjs';
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'token-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'token-');
 
 const FRESH = {
   client_id: 'cid', token_endpoint: 'https://x/oauth/token',

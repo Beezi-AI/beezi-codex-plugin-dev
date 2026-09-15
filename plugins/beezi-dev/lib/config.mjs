@@ -7,7 +7,8 @@ import { ENV_API_BASE, environment } from "./paths.mjs";
 // correction, and all three of its steps are now in place — the environment readers and namespace
 // isolation (G-2-2), the staging variant and internal publisher that give displaced installs a
 // destination (G-1-7), and the migration guard that moves them there before anything is uploaded
-// (lib/env-migration.mjs, wired at every entry point through lib/env-guard.mjs).
+// (lib/env-migration.mjs, wired at every entry point through lib/env-guard.mjs). R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // The guard is not optional scaffolding around this line: an install that was capturing against
 // staging holds cursors pointing into rollouts whose earlier lines are already delivered, and a
@@ -20,8 +21,8 @@ const RELEASE_DEFAULT = 'https://beezi-api-prod.azurewebsites.net/api';
 // The environment assertion comes first, and that is the whole point of it: the API and the
 // namespace are resolved out of one record in lib/paths.mjs, so a variant whose metadata we could
 // not read refuses to name an API rather than quietly answering with the release default. The
-// explicit BEEZI_API_URL override stays live (link-status.mjs:12-14 documents processes that
-// disagree about it), and it deliberately cannot move the namespace — a stored environment
+// explicit BEEZI_API_URL override stays live (`linkStatus` in link-status.mjs documents processes
+// that disagree about it), and it deliberately cannot move the namespace — a stored environment
 // binding is enforced where the credentials are, in lib/credentials.mjs.
 export function apiBase() {
   environment.assertEnvironment();
@@ -53,8 +54,7 @@ export const ENDPOINTS = Object.freeze({
   // Repeatable history repair (lib/session-coverage.mjs, G-3-3/G-9-3), as distinct from the
   // one-time backfill above: /sessions/sync is tracking-policy-aware and never seals, and
   // /sessions/coverage answers what the server actually holds. Both are agent-scoped by the
-  // X-Beezi-Agent header rather than by the path. session-coverage.mjs reads these through
-  // orDefault against its own literals, so those fallbacks are now dead.
+  // X-Beezi-Agent header rather than by the path.
   sessionsSync: "/sessions/sync",
   sessionsCoverage: "/sessions/coverage",
   reposStatus: "/repos/status",

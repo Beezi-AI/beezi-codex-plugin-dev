@@ -16,6 +16,7 @@ import { runLock, withLock, acquireLock, inspectLock } from './single-instance-l
 import { readRawCredential, deleteRawCredential, serviceFor, preserveMigrationCredential, tombstoneMigrationCredential } from './credentials.mjs';
 
 // ── The production cutover guard (G-1-2, R1) ────────────────────────────────────────────────
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // Every build published before this release pointed at the staging API by default
 // (lib/config.mjs RELEASE_DEFAULT), and wrote its queue, cursors, ledger and credentials into the
@@ -39,8 +40,8 @@ import { readRawCredential, deleteRawCredential, serviceFor, preserveMigrationCr
 // build (dev/staging) has its own root by construction and needs no migration — it gets a binding
 // stamp and nothing else.
 
-export const BINDING_VERSION = 1;
-export const MIGRATION_VERSION = 1;
+const BINDING_VERSION = 1;
+const MIGRATION_VERSION = 1;
 
 // The API origins this plugin has ever shipped as a default. The classifier compares the issuer
 // retained in the stored credentials against these, because THE ISSUER IS THE ONLY HONEST RECORD
@@ -114,11 +115,9 @@ export function issuerEnvironment(raw) {
     return issuer !== 'unknown' && issuer === stamp ? issuer : 'unknown';
   }
 
-  if (origin === null) return 'unknown';
-  if (origin === STAGING_API_ORIGIN) return 'staging';
-  if (origin === PRODUCTION_API_ORIGIN) return 'production';
-  // A self-hosted or dev API the plugin has never shipped as a default. R1: stop, do not guess.
-  return 'unknown';
+  // A self-hosted or dev API the plugin has never shipped as a default already resolved to
+  // 'unknown' above. R1: stop, do not guess.
+  return issuer;
 }
 
 function entriesOf(dir, deps) {
@@ -134,7 +133,6 @@ function entriesOf(dir, deps) {
 /** Has this root ever been written to by the plugin? */
 export function rootHasData(dir, deps = {}) {
   const names = entriesOf(dir, deps);
-  if (names === null) return false;
   for (const name of names) {
     if (DATA_ENTRIES.indexOf(name) !== -1) return true;
   }
@@ -261,7 +259,7 @@ function strictRecord(file, deps) {
   catch (error) { if (error.code === 'ENOENT') return null; throw error; }
 }
 
-export function writeBinding(record, deps = {}) {
+function writeBinding(record, deps = {}) {
   const write = orDefault(deps.writeJsonSecure, writeJsonSecure);
   const now = orDefault(deps.now, Date.now);
   write(bindingPathOf(deps), {
@@ -411,8 +409,10 @@ function handOffCredential(raw, destination, deps) {
     preserved = false;
   }
 
-  // Whether or not the copy took, the production namespace must not keep it.
-  if (!preserved) return { preserved: false, cleared: false };
+  // Whether or not the copy took, the production namespace must not keep it — and a copy that did
+  // not verify must stop the migration here rather than travel back as a verdict the caller has to
+  // re-judge. Same message the caller raises when a hand-off comes back uncleared.
+  if (!preserved) throw new Error('Credential hand-off was not verified');
   writeMarker({ phase: 'prepared', from: homeOf(deps), to: destination, credential: { preserved: true, cleared: false } }, deps);
   let cleared = true;
   try { cleared = deleteRaw(deps); } catch { cleared = false; }
@@ -655,9 +655,9 @@ function runMigrationLocked(facts, deps) {
         verification: inventory(source, deps).filter(entry => entry.rel !== 'credentials.json') }, deps);
     }
 
-    // Verify against the source, EXCLUDING what was deliberately not copied.
-    const missing = (phase === 'cleared' || phase === 'prepared' ? [] : verifyCopy(source, destination, deps))
-      .filter((rel) => NOT_COPIED.indexOf(rel.split('/')[0]) === -1);
+    // Verify against the source. inventory() — which verifyCopy walks — already skips the
+    // top-level NOT_COPIED entries, so what comes back is only what was meant to be copied.
+    const missing = phase === 'cleared' || phase === 'prepared' ? [] : verifyCopy(source, destination, deps);
     if (missing.length) {
       writeMarker({ phase: 'copying', from: source, to: destination, missing: missing.slice(0, 20) }, deps);
       return {
@@ -790,6 +790,9 @@ export function adoptAsProduction(deps = {}) {
   return withMigrationRoots(deps, () => {
     const raw = orDefault(deps.readRawCredential, readRawCredential)(deps);
     if (['unlinked', 'production'].indexOf(issuerEnvironment(raw)) === -1) return { ok: false, reason: 'credential-conflict' };
+    // Called for its side effect only: readBinding throws on a malformed or conflicting
+    // environment.json, and adopting a root whose binding cannot be read is exactly what must not
+    // happen. The value is unused — the binding being written below replaces it.
     readBinding(deps);
     if (orDefault(deps.apiOrigin, effectiveApiOrigin()) !== PRODUCTION_API_ORIGIN) return { ok: false, reason: 'api-mismatch' };
     deps.verifyMigration();

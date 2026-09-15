@@ -8,6 +8,7 @@ if (!input) process.exit(0);
 // The production cutover guard (R1). SessionStart is the first hook of every session and the only
 // one with a channel back to the user, so this is where the migration actually happens and where
 // its notice — or its refusal — is shown. Every other entry point gets the memoized answer.
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 const proceed = hookMayProceed();
 const notice = environmentNotice();
 

@@ -71,15 +71,6 @@ export function readJsonSalvaged(filePath) {
   }
 }
 
-// Write JSON to a 0600 file, creating parent dirs.
-//
-// Written to a temp file and renamed so a reader sees either the old file or the new one, never
-// half of each. A torn write is the failure that matters here: readJson falls back to its default
-// on a parse error, and for session state that default is `{cursor: 0}` — the whole session gets
-// re-reported. The hazard is not new (an AV scanner or the indexer can hold any of these files
-// open), but subagent hooks running alongside the parent's checkpoint widened it.
-//
-// The temp name carries the pid so two writers never collide on it.
 const RENAME_ATTEMPTS = 4;
 
 // A real blocking sleep in synchronous code. Every caller of writeJsonSecure is sync and runs inside
@@ -95,6 +86,16 @@ function sleepSync(ms) {
 // hook budget and then reports "held open by another process" for a cause that is not that.
 const RETRYABLE_RENAME = { EPERM: true, EBUSY: true, EACCES: true };
 
+// Write JSON to a 0600 file, creating parent dirs.
+//
+// Written to a temp file and renamed so a reader sees either the old file or the new one, never
+// half of each. A torn write is the failure that matters here: readJson falls back to its default
+// on a parse error, and for session state that default is `{cursor: 0}` — the whole session gets
+// re-reported. The hazard is not new (an AV scanner or the indexer can hold any of these files
+// open), but subagent hooks running alongside the parent's checkpoint widened it.
+//
+// The temp name carries the pid so two writers never collide on it.
+//
 // `deps` is an additive FOURTH parameter, after the existing options object, so none of the
 // existing call sites change. It exists because `fs` is a module-level import: without it the
 // retry loop, the errno filter and the temp cleanup cannot be exercised by a test at all.

@@ -6,7 +6,8 @@ import {
 } from '../lib/env-migration.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 
-// The recovery surface for the production cutover (R1).
+// The recovery surface for the production cutover (R1). R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // The guard in lib/env-guard.mjs decides the ordinary cases by itself and needs nobody. This
 // script exists for the two it deliberately refuses to decide — a legacy root whose environment

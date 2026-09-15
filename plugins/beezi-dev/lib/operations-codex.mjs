@@ -91,11 +91,12 @@ const EXEC_PRECEDENCE = ['mcp', 'file', 'internet', 'shell', 'other'];
 
 // The modern surface names MCP tools with Claude's exact `mcp__<server>__<tool>` convention, so
 // here the server is deterministic from the name and needs no completion-record join at all.
-// Equivalent to Claude's `mcpServer()` (operations.mjs:34-39) on every input, including the
-// degenerate ones: `mcp__a_b__c` -> `a_b` (split is on the double underscore, not the single),
-// `mcp__a__b__c` -> `a`, `mcp__x` -> `x`, and a blank server -> no name. The one difference is the
-// return value for a blank server: Claude returns the literal 'unknown', we return null so a
-// completion record can still win, and the same 'unknown' is applied at the accumulation site.
+// Equivalent to Claude's `mcpServer()` (operations.mjs in the beezi-claude-plugins repo) on every
+// input, including the degenerate ones: `mcp__a_b__c` -> `a_b` (split is on the double underscore,
+// not the single), `mcp__a__b__c` -> `a`, `mcp__x` -> `x`, and a blank server -> no name. The one
+// difference is the return value for a blank server: Claude returns the literal 'unknown', we
+// return null so a completion record can still win, and the same 'unknown' is applied at the
+// accumulation site.
 function mcpServerOf(name) {
   const parts = String(name).split('__');
   const server = parts.length > 1 ? parts[1] : '';
@@ -178,7 +179,11 @@ function outputBytes(output) {
   return Buffer.byteLength(JSON.stringify(output), 'utf-8');
 }
 
-function parseArgs(raw) {
+// A tool call's arguments as an object, or null. Codex writes them as a JSON string on
+// `function_call` and as an already-parsed object on some custom calls, so both shapes arrive.
+// Exported because lib/delta-codex.mjs reads workdir off the same field and must agree on what
+// counts as unparseable — an exec program is NOT JSON and must yield null, not a throw.
+export function parseArgs(raw) {
   if (raw && typeof raw === 'object') return raw;
   if (typeof raw !== 'string') return null;
   try { return JSON.parse(raw); } catch { return null; }

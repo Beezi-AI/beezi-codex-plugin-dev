@@ -144,9 +144,11 @@ test('5. scripts/mcp.mjs still exits cleanly with the watcher opted in — the t
   assert.equal(run.stdout, '', 'the watcher must never write to the JSON-RPC channel');
 });
 
-test('6. the literal gate in scripts/mcp.mjs cannot drift from WATCHER_ENV_VAR', () => {
-  // scripts/mcp.mjs checks the variable by literal name so an un-opted machine never even loads
-  // the watcher's module graph. That is the one place the name is duplicated, so it is pinned.
+test('6. the literal gate in scripts/mcp.mjs cannot drift from isWatcherEnabled', () => {
+  // scripts/mcp.mjs decides by literal name AND literal value list, so an un-opted machine never
+  // even loads the watcher's module graph — asking the module would defeat the gate. Both copies
+  // are pinned here, in both directions: the file's list must be exactly the vocabulary
+  // isWatcherEnabled accepts, no wider and no narrower.
   const source = fs.readFileSync(path.join(PLUGIN_ROOT, 'scripts', 'mcp.mjs'), 'utf-8');
   assert.match(
     source,
@@ -154,6 +156,32 @@ test('6. the literal gate in scripts/mcp.mjs cannot drift from WATCHER_ENV_VAR',
     'scripts/mcp.mjs must gate on the same variable lib/rollout-watcher.mjs documents',
   );
   assert.match(source, /watcher\.stop\(\)/, 'the shutdown path must stop the watcher');
+
+  const literal = /\[((?:\s*'[a-z0-9]+'\s*,?)+)\]\.indexOf\(/.exec(source);
+  assert.ok(literal, 'scripts/mcp.mjs must decide against an inline allowlist of accepted values');
+  const inline = literal[1].split(',').map((v) => v.trim().replace(/'/g, '')).filter(Boolean);
+
+  // Not wider: every value the file accepts, the module accepts too. A value only the file
+  // honours loads the whole watcher graph and then has startWatcher() refuse it.
+  for (const value of inline) {
+    assert.equal(
+      isWatcherEnabled({ [WATCHER_ENV_VAR]: value }), true,
+      `scripts/mcp.mjs accepts ${JSON.stringify(value)} but isWatcherEnabled does not`,
+    );
+  }
+  // Not narrower: every value the module accepts, the file imports for. A value only the module
+  // honours is an opt-in that is silently ignored, which is the worse direction.
+  for (const value of ['1', 'true', 'yes', 'on', 'enabled']) {
+    assert.ok(
+      inline.indexOf(value) !== -1,
+      `isWatcherEnabled accepts ${JSON.stringify(value)} but scripts/mcp.mjs would not import`,
+    );
+  }
+  // And the off-vocabulary is in neither — the whole point of an allowlist over truthiness.
+  for (const off of ['0', 'false', 'no', 'off', 'disabled']) {
+    assert.equal(inline.indexOf(off), -1, `${JSON.stringify(off)} must never enable the watcher`);
+    assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: off }), false);
+  }
 });
 
 test('7. .mcp.json and the module agree about whether Codex can forward the opt-in', () => {
@@ -179,5 +207,39 @@ test('7. .mcp.json and the module agree about whether Codex can forward the opt-
     forwarded
       ? 'BEEZI_CODEX_WATCHER is now forwarded — update lib/rollout-watcher.mjs, which still says it is not'
       : 'lib/rollout-watcher.mjs must record that Codex does not forward BEEZI_CODEX_WATCHER yet',
+  );
+});
+
+test('8. a value that means OFF does not even load the watcher\'s module graph', (t) => {
+  // `BEEZI_CODEX_WATCHER=0` is what a user types to turn something off, and it is a truthy
+  // string. A bare `if (process.env.X)` gate reaches startWatcher(), which refuses correctly —
+  // so nothing observable on disk differs, and every assertion in test 4's style passes on the
+  // broken gate too. The cost is real but invisible: the watcher's whole module graph
+  // (checkpoint, session-audit, coverage, the lock primitive) is parsed and evaluated in every
+  // session of a machine that said no. V8 coverage is what makes "was this module loaded" an
+  // observable, so that is what this asserts.
+  const home = tmp(t, 'watcher-off-home-');
+  const codex = tmp(t, 'watcher-off-codex-');
+  const coverage = tmp(t, 'watcher-off-cov-');
+  const env = {
+    ...process.env, BEEZI_CODEX_HOME: home, CODEX_HOME: codex, NODE_V8_COVERAGE: coverage,
+  };
+  env[WATCHER_ENV_VAR] = '0';
+  delete env.NODE_TEST_CONTEXT;
+
+  const run = spawnSync(process.execPath, [path.join(PLUGIN_ROOT, 'scripts', 'mcp.mjs')], {
+    cwd: PLUGIN_ROOT, encoding: 'utf-8', timeout: 30_000, env, input: '',
+  });
+  assert.equal(run.status, 0, `the server did not exit cleanly: ${run.stderr}`);
+
+  const reports = fs.readdirSync(coverage).map((f) => fs.readFileSync(path.join(coverage, f), 'utf-8'));
+  assert.notEqual(reports.length, 0, 'V8 wrote no coverage — this test proves nothing without it');
+  const loaded = reports.join('\n');
+  // Positive control: the bridge IS loaded, so an empty match below means "not loaded", never
+  // "coverage did not see this process".
+  assert.ok(loaded.includes('mcp-bridge.mjs'), 'coverage must cover the server it ran');
+  assert.ok(
+    !loaded.includes('rollout-watcher.mjs'),
+    'BEEZI_CODEX_WATCHER=0 must not import lib/rollout-watcher.mjs',
   );
 });

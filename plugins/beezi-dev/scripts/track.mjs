@@ -2,17 +2,11 @@ import { trackSession, resolveTrackTarget } from '../lib/track-session.mjs';
 import { quarantinePoisonedSessionState } from '../lib/transcript-codex.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
+import { fail } from '../lib/cli.mjs';
 
 const cwd = process.cwd();
 
-function fail(message) {
-  console.error(`✗ ${message}`);
-  process.exit(1);
-}
-
 async function main() {
-  // R1: no upload, no drain and no credential work while the data root is mid-cutover or its
-  // environment cannot be established. cliMayProceed() prints the reason it refuses.
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   // FIRST, before anything reads state/ or drains queue/. A machine that already ran an older
   // build can hold `state/null.json` and `queue/null_*.json` written by an id-less session; the

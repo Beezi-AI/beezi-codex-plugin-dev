@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { codexSessionsDir } from './paths.mjs';
-import { isUsableSessionId, listRolloutFiles } from './transcript-codex.mjs';
+import { isUsableSessionId, listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
 import { readRolloutHead, subagentIdentityFrom } from './subagent-codex.mjs';
 import { orDefault } from './compat.mjs';
 
@@ -44,14 +44,14 @@ export function listAllRollouts({ sessionsDir = null } = {}) {
     if (!stat.isFile()) continue;
 
     // One record is enough for all three answers: is it a subagent, what session is it, where
-    // was it launched. 512KB mirrors the sweep's own head read.
-    const [first] = readRolloutHead(full, { maxBytes: 512 * 1024, maxRecords: 1 });
+    // was it launched. ROLLOUT_HEAD_BYTES is the shared one-record window.
+    const [first] = readRolloutHead(full, { maxBytes: ROLLOUT_HEAD_BYTES, maxRecords: 1 });
     if (!first) continue;
     if (subagentIdentityFrom([first])) continue;
 
     const meta = first.type === 'session_meta' ? first.payload : null;
     // `id`, never `session_id`: on a subagent rollout the latter holds the PARENT's thread id
-    // (lib/subagent-codex.mjs:91-104), and this entry names THIS file.
+    // (`subagentIdentityFrom` in lib/subagent-codex.mjs), and this entry names THIS file.
     //
     // Both sources are validated rather than merely non-empty. An id that is one of the strings
     // JavaScript makes from a missing value — `null`, `undefined` — is not a session: keyed on it,

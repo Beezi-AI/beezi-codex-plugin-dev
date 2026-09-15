@@ -112,8 +112,9 @@ test('plugin.json is rewritten key by key, and nothing else moves', (t) => {
 test('package and plugin versions stay synchronised, and the package name does not move', (t) => {
   const built = build(t);
   assert.equal(built.pkg.version, built.plugin.version);
-  // package-lock.json pins the name; renaming it here would desync the lockfile for no gain, and
-  // the identity Codex and users see is plugin.json's `name`.
+  // Nothing reads package.json's `name`: there are no dependencies, nothing is published to a
+  // registry, and lib/diagnostics.mjs reads `version` alone. The identity Codex and users see is
+  // plugin.json's `name`, so the four variants deliberately share one package identity.
   assert.equal(built.pkg.name, 'beezi');
   assert.equal(built.pkg.type, 'module', 'every other package.json key is left alone');
 });

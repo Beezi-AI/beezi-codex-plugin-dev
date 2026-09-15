@@ -1,6 +1,6 @@
 import { spawn as _spawn } from 'child_process';
 import { canonicalPlan } from './billing.mjs';
-import { orDefault } from './compat.mjs';
+import { orDefault, readString } from './compat.mjs';
 
 // Ask Codex itself which account it is using, instead of decoding the snapshot it left in
 // ~/.codex/auth.json.
@@ -24,9 +24,9 @@ import { orDefault } from './compat.mjs';
 // isStale() gate that already bounds the plan capture, and never on the checkpoint hot path.
 // NOTHING HERE SPAWNS AT IMPORT TIME — tools/verify-minimum-runtime.cjs imports every lib module.
 
-// Why a probe returned what it returned. A caller distinguishes these because they have different
-// fixes: `unavailable` means install/expose Codex, `no-credentials` means sign in to Codex,
-// `timeout` means try again later, and `disabled` means the user turned this off.
+// Why a probe returned what it returned, for this module's own reporting: `unavailable` means
+// install/expose Codex, `no-credentials` means sign in to Codex, `timeout` means try again later,
+// and `disabled` means the user turned this off.
 export const APP_SERVER_REASON = Object.freeze({
   OK: 'ok',
   DISABLED: 'disabled',
@@ -57,7 +57,6 @@ const FAILURE_FIELDS = Object.freeze({
   subscriptionType: null,
   accountId: null,
   email: null,
-  rateLimits: null,
 });
 
 function failure(reason) {
@@ -108,13 +107,6 @@ function launchArgs(command) {
   };
 }
 
-// A non-empty string, or null. Anything else in a protocol field is not an identifier.
-function readString(value) {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed === '' ? null : trimmed;
-}
-
 // Codex names ChatGPT auth `chatgpt` and key auth `apiKey`. Folded to the two labels the billing
 // ladder already speaks (lib/billing-config.mjs step 4), so nothing downstream has to learn a third
 // spelling of the same fact.
@@ -142,10 +134,9 @@ function readPlan(account) {
 //
 // Never throws and never rejects: every failure is a typed `{ ok: false, reason }`. The child is
 // always closed — on success, on timeout, and on protocol error.
-export function readAccountViaAppServer(options = {}) {
-  const env = orDefault(options.env, process.env);
-  const timeoutMs = orDefault(options.timeoutMs, DEFAULT_TIMEOUT_MS);
-  const deps = orDefault(options.deps, {});
+export function readAccountViaAppServer(deps = {}) {
+  const env = orDefault(deps.env, process.env);
+  const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_TIMEOUT_MS);
   const spawn = orDefault(deps.spawn, _spawn);
 
   if (isDisabled(env)) return Promise.resolve(failure(APP_SERVER_REASON.DISABLED));
@@ -203,7 +194,6 @@ export function readAccountViaAppServer(options = {}) {
         subscriptionType: plan.subscriptionType,
         accountId: readString(limits.accountId),
         email: readString(account.email),
-        rateLimits: orDefault(limits.rateLimits, null),
       });
     }
 
@@ -264,7 +254,7 @@ export function readAccountViaAppServer(options = {}) {
         windowsHide: true,
         windowsVerbatimArguments: launch.verbatim,
       });
-    } catch (error) {
+    } catch {
       return fail(APP_SERVER_REASON.UNAVAILABLE);
     }
 

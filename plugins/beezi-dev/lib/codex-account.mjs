@@ -1,7 +1,7 @@
 import fs from 'fs';
 import { codexAuthFile } from './paths.mjs';
 import { normalizePlan } from './billing.mjs';
-import { base64urlDecode, orDefault } from './compat.mjs';
+import { base64urlDecode, orDefault, readString } from './compat.mjs';
 
 // Read the non-secret ChatGPT subscription info Codex stores in ~/.codex/auth.json. The plan tier
 // lives in the id_token's `https://api.openai.com/auth` claim as `chatgpt_plan_type`; we decode the
@@ -33,18 +33,11 @@ function toEpochMs(iso) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-// A non-empty string, or null. Anything else in a claim is not an identifier.
-function readString(value) {
-  if (typeof value !== 'string') return null;
-  const trimmed = value.trim();
-  return trimmed === '' ? null : trimmed;
-}
-
 // Read ONLY the non-secret subscription fields from ~/.codex/auth.json. Returns null when the file
 // is absent or unparseable — the same two cases readCodexAuthSignals answers with its `none`, which
 // is why a caller may synthesize signals from a null account. `authMode` and `hasStoredApiKey` are
 // exposed on BOTH return shapes so the billing source detector can tell subscription from API-key
-// auth off this one read (billing-config.mjs:116-118).
+// auth off this one read (`resolveSource` in billing-config.mjs).
 export function readCodexAccount(deps = {}) {
   const readFile = orDefault(deps.readFile, (p) => fs.readFileSync(p, 'utf-8'));
   const exists = orDefault(deps.exists, (p) => fs.existsSync(p));
@@ -63,9 +56,9 @@ export function readCodexAccount(deps = {}) {
   // here so ONE parse of auth.json answers both questions the billing ladder asks of that file.
   //
   // LOAD-BEARING, not a convenience. `auth_mode` is null under a ChatGPT sign-in (see the note on
-  // readCodexAuthSignals), so billing-config.mjs:118 — `if (signals && signals.hasStoredApiKey)` —
-  // is genuinely reached with `authMode === null`. A caller that synthesizes signals from this
-  // object without this field resolves such a machine to `unknown` instead of `openai_api_key`, and
+  // readCodexAuthSignals), so `resolveSource`'s `if (signals && signals.hasStoredApiKey)` rung is
+  // genuinely reached with `authMode === null`. A caller that synthesizes signals from this object
+  // without this field resolves such a machine to `unknown` instead of `openai_api_key`, and
   // syncBillingSource then writes the wrong billing source into billing.json.
   const hasStoredApiKey = typeof auth.OPENAI_API_KEY === 'string' && auth.OPENAI_API_KEY.length > 0;
   const claims = decodeJwtPayload(((auth || {}).tokens || {}).id_token);

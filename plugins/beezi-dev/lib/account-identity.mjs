@@ -27,12 +27,9 @@ export function accountIdentityFields(account) {
 // disk but has never captured a plan. Both reads are small and synchronous — THIS RUNS ON THE
 // CHECKPOINT HOT PATH and must never spawn anything.
 export function readAccountIdentity(deps = {}) {
-  const fromConfig = (() => {
-    try {
-      const config = orDefault(deps.readBillingConfig, readBillingConfig)();
-      return accountIdentityFields(config);
-    } catch { return {}; }
-  })();
+  let fromConfig = {};
+  try { fromConfig = accountIdentityFields(orDefault(deps.readBillingConfig, readBillingConfig)()); }
+  catch { fromConfig = {}; }
   if (fromConfig.account_uuid) return fromConfig;
   let fromAuth = {};
   try { fromAuth = accountIdentityFields((deps.readCodexAccount || readCodexAccount)()); }

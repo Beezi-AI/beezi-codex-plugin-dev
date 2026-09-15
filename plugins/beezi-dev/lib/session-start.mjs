@@ -47,7 +47,8 @@ import { syncAccountIfNeeded as _syncAccountIfNeeded } from './account-sync.mjs'
 // it reads the file to preserve `cursor` and writes the whole object back. A checkpoint that
 // advances the cursor between that read and this write has its advance erased — the session
 // re-processes and re-bills a window it already delivered. Resuming a session while a Stop hook
-// from the previous turn is still finishing is exactly that interleaving.
+// from the previous turn is still finishing is exactly that interleaving. R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // Contention DEFERS: the mapping this refreshes is a hint the checkpoint can re-derive, and the
 // cursor it was protecting is untouched, which is the whole point of not writing.
@@ -61,7 +62,7 @@ export function initSessionState(sessionId, { cwd = null, transcriptPath = null 
     state.transcriptPath = transcriptPath;
     state.updatedAt = new Date().toISOString();
     writeJsonSecure(p, state);
-  }, deps.lockDeps);
+  });
   return run.ok
     ? { written: true, skipped: false, reason: null }
     : { written: false, skipped: true, reason: run.reason };
@@ -166,8 +167,8 @@ export async function runSessionStart(input, deps = {}) {
   const readAccountViaAppServer = orDefault(deps.readAccountViaAppServer, _readAccountViaAppServer);
   const syncAccount = orDefault(deps.syncAccount, _syncAccountIfNeeded);
   // Threaded rather than read inside the ladder: step 1 of resolveSource is an environment lookup
-  // (billing-config.mjs:101-102) and a caller with a resolved environment must be able to hand it
-  // over instead of having the host's consulted behind its back (G-10-1 L3).
+  // (`resolveSource` in billing-config.mjs) and a caller with a resolved environment must be able
+  // to hand it over instead of having the host's consulted behind its back (G-10-1 L3).
   const env = orDefault(deps.env, process.env);
   const checkForUpdate = orDefault(deps.checkForUpdate, _checkForUpdate);
 
@@ -250,25 +251,8 @@ export async function runSessionStart(input, deps = {}) {
     // path used to read it, so a machine whose user never invoked the login skill reported
     // subscription_plan: null forever while being nudged about it every single session.
     //
-    // Three gates, in order:
-    //   SUBSCRIPTION      — never touch billing.json on an api-key or third-party machine. The
-    //                       source ladder already outranks auth.json with env and error evidence,
-    //                       so this defers to it rather than going around it.
-    //   !selfReported     — a plan the user answered by hand always wins; we do not even look.
-    //   isStale           — the exact predicate the nudge below uses, so a capture that succeeds
-    //                       silences it in this same run. Normally bounds the work to ~weekly.
-    //
-    // Capture the ChatGPT plan ourselves rather than waiting to be asked. Nothing on the automatic
-    // path used to read it, so a machine whose user never invoked the login skill reported
-    // subscription_plan: null forever while being nudged about it every single session.
-    //
-    // Three gates, in order:
-    //   SUBSCRIPTION      — never touch billing.json on an api-key or third-party machine. The
-    //                       source ladder already outranks auth.json with env and error evidence,
-    //                       so this defers to it rather than going around it.
-    //   !selfReported     — a plan the user answered by hand always wins; we do not even look.
-    //   isStale           — the exact predicate the nudge below uses, so a capture that succeeds
-    //                       silences it in this same run. Normally bounds the work to ~weekly.
+    // shouldProbeAccount is THE gate — the single predicate that decides whether this runs at all.
+    // Its reasoning is below, at the `if`.
     //
     // The reading and the expired-claim rule live in lib/billing-capture.mjs, shared with
     // scripts/billing-capture.mjs so the two cannot disagree about what an expired claim means.

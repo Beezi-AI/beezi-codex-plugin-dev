@@ -2,11 +2,10 @@ import { billingConfigFile } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import {
   BillingSource,
-  detectThirdPartyProvider,
   detectBillingSource as detectBillingSourceFromEnv,
 } from './billing.mjs';
 import { readCodexAuthSignals } from './codex-account.mjs';
-import { orDefault } from './compat.mjs';
+import { orDefault, parseTimestampMs } from './compat.mjs';
 
 const STALE_MS = 7 * 24 * 60 * 60 * 1000; // refresh plan info at least weekly
 
@@ -26,8 +25,8 @@ export function isStale(config, now = Date.now(), staleMs = STALE_MS) {
   // invalidate it; the user signs in again when their tier changes.
   if (config.selfReported) return false;
   if (typeof config.credentialsExpiresAt === 'number' && config.credentialsExpiresAt <= now) return true;
-  const capturedAt = Date.parse(orDefault(config.capturedAt, ''));
-  if (Number.isNaN(capturedAt)) return true;
+  const capturedAt = parseTimestampMs(config.capturedAt);
+  if (capturedAt === null) return true;
   return now - capturedAt > staleMs;
 }
 
@@ -51,8 +50,8 @@ export function shouldProbeAccount(config, source, now = Date.now(), deps = {}) 
   if (source === BillingSource.SUBSCRIPTION) return staleImpl(config, now, staleMs);
   // An api-key or third-party machine bills no subscription: there is no plan to go and find.
   if (source !== BillingSource.UNKNOWN) return false;
-  const capturedAt = Date.parse(orDefault((config || {}).capturedAt, ''));
-  if (Number.isNaN(capturedAt)) return true;
+  const capturedAt = parseTimestampMs((config || {}).capturedAt);
+  if (capturedAt === null) return true;
   return now - capturedAt > staleMs;
 }
 
@@ -66,22 +65,14 @@ export function subscriptionReportFields(billingSource, config) {
   };
 }
 
-// The report payload key naming the third-party provider, or {} when billing is not third-party
-// (or the provider can't be identified from the env). Env-based — no persisted config needed.
-export function thirdPartyReportFields(billingSource, env = process.env) {
-  if (billingSource !== BillingSource.THIRD_PARTY) return {};
-  const provider = detectThirdPartyProvider(env);
-  return provider ? { third_party_provider: provider } : {};
-}
-
 // How long a recorded API error keeps vouching for the billing mode it proved. Short on purpose:
 // it must lapse quickly once the user switches back, and a session still on that mode re-earns it
 // the next time the error fires.
 const EVIDENCE_MS = 24 * 60 * 60 * 1000;
 
 function hasFreshStamp(at, now) {
-  const ms = Date.parse(orDefault(at, ''));
-  if (Number.isNaN(ms)) return false;
+  const ms = parseTimestampMs(at);
+  if (ms === null) return false;
   // `ms <= now` guards a clock that jumped backwards: a stamp from the future is not evidence.
   return now - ms <= EVIDENCE_MS && ms <= now;
 }
@@ -94,9 +85,10 @@ export function hasFreshSubscriptionEvidence(config, now = Date.now()) {
   return hasFreshStamp((config || {}).subscriptionEvidenceAt, now);
 }
 
-// Stamp proof of a billing mode. Returns the updated config, or null when the existing stamp is
-// still fresh (nothing to write). Creates a minimal config when none exists — the evidence has to
-// survive on a machine that never captured a plan.
+// Stamp proof of a billing mode. Always returns an updated config object — the null-when-fresh
+// short-circuit lives one level up, in recordApiKeyEvidence/recordSubscriptionEvidence. Creates a
+// minimal config when none exists — the evidence has to survive on a machine that never captured a
+// plan.
 function record(config, field, now) {
   return { version: 1, ...(config || {}), [field]: now.toISOString() };
 }
@@ -183,7 +175,6 @@ export function resolveBilling(config, env = process.env, deps = {}) {
   return {
     billing_source: source,
     ...subscriptionReportFields(source, config),
-    ...thirdPartyReportFields(source, env),
   };
 }
 

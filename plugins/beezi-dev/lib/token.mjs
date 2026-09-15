@@ -9,7 +9,7 @@ import { setMachineClientId } from './machine-identity.mjs';
 import { recordIssue as _recordIssue, DIAGNOSTIC_CODES } from './diagnostics.mjs';
 import { acquireLock, sharedLock } from './single-instance-lock.mjs';
 import { orDefault } from './compat.mjs';
-import { checkEnvironment } from './env-guard.mjs';
+import { checkEnvironment, shouldCheckEnvironment } from './env-guard.mjs';
 
 const SKEW_MS = 60_000;
 const DEFAULT_EXPIRES_IN_S = 3_600;
@@ -22,7 +22,7 @@ const ready = (creds) => {
 // Preserve the reason a token is unavailable for status/login callers. Analytics callers can
 // continue using getAccessToken, which projects this result onto token-or-null.
 export async function getAuthentication(deps = {}, options = {}) {
-  if (!deps.getCredentials || deps.checkEnvironment) {
+  if (shouldCheckEnvironment(deps, 'getCredentials', 'checkEnvironment')) {
     const guard = (deps.checkEnvironment || checkEnvironment)();
     if (guard.status !== 'ok' && guard.status !== 'migrated') return result('unavailable', 'environment-blocked');
   }

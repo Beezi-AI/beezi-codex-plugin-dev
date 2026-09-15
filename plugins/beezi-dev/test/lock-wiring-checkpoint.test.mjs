@@ -1,7 +1,6 @@
 import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 
 import { runCheckpoint, flushQueue } from '../lib/checkpoint.mjs';
@@ -9,6 +8,7 @@ import { initSessionState } from '../lib/session-start.mjs';
 import { queueDir, stateDir, trackingStateFile } from '../lib/paths.mjs';
 import { readTrackingState } from '../lib/tracking.mjs';
 import { grantConsent, diagnosticsDir } from '../lib/diagnostics.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 import {
   acquireLock,
   inspectLock,
@@ -35,18 +35,7 @@ import {
 
 afterEach(() => forgetHeldLocks());
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-lockwire-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    forgetHeldLocks();
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, { prefix: 'beezi-lockwire-', beforeCleanup: forgetHeldLocks });
 
 // A holder that this process must not be able to recognise as its own.
 function heldElsewhere(target) {

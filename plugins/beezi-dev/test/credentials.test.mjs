@@ -8,21 +8,14 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { getCredentials, setCredentials, deleteCredentials, SERVICE } from '../lib/credentials.mjs';
+import {
+  getCredentials, setCredentials, deleteCredentials, SERVICE, serviceFor, preserveMigrationCredential,
+} from '../lib/credentials.mjs';
 import { BEEZI_ENV } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // Point BEEZI_CODEX_HOME at a temp dir and restore it afterward.
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'creds-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'creds-');
 
 const credsPath = (dir) => path.join(dir, 'credentials.json');
 
@@ -343,4 +336,33 @@ test('a pre-G-2-2 unstamped blob reads as production, so existing installs keep 
   fs.writeFileSync(credsPath(dir), JSON.stringify({ token: JSON.stringify(creds('legacy')) }));
   assert.equal(BEEZI_ENV, '', 'this process is the production namespace');
   assert.deepEqual(await getCredentials(deps), creds('legacy'));
+});
+
+test('the libsecret label follows the service argument, not the module constant', (t) => {
+  // secretToolBackend takes `service` so a caller can address a keyring entry other than this
+  // process's own — preserveMigrationCredential is that caller, and it addresses the STAGING
+  // entry while running in the production namespace. The `--label=` on `store` is what a user
+  // sees in Seahorse, so it has to name the entry that was actually written.
+  const destination = fs.mkdtempSync(path.join(os.tmpdir(), 'creds-preserve-'));
+  t.after(() => fs.rmSync(destination, { recursive: true, force: true }));
+
+  const calls = [];
+  const backing = secretToolRun(new Map(), true);
+  const run = (file, args, input) => {
+    calls.push({ file, args, input });
+    return backing(file, args, input);
+  };
+
+  const preserved = preserveMigrationCredential(
+    JSON.stringify(creds('to-preserve')), destination, { platform: 'linux', run },
+  );
+  assert.equal(preserved, true, 'the staging credential must round-trip through libsecret');
+
+  const store = calls.find((c) => c.args[0] === 'store');
+  const service = store.args[store.args.indexOf('service') + 1];
+  assert.equal(service, serviceFor('staging'), 'the attrs address the staging entry');
+  assert.ok(
+    store.args.includes(`--label=${service}`),
+    `the label must name the entry that was written, got ${JSON.stringify(store.args)}`,
+  );
 });

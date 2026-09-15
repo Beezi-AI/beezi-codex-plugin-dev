@@ -1,26 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // The report payload itself: what gets enqueued, under which remote and segment id, and how a
 // session rename is pushed after the fact. computeDelta is injected — the transcript parsing has
 // its own suite — so these assertions are about the checkpoint's own contract with the server.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-cp-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-cp-');
 
 const queued = () => fs.readdirSync(queueDir()).map((f) =>
   JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));
@@ -102,6 +92,22 @@ test('a segment is enqueued with its repo, branch, line window and token stats',
   assert.equal(p.token_total, 15);
   assert.equal(p.duration_sec, 12);
   assert.ok(typeof p.timezone === 'string' && p.timezone.length > 0, 'the machine timezone rides along');
+});
+
+test("a 'committed' result carries none of the not-checkpointed flags", async (t) => {
+  const home = tmpHome(t);
+  const result = await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg()]));
+
+  assert.equal(result.outcome, 'committed');
+  assert.equal(result.enqueued, 1);
+  // Three of the flags are top-level on the result...
+  assert.ok(!result.gated, 'gated');
+  assert.ok(!result.lockSkipped, 'lockSkipped');
+  assert.ok(!result.unnamedSession, 'unnamedSession');
+  // ...and three live under `skipped`, which the committed return spreads verbatim.
+  assert.ok(!result.skipped.deltaFailed, 'deltaFailed');
+  assert.ok(!result.skipped.rateLimitDeferred, 'rateLimitDeferred');
+  assert.ok(!result.skipped.emitFailed, 'emitFailed');
 });
 
 test('embedded credentials are stripped from the reported remote', async (t) => {

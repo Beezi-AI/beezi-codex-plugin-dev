@@ -5,23 +5,13 @@ import { withCodexAuth } from '../tools/hermetic-env.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runSessionStart, initSessionState } from '../lib/session-start.mjs';
 import { stateDir } from '../lib/paths.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-start-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-start-');
 
 const ok = (body = {}) => ({ ok: true, status: 200, json: async () => body });
 const status = (code, body = {}) => ({ ok: code < 400, status: code, json: async () => body });

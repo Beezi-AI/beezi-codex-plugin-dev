@@ -13,7 +13,7 @@ import { orDefault } from './compat.mjs';
 //
 // This is where the strict id validation lives, and it is deliberately NOT in the resolver.
 // resolveTranscriptByCwd answers `{ sessionId: null, transcriptPath }` for a rollout it can locate
-// but not name, and one of its two callers NEEDS that: liveSession() (lib/session-audit.mjs:87-94)
+// but not name, and one of its two callers NEEDS that: liveSession() (lib/session-audit.mjs)
 // resolves the current session only to exclude it from the backfill, and matches on the transcript
 // PATH. Rejecting at the resolver would make it blind, the backfill would stop excluding the live
 // session, and it would re-segment a transcript the live hooks are already reporting on different

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import url from 'node:url';
-import { ACCOUNT_SYNC_PATH, accountSyncPath } from '../lib/account-sync.mjs';
+import { accountSyncPath } from '../lib/account-sync.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
@@ -31,11 +31,11 @@ const readSource = (...parts) => fs.readFileSync(path.join(pluginRoot, ...parts)
 
 // ── the route ─────────────────────────────────────────────────────────────────────────────────
 
-test('ENDPOINTS.accountSync IS the route the module falls back to, byte for byte', () => {
-  // accountSyncPath() prefers the ENDPOINTS entry and keeps the literal as the floor, so the entry
-  // landing must be a no-op. A typo here would not fail the module's own suite loudly — it would
-  // silently move every check-in to a route the API does not serve.
-  assert.equal(ENDPOINTS.accountSync, ACCOUNT_SYNC_PATH);
+test('ENDPOINTS.accountSync IS the route the module posts to, byte for byte', () => {
+  // accountSyncPath() returns the ENDPOINTS entry verbatim, so the literal is asserted here rather
+  // than against itself. A typo would not fail the module's own suite loudly — it would silently
+  // move every check-in to a route the API does not serve.
+  assert.equal(ENDPOINTS.accountSync, '/me/cli-agent/account');
   assert.equal(accountSyncPath(), '/me/cli-agent/account');
   // Vendor-generic on purpose: the server reads the vendor off X-Beezi-Agent, so scoping this
   // under /me/codex/* would split one account row into two.

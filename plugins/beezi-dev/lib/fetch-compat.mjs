@@ -132,15 +132,15 @@ export function nodeFetch(url, init) {
       reject(err);
     }
 
-    // The abort listener outlives the promise on purpose: a timeout that fires while the
-    // caller is still iterating the body (mcp-bridge's SSE read) has to tear the stream down,
-    // exactly as native fetch does. It is removed when the response stream closes.
     function succeed(response) {
       if (settled) return;
       settled = true;
       resolve(response);
     }
 
+    // The abort listener outlives the promise on purpose: a timeout that fires while the caller is
+    // still iterating the body (mcp-bridge's SSE read) has to tear the stream down, exactly as
+    // native fetch does. It is removed when the response stream closes.
     function onAbort() {
       const err = abortError();
       if (currentRes) currentRes.destroy(err);

@@ -56,7 +56,7 @@ const SCRUBBED_ENV_KEYS = Object.freeze([
   'OPENAI_BASE_URL', 'OPENAI_API_BASE', 'OPENAI_ORGANIZATION',
   'AZURE_OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
   // Endpoint / environment selection (config.mjs:3, :59) and debug output.
-  'BEEZI_API_URL', 'BEEZI_MCP_URL', 'BEEZI_ENV', 'BEEZI_DEBUG', 'BEEZI_CODEX_TOKEN',
+  'BEEZI_API_URL', 'BEEZI_MCP_URL', 'BEEZI_ENV', 'BEEZI_DEBUG',
 ]);
 
 // Filesystem entry points worth watching. Index 0 is a path for all of them; the rename/copy/link

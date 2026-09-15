@@ -2,7 +2,6 @@ import { stateDir } from '../lib/paths.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import {
   scanPass, planPass, runWatchPass, checkpointSucceeded,
@@ -10,6 +9,7 @@ import {
   pruneObservations, observationFile,
 } from '../lib/rollout-watcher.mjs';
 import { pruneStale } from '../lib/prune.mjs';
+import { makeMachine as sandboxMachine, uuid } from '../tools/suite-fixtures.mjs';
 
 // R2's discovery traps, one test each, plus the observation watermark's contract.
 //
@@ -19,24 +19,7 @@ import { pruneStale } from '../lib/prune.mjs';
 
 // ── machine fixture ─────────────────────────────────────────────────────────────────────────
 
-function makeMachine(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-disc-home-'));
-  const codex = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-disc-codex-'));
-  const before = { home: process.env.BEEZI_CODEX_HOME, codex: process.env.CODEX_HOME };
-  process.env.BEEZI_CODEX_HOME = home;
-  process.env.CODEX_HOME = codex;
-  t.after(() => {
-    if (before.home === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = before.home;
-    if (before.codex === undefined) delete process.env.CODEX_HOME;
-    else process.env.CODEX_HOME = before.codex;
-    fs.rmSync(home, { recursive: true, force: true });
-    fs.rmSync(codex, { recursive: true, force: true });
-  });
-  return { home, codex, sessionsDir: path.join(codex, 'sessions') };
-}
-
-const uuid = (n) => `${String(n).padStart(8, '0')}-2222-3333-4444-555555555555`;
+const makeMachine = (t) => sandboxMachine(t, 'watcher-disc-');
 
 function writeRollout(machine, { day = ['2026', '09', '10'], id, records }) {
   const dir = path.join(machine.sessionsDir, ...day);
@@ -152,7 +135,7 @@ test('3. a child-only append schedules the ROOT with the subagent sweep on', asy
   // And the pass must actually enable the sweep — excluding subagents from a listing does not
   // bill them (R2 / G-7-1); `sweepSubagents` is what does.
   const { deps, calls } = passDeps({ now: () => 2_000_000 });
-  saveObservations(record, {});
+  saveObservations(record);
   fs.mkdirSync(stateDir(), { recursive: true });
   fs.writeFileSync(path.join(stateDir(), `${root}.json`), JSON.stringify({ cursor: 1 }));
   await runWatchPass(deps, { sessionsDir: m.sessionsDir, cooldownMs: 0 });
@@ -270,11 +253,13 @@ test('8. the watermark advances only after a durable checkpoint success', async 
   fs.mkdirSync(path.join(m.home, 'state'), { recursive: true });
   fs.writeFileSync(path.join(m.home, 'state', `${id}.json`), JSON.stringify({ cursor: 3, sessionId: id }));
 
-  // Every refusal shape runCheckpoint can report, and none of them may stamp the watermark.
+  // Every refusal shape runCheckpoint can report, in the shape it really reports them: each one
+  // carries a non-'committed' outcome, and none of them may stamp the watermark.
   const refusals = [
-    { lockSkipped: true, lockReason: 'held' },
-    { unnamedSession: true, skipped: {} },
-    { outcome: 'committed', enqueued: 0, skipped: { deltaFailed: true } },
+    { outcome: 'deferred', reason: 'not-checkpointed', enqueued: 0, lockSkipped: true, lockReason: 'held' },
+    { outcome: 'deferred', reason: 'not-checkpointed', enqueued: 0, unnamedSession: true, skipped: {} },
+    { outcome: 'deferred', reason: 'not-checkpointed', enqueued: 0, skipped: { deltaFailed: true } },
+    { outcome: 'failed', reason: 'payload-build-failed', enqueued: 0, skipped: { emitFailed: 1 } },
   ];
   for (const outcome of refusals) {
     fs.rmSync(observationFile(), { force: true });
@@ -298,12 +283,18 @@ test('8. the watermark advances only after a durable checkpoint success', async 
   assert.equal(stamped.mtimeMs, 500_000, 'the observation is the one taken BEFORE the run');
 });
 
-test('9. checkpointSucceeded names the three real failures and nothing else', () => {
+test('9. checkpointSucceeded reads the outcome, which is where every refusal already lands', () => {
+  // `enqueued === 0` is a complete read of a quiet session, so it is success.
   assert.equal(checkpointSucceeded({ outcome: 'committed', enqueued: 0, skipped: {} }), true);
   assert.equal(checkpointSucceeded({ outcome: 'failed', enqueued: 4, skipped: { noRemote: 2, emitFailed: 1 } }), false);
-  assert.equal(checkpointSucceeded({ lockSkipped: true, lockReason: 'held' }), false);
-  assert.equal(checkpointSucceeded({ unnamedSession: true }), false);
-  assert.equal(checkpointSucceeded({ skipped: { deltaFailed: true } }), false);
+  // runCheckpoint reports each refusal as a non-'committed' outcome, carrying the flag alongside
+  // rather than instead of it — see lib/checkpoint.mjs's emptyResult(). Real-shape coverage for
+  // deltaFailed and rateLimitDeferred lives in test/review-data-regressions.test.mjs (F4, F7).
+  assert.equal(checkpointSucceeded({ outcome: 'deferred', lockSkipped: true, lockReason: 'held' }), false);
+  assert.equal(checkpointSucceeded({ outcome: 'deferred', unnamedSession: true }), false);
+  assert.equal(checkpointSucceeded({ outcome: 'deferred', skipped: { deltaFailed: true } }), false);
+  assert.equal(checkpointSucceeded({ outcome: 'deferred', skipped: { rateLimitDeferred: true } }), false);
+  assert.equal(checkpointSucceeded({ outcome: 'deferred', gated: true }), false);
   assert.equal(checkpointSucceeded(null), false);
   assert.equal(checkpointSucceeded(undefined), false);
 });
@@ -313,7 +304,7 @@ test('10. the watermark is a NEW root-level file, not a field in cursor state, a
   assert.equal(path.dirname(observationFile()), m.home, 'it lives at the data root');
   assert.equal(path.basename(observationFile()), 'watcher.json');
 
-  saveObservations({ version: 1, sessions: { a: { mtimeMs: 1, size: 2, at: 3 } }, children: {} }, {});
+  saveObservations({ version: 1, sessions: { a: { mtimeMs: 1, size: 2, at: 3 } }, children: {} });
   const fifteenDays = 15 * 24 * 60 * 60 * 1000;
   const seconds = (Date.now() - fifteenDays) / 1000;
   fs.utimesSync(observationFile(), seconds, seconds);
@@ -327,7 +318,7 @@ test('10. the watermark is a NEW root-level file, not a field in cursor state, a
   const stateFile = path.join(m.home, 'state', 'sess.json');
   fs.mkdirSync(path.dirname(stateFile), { recursive: true });
   fs.writeFileSync(stateFile, JSON.stringify({ cursor: 7 }));
-  saveObservations({ version: 1, sessions: { sess: { mtimeMs: 9, size: 9, at: 9 } }, children: {} }, {});
+  saveObservations({ version: 1, sessions: { sess: { mtimeMs: 9, size: 9, at: 9 } }, children: {} });
   assert.deepEqual(JSON.parse(fs.readFileSync(stateFile, 'utf-8')), { cursor: 7 }, 'cursor state is untouched');
 });
 
@@ -447,7 +438,7 @@ test('17. a child-scheduled root whose own file was not scanned stamps NO parent
 
   // Drive it through a real pass: the parent's stored observation must be untouched, while the
   // child's advances so the root is not rescheduled forever.
-  saveObservations(record, {});
+  saveObservations(record);
   const rootFile = writeRollout(m, { id: root, records: [parentMeta(root)] });
   touch(rootFile, 111);
   const childFile = writeRollout(m, { id: agent, records: [childMeta(agent, root)] });
