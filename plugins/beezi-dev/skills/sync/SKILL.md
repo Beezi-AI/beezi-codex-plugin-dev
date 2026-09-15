@@ -50,8 +50,7 @@ inspect any other files. Report the output verbatim. Never echo a token.
 ## What the output means
 
 - **everything is already uploaded** — a **success**, not a failure. Beezi has everything this
-  machine can offer. Say so and stop; do not re-run hoping for a different answer. This line is
-  printed **only** when nothing was left for later, so it always means "finished".
+  machine can offer right now. Say so and stop; do not re-run hoping for a different answer.
 - **uploaded `<n>` sessions** — the repair worked. The counts are sessions and reports, not tokens.
 - **nothing new was uploaded — `<n>` sessions were left for a later run** — not the same as
   "everything is already uploaded", and the difference matters. Nothing went wrong and nothing was
@@ -62,8 +61,6 @@ inspect any other files. Report the output verbatim. Never echo a token.
   each session reaches, so nothing was uploaded **on purpose**. This is not an error and nothing was
   lost or duplicated; the run refuses to guess rather than risk re-sending. Relay it as a
   "try again in a moment", never as a failure or as data loss.
-- **still active** — those sessions are open in another Codex window and will upload themselves.
-  Never offer to force them.
 - **left alone: what Beezi has recorded for them does not line up** — Beezi's record of those
   sessions is inconsistent with what this machine believes it sent, so re-uploading them could
   double-count. They were deliberately skipped and stay eligible for a later run. Report it and move

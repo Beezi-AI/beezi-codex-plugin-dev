@@ -100,7 +100,6 @@ async function main() {
     const bits = [];
     if (result.alreadyImported > 0) bits.push(`${plural(result.alreadyImported, 'session')} already uploaded`);
     if (result.liveTracked > 0) bits.push(`${result.liveTracked} already tracked live`);
-    if (result.active > 0) bits.push(`${result.active} still active — they upload on a later login`);
     console.log(`✓ Beezi: nothing new to upload${bits.length ? ` (${bits.join(', ')})` : ''}.`);
     if (result.finalized) console.log('✓ Beezi: your history pull is finalized.');
     return;
@@ -127,7 +126,6 @@ async function main() {
   const parts = [`✓ Beezi: uploaded ${plural(result.sessionsImported, 'session')} (${plural(result.reportsStored, 'report')} stored).`];
   if (result.alreadyImported > 0) parts.push(`${result.alreadyImported} were already uploaded.`);
   if (result.liveTracked > 0) parts.push(`${result.liveTracked} were already tracked live.`);
-  if (result.active > 0) parts.push(`${result.active} still active — they upload on a later login.`);
   // Server-side skips already include the errored items; report the errors, not both numbers.
   if (result.itemErrors > 0) {
     parts.push(`${plural(result.itemErrors, 'report')} skipped — their repository is not connected to Beezi.`);
