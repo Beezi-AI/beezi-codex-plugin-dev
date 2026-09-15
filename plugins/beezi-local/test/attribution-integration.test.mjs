@@ -8,6 +8,7 @@ import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } f
 import { resolveRepoRoot } from '../lib/repo-timeline.mjs';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // G-6-1 — the attribution ratchet. `branch` is a BILLING DIMENSION: it rides on every
 // /sessions/report payload built by `enqueueSegments` in lib/checkpoint.mjs, and decides which
@@ -424,17 +425,7 @@ test('A13 — a resumed window never bills a line at or before its cursor', (t) 
 //    injected gitImpl returning reflog text. This is where M2 gets caught.
 // ==============================================================================================
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-attr-cp-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-attr-cp-');
 
 const queued = () => fs.readdirSync(queueDir())
   .map((f) => JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')))

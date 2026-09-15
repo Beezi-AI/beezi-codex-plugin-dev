@@ -1,26 +1,16 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir, billingConfigFile, repoMapFile, trackingStateFile } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // The history import's contract with runCheckpoint: payloads go to the sink and nowhere near the
 // live queue, nothing persists (state, agent cursors, billing evidence), errors are buffered, the
 // subagent sweep runs without a timeline, and the live tracking gate is explicitly bypassed.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-bf-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-bf-');
 
 function stubTranscript(home) {
   const p = path.join(home, 'rollout.jsonl');

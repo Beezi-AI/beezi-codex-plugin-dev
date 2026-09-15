@@ -11,22 +11,17 @@ Unlinking is rarely what someone asking to **switch accounts** wants — logging
 machine over the old credentials, with no logout needed. Ask before running anything unless the user
 clearly asked to sign out or disconnect this machine.
 
-## Finding the script
+## Running it
 
-The command below runs a script under the plugin's `scripts/` directory. That directory is two
-levels above this `SKILL.md` — this file is at `<plugin-root>/skills/logout/SKILL.md`, so the script
-is at `<plugin-root>/scripts/`. Use the absolute path; `codex plugin list` also prints the plugin
-root for `beezi` if you need to confirm it.
-
-There is no MCP logout tool. `beezi_login` and `beezi_status` are the only two the server holds, so
-this one is the script.
+This file is at `<plugin-root>/skills/logout/SKILL.md`, so the script is at
+`<plugin-root>/scripts/logout.mjs` — use the absolute path. There is no MCP logout tool;
+`beezi_login` and `beezi_status` are the only two the server holds.
 
 ```
 node "<plugin-root>/scripts/logout.mjs"
 ```
 
-Do not read, open, or inspect any other files, and never echo a token or the contents of the
-credentials file. Report the output verbatim.
+Report the output verbatim, and never echo a token or the contents of the credentials file.
 
 ## Reading the answer
 

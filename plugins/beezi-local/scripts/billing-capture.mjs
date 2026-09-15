@@ -11,8 +11,6 @@ import { cliMayProceed } from '../lib/env-guard.mjs';
 // 13.2 floor, and rejected by the ban gate. Same shape scripts/me.mjs already uses: the body is an
 // async main(), and main().catch() is the single error exit.
 async function main() {
-  // R1: no upload, no drain and no credential work while the data root is mid-cutover or its
-  // environment cannot be established. cliMayProceed() prints the reason it refuses.
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   const parsed = parseArgs(process.argv.slice(2));
 

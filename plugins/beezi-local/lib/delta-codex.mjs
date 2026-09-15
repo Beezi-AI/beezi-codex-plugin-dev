@@ -2,7 +2,7 @@ import fs from 'fs';
 import { IDLE_GAP_SEC } from './timing.mjs';
 import { orDefault } from './compat.mjs';
 import { computeCodeChanges } from './code-changes-codex.mjs';
-import { computeOperations } from './operations-codex.mjs';
+import { computeOperations, parseArgs } from './operations-codex.mjs';
 import { buildActiveIntervals, totalMs } from './active-time.mjs';
 import { rateLimitObservationFromRecord } from './rate-limits-codex.mjs';
 
@@ -35,12 +35,6 @@ import { rateLimitObservationFromRecord } from './rate-limits-codex.mjs';
 
 function norm(p) {
   return typeof p === 'string' ? p.replace(/\\/g, '/') : p;
-}
-
-function parseArgs(raw) {
-  if (raw && typeof raw === 'object') return raw;
-  if (typeof raw !== 'string') return null;
-  try { return JSON.parse(raw); } catch { return null; }
 }
 
 // The cwd a single rollout record implies, or null (caller carries the previous cwd forward).
@@ -99,10 +93,11 @@ function totalsFromRecord(rec) {
 
 // Context OCCUPANCY at this request, not the session's cumulative total. `last_token_usage`
 // describes ONE request, so its input_tokens IS that request's whole prompt — the context the model
-// was carrying at that instant. `cached_input_tokens` is a SUBSET of it (10368/10368), not a sibling
-// to add: porting the Claude engine's additive formula (delta.mjs:324, where the cache legs ARE
-// disjoint from input) overflows model_context_window in 14.4% of local observations, peaking at
-// 1.77x capacity. `input_tokens` alone never exceeded it once (max 0.908x).
+// was carrying at that instant. `cached_input_tokens` is a SUBSET of it (10368/10368), not a
+// sibling to add: porting the Claude engine's additive formula (delta.mjs in the
+// beezi-claude-plugins repo, where the cache legs ARE disjoint from input) overflows
+// model_context_window in 14.4% of local observations, peaking at 1.77x capacity. `input_tokens`
+// alone never exceeded it once (max 0.908x).
 //
 // `total_token_usage` must never be used here — it is cumulative, one local session reached
 // 25 783 494 against a 258 400 window, and the DTO's `@IsInt() @Min(0)` has no upper bound, so a
@@ -273,11 +268,10 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   const apiErrorEvents = [];
   const rateLimitObservations = [];
   let run = null;
-  let activeCwd = null;
   let activeModel = 'unknown';
-  // 'unknown' is the server's own name for the effort-less bucket — session-report.service.ts:51-53
-  // maps it to a NULL effort row with the legacy source_ref, so a pre-effort payload and an unknown
-  // bucket store identically. Do NOT invent a different sentinel.
+  // 'unknown' is the server's own name for the effort-less bucket — `session-report.service.ts` in
+  // the hb-ai-agent-portal repo maps it to a NULL effort row with the legacy source_ref, so a
+  // pre-effort payload and an unknown bucket store identically. Do NOT invent a different sentinel.
   let activeEffort = 'unknown';
   let activeRoot = null;
   // Cumulative baseline (the last token_count total we've seen, including pre-window history).
@@ -312,14 +306,15 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
       const stats = summarize(run.models, run.timestamps, run.lines, activeIntervals);
       // Context occupancy: absent rather than 0 when the window saw no reading. 0 is a claim that
       // the context was empty and the server stores it as one, so a token-free window must ship no
-      // key at all — mirroring delta.mjs:196-201 on the Claude side.
+      // key at all — mirroring delta.mjs in the beezi-claude-plugins repo.
       if (run.contextFinal != null) {
         stats.context_peak_tokens = run.contextPeak;
         stats.context_final_tokens = run.contextFinal;
         // run.contextFinalModel, never activeModel: closeRun() fires from the run-switch branch
         // AFTER the model read has already advanced activeModel to the record opening the NEXT run,
         // so reading activeModel here would stamp the next segment's model onto this segment's
-        // context. Claude captures it per-reading for the same reason (delta.mjs:327).
+        // context. Claude captures it per-reading for the same reason (delta.mjs in the
+        // beezi-claude-plugins repo).
         stats.context_final_model = String(run.contextFinalModel).slice(0, 100);
       }
       segments.push({
@@ -340,11 +335,10 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     try { rec = JSON.parse(raw[i]); } catch { continue; }
     const lineNo = i + 1;
 
-    // Update the active cwd/model/root from this record BEFORE attributing it, so a turn's work
+    // Update the active root/model from this record BEFORE attributing it, so a turn's work
     // (and its trailing token_count) bills to the cwd the turn declared.
     const cwd = cwdFromRecord(rec);
     if (cwd) {
-      activeCwd = cwd;
       const root = repoRootOf(cwd);
       if (root) activeRoot = root; // last-touch-wins; unresolvable → carry forward
     }

@@ -9,23 +9,13 @@ import { compareVersions } from './version-compare.mjs';
 
 // ── Stale-version check (G-8-4) ─────────────────────────────────────────────────────────────
 //
-// The audit called this "blocked upstream", and half of that was right: NOTHING HERE UPDATES
-// ANYTHING. What was never blocked is the part that matters — the plugin has always carried its
-// own version and nothing read it, so a user running a six-month-old build had no way to find out.
-//
-// M-8-3 is now ANSWERED, and the answer is yes-with-a-caveat: Codex does support remote (Git)
-// marketplaces — `codex plugin marketplace add|upgrade` — but has no `plugin update` verb. See
-// updateNotice() for the command that stands in for one, and for where it came from.
-//
-// So this is a reader and a sentence, not an updater. It compares the installed version against
-// the version published in the manifest the build was stamped with (env.json updateManifestUrl,
-// written by scripts/make-variant.sh for a variant and by scripts/sync-to-github.sh for the public
-// build) and says so once an hour at most.
-//
-// R1: "Do not add an unverified `version` property to Codex's marketplace schema. A Beezi-owned
-// update manifest or fetching the referenced plugin manifest can serve the update checker." This
-// fetches the referenced PLUGIN manifest — `.codex-plugin/plugin.json`, which already has a
-// version because Codex's own schema puts one there. Nothing is invented.
+// A reader and a sentence, not an updater — Codex has no `plugin update` verb; see updateNotice()
+// for the command that stands in for one. It compares the installed version against the version in
+// the `.codex-plugin/plugin.json` at the manifest URL this build was stamped with (env.json
+// updateManifestUrl, written by scripts/make-variant.sh for a variant and scripts/sync-to-github.sh
+// for the public build), once an hour at most. Nothing is invented: that version field is Codex's
+// own schema, which is what R1 asked for instead of adding one to the marketplace schema.
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 
 // How long a fetched reading is trusted. One hour, matching the Claude plugin: the internal
 // pipeline publishes several times a day, so a longer window hides the very updates this exists
@@ -41,7 +31,7 @@ const PLUGIN_JSON_FILE = path.join(
 );
 
 /** Where the last check is remembered. Root level: pruneStale() sweeps state/ at 14 days. */
-export function updateCheckFile() {
+function updateCheckFile() {
   return path.join(beeziCodexHome(), 'update-check.json');
 }
 
@@ -159,7 +149,7 @@ export async function checkForUpdate(deps = {}) {
 }
 
 /** The manifest URL baked into this build, or null for a build that was never stamped. */
-export function environmentManifestUrl() {
+function environmentManifestUrl() {
   const resolved = environment.resolveEnvironment({
     envJson: environment.readEnvJson(),
     env: process.env,

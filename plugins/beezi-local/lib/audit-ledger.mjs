@@ -1,4 +1,5 @@
 import { auditLedgerFile } from './paths.mjs';
+import { BackfillSessionStatus } from './audit-flush.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { withLock, sharedLock } from './single-instance-lock.mjs';
@@ -8,7 +9,7 @@ const LEDGER_VERSION = 1;
 // How long one ledger save may hold its lock. The section is a read, a merge over two small maps
 // and one atomic write — never the caller's scan, which can run for minutes and must not be inside
 // anybody's critical section.
-export const LEDGER_LOCK_LEASE_MS = 5_000;
+const LEDGER_LOCK_LEASE_MS = 5_000;
 
 // Which past sessions the history backfill (the last step of the Beezi login skill) has already
 // handed to the server, and what the server said.
@@ -30,13 +31,12 @@ export function loadLedger(identity = null) {
     return emptyLedger(identity);
   }
   // Only `raw.identity` has to be truthy. Requiring `identity` too meant a null one SKIPPED the
-  // check rather than failing it: session-audit.mjs:256 reads getMachineClientId() on the
-  // assumption that a login primed it, and when nothing did (no credentials, an injected
-  // getAccessToken, or a credentials file with no client_id) the previous login's ledger was
-  // merged and its imported-session set trusted under the current one — sealing the new
-  // tenant's pull empty, with no reopen. An unidentified caller now re-offers every session
-  // instead, which is the safe direction: emptyLedger sets complete:false and re-sending is
-  // idempotent server-side.
+  // check rather than failing it: runAuditLocked in session-audit.mjs reads getMachineClientId() on
+  // the assumption that a login primed it, and when nothing did (no credentials, an injected
+  // getAccessToken, or a credentials file with no client_id) the previous login's ledger was merged
+  // and its imported-session set trusted under the current one — sealing the new tenant's pull
+  // empty, with no reopen. An unidentified caller now re-offers every session instead, which is the
+  // safe direction: emptyLedger sets complete:false and re-sending is idempotent server-side.
   if (raw.identity && raw.identity !== identity) {
     return emptyLedger(identity);
   }
@@ -74,6 +74,26 @@ export function isComplete(ledger) {
 // escape hatch when the repo has since been connected.
 export function isImported(ledger, sessionId) {
   return Object.prototype.hasOwnProperty.call((ledger && ledger.sessions) || {}, sessionId);
+}
+
+// The ledger's outcome for a session, as EVIDENCE rather than as a verdict. R2's whole point is
+// that ledger membership does not prove coverage — but a recorded ACCEPTED/PARTIAL delivery does
+// contradict a coverage answer of "nothing stored", and that contradiction is what tells a
+// mid-session gap apart from a session that never landed. R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
+//
+// A REJECTED entry is deliberately NOT delivery: a repository that was never connected to Beezi
+// rejects every report it sends, and must replay IN FULL the moment it is connected (R2). That is
+// the opposite of isImported() above, which counts REJECTED as imported so a run does not resend
+// it — two different questions about the same row, which is why both live here rather than being
+// re-derived at a call site. lib/session-audit.mjs and lib/rollout-watcher.mjs each once carried
+// their own private copy; this is the one.
+export function ledgerDelivered(ledger, sessionId) {
+  const sessions = (ledger || {}).sessions;
+  if (!sessions || typeof sessions !== 'object') return false;
+  const entry = sessions[sessionId];
+  if (!entry || typeof entry !== 'object') return false;
+  return entry.outcome === BackfillSessionStatus.ACCEPTED || entry.outcome === BackfillSessionStatus.PARTIAL;
 }
 
 export function markImported(ledger, sessionId, { outcome, reports = 0, at = new Date() } = {}) {
@@ -170,12 +190,11 @@ function mergeLedger(ledger, disk) {
 //
 // The merged result is written back into `ledger`, so the caller's in-memory copy stops being the
 // stale one and its later `isImported` checks see the other run's rows too.
-export function saveLedger(ledger, deps = {}) {
+export function saveLedger(ledger) {
   const run = withLock(
     sharedLock('audit-ledger'),
     { leaseMs: LEDGER_LOCK_LEASE_MS },
     () => writeJsonSecure(auditLedgerFile(), mergeLedger(ledger, readLedgerRaw())),
-    deps.lockDeps,
   );
   // 'held'/'contended' is another run mid-save; this one's rows are still in memory and its next
   // save (there is always one — the caller saves per chunk and again at finalize) carries them.

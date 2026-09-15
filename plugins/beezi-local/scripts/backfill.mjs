@@ -3,22 +3,14 @@ import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
+import { fail, plural } from '../lib/cli.mjs';
 
 // The login flow's final step: uploads this machine's past Codex sessions into Beezi. There is
 // no standalone skill for it — the login skill runs it after the link and plan capture, and
 // running the login skill again resumes an interrupted upload. Flags (--dry-run / --since /
 // --force) remain for manual `node scripts/backfill.mjs` runs only.
 
-function fail(message) {
-  console.error(`✗ ${message}`);
-  process.exit(1);
-}
-
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
-
 async function main() {
-  // R1: no upload, no drain and no credential work while the data root is mid-cutover or its
-  // environment cannot be established. cliMayProceed() prints the reason it refuses.
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   const options = parseArgs(process.argv.slice(2));
   const viaLogin = options.via === 'login';

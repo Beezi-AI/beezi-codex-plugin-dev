@@ -7,84 +7,50 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 
 // Coverage reconciliation for Codex history (G-3-3, under the corrections in REVIEW.md §R2).
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 //
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// WHY THE OBVIOUS IMPLEMENTATION IS UNSAFE
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// The sketch this replaces was `if (!seen && isImported(ledger, id)) continue`. Three separate
-// facts make that wrong, and all three are load-bearing here:
-//
+// WHY `if (!seen && isImported(ledger, id)) continue` IS UNSAFE — three facts, all load-bearing:
 //   1. lib/audit-ledger.mjs records `{at, outcome, reports}` and NOTHING about which lines were
-//      delivered. It also marks a REJECTED session imported (session-audit.mjs:396-403), because
-//      an unconnected repository rejects on every run. A rejected repository can later be
-//      connected, and an imported session can resume and grow. Ledger membership is evidence
-//      about a past request, never proof of coverage.
-//   2. Per-session cursors under state/ are pruned at 14 days (lib/prune.mjs:11 sweeps stateDir()
-//      and queueDir()). "No cursor" therefore means "old", not "never delivered".
+//      delivered, and `runAuditLocked` marks a REJECTED session imported. Ledger membership is
+//      evidence about a past request, never proof of coverage.
+//   2. Per-session cursors under state/ are pruned at 14 days (`pruneStale` in lib/prune.mjs), so
+//      "no cursor" means "old", not "never delivered".
 //   3. The server's coverage number is a CONTIGUOUS PARENT-LINE PREFIX, not a maximum:
-//      analytics.repository.ts:4101-4145 orders the stored ranges and stops extending the prefix
-//      at the first gap, and it excludes agent_id/is_subagent rows outright. So `coverage === 0`
-//      does NOT mean "nothing is stored" — the headline G-3-3 case (hooks trusted midway through
-//      a session) stores lines 200-500 and still answers 0, because the prefix from line 1 is
-//      empty. Replaying such a session from 0 re-sends 200-500 under NEW segment ids and
-//      double-counts the spend, which is the exact failure this module exists to prevent.
+//      `analytics.repository.ts` stops extending it at the first gap and excludes subagent rows.
+//      So `coverage === 0` does NOT mean "nothing is stored" — the headline G-3-3 case (hooks
+//      trusted midway through a session) stores lines 200-500 and still answers 0. Replaying from
+//      0 re-sends those lines under NEW segment ids and double-counts the spend.
 //
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// THE REPLAY PROTOCOL: APPEND ONLY, NEVER OVERLAP
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// A segment id is `${scope}:${fromLine}-${toLine}` (lib/checkpoint.mjs:458). A replay partitioned
-// differently from the live run produces DIFFERENT ids for the same lines, so the server cannot
-// supersede one with the other and there is no blanket containment guarantee for arbitrary
-// overlaps or for a narrow report arriving after a wide one. The only safe replay is therefore one
-// that APPENDS: it starts at exactly the confirmed contiguous prefix boundary, so its first
-// segment begins at prefix+1 and can never share a line with anything stored.
+// THE REPLAY PROTOCOL: APPEND ONLY, NEVER OVERLAP. A segment id is `${scope}:${fromLine}-${toLine}`
+// (`runLockedCheckpoint` in lib/checkpoint.mjs), so a replay partitioned differently from the live
+// run produces DIFFERENT ids for the same lines and the server cannot supersede one with the other.
+// The only safe replay starts at exactly the confirmed prefix boundary, so its first segment begins
+// at prefix+1. Overlap is not reconciled, it is FORBIDDEN: a boundary we cannot prove is deferred
+// with a visible status and retried, never downgraded to a scan from zero.
 //
-// Overlap is not reconciled. It is FORBIDDEN. Every case where we cannot prove the boundary is
-// deferred with a visible status and retried later — never downgraded to a scan from zero.
+// UNAVAILABLE IS NOT ZERO. fetchCoverage returns `null`, never an empty Map, for an old server, a
+// transport failure, a non-2xx, an unparseable body, or a 2xx that is not the documented shape.
+// Null means "we could not ask" and every session defers; an empty-but-present Map means the server
+// answered and holds no prefix. Confusing the two turns one network blip into every linked machine
+// re-uploading its whole history at once.
 //
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// UNAVAILABLE IS NOT ZERO
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// fetchCoverage returns `null`, never an empty Map, for an old server, a transport failure, a
-// non-2xx, an unparseable body, or a 2xx that is not the documented shape. Null means "we could
-// not ask" and every session defers. An empty-but-present Map means "the server answered and holds
-// no prefix", which is a different fact with a different decision. Getting these two confused
-// turns one network blip into every linked machine re-uploading its whole history at once.
-//
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// WHERE THE DURABLE STATE LIVES, AND WHY IT SURVIVES PRUNING
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// `<beeziCodexHome()>/coverage.json`, at the data-root LEVEL — deliberately NOT under state/ or
+// DURABLE STATE: `<beeziCodexHome()>/coverage.json`, at the data-root LEVEL — not under state/ or
 // queue/, the only two directories lib/prune.mjs sweeps. It is bound to `{identity, environment,
-// apiBase}`: the machine client id (a new login mints a new one), the resolved environment name,
-// and the API base the answers came from. A binding mismatch discards the record rather than
-// trusting it, and that is safe precisely because this file is a CACHE OF A SERVER-DERIVED FACT —
-// re-askable at any time — and never the only copy of an analytics payload. Nothing that could
-// not be recomputed is ever thrown away here, which is why the R6 quarantine rule (which protects
-// unreported analytics) does not apply to it.
+// apiBase}` and a mismatch DISCARDS the record, which is safe only because this file is a cache of
+// a server-derived fact and never the only copy of an analytics payload; that is why the R6
+// quarantine rule does not apply to it.
 
 // The batch size Claude's reference client uses against the same route.
 export const MAX_COVERAGE_IDS = 200;
 
 // postJson defaults to 3s to protect the 10s hook budget. Coverage is only ever reached from a
 // foreground command with no hook budget behind it, and the server answers over a session table.
-export const COVERAGE_TIMEOUT_MS = 60_000;
+const COVERAGE_TIMEOUT_MS = 60_000;
 
-export const COVERAGE_FILE_VERSION = 1;
-
-// These two belong in lib/config.mjs's ENDPOINTS block next to sessionsBackfill, and the exact
-// diff is in this change's report. lib/config.mjs is owned by another workstream in this release,
-// so they are read from ENDPOINTS FIRST and fall back to the literal only while the key is absent
-// — the moment config.mjs gains them, config wins and these constants go dead with no edit here.
-const COVERAGE_PATH_FALLBACK = '/sessions/coverage';
-const SYNC_PATH_FALLBACK = '/sessions/sync';
-
-export function coverageEndpoint() {
-  return orDefault(ENDPOINTS.sessionsCoverage, COVERAGE_PATH_FALLBACK);
-}
+const COVERAGE_FILE_VERSION = 1;
 
 export function syncEndpoint() {
-  return orDefault(ENDPOINTS.sessionsSync, SYNC_PATH_FALLBACK);
+  return ENDPOINTS.sessionsSync;
 }
 
 // ── The wire ────────────────────────────────────────────────────────────────────────────────
@@ -126,10 +92,9 @@ export async function fetchCoverage(sessionIds, token, deps = {}, options = {}) 
   const postJsonImpl = orDefault(deps.postJsonImpl, postJson);
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const timeoutMs = orDefault(options.timeoutMs, COVERAGE_TIMEOUT_MS);
-  const url = `${apiBase()}${coverageEndpoint()}`;
-  const batchSize = orDefault(options.batchSize, MAX_COVERAGE_IDS);
+  const url = `${apiBase()}${ENDPOINTS.sessionsCoverage}`;
 
-  for (const batch of chunkIds([...new Set(ids)], batchSize)) {
+  for (const batch of chunkIds([...new Set(ids)], MAX_COVERAGE_IDS)) {
     let res;
     try {
       res = await postJsonImpl(url, token, { sessionIds: batch }, { fetchImpl, timeoutMs });
@@ -212,10 +177,9 @@ export function loadCoverageCheckpoints(binding, deps = {}) {
   return stored;
 }
 
-export function saveCoverageCheckpoints(record, deps = {}) {
-  const write = orDefault(deps.writeJsonSecureImpl, writeJsonSecure);
+export function saveCoverageCheckpoints(record) {
   try {
-    write(coverageCheckpointFile(), { ...record, updatedAt: new Date().toISOString() });
+    writeJsonSecure(coverageCheckpointFile(), { ...record, updatedAt: new Date().toISOString() });
     return true;
   } catch {
     return false;
@@ -318,10 +282,10 @@ export function decideReplay(sessionId, facts = {}) {
 // ── The child repair policy ─────────────────────────────────────────────────────────────────
 //
 // STATED SEPARATELY FROM PARENT COVERAGE ON PURPOSE. The coverage query excludes agent_id /
-// is_subagent rows (analytics.repository.ts:4101-4145), and a subagent's segments are scoped
-// `${sessionId}:${agentId}` over its OWN rollout's line space — an unrelated coordinate system
-// from the parent's. So a parent prefix of N says exactly nothing about which children landed,
-// and there is no server answer that could be asked for them.
+// is_subagent rows (`analytics.repository.ts` in the hb-ai-agent-portal repo), and a subagent's
+// segments are scoped `${sessionId}:${agentId}` over its OWN rollout's line space — an unrelated
+// coordinate system from the parent's. So a parent prefix of N says exactly nothing about which
+// children landed, and there is no server answer that could be asked for them.
 //
 // No parent boundary authorizes replay of children. Historical child repair remains deferred
 // until agent-scoped coverage is available. Live capture keeps its durable child cursors.

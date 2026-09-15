@@ -138,10 +138,10 @@ export function describeReporting(status) {
       return withBroken('Analytics hooks are installed. If nothing is arriving, run /hooks in Codex and trust the Beezi entries — Codex will not run a hook it has not been shown.');
     // The three unhealthy states name no command for the user to run. Every surface that reads
     // this — the MCP status tool, the `me` script, the session banner — repairs the install itself
-    // before it reports, so quoting `installCommand()` here would hand the user a step that has
+    // before it reports, so quoting an install command here would hand the user a step that has
     // already been taken. What is left is the trust step, which genuinely cannot be automated.
     case 'absent':
-      return withBroken(`Analytics are NOT being reported: the hooks are not installed. Beezi installs them for you — then run /hooks in Codex and trust the Beezi entries.`);
+      return withBroken('Analytics are NOT being reported: the hooks are not installed. Beezi installs them for you — then run /hooks in Codex and trust the Beezi entries.');
     case 'stale':
       return withBroken('Analytics are NOT being reported: the hooks point at an older plugin version. Beezi repairs them for you — then re-trust via /hooks.');
     case 'partial':

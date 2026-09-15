@@ -4,16 +4,15 @@ import { beeziCodexHome, codexSessionsDir, stateDir } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { acquireLock as _acquireLock, electionLock, withLock, sharedLock } from './single-instance-lock.mjs';
-import { hookMayProceed } from './env-guard.mjs';
-import { isUsableSessionId, listRolloutFiles as _listRolloutFiles } from './transcript-codex.mjs';
+import { hookMayProceed, shouldCheckEnvironment } from './env-guard.mjs';
+import { isUsableSessionId, listRolloutFiles as _listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
 import { readRolloutHead as _readRolloutHead, subagentIdentityFrom as _subagentIdentityFrom } from './subagent-codex.mjs';
 import { runCheckpoint as _runCheckpoint, reconcileSession } from './checkpoint.mjs';
 import { runAudit as _runAudit, SYNC_MODE } from './session-audit.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { pruneStale as _pruneStale } from './prune.mjs';
 import { readTrackingState, isLiveTrackingAllowed } from './tracking.mjs';
-import { loadLedger as _loadLedger } from './audit-ledger.mjs';
-import { BackfillSessionStatus } from './audit-flush.mjs';
+import { loadLedger as _loadLedger, ledgerDelivered } from './audit-ledger.mjs';
 import { getMachineClientId } from './machine-identity.mjs';
 import {
   fetchCoverage as _fetchCoverage,
@@ -21,147 +20,68 @@ import {
   checkpointLineFor,
   currentBinding,
   decideReplay,
-  childSweepAllowed,
   ReplayDecision,
   DeferReason,
 } from './session-coverage.mjs';
 
-// The C-in-MCP rollout watcher (G-1-1, Branch A) — under the corrections in REVIEW.md §R2/§R3.
+// The C-in-MCP rollout watcher (G-1-1, Branch A), under REVIEW.md §R2/§R3.
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 //
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// SHIPPED OFF. THE OPT-IN IS `BEEZI_CODEX_WATCHER`.
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// The plan's release order (`2026-09-10-codex-gap-closure-plan.md` §"Release order") puts delivery
-// automation AFTER the production cutover and its guarded migration. This module therefore starts
-// nothing unless `BEEZI_CODEX_WATCHER` is set to one of TRUE_VALUES below. `startWatcher()` on an
-// un-opted machine arms NO timer, makes NO filesystem call and touches NO state — pinned by
-// test/watcher-optin.test.mjs, which injects an `fs` whose every method throws.
+// SHIPPED OFF: nothing starts unless `BEEZI_CODEX_WATCHER` names one of TRUE_VALUES below.
+// scripts/mcp.mjs states the opt-in rationale and holds the gate that keeps this module unimported
+// on an un-opted machine; test/watcher-optin.test.mjs pins that startWatcher() then touches nothing.
 //
-// `.mcp.json`'s `env_vars` is an ALLOWLIST of the variables Codex forwards into the plugin's
-// stdio server, and it NOW NAMES THIS ONE — so a machine that sets `BEEZI_CODEX_WATCHER=1` gets
-// a watcher, and a machine that does not is exactly where it was. That second lock was there
-// because the production cutover had not shipped; it has (G-1-2, R1), so the lock is gone and
-// the remaining gate is the opt-in itself. The default stays OFF: a resident scan loop belongs
-// to machines that asked for one until a soak says otherwise.
+// This process has NO session identity (the MCP server's `initialize` carries none), so DISCOVERY IS
+// THE ONLY PATH and the election lock is load-bearing. R2 forbids a directory-mtime gate and a
+// quiet-age threshold, so the scan walks the whole tree every pass, chunked and bounded per pass;
+// test/watcher-discovery.test.mjs pins that. Trap list and design narration:
+// docs/plans/2026-09-15-comment-archive.md.
 //
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// WHAT THIS PROCESS KNOWS ABOUT ITSELF: NOTHING
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// M-1-2's standing measurement (F11/F12, and the option-C design's §2.1) is that the plugin's MCP
-// server spawns eagerly at session start, lives for the whole session, and its `initialize` params
-// carry no session id, no thread id and no project cwd. `process.cwd()` is the plugin cache
-// directory. Re-checked against lib/mcp-bridge.mjs at this commit: nothing there reads a session
-// identity out of the handshake, and `.mcp.json` forwards only static strings.
-//
-// Two consequences shape everything below:
-//
-//   1. DISCOVERY IS THE ONLY PATH. The watcher cannot ask "which session am I?", so it processes
-//      every rollout whose observation moved, whichever session this process belongs to. The
-//      engine already fits that: state files are keyed by session id, `segmentId` is
-//      `<sessionId>:<from>-<to>`, and `session_meta.cwd` recovers the project from the rollout.
-//   2. THE ELECTION LOCK IS LOAD-BEARING, NOT DECORATIVE. One MCP process per session means N
-//      concurrent watchers on one machine, all equally eligible, all scanning one tree. Without
-//      the lock they would each open the same rollouts and each POST the same windows.
-//
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// R2'S DISCOVERY TRAPS, AND WHERE EACH IS HANDLED
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-//   * NEVER GATE ON DIRECTORY MTIME. Appending to a rollout does not touch its parent directory's
-//     mtime, so a "did today's folder change?" pre-check misses every append. The cheap pre-check
-//     from the option-C sketch (§3.3) is therefore NOT implemented here — `scanPass` always walks
-//     the whole tree. Deliberate cost, pinned by test/watcher-discovery.test.mjs.
-//   * OLD DATE DIRECTORIES. A resumed session keeps writing into the directory it was created in,
-//     which may be weeks back. The walk is the WHOLE tree (listRolloutFiles is depth-bounded at
-//     the sessions/YYYY/MM/DD shape), plus a per-file stat, so an old-date append is seen exactly
-//     like a today append.
-//   * NO QUIET-AGE THRESHOLD. R2 forbids one, because it starves a continuously growing rollout.
-//     Instead a session that changed is due IMMEDIATELY, and the only rate limit is a per-session
-//     COOLDOWN measured from its last successful checkpoint: a rollout under continuous write is
-//     processed once per cooldown, forever, never skipped. G-1-6 already holds back a torn
-//     trailing line, so reading mid-write is safe and no delay is needed for correctness.
-//   * BOUNDED WORK. Per pass: a cap on head reads, a cap on sessions checkpointed, a per-session
-//     network budget, one coverage request, and a yield to the event loop every CHUNK files.
-//     Whatever does not fit is carried to the next pass by a rotating scan index and by simply
-//     staying due — nothing is dropped.
-//   * PRUNING WITHOUT A TRUSTED HOOK. `pruneStale()` runs on its own long interval from the tick,
-//     recorded in the watermark, so a machine that never trusted SessionStart still gets swept.
-//   * MCP RESPONSIVENESS. R2 is explicit that "never write to stdout" does not protect the
-//     JSON-RPC channel from a SYNCHRONOUS filesystem/JSON stall. The scan is therefore chunked
-//     with an awaited yield between chunks, and every await point re-checks `stopped`.
-//
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// THE OBSERVATION WATERMARK — A NEW FILE, NOT A FIELD IN CURSOR STATE
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// R2 forbids inventing a persisted `mtimeMs` on the existing per-session cursor state, so this is
-// its own record at `<beeziCodexHome()>/watcher.json`, at the data-root LEVEL for the same reason
-// coverage.json / tracking.json / audit-ledger.json are: lib/prune.mjs sweeps state/ and queue/,
-// and a watermark that expired at 14 days would make every old rollout look brand new.
+// ── THE OBSERVATION WATERMARK ─────────────────────────────────────────────────
+// Its own file at `<beeziCodexHome()>/watcher.json`, at the data-root LEVEL: R2 forbids a persisted
+// `mtimeMs` on the per-session cursor, and lib/prune.mjs sweeps state/ and queue/ at 14 days, which
+// would make every old rollout look brand new.
 //
 //   { version, sessions: { <sessionId>: { mtimeMs, size, at } },
 //     children: { <agentThreadId>: { mtimeMs, size, root, at } },
 //     prunedAt, historyAt, updatedAt }
 //
-// IT IS AN OBSERVATION, NOT A CURSOR. It answers exactly one question — "has this file changed
-// since the last time a checkpoint of it SUCCEEDED?" — and it is never consulted to decide which
-// LINES to read. Lines come from state/<id>.json, or from the coverage core.
+// IT IS AN OBSERVATION, NOT A CURSOR. It answers one question — "has this file changed since the
+// last time a checkpoint of it SUCCEEDED?" — and is never consulted to decide which LINES to read;
+// lines come from state/<id>.json or the coverage core. It advances ONLY after
+// `checkpointSucceeded()`, so a pass that was locked out, refused to name the session or failed its
+// delta leaves it alone and the next pass retries; `enqueued === 0` IS success. What is recorded is
+// the observation taken BEFORE the checkpoint ran, never a fresh stat after it — a rollout that grew
+// while its checkpoint was in flight must stay due.
 //
-// WHEN IT ADVANCES: only after a checkpoint of that session reported durable success
-// (`checkpointSucceeded()` below). A pass that was locked out, refused to name the session or
-// failed its delta leaves the watermark alone, so the next pass retries. `enqueued === 0` IS
-// success — a session with no new billable usage is a correct, complete read.
+// ── ELIGIBILITY: THREE PATHS, NO OVERLAP ──────────────────────────────────────────
+// Nothing here consults `isImported`: the ledger has no imported line boundary and marks REJECTED
+// sessions imported (R2). A session is routed by whether a NON-OVERLAPPING START LINE is already
+// established:
 //
-// WHAT IS RECORDED: the observation taken BEFORE the checkpoint ran, never a fresh stat after it.
-// A rollout that grew while its checkpoint was in flight must stay due; stamping the post-run
-// mtime would silently swallow that append until the next one.
+//   A. ESTABLISHED — a local cursor (state/<id>.json) or a watermark for it exists. The boundary is
+//      known; run the ordinary incremental checkpoint. Cheapest, most common.
+//   B. UNESTABLISHED AND ACTIVE — no boundary, and the file moved inside ACTIVE_WINDOW_MS. These are
+//      exactly the sessions lib/session-audit.mjs REFUSES, so nobody else will ever establish them.
+//      ONE `/sessions/coverage` request PER SESSION, inside that session's own reconcile lock (so it
+//      cannot be hoisted out and shared), bounded by MAX_ESTABLISH_PER_PASS. `decideReplay`'s REPLAY
+//      verdict goes to runCheckpoint as a `startCursor` HARD OVERRIDE (G-3-3) with
+//      `sweepSubagents: false`; DEFER is retried, and `coverage === null` is a DEFER, never zero.
+//   C. UNESTABLISHED AND QUIET — still for longer than the active window. That is history, and R2
+//      requires history to ride `runAudit({ mode: SYNC_MODE })`: it drains the queue first, consults
+//      coverage, honours audit-only tenants and neither seals nor reopens the one-time backfill.
+//      This module reimplements none of that.
 //
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// ELIGIBILITY: THREE PATHS, NO OVERLAP
-// ─────────────────────────────────────────────────────────────────────────────────────────────
-// `if (!seen && isImported(...)) continue` is unsafe (R2): the ledger has no imported line
-// boundary and marks REJECTED sessions imported. Nothing here consults `isImported`. Instead a
-// session is routed by whether a NON-OVERLAPPING START LINE IS ALREADY ESTABLISHED:
+// A and B are LIVE capture and are gated on `isLiveTrackingAllowed()`; C gates itself. A CHANGED
+// CHILD SCHEDULES ITS ROOT (R2, G-7-1/G-7-2): `listAllRollouts()` excludes subagent rollouts, so the
+// walk classifies every file with the SAME `subagentIdentityFrom` discriminator it uses, and a child
+// whose observation moved marks its `rootSessionId` due with `sweepSubagents: true`.
 //
-//   A. ESTABLISHED — a local cursor exists (state/<id>.json) or this watcher has a watermark for
-//      it. The boundary is known; run the ordinary incremental checkpoint. Cheapest, most common.
-//   B. UNESTABLISHED AND ACTIVE — no boundary, and the file moved inside ACTIVE_WINDOW_MS. These
-//      are exactly the sessions lib/session-audit.mjs REFUSES (it skips anything younger than its
-//      own active window to avoid racing live writers), so nobody else will ever establish them.
-//      One batched `/sessions/coverage` request per pass, then `decideReplay` decides. A REPLAY
-//      verdict is handed to runCheckpoint as a `startCursor` HARD OVERRIDE (G-3-3) with the
-//      subagent sweep set by `childSweepAllowed`. A DEFER verdict is counted and retried — and
-//      `coverage === null` (unavailable) is a DEFER, never a scan from zero.
-//   C. UNESTABLISHED AND QUIET — no boundary, and the file has been still for longer than the
-//      active window. That is history, and R2 requires history to ride the tracking-policy-aware
-//      sync route: `runAudit({ mode: SYNC_MODE })`, on a long interval. It drains the queue first,
-//      consults coverage, honours audit-only tenants and neither seals nor reopens the one-time
-//      backfill. This module does not reimplement any of that.
+// KNOWN RESIDUAL — IDENTITY CHANGE (R2's row, NOT closed here). After a logout/login into a
+// different workspace a surviving local cursor still reads as ESTABLISHED, so path A would
+// checkpoint the previous tenant's tails. Binding this file alone would not fix it — the cursor is
+// the unbound thing. Reported, untested. Write-up: docs/plans/2026-09-15-comment-archive.md.
 //
-// Path A and B are LIVE capture and are gated on `isLiveTrackingAllowed()`; path C gates itself.
-//
-// A CHANGED CHILD SCHEDULES ITS ROOT (R2, G-7-1/G-7-2). `listAllRollouts()` excludes subagent
-// rollouts, and excluding them from a listing does not bill them — the parent's sweep does. So the
-// walk classifies every file with the SAME discriminator listAllRollouts uses
-// (`subagentIdentityFrom` on the head record), and a child whose observation moved marks its
-// `rootSessionId` due with `sweepSubagents: true`.
-//
-// KNOWN RESIDUAL — IDENTITY CHANGE (R2's "identity change" row, NOT closed here). `coverage.json`
-// is bound to `{identity, environment, apiBase}` and discards a record written under another
-// login. Neither this watermark nor `state/<id>.json` carries that binding. After a
-// logout→login into a different workspace, every session with a surviving local cursor still reads
-// as ESTABLISHED, so path A would keep checkpointing the previous tenant's tails under the new
-// one's credentials, from a cursor that means nothing there. A hook only ever sees the session it
-// fired in; a watcher sweeps the whole machine, so it makes the same latent bug much wider.
-// Binding this file alone would NOT fix it — `establishedProbe` reads the cursor, and the cursor
-// is the thing that is unbound. The fix belongs in the cursor's own module and in the login path,
-// neither of which this change owns. Reported, untested, deliberately not worked around here.
-//
-// WHY NOT JUST CALL listAllRollouts(). It walks the tree and head-reads every file synchronously
-// and without bound, which is the stall R2 says a stdout rule does not protect against, and it
-// discards children, which are half of what this module has to see. The classification here is a
-// deliberate mirror of it — same head read, same discriminator, same `id`-then-filename id
-// derivation, same newest-file-wins collapse for a resumed session id — so the two can never
-// disagree about what a top-level session is.
-
 // ── The opt-in ──────────────────────────────────────────────────────────────────────────────
 
 /** The documented opt-in. Absent or anything outside TRUE_VALUES means the watcher never starts. */
@@ -184,34 +104,32 @@ export const TICK_MS = 20_000;
 /** Election lease. Comfortably longer than a tick, so a renew is never racing its own expiry. */
 export const ELECTION_LEASE_MS = 120_000;
 /** A session is re-checkpointed at most this often, however fast its rollout grows. */
-export const SESSION_COOLDOWN_MS = 60_000;
+const SESSION_COOLDOWN_MS = 60_000;
 /** Files classified (head-read) per pass. The remainder rides a rotating index to the next pass. */
-export const MAX_HEAD_READS_PER_PASS = 120;
+const MAX_HEAD_READS_PER_PASS = 120;
 /** Sessions checkpointed per pass on the INCREMENTAL path (A). The rest stay due, oldest first. */
-export const MAX_SESSIONS_PER_PASS = 5;
+const MAX_SESSIONS_PER_PASS = 5;
 /**
  * Sessions ESTABLISHED per pass on the coverage path (B), counted separately from path A. The two
  * ceilings add up, so the real per-pass maximum is MAX_SESSIONS_PER_PASS + MAX_ESTABLISH_PER_PASS.
  * Path B is the more expensive one — a first read of a session is a whole-transcript parse — so it
  * gets the smaller number, and a fresh machine ramps up over several passes instead of one.
  */
-export const MAX_ESTABLISH_PER_PASS = 2;
-/** Session ids asked about in one coverage request. */
-export const MAX_COVERAGE_PER_PASS = 50;
+const MAX_ESTABLISH_PER_PASS = 2;
 /** Network budget handed to one checkpoint, so a dead server cannot stall a pass. */
-export const CHECKPOINT_BUDGET_MS = 8_000;
+const CHECKPOINT_BUDGET_MS = 8_000;
 /** Files walked between yields to the event loop. This is the MCP-responsiveness knob. */
-export const SCAN_CHUNK = 25;
+const SCAN_CHUNK = 25;
 /** Matches lib/session-audit.mjs's ACTIVE_SESSION_WINDOW_MS — the boundary between B and C. */
-export const ACTIVE_WINDOW_MS = 30 * 60 * 1000;
+const ACTIVE_WINDOW_MS = 30 * 60 * 1000;
 /** pruneStale() cadence, independent of any hook. */
-export const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const PRUNE_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** runAudit(sync) cadence. Long: it is a whole-machine reconciliation, not a tick's work. */
-export const HISTORY_INTERVAL_MS = 6 * 60 * 60 * 1000;
+const HISTORY_INTERVAL_MS = 6 * 60 * 60 * 1000;
 /** Watermark entries kept. Oldest observation evicted first; eviction only costs a re-read. */
-export const MAX_OBSERVATIONS = 2000;
+const MAX_OBSERVATIONS = 2000;
 
-export const OBSERVATION_VERSION = 1;
+const OBSERVATION_VERSION = 1;
 
 // ── The observation watermark ───────────────────────────────────────────────────────────────
 
@@ -259,17 +177,14 @@ export function loadObservations(deps) {
   };
 }
 
-export function saveObservations(record, deps) {
-  const write = orDefault((deps || {}).writeJsonSecureImpl, writeJsonSecure);
+export function saveObservations(record) {
   try {
-    const result = withLock(sharedLock('watcher-observations'), {}, () => {
-      write(observationFile(), { ...record, updatedAt: new Date().toISOString() });
+    withLock(sharedLock('watcher-observations'), {}, () => {
+      writeJsonSecure(observationFile(), { ...record, updatedAt: new Date().toISOString() });
     });
-    return result.ok;
   } catch {
     // Best-effort like every other write in this plugin: a watermark we could not persist costs a
     // repeated read next pass, and the server upserts by segmentId, so nothing is double-counted.
-    return false;
   }
 }
 
@@ -292,29 +207,27 @@ export function childObservationFor(record, agentThreadId) {
  * Stamp an observation. `observed` is the stat taken BEFORE the checkpoint, never after — see the
  * header. Called only on durable checkpoint success.
  */
-export function recordObservation(record, sessionId, observed, nowMs) {
-  if (!record || !record.sessions) return record;
-  if (typeof sessionId !== 'string' || !sessionId) return record;
-  if (!observed || typeof observed.mtimeMs !== 'number') return record;
+function recordObservation(record, sessionId, observed, nowMs) {
+  if (!record || !record.sessions) return;
+  if (typeof sessionId !== 'string' || !sessionId) return;
+  if (!observed || typeof observed.mtimeMs !== 'number') return;
   record.sessions[sessionId] = {
     mtimeMs: observed.mtimeMs,
     size: typeof observed.size === 'number' ? observed.size : null,
     at: nowMs,
   };
-  return record;
 }
 
-export function recordChildObservation(record, agentThreadId, observed, rootSessionId, nowMs) {
-  if (!record || !record.children) return record;
-  if (typeof agentThreadId !== 'string' || !agentThreadId) return record;
-  if (!observed || typeof observed.mtimeMs !== 'number') return record;
+function recordChildObservation(record, agentThreadId, observed, rootSessionId, nowMs) {
+  if (!record || !record.children) return;
+  if (typeof agentThreadId !== 'string' || !agentThreadId) return;
+  if (!observed || typeof observed.mtimeMs !== 'number') return;
   record.children[agentThreadId] = {
     mtimeMs: observed.mtimeMs,
     size: typeof observed.size === 'number' ? observed.size : null,
     root: orDefault(rootSessionId, null),
     at: nowMs,
   };
-  return record;
 }
 
 /**
@@ -335,7 +248,6 @@ export function pruneObservations(record, max = MAX_OBSERVATIONS) {
     });
     for (let i = 0; i < names.length - max; i += 1) delete table[names[i]];
   }
-  return record;
 }
 
 // ── Classification (a deliberate mirror of listAllRollouts) ─────────────────────────────────
@@ -351,17 +263,17 @@ function str(v) {
 
 /**
  * One head record answers all three questions: is it a subagent, which session is it, where was it
- * launched. 512KB / 1 record mirrors listAllRollouts exactly.
+ * launched. ROLLOUT_HEAD_BYTES / 1 record mirrors listAllRollouts exactly.
  *
  * Returns `{ kind: 'top', sessionId, cwd }`, `{ kind: 'child', agentThreadId, rootSessionId }`, or
  * `{ kind: 'skip' }`.
  */
-export function classifyRollout(file, deps) {
+function classifyRollout(file, deps) {
   const headRead = orDefault((deps || {}).readRolloutHead, _readRolloutHead);
   const identityFrom = orDefault((deps || {}).subagentIdentityFrom, _subagentIdentityFrom);
   let records;
   try {
-    records = headRead(file, { maxBytes: 512 * 1024, maxRecords: 1 });
+    records = headRead(file, { maxBytes: ROLLOUT_HEAD_BYTES, maxRecords: 1 });
   } catch {
     return { kind: 'skip' };
   }
@@ -502,7 +414,7 @@ export async function scanPass(options = {}, deps = {}) {
   }
   if (!truncated) nextIndex = start;
 
-  return { tops, children, scanned, classified, truncated, nextIndex, total };
+  return { tops, children, scanned, classified, truncated, nextIndex };
 }
 
 // ── The plan ────────────────────────────────────────────────────────────────────────────────
@@ -646,30 +558,17 @@ export function planPass(input = {}) {
 /**
  * Did this checkpoint actually read and commit the window?
  *
+ * `outcome` is the whole answer. runCheckpoint reports every refusal that means the window was NOT
+ * processed — a held session lock, an unusable session id, a failed delta, a deferred rate-limit
+ * write, a tracking gate, a failed emit or commit — as `'deferred'` or `'failed'`, never as
+ * `'committed'`. Re-testing the individual flags here only invited them to drift apart.
+ *
  * `enqueued === 0` is SUCCESS: a transcript with no new billable usage is a complete read, and
  * gating the watermark on a non-empty enqueue would make every quiet session re-read forever.
- * The three real failures are the ones that mean the window was NOT processed.
  */
 export function checkpointSucceeded(result) {
   if (!result || typeof result !== 'object') return false;
-  if (result.outcome !== 'committed') return false;
-  if (result.gated || (result.skipped && result.skipped.emitFailed)) return false;
-  if (result.lockSkipped === true) return false;      // another writer held the session lock
-  if (result.unnamedSession === true) return false;   // refused to write under an unusable id
-  if (result.skipped && result.skipped.deltaFailed === true) return false;
-  if (result.skipped && result.skipped.rateLimitDeferred === true) return false;
-  return true;
-}
-
-function ledgerDelivered(ledger, sessionId) {
-  const sessions = (ledger || {}).sessions;
-  if (!sessions || typeof sessions !== 'object') return false;
-  const entry = sessions[sessionId];
-  if (!entry || typeof entry !== 'object') return false;
-  // ACCEPTED/PARTIAL only. A REJECTED entry is NOT delivery — that is what lets a repository that
-  // was once unconnected replay in full the moment it is connected (R2). Mirrors the private
-  // helper in lib/session-audit.mjs; kept in step by test/watcher-eligibility.test.mjs.
-  return entry.outcome === BackfillSessionStatus.ACCEPTED || entry.outcome === BackfillSessionStatus.PARTIAL;
+  return result.outcome === 'committed';
 }
 
 // ── One pass ────────────────────────────────────────────────────────────────────────────────
@@ -699,7 +598,8 @@ function emptyPass(reason) {
  * process must never do is take the MCP bridge down with it.
  */
 export async function runWatchPass(deps = {}, options = {}) {
-  if ((!deps.getAccessToken || deps.hookMayProceed) && !(deps.hookMayProceed || hookMayProceed)()) {
+  if (shouldCheckEnvironment(deps, 'getAccessToken', 'hookMayProceed')
+    && !(deps.hookMayProceed || hookMayProceed)()) {
     return emptyPass('environment-blocked');
   }
   const nowFn = orDefault(deps.now, Date.now);
@@ -737,11 +637,11 @@ export async function runWatchPass(deps = {}, options = {}) {
   if (!token) {
     // Unlinked. Quiet by design — the option-C constraint: ticket drafting must keep working when
     // analytics cannot, and an unlinked machine must not produce one error per tick forever.
-    if (dirty) saveObservations(record, deps);
+    if (dirty) saveObservations(record);
     result.reason = 'unlinked';
     return result;
   }
-  if (shouldStop()) { if (dirty) saveObservations(record, deps); result.reason = 'stopped'; return result; }
+  if (shouldStop()) { if (dirty) saveObservations(record); result.reason = 'stopped'; return result; }
 
   const scan = await scanPass(
     {
@@ -756,7 +656,7 @@ export async function runWatchPass(deps = {}, options = {}) {
   result.classified = scan.classified;
   result.truncated = scan.truncated;
   result.nextIndex = scan.nextIndex;
-  if (shouldStop()) { if (dirty) saveObservations(record, deps); result.reason = 'stopped'; return result; }
+  if (shouldStop()) { if (dirty) saveObservations(record); result.reason = 'stopped'; return result; }
 
   const plan = planPass({
     tops: scan.tops,
@@ -829,8 +729,7 @@ export async function runWatchPass(deps = {}, options = {}) {
 
   // ── Path B: unestablished but still active — coverage decides the boundary ────────────────
   if (live && plan.fresh.length > 0 && !shouldStop()) {
-    for (const entry of plan.fresh.slice(0, Math.min(orDefault(options.maxEstablish, MAX_ESTABLISH_PER_PASS),
-      orDefault(options.maxCoverageIds, MAX_COVERAGE_PER_PASS)))) {
+    for (const entry of plan.fresh.slice(0, orDefault(options.maxEstablish, MAX_ESTABLISH_PER_PASS))) {
       if (shouldStop()) break;
       const reconciled = await (deps.reconcileSession || reconcileSession)(entry.sessionId, token, async sessionHandle => {
         const coverage = await fetchCoverage([entry.sessionId], token, {}, {});
@@ -875,7 +774,7 @@ export async function runWatchPass(deps = {}, options = {}) {
 
   if (dirty) {
     pruneObservations(record, orDefault(options.maxObservations, MAX_OBSERVATIONS));
-    saveObservations(record, deps);
+    saveObservations(record);
   }
   return result;
 }
@@ -948,7 +847,7 @@ export function startWatcher(deps = {}, options = {}) {
     }
     let taken;
     try {
-      taken = acquire(electionLock('watcher'), { leaseMs }, deps.lockDeps);
+      taken = acquire(electionLock('watcher'), { leaseMs });
     } catch {
       return 'skip';
     }

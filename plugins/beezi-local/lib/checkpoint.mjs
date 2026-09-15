@@ -26,7 +26,7 @@ import {
   recordSubscriptionEvidence,
 } from './billing-config.mjs';
 import { resolveSessionName as _resolveSessionName, sanitizeSessionName } from './session-name-codex.mjs';
-import { readJson, readJsonSalvaged, writeJsonSecure, writeJsonDurable, safeFileName } from './fs-store.mjs';
+import { readJson, readJsonSalvaged, writeJsonDurable, safeFileName } from './fs-store.mjs';
 import { isLiveTrackingAllowed, markTrackingDisabled } from './tracking.mjs';
 import { acquireLock, withLockAsync, sessionLock, sharedLock } from './single-instance-lock.mjs';
 // Static, and verified acyclic before it was added: diagnostics' full import closure is
@@ -101,10 +101,11 @@ function localRemote(dir) {
   return name ? `local:${name}` : null;
 }
 
-// Server-side DTO caps (session-report.request.dto.ts:276-279). One over-long field 400s the whole
-// request, and flushQueue treats a 400 as permanent: it deletes that queue file and moves on, so
-// the segment is gone rather than retried. `branch` is required, so it is truncated rather than
-// dropped — a truncated ref still names the work recognisably, an empty one fails validation too.
+// Server-side DTO caps (`session-report.request.dto.ts` in the hb-ai-agent-portal repo). One
+// over-long field 400s the whole request, and flushQueue treats a 400 as permanent: it deletes that
+// queue file and moves on, so the segment is gone rather than retried. `branch` is required, so it
+// is truncated rather than dropped — a truncated ref still names the work recognisably, an empty
+// one fails validation too.
 //
 // `remote` stays unclamped on purpose: a truncated remote would fabricate a repo key that matches
 // nothing server-side, which is worse than the 400. Do not extend this by copy-paste.
@@ -137,6 +138,7 @@ function detectTimezone() {
 // an unknown key 400s the whole payload and flushQueue treats a 400 as permanent — it DELETES the
 // rejected segment (REVIEW R4) — so nothing new may be sent before the DTO accepts it. On an
 // `X-Beezi-Agent: codex` row this field means AGENTS.md; that is a decoding rule, not an ambiguity.
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 function agentsMdLines(repoRoot) {
   // Typed, not merely truthy. This runs OUTSIDE the per-segment try/catch, and
   // `path.join(<truthy non-string>, …)` throws ERR_INVALID_ARG_TYPE — which would escape
@@ -175,7 +177,7 @@ export const SESSION_LOCK_LEASE_MS = 60_000;
 // that has to cover real latency; the CLI path can exceed it, and the same reasoning applies —
 // nobody evicts a holder that is still alive, and release re-reads its own generation before it
 // unlinks anything.
-export const QUEUE_LOCK_LEASE_MS = 60_000;
+const QUEUE_LOCK_LEASE_MS = 60_000;
 
 // Do we still own the session lock, and may this transaction commit?
 //
@@ -210,7 +212,9 @@ function ingestSubagents({
   sessionId, parentTranscriptPath, computeDelta, resolvers, enqueueSegments, sweep, persist = true, recovery = false, deps = {},
 }) {
   const readAgents = orDefault(deps.readAgents, _readAgents);
-  const writeAgent = orDefault(deps.writeAgent, _writeAgent);
+  // Not a fallback: runCheckpoint always injects one (it redirects the child write into the
+  // transaction it is about to commit), so a default here would only ever mask a miswired caller.
+  const writeAgent = deps.writeAgent;
   const inspectRollout = orDefault(deps.inspectSubagentRollout, _inspectSubagentRollout);
   const findRollouts = orDefault(deps.findSubagentRollouts, _findSubagentRollouts);
   const startedAt = orDefault(deps.rolloutStartedAt, _rolloutStartedAt);
@@ -280,9 +284,7 @@ function ingestSubagents({
     apiErrorEvents.push(...orDefault(delta.apiErrorEvents, []));
 
     if (persist && delta.nextCursor !== from) {
-      try {
-        writeAgent(sessionId, agentId, { cursor: delta.nextCursor, transcriptPath: rolloutPath });
-      } catch (error) { throw error; }
+      writeAgent(sessionId, agentId, { cursor: delta.nextCursor, transcriptPath: rolloutPath });
     }
   }
 
@@ -332,19 +334,19 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const transcript_path = resolved.transcriptPath;
   // The hook's own id FIRST, the resolver's second — that order is load-bearing and not
   // interchangeable. resolveCodexTranscript falls through to findRolloutBySessionState, which
-  // matches on `cwd` ALONE (lib/transcript-codex.mjs:74), so `resolved.sessionId` can name a
-  // PREVIOUS session that ran in this directory. Preferring it over a perfectly usable hook id
-  // would bill this session's segments, state file and wire id under that older session — a
-  // cross-session mis-attribution strictly worse than the null-id bug being closed here. The
-  // resolver only gets to answer when the hook did not, which is exactly the poisoned path.
+  // matches on `cwd` ALONE (lib/transcript-codex.mjs), so `resolved.sessionId` can name a PREVIOUS
+  // session that ran in this directory. Preferring it over a perfectly usable hook id would bill
+  // this session's segments, state file and wire id under that older session — a cross-session
+  // mis-attribution strictly worse than the null-id bug being closed here. The resolver only gets
+  // to answer when the hook did not, which is exactly the poisoned path.
   const sessionId = isUsableSessionId(session_id)
     ? session_id
     : (isUsableSessionId(resolved.sessionId) ? resolved.sessionId : null);
   // Refuse rather than write under a name we do not have. This is the WRITING entry point, so the
   // strict check belongs here — never in the resolver, whose null tolerance liveSession()
-  // (lib/session-audit.mjs:87-94) depends on to exclude the live session by path. Reported as a
-  // distinct outcome, not as a silent empty result, so a caller with zero reports can tell "no
-  // usage" from "we refused to name it".
+  // (lib/session-audit.mjs) depends on to exclude the live session by path. Reported as a distinct
+  // outcome, not as a silent empty result, so a caller with zero reports can tell "no usage" from
+  // "we refused to name it".
   if (sessionId === null) return { ...emptyResult(), unnamedSession: true };
 
   // ── The per-session checkpoint transaction (G-8-3 / R3) ───────────────────────────────────────
@@ -367,7 +369,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const borrowed = deps.sessionHandle && deps.sessionHandle.name === sessionLock(sessionId).name
     && stillOwnsSession(deps.sessionHandle);
   const acquired = borrowed ? { ok: true, handle: deps.sessionHandle }
-    : acquireLock(sessionLock(sessionId), { leaseMs: SESSION_LOCK_LEASE_MS, recoveryPermit: deps.recoveryPermit }, deps.lockDeps);
+    : acquireLock(sessionLock(sessionId), { leaseMs: SESSION_LOCK_LEASE_MS, recoveryPermit: deps.recoveryPermit });
   if (!acquired.ok) {
     // 'held' and 'contended' are somebody else mid-transaction on this same session: defer, and the
     // next hook picks the window up with nothing lost.
@@ -395,7 +397,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
       deps, options, sessionId, transcript_path, cwd, now, deadline, timeLeft, emit,
       collectedErrors, skipped, emptyResult,
     });
-  } catch (error) {
+  } catch {
     return { ...emptyResult(), outcome: 'failed', reason: 'checkpoint-failed' };
   } finally {
     // Unconditional: a section that threw still has to hand the lock back, or the next checkpoint
@@ -406,7 +408,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 
 // Keep the session writer excluded from the drain through coverage and checkpoint commit.
 export async function reconcileSession(sessionId, token, fn, deps = {}) {
-  const acquired = acquireLock(sessionLock(sessionId), { leaseMs: SESSION_LOCK_LEASE_MS }, deps.lockDeps);
+  const acquired = acquireLock(sessionLock(sessionId), { leaseMs: SESSION_LOCK_LEASE_MS });
   if (!acquired.ok) return { outcome: 'deferred', reason: 'session-busy' };
   try {
     const pending = readTransaction(sessionId);
@@ -424,7 +426,7 @@ export async function reconcileSession(sessionId, token, fn, deps = {}) {
     if (files.length) return { outcome: 'deferred', reason: 'pending-not-drained' };
     if (!stillOwnsSession(acquired.handle)) return { outcome: 'deferred', reason: 'ownership-lost' };
     return await fn(acquired.handle);
-  } catch (error) { return { outcome: 'deferred', reason: 'reconciliation-unavailable' }; }
+  } catch { return { outcome: 'deferred', reason: 'reconciliation-unavailable' }; }
   finally { acquired.handle.release(); }
 }
 
@@ -464,7 +466,7 @@ async function runLockedCheckpoint(lock, ctx) {
         return { ...emptyResult(), outcome: 'committed', reason: 'resumed', committedBoundaries: boundaries,
           enqueued: pendingTransaction.payloads.length };
       }
-    } catch (error) {
+    } catch {
       return { ...emptyResult(), outcome: 'failed', reason: 'transaction-resume-failed' };
     }
   }
@@ -607,8 +609,8 @@ async function runLockedCheckpoint(lock, ctx) {
   // so a caller that injected every other resolver still resolves billing off the host machine.
   //
   // `now` is handed over as an EPOCH, not as this file's clock function: resolveSource's `now` is a
-  // number (billing-config.mjs:98), and passing the function through would make every
-  // evidence-freshness comparison NaN and silently discard a fresh API-key stamp.
+  // number (`resolveSource` in billing-config.mjs), and passing the function through would make
+  // every evidence-freshness comparison NaN and silently discard a fresh API-key stamp.
   const billingFields = resolveBilling(
     billingConfig,
     orDefault(deps.env, process.env),
@@ -623,10 +625,9 @@ async function runLockedCheckpoint(lock, ctx) {
   let lastPayload = null;
   const timezone = detectTimezone();
 
-  // Wall clock already billed this session, as a union of intervals. A subagent and its parent
-  // describe the SAME stretch of clock — the parent blocks in wait_agent while the agent works — so
-  // summing their durations bills those seconds twice. Measured locally: one parent and three agents
-  // spanning 431s of wall clock summed to 1117s.
+  // Wall clock already billed this session, as a union of intervals — never a sum.
+  // lib/active-time.mjs is the single definition of that rule and carries the measurement behind it.
+  // Write-up: docs/plans/2026-09-15-comment-archive.md.
   let covered = mergeIntervals(Array.isArray(state.coveredIntervals) ? state.coveredIntervals : []);
   let coveredDirty = false;
 
@@ -648,9 +649,10 @@ async function runLockedCheckpoint(lock, ctx) {
       const mdLines = agentsMdLinesOf(seg.repoRoot);
       // A subagent runs its own context window, so the parent's occupancy is not its own and these
       // three never ship on a non-main segment. The server already nulls them there
-      // (session-report.service.ts:334-336), so this is hygiene rather than correctness — but the
-      // payload must never state something the server will discard. Byte-identical construct to the
-      // Claude plugin's lib/checkpoint.mjs:358; object rest is ES2018 and clears the ban gate.
+      // (`session-report.service.ts` in the hb-ai-agent-portal repo), so this is hygiene rather
+      // than correctness — but the payload must never state something the server will discard.
+      // Byte-identical construct to the Claude plugin's own lib/checkpoint.mjs (the
+      // beezi-claude-plugins repo); object rest is ES2018 and clears the ban gate.
       const { context_peak_tokens, context_final_tokens, context_final_model, ...statsSansContext } = seg.stats;
       const segStats = isSubagent ? statsSansContext : seg.stats;
       // Build the complete immutable transaction before publishing any payload.
@@ -701,7 +703,7 @@ async function runLockedCheckpoint(lock, ctx) {
     sweep: options.emitTimeline === true || options.sweepSubagents === true,
     persist: options.persistState !== false,
     recovery: options.recovery === true || state.childRecoveryRequired === true,
-    deps: { ...deps, writeAgent: (parentId, agentId, childState) => children.push({ agentId, state: childState }) },
+    deps: { ...deps, writeAgent: (_parentId, agentId, childState) => children.push({ agentId, state: childState }) },
   });
   if (options.recovery) state.childRecoveryRequired = true;
   apiErrorEvents.push(...agentResults.apiErrorEvents);
@@ -864,9 +866,10 @@ async function runLockedCheckpoint(lock, ctx) {
   // transcript has content, so an empty session writes no state.
   //
   // `sessionId` is recorded IN the file, not just as its name. findRolloutBySessionState
-  // (lib/transcript-codex.mjs:103) prefers the recorded id over the filename precisely so a state
-  // file cannot answer with whatever string it happens to be named — the read side of that guard
-  // is a no-op until this write lands. Old state files keep falling through to the filename.
+  // (`findRolloutBySessionState` in lib/transcript-codex.mjs) prefers the recorded id over the
+  // filename precisely so a state file cannot answer with whatever string it happens to be named —
+  // the read side of that guard is a no-op until this write lands. Old state files keep falling
+  // through to the filename.
   if (nextCursor > 0
     && (state.cwd !== cwd || state.transcriptPath !== transcript_path || state.sessionId !== sessionId)) {
     state.cwd = orDefault(cwd, null);
@@ -876,25 +879,18 @@ async function runLockedCheckpoint(lock, ctx) {
     stateDirty = true;
   }
   // The one write that must never race, so it is the one write gated on still owning the lock.
-  //
-  // 'lost' means a successor holds this session's lock and has been computing its own delta from
-  // the cursor we are about to overwrite: committing here is exactly the lost update R3 names, and
-  // the contract is to abort rather than commit. Nothing is destroyed by aborting — the cursor
-  // simply does not advance, the window is recomputed next checkpoint, and the server upserts by
-  // segmentId, so any segment already enqueued is idempotent.
-  //
-  // 'expired' is NOT 'lost' and must not be collapsed into it: nobody took the lock, our own lease
-  // merely lapsed while we were on the network, and the record on disk is still ours. Renew and
-  // proceed — treating it as lost would silently stop persisting state on the manual `track` path,
-  // which passes no budget and can outrun any lease.
+  // `stillOwnsSession` above is where the expired-vs-lost rule is stated; this is the site it
+  // protects. Aborting on 'lost' destroys nothing: the cursor simply does not advance, the window is
+  // recomputed next checkpoint, and the server upserts by segmentId, so anything already enqueued is
+  // idempotent. Write-up: docs/plans/2026-09-15-comment-archive.md.
   if (skipped.emitFailed || skipped.noRemote) return { ...emptyResult(), outcome: 'failed', reason: 'payload-build-failed' };
   let committedBoundaries;
   try {
     if (!stillOwnsSession(lock)) return { ...emptyResult(), reason: 'ownership-lost' };
     const tx = { version: 1, sessionId, payloads, children, state };
-    if (durable) orDefault(deps.writeTransaction, writeJsonDurable)(transactionFile(sessionId), tx);
+    if (durable) writeJsonDurable(transactionFile(sessionId), tx);
     committedBoundaries = commitTransaction(tx, lock, emit, deps, durable);
-  } catch (error) {
+  } catch {
     skipped.emitFailed += 1;
     return { ...emptyResult(), outcome: 'failed', reason: 'transaction-commit-failed' };
   }
@@ -920,11 +916,11 @@ async function runLockedCheckpoint(lock, ctx) {
 
 // Once tracking is off, queued reports are held for this long: a tenant that converts to paid
 // inside the window flushes them normally on its first live session; after it they expire.
-export const QUEUE_HOLD_MS = 3 * 24 * 60 * 60 * 1000;
+const QUEUE_HOLD_MS = 3 * 24 * 60 * 60 * 1000;
 
 // Expire queue files older than the hold window. Only meaningful while tracking is off — a
 // live-mode queue drains through flushing, not expiry.
-function sweepHeldQueue(dir, result, now = Date.now()) {
+function sweepHeldQueue(dir, result, now) {
   let files;
   try {
     files = fs.readdirSync(dir);
@@ -943,17 +939,18 @@ function sweepHeldQueue(dir, result, now = Date.now()) {
 }
 
 // Returns { flushed, rejected, failed, deferred, expired, quarantined, salvaged, unreadable,
-// unnamed, trackingDisabled, lockSkipped, lockReason, lastError } —
-// flushed = accepted (2xx), rejected = permanently declined by the server (4xx, e.g. branch not
-// linked), failed = transient or reversible (5xx/network/code-less 403, file kept for retry),
-// deferred = budget ran out, expired = held files past the 3-day window, quarantined = unparseable
-// and renamed to `<file>.corrupt` for inspection, salvaged = recovered from a torn write and
-// posted, unreadable = could not be opened this pass and was left alone, unnamed = carries a
-// session id the plugin could not name, so it was left in place for the quarantine sweep rather
-// than posted, trackingDisabled = the workspace is dark (audit mode) and the flush stopped,
-// lockSkipped = another process holds the queue lock and this pass deferred without reading the
-// directory at all (lockReason carries the primitive's refusal), trackingDisabledWrite = the
-// outcome of recording a dark-mode verdict, present only when the server sent one.
+// unnamed, trackingDisabled, lockSkipped, lockReason, lastError }. The four that are not their own
+// names:
+//   rejected     permanently declined by the server (4xx, e.g. branch not linked), as against
+//                `failed`, which is transient or reversible and keeps the file for retry.
+//   quarantined  unparseable, renamed to `<file>.corrupt` for inspection.
+//   salvaged     recovered from a torn write and posted.
+//   unnamed      carries a session id the plugin could not name, so it was left in place for the
+//                quarantine sweep rather than posted.
+// `lockSkipped` means another process held the queue lock and this pass deferred without reading
+// the directory at all; `lockReason` carries the primitive's refusal. `trackingDisabledWrite` is
+// present only when the server sent a dark-mode verdict.
+// Write-up: docs/plans/2026-09-15-comment-archive.md.
 export async function flushQueue(token, deps = {}) {
   const result = {
     flushed: 0, rejected: 0, failed: 0, deferred: 0, expired: 0,
@@ -983,7 +980,6 @@ export async function flushQueue(token, deps = {}) {
     sharedLock('queue'),
     { leaseMs: QUEUE_LOCK_LEASE_MS },
     () => drainQueue(token, deps, result, verdict),
-    deps.lockDeps,
   );
   if (!run.ok) {
     result.lockSkipped = true;
@@ -1039,13 +1035,13 @@ async function drainQueue(token, deps, result, verdict) {
   let files;
   try {
     // Only queued payloads, and filtered HERE rather than inside the loop so `result.deferred`
-    // counts postable files instead of dirents. Two things this skips, neither ever postable:
-    // the `.tmp` writeJsonSecure leaves behind when a hard kill lands between the temp write and
-    // the rename (fs-store.mjs — the temp is a sibling of its target), and the `.corrupt` files
+    // counts postable files instead of dirents. Two things this skips, neither ever postable: the
+    // `.tmp` writeJsonSecure leaves behind when a hard kill lands between the temp write and the
+    // rename (fs-store.mjs — the temp is a sibling of its target), and the `.corrupt` files
     // quarantined below. pruneStale expires both at 14 days. The house pattern two modules over
-    // already does this — subagent-state.mjs:41,72 and transcript-codex.mjs:67; the queue drain
-    // was the one outlier, and an unfiltered readdir is how a truncated `.tmp` got re-read on
-    // every flush forever.
+    // already does this — `readAgents`/`pruneAgents` in subagent-state.mjs and
+    // `findRolloutBySessionId` in transcript-codex.mjs; the queue drain was the one outlier, and an
+    // unfiltered readdir is how a truncated `.tmp` got re-read on every flush forever.
     files = fs.readdirSync(dir).filter((name) => name.endsWith('.json'));
   } catch {
     return;

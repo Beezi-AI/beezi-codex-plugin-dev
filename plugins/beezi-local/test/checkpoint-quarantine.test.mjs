@@ -1,10 +1,10 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { flushQueue } from '../lib/checkpoint.mjs';
 import { queueDir } from '../lib/paths.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // The drain used to `fs.readdirSync(dir)` with no filter and `readJson(...) == null ? continue`.
 // Two consequences, both silent:
@@ -15,16 +15,11 @@ import { queueDir } from '../lib/paths.mjs';
 //     the session's analytics went with it.
 // These lock the filter, the quarantine and the one case that must NOT be quarantined.
 
+// The queue dir is created eagerly, so a test that asserts on the drain's *listing* starts from an
+// empty directory rather than from "no directory".
 function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-quarantine-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
+  const dir = sandboxHome(t, 'beezi-quarantine-');
   fs.mkdirSync(queueDir(), { recursive: true });
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
   return dir;
 }
 

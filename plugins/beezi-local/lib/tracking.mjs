@@ -9,7 +9,7 @@ const STATE_VERSION = 1;
 // How long one tracking.json read-modify-write may hold its lock. The section is a small read, an
 // object spread and one atomic write — orders of magnitude under this — so the lease exists to
 // bound a crashed holder, not to fit the work.
-export const TRACKING_LOCK_LEASE_MS = 5_000;
+const TRACKING_LOCK_LEASE_MS = 5_000;
 
 // Mirror of the server's TrackingMode enum — the whoami contract, never string-matched inline.
 export const TrackingMode = Object.freeze({
@@ -75,6 +75,7 @@ export function matchesIdentity(state, identity) {
 // and that is precisely why the hazard is invisible without a lock: two processes that both read
 // the same state and then both write it produce two well-formed files, and the second one silently
 // erases the first one's field. `markLinked` losing to a concurrent `recordWhoami` is that bug.
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // Bare READS are deliberately NOT locked. Nothing they could tear, and locking them would nest a
 // second rank-3 lock inside this one at flushQueue's `isLiveTrackingAllowed()` — refused as
@@ -88,7 +89,6 @@ function patchTrackingState(patch, deps = {}) {
     sharedLock('tracking'),
     { leaseMs: TRACKING_LOCK_LEASE_MS },
     () => writeTrackingState({ ...orDefault(readTrackingState(deps), {}), ...patch }, deps),
-    deps.lockDeps,
   );
   return run.ok
     ? { written: true, skipped: false, reason: null }
@@ -146,11 +146,10 @@ export function markBackfillCompleted(deps = {}) {
   return patchTrackingState({ backfillCompleted: true, fetchedAt: new Date().toISOString() }, deps);
 }
 
-export function clearTrackingState(deps = {}) {
-  const fsImpl = orDefault(deps.fsImpl, fs);
+export function clearTrackingState() {
   try {
     // unlinkSync instead of rmSync (Node 14.14+): this deletes a single state file, and the
     // catch swallows ENOENT exactly as `force: true` did.
-    fsImpl.unlinkSync(trackingStateFile());
+    fs.unlinkSync(trackingStateFile());
   } catch { /* best-effort */ }
 }

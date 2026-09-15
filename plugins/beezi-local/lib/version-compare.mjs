@@ -1,6 +1,6 @@
 // Semver ordering, split out of update-check.mjs so the comparison can be read, tested and reused
-// without dragging the fetch/cache machinery along. Moved verbatim — the rules below are the ones
-// the stale-version check (G-8-4) has always applied.
+// without dragging the fetch/cache machinery along. These are the rules the stale-version check
+// (G-8-4) applies.
 //
 // Node 13.2 floor: no optional chaining, no nullish coalescing.
 

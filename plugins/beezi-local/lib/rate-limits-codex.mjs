@@ -1,6 +1,6 @@
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { usageObservationsFile } from './paths.mjs';
-import { orDefault } from './compat.mjs';
+import { orDefault, parseTimestampMs } from './compat.mjs';
 import { canonicalPlan } from './billing.mjs';
 import { withLock, sharedLock } from './single-instance-lock.mjs';
 
@@ -22,8 +22,8 @@ import { withLock, sharedLock } from './single-instance-lock.mjs';
 // 10338 local observations, 7240 had primary=300/secondary=10080, but 2775 carried the WEEKLY
 // window in the `primary` slot with `secondary: null`, and 315 carried a 30-day window there.
 // Reading `primary` as "the 5-hour window" mislabels 30% of all observations — weekly utilisation
-// written into the five_hour column. The parity plan's own description of this payload
-// (docs/plans/2026-07-27-codex-parity-plan.md) has that bug; do not reintroduce it here.
+// written into the five_hour column. The parity plan's own description of this payload (repo-root
+// docs/plans/2026-07-27-codex-parity-plan.md) has that bug; do not reintroduce it here.
 const FIVE_HOUR_MINUTES = 300;
 const SEVEN_DAY_MINUTES = 10080;
 // The 30-day window free plans report — 315 of the 10338 local observations. It has no dedicated
@@ -97,9 +97,11 @@ function epochToIso(seconds) {
 // toStrictDate drops an unparseable timestamp silently while still answering 200 "stored", and the
 // drain would then clear a row that was never written — so the rejection has to happen here.
 function recordTimestampToIso(value) {
+  // The typeof guard stays AHEAD of the parse: parseTimestampMs coerces its input the same way,
+  // so a bare number would otherwise be read as a year and stored as a plausible ISO date.
   if (typeof value !== 'string' || value === '') return null;
-  const parsed = Date.parse(value);
-  if (isNaN(parsed)) return null;
+  const parsed = parseTimestampMs(value);
+  if (parsed === null) return null;
   return isoInRange(new Date(parsed));
 }
 
@@ -113,15 +115,17 @@ export function isMaterial(next, last) {
 }
 
 // The sub-fields the five whitelisted columns cannot express, for the `raw` jsonb passthrough
-// (usage-snapshot.request.dto.ts:131-134, "stored as jsonb passthrough"). A NAMED list, never a
-// spread of the whole block: the list is what makes the round-trip assertable, and it stops a
-// future Codex build's new — possibly large — field from riding along unreviewed.
+// (`usage-snapshot.request.dto.ts` in the hb-ai-agent-portal repo, "stored as jsonb passthrough").
+// A NAMED list, never a spread of the whole block: the list is what makes the round-trip
+// assertable, and it stops a future Codex build's new — possibly large — field from riding along
+// unreviewed.
 //
 // What each one buys: `credits.*` is the difference between "out of window" and "out of money",
 // which today is only recoverable AFTER the fact from an insufficient_quota error
-// (delta-codex.mjs:106-118); `plan_type` is the server's own plan label for this reading;
-// `spend_control_reached` and `rate_limit_reached_type` say why a limit bit; `primary`/`secondary`
-// preserve the untranslated windows including the `window_minutes` that classified them.
+// (`classifyError` in delta-codex.mjs); `plan_type` is the server's own plan label for
+// this reading; `spend_control_reached` and `rate_limit_reached_type` say why a limit bit;
+// `primary`/`secondary` preserve the untranslated windows including the `window_minutes` that
+// classified them.
 //
 // `limit_name` and `individual_limit` are measured on the block and deliberately absent: they are
 // not on §4 G-4-9's list and carry nothing we can read.
@@ -137,8 +141,8 @@ function rawBlock(limits) {
   for (let i = 0; i < RAW_KEYS.length; i++) {
     const key = RAW_KEYS[i];
     // hasOwnProperty, not a bare lookup: `limits` is parsed off a file on disk, and an
-    // Object.prototype key like `constructor` would otherwise resolve to something that is not
-    // data at all. Same guard billing.mjs:99 puts on a reported plan label.
+    // Object.prototype key like `constructor` would otherwise resolve to something that is not data
+    // at all. Same guard `canonicalPlan` in lib/billing.mjs puts on a reported plan label.
     if (!Object.prototype.hasOwnProperty.call(limits, key)) continue;
     out[key] = limits[key];
     any = true;
@@ -176,14 +180,13 @@ export function rateLimitObservationFromRecord(rec) {
 }
 
 // The API deep-whitelists nested limit entries: the global pipe traverses @ValidateNested()
-// (usage-snapshot.request.dto.ts:16-18, :125-129), so ONE unknown key inside limits[] 400s the
-// whole snapshot — and a 400 breaks the drain WITHOUT clearing. This is the Claude plugin's
-// sanitizeLimit (beezi-claude-plugins/plugins/beezi/lib/usage-snapshot-report.mjs:19-30) verbatim
-// in shape: exactly the seven keys UsageSnapshotLimitDto declares, whatever the caller hands in.
-// JSON.stringify drops the undefined ones, so `window_minutes` — the classifier, which the DTO has
-// no column for — can never ride along even if someone passes a whole window object in.
-export function sanitizeLimit(l) {
-  const limit = l == null ? {} : l;
+// (`usage-snapshot.request.dto.ts` in the hb-ai-agent-portal repo), so ONE unknown key inside
+// limits[] 400s the whole snapshot — and a 400 breaks the drain WITHOUT clearing. This is the
+// Claude plugin's sanitizeLimit (lib/usage-snapshot-report.mjs in the beezi-claude-plugins repo)
+// verbatim in shape: exactly the seven keys UsageSnapshotLimitDto declares, whatever the caller
+// hands in. JSON.stringify drops the undefined ones, so `window_minutes` — the classifier, which
+// the DTO has no column for — can never ride along even if someone passes a whole window object in.
+export function sanitizeLimit(limit) {
   return {
     kind: limit.kind,
     group: limit.group,
@@ -218,7 +221,8 @@ function limitsFor(o) {
 // whitelisted `subscription_plan` that usage-report-codex.mjs resolves.
 //
 // null rather than absent for the two passthroughs is the shape the Claude plugin already ships
-// (usage-snapshot-report.mjs:158 posts `limits: null, raw: null`), and @IsOptional() skips a null.
+// (usage-snapshot-report.mjs in the beezi-claude-plugins repo posts `limits: null, raw: null`), and
+// @IsOptional() skips a null.
 function buildRow(o) {
   return {
     fetched_at: o.observedAt,
@@ -255,7 +259,7 @@ function seriesFor(state, limitId) {
 //
 //  * a tier canonicalPlan does not recognise is NOT stored. 'unknown' as a plan reads as a fact on
 //    the wire and would also leave billing.json permanently stale — the same failure `go` used to
-//    cause (billing.mjs:72-76).
+//    cause (`canonicalPlan` in lib/billing.mjs).
 //  * a `plan_type: null` reading (roughly two thirds of local observations, older Codex builds)
 //    returns null here, and the caller must then leave the stored value ALONE rather than clear it.
 function planLabelOf(observation) {
@@ -303,24 +307,25 @@ function recordObservationsLocked(observations, deps) {
   const pending = Array.isArray(state.pending) ? state.pending : [];
 
   // Rung 2 of the plan ladder, kept beside the debounce state because this file is root-level and
-  // survives pruneStale's 14-day sweep (paths.mjs:42-48) — the plan must outlive the queue it was
-  // observed alongside. The baseline only moves FORWARD in observation time, and only a reading
-  // that actually names a tier can move it: a null must leave the last known plan standing.
+  // survives pruneStale's 14-day sweep (`pruneStale` in lib/prune.mjs) — the plan must outlive the
+  // queue it was observed alongside. The baseline only moves FORWARD in observation time, and only
+  // a reading that actually names a tier can move it: a null must leave the last known plan
+  // standing.
   const storedPlan = state.observedPlan && typeof state.observedPlan === 'object'
     ? state.observedPlan : null;
   let observedPlan = storedPlan;
   let observedPlanMs = -1;
   if (storedPlan != null) {
-    const storedMs = Date.parse(orDefault(storedPlan.observedAt, ''));
-    if (!isNaN(storedMs)) observedPlanMs = storedMs;
+    const storedMs = parseTimestampMs(storedPlan.observedAt);
+    if (storedMs !== null) observedPlanMs = storedMs;
   }
 
   let recorded = 0;
   for (let i = 0; i < observations.length; i++) {
     const o = observations[i];
     const s = seriesFor(series, o.limitId);
-    const atMs = Date.parse(o.observedAt);
-    if (isNaN(atMs)) continue;
+    const atMs = parseTimestampMs(o.observedAt);
+    if (atMs === null) continue;
     // Before the debounce, deliberately: whether a READING is worth queueing says nothing about
     // whether the PLAN it names is worth remembering, and the plan is the cheaper of the two.
     const label = planLabelOf(o);

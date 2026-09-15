@@ -1,12 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir } from '../lib/paths.mjs';
 import { findSubagentRollouts } from '../lib/subagent-codex.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // G-7-1, end to end: a subagent spawned by ANOTHER SUBAGENT reaches the queue.
 //
@@ -21,17 +21,7 @@ import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
 // The sessions tree here is written under a per-test temp home and passed to the sweep explicitly,
 // so the real ~/.codex/sessions is never read.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-nest-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-nest-');
 
 const queued = () => fs.readdirSync(queueDir()).map((f) =>
   JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));

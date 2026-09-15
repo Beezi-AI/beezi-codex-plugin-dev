@@ -125,12 +125,16 @@ export function planChunks(sessionGroups, { maxItems = MAX_CHUNK_ITEMS, maxBytes
 // error filter only covers requests that reach the router — an over-limit or malformed body is
 // answered by Express itself with an HTML page, so `code`/`message` are null there and `raw`
 // carries a capped excerpt for the summary line.
-export async function readResponseBody(res) {
+//
+// Always { code, message, raw, body }: `body` is the parsed JSON when there was some, and null on
+// every other branch — unreadable, or not JSON at all — so a caller may read it without first
+// checking that the key exists.
+async function readResponseBody(res) {
   let raw = '';
   try {
     raw = await res.text();
   } catch {
-    return { code: null, message: null, raw: '' };
+    return { code: null, message: null, raw: '', body: null };
   }
   try {
     const body = JSON.parse(raw);
@@ -139,7 +143,7 @@ export async function readResponseBody(res) {
     const message = Array.isArray(msg) ? msg[0] : orDefault(msg, null);
     return { code: orDefault((body || {}).code, null), message, raw: raw.slice(0, 2000), body };
   } catch {
-    return { code: null, message: null, raw: raw.slice(0, 2000) };
+    return { code: null, message: null, raw: raw.slice(0, 2000), body: null };
   }
 }
 

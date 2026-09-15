@@ -6,11 +6,15 @@ import {
   mergeAccounts,
 } from './codex-app-server.mjs';
 import { UserError } from './friendly-error.mjs';
-import { orDefault } from './compat.mjs';
+import { boundedLabel, orDefault } from './compat.mjs';
 
 // The credential fields are short opaque labels. Anything token-shaped (a secret,
 // an over-long string, or embedded whitespace) is refused so a misdirected value
 // can never be persisted.
+//
+// Deliberately NOT built on boundedLabel: that helper RETURNS NULL for an over-long value, while
+// this one THROWS. Layering them would silently downgrade this refusal — the point of which is to
+// stop a secret being written — into a quietly dropped field.
 const TOKEN_LIKE = /sk-|\s/;
 
 function safeField(value) {
@@ -24,21 +28,14 @@ function safeField(value) {
 }
 
 // The identity billing.json carries alongside the plan. Same bounds the two DTOs state
-// (@MaxLength 64 on accountUuid, 320 on email); an oversized value is DROPPED, never truncated —
-// a truncated uuid names a DIFFERENT account.
+// (@MaxLength 64 on accountUuid, 320 on email); boundedLabel (lib/compat.mjs) drops an oversized
+// value rather than truncating it, because a truncated uuid names a DIFFERENT account.
 //
 // It is persisted at all because tier 1 is the only source of an account id on a machine whose
 // credentials never touch auth.json, and the probe runs at most weekly. Without a home in
 // billing.json the id would exist for exactly the one session that spawned the probe.
 const MAX_ACCOUNT_ID = 64;
 const MAX_ACCOUNT_EMAIL = 320;
-
-function boundedLabel(value, max) {
-  if (value === null || value === undefined) return null;
-  const s = String(value).trim();
-  if (s === '' || s.length > max) return null;
-  return s;
-}
 
 // A capture that learned no identity must not ERASE the one already recorded: the self-report path
 // (`--plan`) never knows an account id, and it rewrites the whole config.
@@ -100,10 +97,10 @@ function declaredSource(declared, existingConfig, env, deps) {
 }
 
 // `deps` is the fifth parameter, threaded to BOTH resolveSource calls below (G-10-1 L1). Dropped,
-// step 4 of the ladder (billing-config.mjs:110-118) opens the real ~/.codex/auth.json through
-// codexAuthFile(), so a caller that injected every other resolver still resolves billing off the
-// host machine. Two seams are honoured: `deps.resolveSource` replaces the ladder wholesale (what
-// runSessionStart injects, so its outer and inner resolutions cannot disagree), and
+// step 4 of the ladder (`resolveSource` in billing-config.mjs) opens the real ~/.codex/auth.json
+// through codexAuthFile(), so a caller that injected every other resolver still resolves billing
+// off the host machine. Two seams are honoured: `deps.resolveSource` replaces the ladder wholesale
+// (what runSessionStart injects, so its outer and inner resolutions cannot disagree), and
 // `deps.readCodexAuthSignals` replaces only step 4's read of auth.json.
 export function buildConfig(args, env = process.env, now = new Date(), existingConfig = null, deps = {}) {
   if (args.plan != null) {
@@ -148,7 +145,7 @@ export function buildConfig(args, env = process.env, now = new Date(), existingC
     source,
     subscriptionType: isSub ? subscriptionType : null,
     rateLimitTier: isSub ? rateLimitTier : null,
-    plan: isSub ? normalizePlan(subscriptionType, rateLimitTier) : null,
+    plan: isSub ? normalizePlan(subscriptionType) : null,
     credentialsExpiresAt: Number.isFinite(expiresAt) ? expiresAt : null,
     capturedAt: now.toISOString(),
     capturedBy: via,
@@ -166,27 +163,17 @@ export function shouldKeepExisting(freshConfig, existingConfig) {
     && existingConfig.plan !== 'unknown';
 }
 
-// Read the ChatGPT plan and account id, and build the config to persist.
+// Read the ChatGPT plan and account id, and build the config to persist. CLAUDE.md states the
+// three-tier ladder (`codex app-server`, the auth.json id_token decode, the user's own answer) and
+// the single-definition rule over it. The tiers meet in mergeAccounts, which produces ONE account
+// object shaped exactly like tier 2's, so every consumer below this line is unchanged.
 //
-// THREE TIERS, in order, because no single one covers every machine:
+// THE EXPIRY RULE lives here, not in either caller, because when it lived in only one of them the
+// nudge it produces sent the user to the caller that did not have it — which wrote the bad plan
+// back. It is tier 2's rule alone: a live tier-1 reading has no expiry to go stale.
 //
-//   1. `codex app-server` — ask Codex itself (lib/codex-app-server.mjs). Live, and it works on a
-//      machine whose credentials never touch auth.json because Codex kept them in the OS keychain
-//      or only in its own memory. Costs one short-lived subprocess, bounded by a timeout.
-//   2. ~/.codex/auth.json — the id_token decode (lib/codex-account.mjs). Kept, not replaced: the
-//      app-server command documents itself as `[experimental]`, and this tier costs one small read.
-//   3. The user's own answer — skills/login/SKILL.md step 3, unchanged. Reached only when neither
-//      tier above named a plan, and recorded as `selfReported` so nothing here overwrites it.
-//
-// The tiers meet in mergeAccounts, which produces ONE account object shaped exactly like tier 2's,
-// so every consumer below this line is unchanged.
-//
-// Shared by the SessionStart hook and scripts/billing-capture.mjs deliberately: both do this, and
-// when the expiry rule below lived in only one of them, the nudge it produces sent the user
-// straight to the caller that did not have it — which promptly wrote the bad plan back.
-//
-// The expiry rule: the plan in auth.json is a SNAPSHOT, not a live lookup, and it goes stale in
-// place. Measured on a real machine, an id_token that expired three days earlier still asserted
+// The plan in auth.json is a SNAPSHOT, not a live lookup, and it goes stale in place. Measured on
+// a real machine, an id_token that expired three days earlier still asserted
 // `chatgpt_plan_type: "free"` with a subscription window six weeks past. Believing that files a
 // paying user under `free` — and `free` is a valid plan, so it then looks settled enough that
 // nothing ever asks again. So the EXPIRY is kept and the LABEL is not: an expired claim records
@@ -198,8 +185,8 @@ export function shouldKeepExisting(freshConfig, existingConfig) {
 // caller that has already resolved an environment can hand its own over (G-10-1 L3);
 // runSessionStart does, and scripts/billing-capture.mjs deliberately takes the default.
 //
-// ASYNC because tier 1 is a subprocess. Both callers already await it; nothing on the checkpoint
-// hot path calls this, so no hot path grew a spawn — see the gate at lib/session-start.mjs.
+// ASYNC because tier 1 is a subprocess. Nothing on the checkpoint hot path calls this, so no hot
+// path grew a spawn — see the gate at lib/session-start.mjs.
 //
 // Returns { config, reason, tier }; `config` is null unless there is something to write.
 // reason ∈ no-account | kept-self-reported | expired-claim | captured.
@@ -234,9 +221,10 @@ export async function captureFromCodexAccount({
   // and it removes the window in which the two reads could disagree about the same file.
   //
   // `hasStoredApiKey` is load-bearing, not decoration: auth_mode is null under a ChatGPT sign-in
-  // (codex-account.mjs), so billing-config.mjs:118 is genuinely reached with authMode === null.
-  // Signals synthesized without it resolve a machine holding a stored key to `unknown` instead of
-  // `openai_api_key`, and syncBillingSource then writes that wrong source into billing.json.
+  // (codex-account.mjs), so `resolveSource`'s stored-key rung is genuinely reached with authMode
+  // === null. Signals synthesized without it resolve a machine holding a stored key to `unknown`
+  // instead of `openai_api_key`, and syncBillingSource then writes that wrong source into
+  // billing.json.
   const signals = {
     authMode: orDefault(account.authMode, null),
     hasStoredApiKey: account.hasStoredApiKey === true,

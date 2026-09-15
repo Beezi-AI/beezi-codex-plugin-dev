@@ -19,14 +19,16 @@ import { syncAccountIfNeeded } from './account-sync.mjs';
 // tool, whose process owns stdout for JSON-RPC and must not print a single byte. Hence `onStep`
 // rather than console.log — the default is silence, and only the CLI opts into output.
 
-// Non-blocking, but *observed*. It stays async — this used to be execFileSync, which is harmless
-// in a CLI but blocks the event loop of the MCP server that now also signs in; cold PowerShell
-// costs several hundred ms, during which readline stops draining stdin and the loopback listener
-// cannot accept the very callback we are waiting for. It is no longer detached-and-forgotten
-// though: a launcher that fails is the difference between "a tab opened" and a user staring at a
-// spinner, and under a sandboxed shell (Codex sandboxes what it runs) or a machine with no http
-// association, failing silently leaves nothing to go on. Resolves { ok } | { ok: false, detail }.
-function launch(file, args, env, { timeoutMs = LAUNCH_TIMEOUT_MS } = {}) {
+// The launcher timeout. Declared above its use rather than relying on hoisting.
+const LAUNCH_TIMEOUT_MS = 5000;
+
+// Non-blocking, but *observed*. NEVER SYNCHRONOUS: this also runs inside the MCP server, and a
+// synchronous spawn blocks its event loop — cold PowerShell costs several hundred ms, during which
+// readline stops draining stdin and the loopback listener cannot accept the very callback we are
+// waiting for. Not detached-and-forgotten either: under a sandboxed shell (Codex sandboxes what it
+// runs) or on a machine with no http association, a launcher that fails silently leaves the user
+// staring at a spinner with nothing to go on. Resolves { ok } | { ok: false, detail }.
+function launch(file, args, env) {
   return new Promise((resolve) => {
     let child;
     try {
@@ -53,15 +55,13 @@ function launch(file, args, env, { timeoutMs = LAUNCH_TIMEOUT_MS } = {}) {
     };
     // The launcher only asks the OS to open a URL, so it should exit immediately. If it does not,
     // treat the launch as unobserved rather than waiting: the caller has already shown the URL.
-    const timer = setTimeout(() => settle({ ok: true }), timeoutMs);
+    const timer = setTimeout(() => settle({ ok: true }), LAUNCH_TIMEOUT_MS);
     if (timer.unref) timer.unref();
     child.on('error', (error) => settle({ ok: false, detail: orDefault((error || {}).message, String(error)) }));
     child.on('exit', (code) =>
       settle(code === 0 ? { ok: true } : { ok: false, detail: stderr.trim() || `launcher exited ${code}` }));
   });
 }
-
-const LAUNCH_TIMEOUT_MS = 5000;
 
 // Ask the OS to open `url` in the user's browser. Resolves { ok } | { ok: false, detail } — never
 // rejects, and never throws: the caller has the URL and can always fall back to showing it.

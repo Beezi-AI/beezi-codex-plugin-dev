@@ -1,6 +1,6 @@
 {
   "name": "beezi",
-  "version": "0.10.1-local.5227",
+  "version": "0.10.18-local.5234",
   "private": true,
   "type": "module",
   "description": "Beezi analytics + ticket-drafting plugin for Codex.",

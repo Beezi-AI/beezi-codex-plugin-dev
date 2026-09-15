@@ -90,7 +90,7 @@ const RATE_LIMITS = {
 };
 
 function run(spawn, env = {}, extra = {}) {
-  return readAccountViaAppServer({ env, timeoutMs: 200, deps: { spawn }, ...extra });
+  return readAccountViaAppServer({ env, timeoutMs: 200, spawn, ...extra });
 }
 
 test('reads the plan from account/read and the account id from account/rateLimits/read', async () => {
@@ -349,7 +349,7 @@ const FILE_ACCOUNT = {
   email: 'stale@example.com',
 };
 
-test('a live app-server answer outranks the auth.json decode', () => {
+test('mergeAccounts — a live app-server answer outranks the auth.json decode', () => {
   const live = {
     ok: true, authType: 'chatgpt', plan: 'plus', subscriptionType: 'plus',
     accountId: 'live-uuid', email: 'live@example.com',

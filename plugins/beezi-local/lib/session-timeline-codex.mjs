@@ -1,11 +1,12 @@
 import { fetchCompat } from './fetch-compat.mjs';
 import fs from 'fs';
 import { timelineWaits, isBackgroundNotification, isTimelineUserPrompt } from './timeline-waits-codex.mjs';
+import { toolNamesFromProgram } from './exec-program.mjs';
+import { parseArgs } from './operations-codex.mjs';
 import { IDLE_GAP_SEC } from './timing.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
-import { readAgents as _readAgents } from './subagent-state.mjs';
-import { orDefault } from './compat.mjs';
+import { orDefault, parseTimestampMs } from './compat.mjs';
 
 // Whole-session activity timeline, derived from a Codex rollout. Same output contract as the Claude
 // engine ({ periods, plan_events, subagents, started_at, ended_at, generated_at }), so the server
@@ -62,28 +63,23 @@ function tsOf(rec) {
   return Number.isFinite(ms) ? ms : null;
 }
 
-// A genuine user turn-start: legacy user_message or modern item_completed/UserMessage.
-// the injected AGENTS.md / user-instructions preamble is a `response_item` message and is ignored.
-function isRealUserPrompt(rec) {
-  return isTimelineUserPrompt(rec);
-}
-
 // Esc. Codex records it as `event_msg/turn_aborted` — 79 occurrences locally, `reason:'interrupted'`
 // on 79/79, so the reason is not worth matching on and matching it would only add a way to miss a
 // future one.
 //
 // The `rec.type === 'event_msg'` guard is the load-bearing part: `<turn_aborted>…</turn_aborted>`
-// also appears as literal *prose* inside a developer `response_item` message (54 occurrences, all on
-// `response_item/message` and 0 on `event_msg/user_message`), and that prose is not an interrupt.
-// The same distinction is already drawn for session naming at lib/session-name-codex.mjs:236.
+// also appears as literal *prose* inside a developer `response_item` message (54 occurrences, all
+// on `response_item/message` and 0 on `event_msg/user_message`), and that prose is not an
+// interrupt. The same distinction is already drawn for session naming by `isSafeSessionName` in
+// lib/session-name-codex.mjs, whose `/^</` rule rejects the same prose.
 function isInterrupt(rec) {
   return (rec || {}).type === 'event_msg' && (rec.payload || {}).type === 'turn_aborted';
 }
 
-// Substring, not equality — the same latitude the Claude engine takes (session-timeline.mjs:14), so
-// a rename to 'plan_mode' or 'planning' still classifies instead of silently falling back to
-// `working` and dropping the dimension. None of the other observed kinds — 'default', 'custom',
-// 'code' — contains 'plan', so the looseness costs nothing.
+// Substring, not equality — the same latitude the Claude engine takes (`session-timeline.mjs` in
+// the beezi-claude-plugins repo), so a rename to 'plan_mode' or 'planning' still classifies instead
+// of silently falling back to `working` and dropping the dimension. None of the other observed
+// kinds — 'default', 'custom', 'code' — contains 'plan', so the looseness costs nothing.
 function isPlanMode(mode) {
   return typeof mode === 'string' && mode.toLowerCase().indexOf('plan') !== -1;
 }
@@ -133,7 +129,7 @@ function buildPeriods(records) {
     // never reorder the chain, and it stays correct if Codex ever routes an abort through
     // `user_message`. Measured today: 0 of 79 aborts arrive as `user_message`, so this is a guard,
     // not a reclassification.
-    anchors.push({ ts: ms, isPrompt: isRealUserPrompt(rec) && !isInterrupt(rec),
+    anchors.push({ ts: ms, isPrompt: isTimelineUserPrompt(rec) && !isInterrupt(rec),
       isBackground: isBackgroundNotification(rec), mode: currentMode });
   }
   anchors.sort((a, b) => a.ts - b.ts);
@@ -160,7 +156,7 @@ function buildPeriods(records) {
     else if (gapMs >= IDLE_GAP_SEC * 1000) state = STATE.IDLE;
     // Planning last, below idle and waiting_user deliberately: a five-minute silence inside plan
     // mode is still idle, and a plan sitting unapproved is the human's time, not more planning.
-    // Same rank as session-timeline.mjs:502-503.
+    // Same rank as `session-timeline.mjs` in the beezi-claude-plugins repo gives it.
     else if (isPlanMode(cur.mode)) state = STATE.PLANNING;
     else state = STATE.WORKING;
 
@@ -176,19 +172,14 @@ function buildPeriods(records) {
   }));
 }
 
-function parseArgs(raw) {
-  if (raw && typeof raw === 'object') return raw;
-  if (typeof raw !== 'string') return null;
-  try { return JSON.parse(raw); } catch { return null; }
+// `tools.update_plan(` inside a unified-exec program. G-5-2's `toolNamesFromProgram`
+// (lib/exec-program.mjs) is the one census of which tools a program called, and it keys on the same
+// literal `tools.` prefix — which is what separates the call from the same words appearing in
+// prose. The question asked here is the narrow one: "did this program call update_plan". Measured:
+// 13 occurrences across 2 local rollouts, which is the whole population the appendix counted.
+function execCallsUpdatePlan(source) {
+  return toolNamesFromProgram(source).indexOf('update_plan') !== -1;
 }
-
-// `tools.update_plan(` inside a unified-exec program. A local regex rather than G-5-2's
-// `toolNamesFromProgram` because that helper lives in a module this file cannot depend on yet;
-// swap it in once it lands. The question asked here is narrower than a general tool-name census —
-// "did this program call update_plan" — and the literal `tools.` prefix is what separates the call
-// from the same words appearing in prose. Measured: 13 occurrences across 2 local rollouts, which
-// is the whole population the appendix counted.
-const EXEC_UPDATE_PLAN = /\btools\.update_plan\s*\(/;
 
 // Codex has emitted plan activity three ways, and which one you see is purely a question of build:
 //
@@ -219,7 +210,7 @@ function planMarkersOf(rec) {
     return { start: true, ready: plan.length > 0 && plan.every((s) => (s || {}).status === 'completed') };
   }
   if (p.type === 'custom_tool_call' && p.name === 'exec' && typeof p.input === 'string') {
-    return EXEC_UPDATE_PLAN.test(p.input) ? { start: true, ready: false } : null;
+    return execCallsUpdatePlan(p.input) ? { start: true, ready: false } : null;
   }
   return null;
 }
@@ -262,6 +253,8 @@ function buildPlanEvents(records) {
   return events;
 }
 
+const MAX_SUBAGENTS = 1000;
+
 // One active span per subagent, from the records the SubagentStart/SubagentStop hooks left behind.
 //
 // The span cannot come from the transcript: Codex writes a subagent to its own top-level rollout,
@@ -273,16 +266,14 @@ function buildPlanEvents(records) {
 // own end. That is the last moment we have evidence anything was alive, it can never overflow the
 // parent's bar, and it is self-correcting: the timeline is re-derived and re-sent at every turn end,
 // so the true end lands as soon as the agent finishes.
-const MAX_SUBAGENTS = 1000;
-
 function buildSubagents(agents, fallbackEndMs) {
   const out = [];
   for (const [agentId, rec] of Object.entries(agents || {})) {
-    const started = Date.parse(orDefault((rec || {}).started_at, ''));
+    const started = parseTimestampMs((rec || {}).started_at);
     // No start means no span the server would accept; drop it rather than invent one.
-    if (!Number.isFinite(started)) continue;
-    const ended = Date.parse(orDefault((rec || {}).ended_at, ''));
-    const endMs = Number.isFinite(ended) ? ended : fallbackEndMs;
+    if (started === null) continue;
+    const ended = parseTimestampMs((rec || {}).ended_at);
+    const endMs = ended === null ? fallbackEndMs : ended;
     out.push({
       agent_id: String(agentId).slice(0, 200),
       agent_type: rec && rec.agent_type ? String(rec.agent_type).slice(0, 100) : null,
@@ -313,10 +304,19 @@ export function computeSessionTimeline(transcriptPath, sessionId = null, deps = 
   }
   if (minTs === Infinity) return null;
 
+  // `deps.readAgents` is REQUIRED alongside a sessionId — both callers (checkpoint and the audit)
+  // hand over the agent map they just built, sweep entries included, rather than letting this
+  // re-read the (possibly pruned) sidecars. No sessionId means no lookup and no subagent spans.
+  //
+  // The check is outside the try on purpose: a miswired caller must fail loudly, not be handed an
+  // empty subagent array that looks exactly like a session that spawned none. The try covers only
+  // the read, where a pruned or unreadable sidecar directory legitimately answers with nothing.
   let agents = {};
   if (sessionId) {
-    const readAgents = orDefault(deps.readAgents, _readAgents);
-    try { agents = readAgents(sessionId); } catch { agents = {}; }
+    if (typeof deps.readAgents !== 'function') {
+      throw new TypeError('computeSessionTimeline needs deps.readAgents when a sessionId is given');
+    }
+    try { agents = deps.readAgents(sessionId); } catch { agents = {}; }
   }
   const subagents = buildSubagents(agents, maxTs);
 
@@ -330,8 +330,9 @@ export function computeSessionTimeline(transcriptPath, sessionId = null, deps = 
   };
 }
 
-// POST the session timeline to Beezi. Session-scoped (upserted by sessionId), fire-and-forget by
-// convention — callers swallow the result.
+// POST the session timeline to Beezi. Session-scoped (upserted by sessionId). The result is read:
+// `runLockedCheckpoint` in checkpoint.mjs destructures `{ reported }` and branches on it, so a
+// `reported: false` reason has to stay accurate.
 export async function postSessionTimeline(payload, token, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   if (!payload || !payload.sessionId || !Array.isArray(payload.periods)) {

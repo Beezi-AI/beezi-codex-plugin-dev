@@ -61,8 +61,8 @@ function fileKey(filePath) {
   return String(filePath).split('\\').join('/').toLowerCase();
 }
 
-// Claude's rule (beezi-claude-plugins lib/code-changes.mjs:4-7), copied so whole-file adds and
-// deletes are counted identically on both platforms: strip exactly one trailing newline, split.
+// Claude's rule (lib/code-changes.mjs in the beezi-claude-plugins repo), copied so whole-file adds
+// and deletes are counted identically on both platforms: strip exactly one trailing newline, split.
 function lineCount(s) {
   if (typeof s !== 'string' || s === '') return 0;
   return s.replace(/\n$/, '').split('\n').length;

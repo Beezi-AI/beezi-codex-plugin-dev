@@ -56,7 +56,7 @@ test('F3: a retained observation with a pruned cursor consults coverage before r
   write(file, records.slice(0, 5));
   await runCheckpoint({ session_id: id, cwd: dir }, deps, { skipFlush: true, sink: p => sent.push(p) });
   const stat = fs.statSync(file), before = Date.now() - 15 * 86400000;
-  watcher.saveObservations({ version: 1, sessions: { [id]: { mtimeMs: stat.mtimeMs, size: stat.size, at: before } }, children: {} }, {});
+  watcher.saveObservations({ version: 1, sessions: { [id]: { mtimeMs: stat.mtimeMs, size: stat.size, at: before } }, children: {} });
   const state = path.join(paths.stateDir(), `${id}.json`);
   fs.utimesSync(state, before / 1000, before / 1000); pruneStale();
   assert.equal(fs.existsSync(state), false);

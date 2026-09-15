@@ -4,14 +4,10 @@ import { friendlyMessage } from '../lib/friendly-error.mjs';
 // Dead entries are reported in EVERY branch, including `installed`.
 //
 // Codex spawns a registered hook whether or not its target still exists, and a failed spawn is
-// reported as `hook: <Event> Failed` for the whole event — so one orphan left by a variant the
-// user has since removed breaks that event's reporting for every session on the machine. This
-// block is the only thing that names it: `state` is owner-scoped by design, so the owner that can
-// see the orphan is usually not the owner that can remove it.
-//
-// It no longer asks the user to go and run the OTHER variant's uninstall. That instruction was
-// unanswerable in the shape that produced it — the variant that left the orphans was one the user
-// had already removed, so there was nothing left to run. `install` sweeps them itself now.
+// reported as `hook: <Event> Failed` for the whole event — so one orphan left by a variant the user
+// has since removed breaks that event's reporting for every session on the machine. This block is
+// the only thing that names it: `state` is owner-scoped by design, so the owner that can see the
+// orphan is usually not the owner that can remove it. `install` sweeps them itself.
 function reportBroken(status) {
   if (!status.broken || !status.broken.length) return;
 

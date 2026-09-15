@@ -2,12 +2,17 @@ import { ensureEnvironmentMigrated } from './env-migration.mjs';
 import { orDefault } from './compat.mjs';
 
 // ── The entry-point guard (R1) ──────────────────────────────────────────────────────────────
+// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 //
-// Validate each operation: resident MCP processes may span recovery and migrations.
-// A refused check is retryable; authentication must not replace the evidence before this check.
+// THE RULE, stated once for every entry point: no upload, no drain and no credential work while the
+// data root is mid-cutover or its environment cannot be established. Hooks reach it through
+// hookMayProceed(), CLI scripts through cliMayProceed() (which prints the reason it refuses), and
+// SessionStart also surfaces environmentNotice().
+//
+// Validated per OPERATION, not once per process: a resident MCP server spans recovery and
+// migrations. A refused check is retryable; authentication must not replace the evidence first.
 
 export function checkEnvironment(deps = {}) {
-  // Resident MCP processes can span recovery or a migration. Revalidate every operation.
   const ensure = orDefault(deps.ensureEnvironmentMigrated, ensureEnvironmentMigrated);
   let result;
   try {
@@ -27,8 +32,18 @@ export function checkEnvironment(deps = {}) {
   return result;
 }
 
-/** Test seam only: forget the memoized answer. */
-export function resetEnvironmentCheck() {
+/**
+ * Does this caller want the environment guard run at all?
+ *
+ * One predicate, two call sites (getAuthentication in lib/token.mjs, runWatchPass in
+ * lib/rollout-watcher.mjs), because the triple-negated form was duplicated and read backwards.
+ * `workKey` is the module's real-work seam and `guardKey` its guard seam: a caller that injected
+ * the work seam is a test standing in for the whole operation and skips the guard, UNLESS it also
+ * injected a guard of its own, which is the test that wants the refusal exercised. Production
+ * injects neither, so the guard always runs.
+ */
+export function shouldCheckEnvironment(deps, workKey, guardKey) {
+  return !deps[workKey] || Boolean(deps[guardKey]);
 }
 
 /**

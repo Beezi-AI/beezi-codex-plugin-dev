@@ -7,20 +7,14 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { beeziCodexHome } from './paths.mjs';
 import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
-import { orDefault } from './compat.mjs';
+import { boundedLabel, orDefault, parseTimestampMs } from './compat.mjs';
 
 // The vendor-generic account check-in (G-2-1).
 //
-// WHAT IT BUYS, precisely — the machine already appears in the portal without it, because there is
-// no registration endpoint: the portal mints a machine from the X-Beezi-Host / X-Beezi-Client
-// headers machine-identity.mjs puts on every authenticated request. Three things it does buy:
-//   1. `last_seen_at` on the ACCOUNT row. Without a check-in a machine whose account never changes
-//      goes silent forever after its first one.
-//   2. A moment at which an account switch propagates. A user who signs out of one ChatGPT account
-//      and into another otherwise keeps the old accountUuid and plan on the portal indefinitely,
-//      while their usage rows (which carry account_uuid per row) move — and the two then disagree.
-//   3. A plan change with no usage behind it. A machine idle for a billing period never tells the
-//      portal it moved from Free to Plus, because plan only travels attached to a usage row.
+// Not registration — the portal already mints the machine from the headers machine-identity.mjs
+// sends. This refreshes `last_seen_at` on the ACCOUNT row, propagates an account switch (usage rows
+// carry account_uuid and would otherwise drift from the portal's copy), and reports a plan change
+// on an idle machine, where plan has no usage row to travel on.
 //
 // Best-effort by contract: it never throws, it is bounded by postJson's own timeout, and it
 // swallows every failure. An older API answering 404 is as harmless as being offline.
@@ -36,15 +30,8 @@ export const RESYNC_MS = 7 * 24 * 60 * 60 * 1000;
 // /me/codex/* routes: the server reads the vendor off the X-Beezi-Agent header that
 // machineHeaders() already sends (AGENT === 'codex'), maps it to its OpenAI vendor, and both
 // plugins therefore share one account-row shape. There is no vendor field in the body.
-//
-// Resolved through ENDPOINTS when that entry exists, with the literal as the floor. The entry is a
-// one-line addition to lib/config.mjs that is sequenced separately from this module; reading it
-// this way means the module works on both sides of that landing and its behaviour does not change
-// when it does.
-export const ACCOUNT_SYNC_PATH = '/me/cli-agent/account';
-
 export function accountSyncPath() {
-  return orDefault(ENDPOINTS.accountSync, ACCOUNT_SYNC_PATH);
+  return ENDPOINTS.accountSync;
 }
 
 // Hash + timestamp of the last check-in the SERVER confirmed. Root-level, NOT under state/:
@@ -53,10 +40,7 @@ export function accountSyncPath() {
 // usageObservationsFile().
 //
 // It joins onto beeziCodexHome() exactly as every accessor in lib/paths.mjs does, so the
-// environment suffix and the BEEZI_CODEX_HOME override both apply to it unchanged. It lives here
-// rather than there because lib/paths.mjs's export surface is swept wholesale by
-// test/hermetic.test.mjs's L2 check and is owned by a different change; moving it is a mechanical
-// follow-up, not a behavioural one.
+// environment suffix and the BEEZI_CODEX_HOME override both apply to it unchanged.
 export function accountSyncStateFile() {
   return path.join(beeziCodexHome(), 'account-sync.json');
 }
@@ -68,24 +52,11 @@ export function accountSyncStateFile() {
 // coincidence rather than a contract — generalizing from one to the other is exactly the mistake
 // that ships a 400.
 //
-// An oversized value is DROPPED, never truncated. A truncated uuid names a different account, and
-// an over-long one fails validation, which under the API's forbidNonWhitelisted pipe refuses the
-// WHOLE check-in rather than the one field.
+// The bounds this check-in states. boundedLabel (lib/compat.mjs) enforces them: an oversized value
+// is DROPPED, never truncated, for the reason recorded there.
 const MAX_ACCOUNT_UUID = 64;
 const MAX_ACCOUNT_EMAIL = 320;
 const MAX_SUBSCRIPTION_TYPE = 50;
-
-function label(value) {
-  if (value === null || value === undefined) return null;
-  const s = String(value).trim();
-  return s === '' ? null : s;
-}
-
-function bounded(value, max) {
-  const s = label(value);
-  if (s === null) return null;
-  return s.length > max ? null : s;
-}
 
 // Which plan, if any, this check-in may claim.
 //
@@ -104,12 +75,12 @@ function bounded(value, max) {
 // never filed under a plan a stale snapshot claimed.
 function resolveSubscriptionType(config, account, nowMs) {
   if (config !== null && config !== undefined) {
-    return bounded(config.subscriptionType, MAX_SUBSCRIPTION_TYPE);
+    return boundedLabel(config.subscriptionType, MAX_SUBSCRIPTION_TYPE);
   }
   if (account === null || account === undefined) return null;
   const expiresAt = account.expiresAt;
   if (typeof expiresAt === 'number' && expiresAt <= nowMs) return null;
-  return bounded(account.subscriptionType, MAX_SUBSCRIPTION_TYPE);
+  return boundedLabel(account.subscriptionType, MAX_SUBSCRIPTION_TYPE);
 }
 
 // The check-in body. Built from values the plugin has ALREADY parsed — one small read of
@@ -119,8 +90,7 @@ function resolveSubscriptionType(config, account, nowMs) {
 // EVERY key here is one CliAgentAccountSyncRequestDto whitelists, and nothing else travels. That
 // DTO is validated with forbidNonWhitelisted, so a single unknown key 400s the entire check-in;
 // unlike the usage drain there is no queue to stall behind it, which makes the failure silent and
-// permanent-looking. `options.via` in particular names the caller for local reasoning only and is
-// NEVER part of the wire body.
+// permanent-looking.
 //
 // DELIBERATELY ABSENT:
 //   rateLimitTier — Anthropic-shaped. On Codex `subscriptionType` IS the plan and the tier is
@@ -145,7 +115,7 @@ export function buildAccountSyncPayload({ config = null, account = null, now = D
   // billing.json first, ~/.codex/auth.json second — the same precedence lib/account-identity.mjs
   // states, and for the same reason: the config is the only place a `codex app-server` identity is
   // written down, and on a keychain-only machine auth.json names no account at all.
-  const field = (source, key, max) => bounded(
+  const field = (source, key, max) => boundedLabel(
     source === null || source === undefined ? null : source[key],
     max,
   );
@@ -185,7 +155,7 @@ export function payloadHash(payload) {
   return crypto.createHash('sha256').update(canonicalJson(payload)).digest('hex');
 }
 
-export function readAccountSyncState(deps = {}) {
+function readAccountSyncState(deps = {}) {
   const read = orDefault(deps.readJsonImpl, readJson);
   let raw = null;
   try {
@@ -206,8 +176,8 @@ function writeAccountSyncState(state, deps = {}) {
 
 function dueForResync(state, nowMs) {
   const stamp = state === null || state === undefined ? null : state.lastSyncedAt;
-  const at = Date.parse(orDefault(stamp, ''));
-  if (Number.isNaN(at)) return true;
+  const at = parseTimestampMs(stamp);
+  if (at === null) return true;
   // A stamp from the future is a clock change, not a fresh sync.
   return nowMs - at > RESYNC_MS || at > nowMs;
 }

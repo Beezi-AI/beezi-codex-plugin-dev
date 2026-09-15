@@ -3,6 +3,7 @@ import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
+import { fail, plural } from '../lib/cli.mjs';
 
 // The repeatable history repair pass (G-3-3 engine, G-9-3 surface).
 //
@@ -19,13 +20,6 @@ import { cliMayProceed } from '../lib/env-guard.mjs';
 //   --force exists on the import to skip the LOCAL seal caches. There is no seal on this path to
 //   force past, so accepting the flag would only advertise a bypass that does not exist — and
 //   invite the model to reach for it the moment the one-time import refuses.
-
-function fail(message) {
-  console.error(`✗ ${message}`);
-  process.exit(1);
-}
-
-const plural = (n, word) => `${n} ${word}${n === 1 ? '' : 's'}`;
 
 function parseSyncArgs(argv) {
   for (const flag of argv) {
@@ -46,8 +40,6 @@ function parseSyncArgs(argv) {
 }
 
 async function main() {
-  // R1: no upload, no drain and no credential work while the data root is mid-cutover or its
-  // environment cannot be established. cliMayProceed() prints the reason it refuses.
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   const options = parseSyncArgs(process.argv.slice(2));
 

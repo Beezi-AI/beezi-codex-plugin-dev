@@ -15,9 +15,9 @@ import url from 'url';
 // Codex's own roots (`codexHome()` and its children, further down) are NOT suffixed: they belong
 // to Codex, not to this plugin, and both variants read the same transcripts.
 
-// The only environment names that may reach a filesystem path or a PowerShell credential
-// template. '' is production. An unlisted name is a broken build — never a silent fall-through
-// to production (R1), and never interpolated anywhere.
+// The only environment names that may reach a filesystem path or a PowerShell credential template.
+// '' is production. An unlisted name is a broken build — never a silent fall-through to production
+// (R1), and never interpolated anywhere. R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 export const KNOWN_ENVIRONMENTS = Object.freeze(['', 'dev', 'staging', 'local']);
 
 // The variant builder (G-1-7) writes `env.json` beside package.json when it stamps a variant; the
@@ -141,8 +141,9 @@ function resolveEnvironment(options) {
     return { error: `env.json declares environment '${describeName(baked)}' but no apiBase` };
   }
 
-  // Published from a tested schema for G-8-4 (blocked upstream); deliberately not wired to a
-  // reader yet. Validating it here is what stops a variant shipping a key nothing can use.
+  // Published from a tested schema for G-8-4 and read by `environmentManifestUrl()` in
+  // lib/update-check.mjs. Validating it here is what stops a variant shipping a key nothing can
+  // use.
   const manifest = file.value.updateManifestUrl;
   let updateManifestUrl = null;
   if (manifest !== undefined && manifest !== null) {
@@ -227,12 +228,11 @@ export const environment = Object.freeze({
 // captured a subscription plan last winning `billing.json` for both. Same reasoning as the
 // `beezi-codex` keyring entry — one store per agent, no exceptions.
 //
-// The environment suffix lands here and nowhere else below: every accessor joins onto this root,
-// so a dev or staging install gets `~/.beezi-codex-staging` and cannot see production's state.
-// `BEEZI_CODEX_HOME` remains an explicit FULL-ROOT override — a caller running two environments
-// must supply two distinct roots. Sharing one is caught by the environment stamp
-// lib/credentials.mjs binds to the stored credentials, which withholds the token and so prevents
-// the upload rather than letting it proceed across the binding (R1).
+// The environment suffix is applied here, so a dev or staging install gets `~/.beezi-codex-staging`
+// and cannot see production's state. `BEEZI_CODEX_HOME` remains an explicit FULL-ROOT override — a
+// caller running two environments must supply two distinct roots. Sharing one is caught by the
+// environment stamp lib/credentials.mjs binds to the stored credentials, which withholds the
+// token and so prevents the upload rather than letting it proceed across the binding (R1).
 export function beeziCodexHome() {
   const suffix = envSuffix(); // asserts first: an unresolved environment names no root at all
   return process.env.BEEZI_CODEX_HOME || path.join(os.homedir(), `.beezi-codex${suffix}`);

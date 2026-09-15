@@ -6,7 +6,8 @@ import { beeziCodexHome } from './paths.mjs';
 import { orDefault } from './compat.mjs';
 import { safeFileName } from './fs-store.mjs';
 
-// One lock contract for every Beezi Codex writer (G-8-3 / R3).
+// One lock contract for every Beezi Codex writer (G-8-3 / R3). R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // WHY THIS IS NOT THE CLAUDE PORT
@@ -88,12 +89,12 @@ import { safeFileName } from './fs-store.mjs';
 // LOCK KINDS AND LOCK ORDER
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // A global election lock only excludes other watchers; it does nothing about a Stop hook writing
-// the same session's state underneath one. Two kinds are therefore needed, plus two narrower ones,
-// and they are ranked coarse-to-fine. Acquiring a lock of equal or finer rank than one this
+// the same session's state underneath one. Two kinds are therefore needed, plus three narrower
+// ones, and they are ranked coarse-to-fine. Acquiring a lock of equal or finer rank than one this
 // process already holds is refused with reason 'lock-order' — that refusal is the deadlock
 // prevention, not a comment asking callers to be careful.
 //
-//   election (0) → run (1) → session (2) → shared (3)
+//   election (0) → run (1) → session (2) → shared (3) → credential (4)
 //
 // Per-session locks are keyed on the ROOT session id. Subagent work runs under its root's lock, so
 // no caller ever needs two session locks at once and same-rank nesting stays refused. The same
@@ -124,7 +125,7 @@ export const MAX_HOLDER_LEASE_MS = 30 * 60 * 1000;
 export const LIVENESS_GRACE_MS = 60_000;
 // Expired and the holder is on another host, where no probe is possible. Age is all there is, so
 // it gets the same extra margin and the decision is reported as 'age-only'.
-export const FOREIGN_HOST_GRACE_MS = 60_000;
+const FOREIGN_HOST_GRACE_MS = 60_000;
 // A lock file that is empty or unparseable has no token to age, so it is aged by mtime — against
 // its own small constant, never against the caller's lease. A backfill's ten-minute lease must not
 // mean a truncated lock file blocks every hook for ten minutes.
@@ -134,10 +135,9 @@ export const CORRUPT_GRACE_MS = 15_000;
 export const BREAKER_STALE_MS = 30_000;
 // Bounded work per acquire: no sleeping, no unbounded retry. Each attempt is one re-read after a
 // generation moved underneath us.
-export const DEFAULT_ATTEMPTS = 3;
+const DEFAULT_ATTEMPTS = 3;
 // Opportunistic cleanup of breaker files nothing will ever look at again. locks/ is outside
 // prune.mjs's state/ + queue/ sweep, so without this the directory only grows.
-const BREAKER_SWEEP_AGE_MS = BREAKER_STALE_MS * 10;
 const BREAKER_SWEEP_MAX = 20;
 
 export const LOCK_KINDS = Object.freeze({
@@ -206,8 +206,7 @@ export function sharedLock(name) {
 }
 
 function toDescriptor(target) {
-  if (typeof target === 'string') return descriptor(LOCK_KINDS.SHARED, target);
-  if (!target || typeof target !== 'object') throw new TypeError('lock target must be a descriptor or a name');
+  if (!target || typeof target !== 'object') throw new TypeError('lock target must be a descriptor');
   const kind = orDefault(target.kind, LOCK_KINDS.SHARED);
   const name = target.name;
   if (typeof name !== 'string' || !name) throw new TypeError('lock descriptor needs a name');
@@ -548,6 +547,8 @@ export function forgetHeldLocks() {
   heldByToken.clear();
 }
 
+// `'migration'` is deliberately OUTSIDE LOCK_KINDS: lockRank returns -1 for it, and this early
+// return is why that never matters. Do not add it — a rank would change acquisition behaviour.
 function checkLockOrder(desc, rank) {
   if (desc.kind === 'migration') return null;
   let worstRank = -1;
@@ -607,10 +608,13 @@ function resolvePolicy(options) {
   return {
     leaseMs: num(o.leaseMs, DEFAULT_LEASE_MS),
     maxHolderLeaseMs: num(o.maxHolderLeaseMs, MAX_HOLDER_LEASE_MS),
-    livenessGraceMs: num(o.livenessGraceMs, LIVENESS_GRACE_MS),
-    foreignHostGraceMs: num(o.foreignHostGraceMs, FOREIGN_HOST_GRACE_MS),
-    corruptGraceMs: num(o.corruptGraceMs, CORRUPT_GRACE_MS),
-    breakerStaleMs: num(o.breakerStaleMs, BREAKER_STALE_MS),
+    // Constants, not options: the four grace windows are the primitive's own safety margins and
+    // every caller takes them as given. They stay on the policy object because the protocol below
+    // reads them from it — they are simply no longer overridable.
+    livenessGraceMs: LIVENESS_GRACE_MS,
+    foreignHostGraceMs: FOREIGN_HOST_GRACE_MS,
+    corruptGraceMs: CORRUPT_GRACE_MS,
+    breakerStaleMs: BREAKER_STALE_MS,
     attempts: Math.max(1, num(o.attempts, DEFAULT_ATTEMPTS)),
     sweep: o.sweep !== false,
   };
@@ -743,14 +747,15 @@ function makeHandle(ctx, policy, token, acquiredAt, expiresAt) {
 /**
  * Non-blocking acquire. Never sleeps and never waits on another process.
  *
- * @param target  a descriptor from electionLock/runLock/sessionLock/sharedLock, or a bare name
- *                (which is treated as a 'shared' lock).
- * @param options per-use policy: leaseMs, maxHolderLeaseMs, livenessGraceMs, foreignHostGraceMs,
- *                corruptGraceMs, breakerStaleMs, attempts, sweep.
+ * @param target  a descriptor from electionLock/runLock/sessionLock/sharedLock. Nothing else is
+ *                accepted — a non-object throws TypeError, as does one without a name.
+ * @param options per-use policy: leaseMs, maxHolderLeaseMs, attempts, sweep. The four grace
+ *                windows are module constants, not overrides — see resolvePolicy.
  * @param deps    injected fs / now / hostname / pid / isProcessAlive / randomToken.
  * @returns {{ok: true, handle: object}} or {{ok: false, reason: string, holder: object|null}}.
  *          Refusal reasons: 'held', 'contended', 'lock-order', 'write-failed', 'mkdir-failed',
- *          'unlink-failed', 'breaker-write-failed'.
+ *          'unlink-failed', 'breaker-write-failed', 'migration' (the migration barrier is up) and
+ *          'reconciliation' (a backfill barrier is up over this session).
  */
 export function acquireLock(target, options, deps) {
   const desc = toDescriptor(target);

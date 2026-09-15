@@ -3,7 +3,7 @@ import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
 import { credentialsFile, environment, BEEZI_ENV } from './paths.mjs';
-import { readJson, writeJsonDurable as writeJsonSecure } from './fs-store.mjs';
+import { readJson, writeJsonDurable } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { withLock, sharedLock } from './single-instance-lock.mjs';
 
@@ -16,8 +16,8 @@ import { withLock, sharedLock } from './single-instance-lock.mjs';
 // Credential Manager target, a different keychain item and a different libsecret attribute set, so
 // two installed variants never share a token. `envSuffix()` throws on unresolvable metadata, which
 // is why a malformed variant env.json fails at THIS module's load rather than silently producing
-// the production target name — and it is validated against `'' | dev | staging` before it reaches
-// the PowerShell templates below, which interpolate SERVICE as literal script text.
+// the production target name — and it is validated against `'' | dev | staging | local` before
+// it reaches the PowerShell templates below, which interpolate SERVICE as literal script text.
 export const SERVICE = `beezi-codex${environment.envSuffix()}`;
 
 const ACCOUNT = 'token';
@@ -25,10 +25,11 @@ const ACCOUNT = 'token';
 // The environment the stored credentials were issued under, persisted alongside them.
 //
 // SERVICE already keeps the native keyrings apart, but `BEEZI_CODEX_HOME` is an explicit FULL-ROOT
-// override: a caller who points two environments at one root shares the file store between them.
-// R1 requires that a mismatched binding PREVENT UPLOAD rather than proceed, so a blob whose stamp
-// disagrees with the resolved environment reads as "no credentials" — getAccessToken() then
-// returns null and every reporting path has no bearer token to flush with.
+// override: a caller who points two environments at one root shares the file store between them. R1
+// requires that a mismatched binding PREVENT UPLOAD rather than proceed, so a blob whose stamp
+// disagrees with the resolved environment reads as "no credentials" — getAccessToken() then returns
+// null and every reporting path has no bearer token to flush with. R-numbers cite
+// docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // An UNSTAMPED blob is the pre-G-2-2 state, and there was exactly one namespace then: it reads as
 // production, so existing unsuffixed installs keep working untouched and a staging build cannot
@@ -82,7 +83,7 @@ function fileRead() {
 }
 
 function fileWrite(obj) {
-  writeJsonSecure(credentialsFile(), obj);
+  writeJsonDurable(credentialsFile(), obj);
 }
 
 function fileDelete() {
@@ -116,7 +117,7 @@ function secretToolBackend(run, service = SERVICE) {
     },
     set(token) {
       // secret-tool reads the secret from stdin — keeps it out of the process list.
-      return run('secret-tool', ['store', `--label=${SERVICE}`, ...attrs], token).ok
+      return run('secret-tool', ['store', `--label=${service}`, ...attrs], token).ok
         ? 'the OS secret service (libsecret)' : false;
     },
     delete() {
@@ -341,9 +342,8 @@ export async function getCredentials(deps = {}) {
   return null;
 }
 
-// Returns a human-readable description of where the credentials were actually
-// stored, so the caller can report accurately (keychain vs a local file)
-// instead of always claiming the keychain.
+// The one read-modify-write wrapper for the credential store: rank-4 `credential` lock, an
+// optimistic revision check, and a fresh revision handed to the mutation.
 function mutateCredentials(options, fn) {
   const result = withLock({ ...sharedLock('credentials'), kind: 'credential' }, { migrationPermit: options.migrationPermit }, lock => {
     const control = readControl();
@@ -357,6 +357,8 @@ function mutateCredentials(options, fn) {
   return result.value;
 }
 
+// Returns a human-readable description of where the credentials were actually stored, so the caller
+// can report accurately (keychain vs a local file) instead of always claiming the keychain.
 export async function setCredentials(creds, deps = {}, options = {}) {
   return mutateCredentials(options, (revision, lock) => {
     const raw = JSON.stringify({ ...creds, [ENV_STAMP]: BEEZI_ENV, beezi_revision: revision });
@@ -365,7 +367,7 @@ export async function setCredentials(creds, deps = {}, options = {}) {
       const where = b.set(raw);
       if (!where) continue;
       if (!lock.verify().ok) throw unavailable('Credential lock was lost');
-      writeJsonSecure(controlFile(), { version: 1, revision, backend: b.name, beezi_env: BEEZI_ENV });
+      writeJsonDurable(controlFile(), { version: 1, revision, backend: b.name, beezi_env: BEEZI_ENV });
       return where;
     }
     throw unavailable('No credential backend accepted the write');
@@ -375,7 +377,7 @@ export async function setCredentials(creds, deps = {}, options = {}) {
 export async function deleteCredentials(deps = {}, options = {}) {
   return mutateCredentials(options, (revision) => {
     // A tombstone prevents stale native-store copies or delayed refreshes reviving a logout.
-    writeJsonSecure(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
+    writeJsonDurable(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
     for (const b of backends(deps)) {
       if (b.available()) { try { b.delete(); } catch { /* ignore */ } }
     }
@@ -428,7 +430,7 @@ export function readRawCredential(deps = {}) {
 export function deleteRawCredential(deps = {}) {
   try {
     mutateCredentials({ migrationPermit: deps.migrationPermit }, (revision) => {
-      writeJsonSecure(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
+      writeJsonDurable(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
       for (const b of backends(deps)) {
         if (b.available()) { try { b.delete(); } catch { /* try the rest, then verify */ } }
       }
@@ -459,12 +461,12 @@ export function preserveMigrationCredential(raw, destination, deps = {}) {
     : platform === 'linux' ? { name: 'secret-service', ...secretToolBackend(run, serviceFor('staging')) }
       : platform === 'win32' ? { name: 'credman', ...credManBackend(run, serviceFor('staging')) } : null;
   if (!backend || !backend.available() || !backend.set(token) || backend.get() !== token) {
-    writeJsonSecure(path.join(destination, 'credential-control.json'), {
+    writeJsonDurable(path.join(destination, 'credential-control.json'), {
       version: 1, revision, backend: null, beezi_env: 'staging',
     });
     return false;
   }
-  writeJsonSecure(path.join(destination, 'credential-control.json'), {
+  writeJsonDurable(path.join(destination, 'credential-control.json'), {
     version: 1, revision, backend: backend.name, beezi_env: 'staging',
   });
   return true;
@@ -472,7 +474,7 @@ export function preserveMigrationCredential(raw, destination, deps = {}) {
 
 export function tombstoneMigrationCredential(deps = {}) {
   return mutateCredentials({ migrationPermit: deps.migrationPermit }, revision => {
-    writeJsonSecure(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
+    writeJsonDurable(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
     return readControl().backend === null;
   });
 }

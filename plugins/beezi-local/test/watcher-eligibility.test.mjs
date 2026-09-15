@@ -1,9 +1,9 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runWatchPass, loadObservations, observationFor } from '../lib/rollout-watcher.mjs';
+import { makeMachine as sandboxMachine, uuid } from '../tools/suite-fixtures.mjs';
 
 // R2's eligibility matrix, driven through the watcher rather than through the coverage core.
 //
@@ -16,24 +16,8 @@ import { runWatchPass, loadObservations, observationFor } from '../lib/rollout-w
 // could not be answered defers every session it covered. It never becomes a scan from line 0 —
 // that is how one network blip turns into every linked machine re-uploading its whole history.
 
-function makeMachine(t) {
-  const home = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-elig-home-'));
-  const codex = fs.mkdtempSync(path.join(os.tmpdir(), 'watcher-elig-codex-'));
-  const before = { home: process.env.BEEZI_CODEX_HOME, codex: process.env.CODEX_HOME };
-  process.env.BEEZI_CODEX_HOME = home;
-  process.env.CODEX_HOME = codex;
-  t.after(() => {
-    if (before.home === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = before.home;
-    if (before.codex === undefined) delete process.env.CODEX_HOME;
-    else process.env.CODEX_HOME = before.codex;
-    fs.rmSync(home, { recursive: true, force: true });
-    fs.rmSync(codex, { recursive: true, force: true });
-  });
-  return { home, codex, sessionsDir: path.join(codex, 'sessions') };
-}
+const makeMachine = (t) => sandboxMachine(t, 'watcher-elig-');
 
-const uuid = (n) => `${String(n).padStart(8, '0')}-2222-3333-4444-555555555555`;
 const NOW = 2_000_000_000;
 
 // `mtimeMs` decides which of the two unestablished paths a session takes: inside the active
@@ -317,14 +301,14 @@ test('14. a missing tracking cache fails OPEN, matching lib/tracking.mjs\'s docu
 
 // ── bounds on the eligibility work itself ───────────────────────────────────────────────────
 
-test('15. one coverage request per pass, bounded, and the remainder waits', async (t) => {
+test('15. one coverage request per SESSION, bounded by the establish cap, and the remainder waits', async (t) => {
   const m = makeMachine(t);
   for (let i = 20; i < 30; i += 1) writeRollout(m, uuid(i));
 
   const { deps, calls } = passDeps({ fetchCoverage: async (ids) => { calls.coverageAsks.push(ids); return null; } });
-  await runWatchPass(deps, opts(m, { maxCoverageIds: 3 }));
+  await runWatchPass(deps, opts(m, { maxEstablish: 2 }));
 
-  assert.equal(calls.coverageAsks.length, 2, 'eligibility is serialized per session and capped');
+  assert.equal(calls.coverageAsks.length, 2, 'eligibility is serialized per session and capped by maxEstablish');
   assert.equal(calls.coverageAsks[0].length, 1, 'one session lock protects each coverage request');
 });
 

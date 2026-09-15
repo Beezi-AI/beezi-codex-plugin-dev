@@ -1,27 +1,17 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
-import os from 'node:os';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
 import { writeAgent, readAgents, agentDir } from '../lib/subagent-state.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
+import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 // The subagent half of the checkpoint: which rollouts get billed, under what segment ids, with which
 // identity fields, and how their wall clock is reconciled with the parent's.
 
-function tmpHome(t) {
-  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-sac-'));
-  const prev = process.env.BEEZI_CODEX_HOME;
-  process.env.BEEZI_CODEX_HOME = dir;
-  t.after(() => {
-    if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
-    else process.env.BEEZI_CODEX_HOME = prev;
-    fs.rmSync(dir, { recursive: true, force: true });
-  });
-  return dir;
-}
+const tmpHome = (t) => sandboxHome(t, 'beezi-sac-');
 
 const queued = () => fs.readdirSync(queueDir()).map((f) =>
   JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));

@@ -23,9 +23,10 @@
 //      property: a killed hook loses nothing it had already recorded). The only module-level state
 //      is the in-flight source and the reentrancy flag.
 //
-// The wire vocabulary is CLOSED on the server (`plugin-diagnostics.request.dto.ts:26-30` validates
-// `code` and `source` with @IsEnum), so an invented value 400s the whole batch. Both frozen maps
-// below are therefore subsets of the server's enums, never extensions of them.
+// The wire vocabulary is CLOSED on the server (`plugin-diagnostics.request.dto.ts` in the
+// hb-ai-agent-portal repo validates `code` and `source` with @IsEnum), so an invented value 400s
+// the whole batch. Both frozen maps below are therefore subsets of the server's enums, never
+// extensions of them.
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -57,10 +58,6 @@ export const DIAGNOSTIC_CODES = Object.freeze({
 // actually has. The rest of that enum is Claude-shaped (`statusline`, `pulse`, `usage_ping`,
 // `stop_failure`, `track_prompt`).
 //
-// `stop` was missing from this list for a while and should not have been: the server has had
-// `STOP = 'stop'` since the enum's first migration, and scripts/stop.mjs is one of Codex's five
-// hooks, so a Stop crash was reporting as UNKNOWN for no reason.
-//
 // `subagent_start` / `subagent_stop` are deliberately still absent. The server enum gained them in
 // BE-2, but that is a Postgres enum behind a migration and this list may only name values the
 // DEPLOYED server accepts — one unrecognised source 400s the whole batch. Add them here once BE-2
@@ -91,7 +88,7 @@ export const MAX_PENDING = 200;
 export const MAX_EVENT_AGE_MS = 14 * 24 * 60 * 60 * 1000;
 
 // One batch is 50 events. The route caps the array server-side and a bigger body buys nothing.
-export const MAX_PER_BATCH = 50;
+const MAX_PER_BATCH = 50;
 
 export const CONSENT_VERSION = 1;
 
@@ -352,8 +349,7 @@ export function recordIssue(issue, deps = {}) {
 function writeIssue(issue, deps) {
   // Consent first, before anything is computed and long before anything is written. G-9-6 flips
   // this; until it does, and on any machine that has not answered, this is where every call stops.
-  const granted = orDefault(deps.isGranted, isTelemetryGranted);
-  if (!granted()) return false;
+  if (!isTelemetryGranted()) return false;
 
   const now = orDefault(deps.now, Date.now);
   const write = orDefault(deps.write, writeJsonSecure);
@@ -432,7 +428,6 @@ export async function flushDiagnostics(token, deps = {}) {
   const postJsonImpl = orDefault(deps.postJsonImpl, postJson);
   const fetchImpl = orDefault(deps.fetchImpl, fetchCompat);
   const now = orDefault(deps.now, Date.now);
-  const granted = orDefault(deps.isGranted, isTelemetryGranted);
 
   if (!token) {
     result.skipped = 'no-token';
@@ -440,13 +435,14 @@ export async function flushDiagnostics(token, deps = {}) {
   }
   // Redundant against the record-time gate by design. It is the direct assertion that nothing
   // leaves this machine without consent, rather than a property inherited from another function.
-  if (!granted()) {
+  if (!isTelemetryGranted()) {
     result.skipped = 'no-consent';
     return result;
   }
 
-  // ENDPOINTS is read, never extended from here. The route is `/cli-agent/plugin-diagnostics`; until
-  // that entry exists in lib/config.mjs the flush is a no-op rather than a guess at a URL.
+  // ENDPOINTS is read, never extended from here. The route is `/cli-agent/plugin-diagnostics`,
+  // defined as `pluginDiagnostics` in lib/config.mjs; with no entry the flush is a no-op rather
+  // than a guess at a URL.
   const endpointPath = 'endpointPath' in deps ? deps.endpointPath : ENDPOINTS.pluginDiagnostics;
   if (endpointPath === null || endpointPath === undefined || endpointPath === '') {
     result.skipped = 'no-endpoint';

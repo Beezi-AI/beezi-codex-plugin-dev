@@ -33,9 +33,9 @@ const RESERVED_ID = { null: true, undefined: true, NaN: true, true: true, false:
 // (<id>:<from>-<to>), the queue filename derived from it, and the sessionId on the wire.
 //
 // Deliberately NOT applied inside the resolvers' return value: a transcript we can locate but not
-// name is still worth returning, because lib/session-audit.mjs:87-94 excludes the live session by
-// PATH and a null id there is legitimate. The validation belongs at the entry points that WRITE —
-// see lib/track-session.mjs resolveTrackTarget.
+// name is still worth returning, because `liveSession` in lib/session-audit.mjs excludes the live
+// session by PATH and a null id there is legitimate. The validation belongs at the entry points
+// that WRITE — see lib/track-session.mjs resolveTrackTarget.
 export function isUsableSessionId(id) {
   return isValidSessionId(id) && RESERVED_ID[id] !== true;
 }
@@ -96,10 +96,10 @@ function findRolloutBySessionState(cwd) {
     // shared by every id-less session in this directory, and reading its name back made every
     // later resolve from that cwd answer with the string "null" — a valid-looking id the server
     // accepts, matched on cwd alone, so it kept answering that way even for correctly-named
-    // sessions. Prefer an id recorded INSIDE the file (checkpoint does not persist `sessionId`
-    // yet — see the follow-up noted for lib/checkpoint.mjs; this read side is a no-op until it
-    // does), fall back to the filename for everything written before that, and skip anything that
-    // is not a usable id so an already-poisoned file on disk can never be answered with again.
+    // sessions. Prefer an id recorded INSIDE the file — lib/checkpoint.mjs writes `sessionId` into
+    // the state it saves — fall back to the filename for state files written before that write
+    // existed, and skip anything that is not a usable id so an already-poisoned file on disk can
+    // never be answered with again.
     const fileId = file.slice(0, -'.json'.length);
     const id = typeof state.sessionId === 'string' ? state.sessionId : fileId;
     if (!isUsableSessionId(id)) continue;
@@ -129,34 +129,38 @@ const TRAILING_UUID_RE = /-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-f
 // backup rollout and a state file called `null.json`.
 //
 // `payload.id` FIRST, not `payload.session_id`. On a SUBAGENT rollout `session_id` holds the
-// PARENT's thread id while `id` is the file's own (lib/subagent-codex.mjs:91-104 documents and
-// depends on exactly that), and subagent rollouts are top-level files in the same date tree
-// carrying the parent's cwd — so resolveTranscriptByCwd can and does see them. Pairing a parent id
-// with a child transcript would write the parent's cursor from the child's lines, which is worse
-// than the null id this exists to prevent. On a normal rollout the two are equal, so the
+// PARENT's thread id while `id` is the file's own (`subagentIdentityFrom` in lib/subagent-codex.mjs
+// documents and depends on exactly that), and subagent rollouts are top-level files in the same
+// date tree carrying the parent's cwd — so resolveTranscriptByCwd can and does see them. Pairing a
+// parent id with a child transcript would write the parent's cursor from the child's lines, which
+// is worse than the null id this exists to prevent. On a normal rollout the two are equal, so the
 // preference is invisible there; it also matches lib/transcript-index-codex.mjs, which has always
 // read `id` alone.
 //
-// The read is a bounded STREAM, not a fixed head slice. It used to copy 8KB and parse whatever
-// came back, which never worked on a real machine: session_meta is dominated by
-// `base_instructions`, first lines on this corpus crossed 8KB in 2026-02 and reach 48KB, and
-// lib/session-name-codex.mjs:120-126 measures ~37KB for the record once dynamic_tools is counted.
-// A slice that stops mid-line hands JSON.parse an unterminated string, so the file read as "no
-// session_meta at all" and dropped out of the cwd scan — silently, because the parse failure and a
-// missing file collapse into the same null. It was masked on any machine with working hooks, where
-// findRolloutBySessionState answers first.
+// The read is a bounded STREAM, not a fixed head slice. session_meta is dominated by
+// `base_instructions`: measured on this corpus, first lines reach 48KB, and `scanRecords` in
+// lib/session-name-codex.mjs measures ~37KB for the record once dynamic_tools is counted. A slice
+// that stops mid-line hands JSON.parse an unterminated string, so the file reads as "no session_meta
+// at all" and drops out of the cwd scan — silently, because a parse failure and a missing file
+// collapse into the same null.
 //
 // scanRecords is the single definition of "read records off a rollout" (it chunks at 256KB with a
 // streaming decoder and carries a partial trailing line forward), so there is no second cap here to
-// drift out of step with reality. 512KB matches what lib/transcript-index-codex.mjs:48 passes for
-// the same one-record head read; its own default is 2MB.
-const META_SCAN_BYTES = 512 * 1024;
+// drift out of step with reality.
+//
+// Exported because it is the ONE window every one-record head read uses — rolloutMeta below,
+// listAllRollouts in lib/transcript-index-codex.mjs, the sweep in lib/subagent-codex.mjs and the
+// watcher's identity read all import it rather than re-spelling `512 * 1024`. It is NOT
+// readRolloutHead's default: that is HEAD_BYTES (2MB) in lib/subagent-codex.mjs, sized for the
+// fork-prefix scan, which reads many records rather than one. Both are passed explicitly at the
+// sites that want this narrower one.
+export const ROLLOUT_HEAD_BYTES = 512 * 1024;
 
 function rolloutMeta(transcriptPath) {
   let rec = null;
   // One record is all this needs, and scanRecords is a generator — the loop breaks before a second
   // chunk is ever read on all but a pathological file.
-  for (const first of scanRecords(transcriptPath, { maxBytes: META_SCAN_BYTES })) {
+  for (const first of scanRecords(transcriptPath, { maxBytes: ROLLOUT_HEAD_BYTES })) {
     rec = first;
     break;
   }
@@ -198,11 +202,12 @@ export function resolveTranscriptByCwd(cwd) {
   // first line is unreadable, and removing it would lose sessions this can still name.
   //
   // sessionId may still come back null, and this must NOT become a `return null`. liveSession()
-  // (lib/session-audit.mjs:87-94) calls this only to exclude the currently-live session from the
-  // backfill and matches on the transcript PATH; a null here is legitimate for it, and refusing
-  // would stop the backfill excluding the live session and re-segment a transcript the live hooks
-  // are already reporting — double-billing it. Pinned by test/session-audit.test.mjs case 7.
-  // Callers that need a name for a durable key validate for themselves (lib/track-session.mjs).
+  // (`liveSession` in lib/session-audit.mjs) calls this only to exclude the currently-live session
+  // from the backfill and matches on the transcript PATH; a null here is legitimate for it, and
+  // refusing would stop the backfill excluding the live session and re-segment a transcript the
+  // live hooks are already reporting — double-billing it. Pinned by test/session-audit.test.mjs
+  // case 7. Callers that need a name for a durable key validate for themselves
+  // (lib/track-session.mjs).
   const m = TRAILING_UUID_RE.exec(path.basename(best.full));
   const fromName = m && isUsableSessionId(m[1]) ? m[1] : null;
   return { sessionId: orDefault(best.sessionId, fromName), transcriptPath: best.full };
@@ -217,12 +222,8 @@ export function resolveCodexTranscript(input) {
   if (provided) {
     try {
       if (fs.statSync(provided).isFile()) {
-        // A hook can hand over a path with no session_id (or a junk one). The rollout knows its
-        // own id, and we are already touching the file — so answer with it rather than pass the
-        // gap on. NOTE: lib/checkpoint.mjs:202 reads `input.session_id` directly and uses only
-        // `resolved.transcriptPath`, so today this improves the contract without changing the
-        // hook path's behaviour; adopting `resolved.sessionId` there is the follow-up recorded in
-        // the report, and is what closes the last route to a `state/null.json`.
+        // A hook can hand over a path with no session_id (or a junk one). The rollout knows its own
+        // id, and we are already touching the file — so answer with it rather than pass the gap on.
         return {
           sessionId: isUsableSessionId(sessionId) ? sessionId : rolloutSessionId(provided),
           transcriptPath: provided,

@@ -39,12 +39,13 @@ if (!boundary && !heartbeat) process.exit(0);
 // shell tool has a different name on each of its two surfaces, so the matcher cannot be narrowed
 // yet), and the checkpoint engine pulls in ~28 modules that all but a few invocations discard.
 //
-// Async IIFE rather than top-level await (Node 14.8+): the guards above stay synchronous, and the
-// catch mirrors what a rejected top-level await did — print the error and exit non-zero.
+// Async IIFE, not top-level await: top-level await is Node 14.8+, past this plugin's 13.2 floor
+// and banned by the gate. The catch below is what a rejected top-level await did.
 (async () => {
   // R1's guard, imported HERE rather than at the top for the same reason the engine is: it reaches
-  // the lock primitive, the credential store and the data root, and this hook is registered
-  // against every tool call. Past the gates above, the process is already paying for the engine.
+  // the lock primitive, the credential store and the data root, and this hook is registered against
+  // every tool call. Past the gates above, the process is already paying for the engine. R-numbers
+  // cite docs/plans/2026-09-10-sections/REVIEW.md.
   const { hookMayProceed } = await import('../lib/env-guard.mjs');
   if (!hookMayProceed()) return exitClean(0);
   const { runCheckpoint, HOOK_BUDGET_MS } = await import('../lib/checkpoint.mjs');
