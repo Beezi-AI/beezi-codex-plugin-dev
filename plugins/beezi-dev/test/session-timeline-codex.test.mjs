@@ -264,21 +264,20 @@ test('a rollout with no collaboration_mode anywhere produces the periods it alwa
   const tl = computeSessionTimeline(writeRollout([work(0), work(1), userMsg(2), work(3), work(20)]));
   assert.deepEqual(tl.periods, [
     { state: 'working', started_at: at(0), ended_at: at(1) },
-    { state: 'waiting_user', started_at: at(1), ended_at: at(2) },
+    { state: 'waiting_user', waiting_subtype: 'next_instruction', started_at: at(1), ended_at: at(2) },
     { state: 'working', started_at: at(2), ended_at: at(3) },
     { state: 'idle', started_at: at(3), ended_at: at(20) },
   ]);
 });
 
-test('every period carries exactly three keys, with no waiting_subtype even on waiting_user', () => {
-  // An unknown key is the failure mode that 400s the ingest, and a present-but-null subtype is a
-  // false claim: its absence is how the server reads "this plugin predates the field".
+test('waiting_subtype is emitted only on waiting_user periods', () => {
   const tl = computeSessionTimeline(writeRollout([
     turnCtx(0, 'plan'), work(1), userMsg(2), turnCtx(3, 'code'), work(4), work(20), workAt(30 * HOUR),
   ]));
   const states = tl.periods.map((p) => p.state);
   assert.deepEqual(states, ['planning', 'waiting_user', 'working', 'idle', 'break']);
-  for (const p of tl.periods) assert.deepEqual(Object.keys(p).sort(), ['ended_at', 'started_at', 'state']);
+  for (const p of tl.periods) assert.deepEqual(Object.keys(p).sort(),
+    p.state === 'waiting_user' ? ['ended_at', 'started_at', 'state', 'waiting_subtype'] : ['ended_at', 'started_at', 'state']);
   // Every value must fit the server's @MaxLength(50) bound on the state string.
   for (const s of states) assert.ok(s.length <= 50, s);
 });
@@ -354,4 +353,152 @@ test('each span carries exactly the four fields the server accepts', () => {
 test('no session id means no subagent lookup, and an empty array', () => {
   const tl = computeSessionTimeline(writeRollout([userMsg(0), work(9)]));
   assert.deepEqual(tl.subagents, []);
+});
+
+const callAt = (ms, name, id, args = {}) => ({ timestamp: iso(ms), type: 'response_item',
+  payload: { type: 'function_call', name, call_id: id, arguments: JSON.stringify(args) } });
+const resultAt = (ms, id, output = {}) => ({ timestamp: iso(ms), type: 'response_item',
+  payload: { type: 'function_call_output', call_id: id, output: JSON.stringify(output) } });
+const eventAt = (ms, type, extra = {}) => ({ timestamp: iso(ms), type: 'event_msg', payload: { type, ...extra } });
+const summarize = (records) => computeSessionTimeline(writeRollout(records)).periods
+  .map((p) => [p.state, p.waiting_subtype, Date.parse(p.ended_at) - Date.parse(p.started_at)]);
+
+test('question answers are human time across bookkeeping, even in plan mode and beyond 5 minutes', () => {
+  const periods = summarize([
+    { ...turnCtx(0, 'plan'), timestamp: iso(0) },
+    callAt(MIN, 'request_user_input', 'q'), eventAt(2 * MIN, 'token_count'),
+    resultAt(11 * MIN, 'q', { answers: { choice: { answers: ['yes'] } } }),
+  ]);
+  assert.deepEqual(periods, [['planning', undefined, MIN], ['waiting_user', 'question_answer', 10 * MIN]]);
+});
+
+test('question-tool failures do not invent human waits', () => {
+  assert.deepEqual(summarize([callAt(0, 'request_user_input', 'q'),
+    resultAt(2000, 'q', { error: 'not available' })]), [['working', undefined, 2000]]);
+});
+
+test('adjacent question and command decisions keep different subtypes', () => {
+  assert.deepEqual(summarize([
+    callAt(0, 'request_user_input', 'q'), resultAt(MIN, 'q', { answers: { q: {} } }),
+    callAt(MIN, 'request_permissions', 'p'), resultAt(2 * MIN, 'p', { permissions: {} }),
+  ]), [['waiting_user', 'question_answer', MIN], ['waiting_user', 'command_approval', MIN]]);
+});
+
+test('instant permission resolution does not charge the human', () => {
+  assert.deepEqual(summarize([callAt(0, 'request_permissions', 'p'), resultAt(500, 'p')]),
+    [['working', undefined, 500]]);
+});
+
+test('a presented Plan waits for approval after task completion, across resume metadata', () => {
+  assert.deepEqual(summarize([
+    eventAt(0, 'item_completed', { item: { type: 'Plan', text: 'plan' } }),
+    eventAt(1000, 'task_complete'), eventAt(2 * MIN, 'token_count'),
+    eventAt(3 * MIN, 'task_started'), promptAt(3 * MIN + 1),
+  ]), [['working', undefined, 1000], ['waiting_user', 'plan_approval', 3 * MIN + 1 - 1000]]);
+});
+
+test('ordinary completed turns wait for the next instruction', () => {
+  assert.deepEqual(summarize([eventAt(0, 'task_complete'), eventAt(MIN, 'token_count'), promptAt(2 * MIN)]),
+    [['waiting_user', 'next_instruction', 2 * MIN]]);
+});
+
+test('a plan checklist completion alone is not a plan approval request', () => {
+  assert.deepEqual(summarize([
+    updatePlan(0, [{ step: 'done', status: 'completed' }]), eventAt(MIN, 'task_complete'), promptAt(2 * MIN),
+  ]), [['working', undefined, MIN], ['waiting_user', 'next_instruction', MIN]]);
+});
+
+test('background wait tools classify short waits and waits exceeding six hours as idle', () => {
+  for (const [name, args] of [['wait_agent', {}], ['wait', { cell_id: 'c' }],
+    ['wait', { ids: ['agent'] }], ['write_stdin', { session_id: 1, chars: '' }]]) {
+    for (const duration of [1000, 7 * HOUR]) {
+      assert.deepEqual(summarize([callAt(0, name, 'w', args), eventAt(500, 'token_count'), resultAt(duration, 'w')]),
+        [['idle', undefined, duration]], name);
+    }
+  }
+});
+
+test('sending command stdin and spawning a child are not background waits', () => {
+  for (const [name, args] of [['write_stdin', { session_id: 1, chars: 'go\n' }], ['spawn_agent', {}]]) {
+    assert.deepEqual(summarize([callAt(0, name, 'w', args), resultAt(MIN, 'w')]), [['working', undefined, MIN]]);
+  }
+});
+
+test('background notifications are never human prompts, including long waits', () => {
+  for (const notification of [
+    { timestamp: iso(7 * HOUR), type: 'response_item', payload: { type: 'agent_message', author: 'child' } },
+    eventAt(7 * HOUR, 'user_message', { message: '<task-notification>done</task-notification>' }),
+  ]) assert.deepEqual(summarize([workAt(0), notification]), [['idle', undefined, 7 * HOUR]]);
+});
+
+test('main-thread work during a pending tool keeps its own time', () => {
+  assert.deepEqual(summarize([
+    callAt(0, 'wait_agent', 'w'), workAt(MIN), eventAt(2 * MIN, 'token_count'), resultAt(3 * MIN, 'w'),
+  ]), [['working', undefined, MIN], ['idle', undefined, 2 * MIN]]);
+});
+
+test('unrelated result ids do not close waits and unresolved calls do not invent durations', () => {
+  assert.deepEqual(summarize([callAt(0, 'wait_agent', 'w'), resultAt(MIN, 'other')]), [['working', undefined, MIN]]);
+});
+
+test('exactly five minutes is idle fallback, matching Claude', () => {
+  assert.deepEqual(summarize([workAt(0), workAt(5 * MIN)]), [['idle', undefined, 5 * MIN]]);
+  assert.deepEqual(summarize([workAt(0), workAt(5 * MIN - 1)]), [['working', undefined, 5 * MIN - 1]]);
+});
+
+test('six-hour human waits remain breaks', () => {
+  assert.deepEqual(summarize([callAt(0, 'request_user_input', 'q'), resultAt(6 * HOUR, 'q', { answers: { q: {} } })]),
+    [['break', undefined, 6 * HOUR]]);
+});
+
+test('invalid timestamp records cannot break the timeline', () => {
+  assert.deepEqual(summarize([workAt(0), { ...workAt(1), timestamp: 'invalid' }, workAt(MIN)]),
+    [['working', undefined, MIN]]);
+});
+
+test('modern UserMessage items close next-instruction and plan-approval waits', () => {
+  for (const plan of [false, true]) {
+    const records = plan ? [eventAt(0, 'item_completed', { item: { type: 'Plan' } })] : [workAt(0)];
+    records.push(eventAt(MIN, 'task_complete'), eventAt(2 * MIN, 'task_started'),
+      { timestamp: iso(2 * MIN), type: 'response_item', payload: { type: 'message', role: 'user', content: [] } },
+      eventAt(2 * MIN + 1, 'item_completed', { item: { type: 'UserMessage', content: [] } }));
+    assert.deepEqual(summarize(records), [['working', undefined, MIN],
+      ['waiting_user', plan ? 'plan_approval' : 'next_instruction', MIN + 1]]);
+  }
+});
+
+test('async questions allow continued work and classify only the subsequent turn-end wait', () => {
+  assert.deepEqual(summarize([
+    callAt(0, 'request_user_input_async', 'q'), resultAt(100, 'q', { accepted: true }),
+    workAt(MIN), eventAt(2 * MIN, 'task_complete'), promptAt(3 * MIN),
+  ]), [['working', undefined, 2 * MIN], ['waiting_user', 'question_answer', MIN]]);
+});
+
+test('wrapped stdin polling includes the CommandExecution completion echo in its idle span', () => {
+  const call = { timestamp: iso(0), type: 'response_item', payload: { type: 'custom_tool_call',
+    name: 'exec', call_id: 'e', input: 'const r = await tools.write_stdin({session_id: 1,chars:"",yield_time_ms:30000}); text(r.output);' } };
+  const result = { timestamp: iso(MIN), type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: 'e', output: [] } };
+  assert.deepEqual(summarize([call, eventAt(MIN - 1, 'item_completed', { item: { type: 'CommandExecution' } }), result]),
+    [['idle', undefined, MIN]]);
+  call.payload.input = 'await tools.write_stdin({session_id: 1,chars:"go"});';
+  assert.deepEqual(summarize([call, result]), [['working', undefined, MIN]]);
+});
+
+test('modern subagent completion notifications are background waits', () => {
+  assert.deepEqual(summarize([workAt(0), eventAt(MIN, 'item_completed',
+    { item: { type: 'SubAgentActivity', kind: 'completed' } })]), [['idle', undefined, MIN]]);
+});
+
+test('mixed exec work is not charged entirely to a waiting tool', () => {
+  const call = { timestamp: iso(0), type: 'response_item', payload: { type: 'custom_tool_call',
+    name: 'exec', call_id: 'e', input: 'await tools.exec_command({cmd:"build"}); await tools.request_permissions({});' } };
+  assert.deepEqual(summarize([call, { ...resultAt(MIN, 'e'), payload: { type: 'custom_tool_call_output', call_id: 'e', output: '{}' } }]),
+    [['working', undefined, MIN]]);
+});
+
+test('failed async questions do not turn the next instruction into a question answer', () => {
+  assert.deepEqual(summarize([
+    callAt(0, 'request_user_input_async', 'q'), resultAt(100, 'q', { error: 'unavailable' }),
+    eventAt(MIN, 'task_complete'), promptAt(2 * MIN),
+  ]), [['working', undefined, MIN], ['waiting_user', 'next_instruction', MIN]]);
 });

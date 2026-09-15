@@ -38,19 +38,31 @@ would have to be linked twice.
 ### Analytics needs the hooks installed and trusted
 
 Codex loads a plugin's `skills/` and `.mcp.json`, but **not** its `hooks.json` — the
-`plugin_hooks` feature is `removed`. Ask Codex to *"set up Beezi analytics"* (the
-`analytics-hooks` skill), or run it yourself; `codex plugin list` prints the plugin root, call
-it `$P`:
+`plugin_hooks` feature is `removed`. The plugin therefore writes the entries into
+`~/.codex/hooks.json` itself, and **installs and repairs them without being asked**:
+
+- `beezi_login` / the `login` skill installs them once the machine is linked;
+- the plugin's MCP server — spawned every session, and the only Beezi code that still runs when the
+  hooks are broken — repairs them on the session's first message;
+- the `me` skill repairs them before it reports.
+
+A healthy install is never rewritten. That is deliberate rather than an optimisation: Codex keys
+hook trust to each entry's **hash**, so rewriting identical entries would revoke trust you had
+already granted.
+
+You can still drive it by hand — ask Codex to *"set up Beezi analytics"* (the `analytics-hooks`
+skill), or run it yourself; `codex plugin list` prints the plugin root, call it `$P`:
 
 ```bash
-node "$P/scripts/hooks.mjs" install   # writes ~/.codex/hooks.json (each entry contains the complete Node invocation)
+node "$P/scripts/hooks.mjs" install   # a no-op when the install is already current; --force rewrites anyway
+node "$P/scripts/hooks.mjs" status    # read-only
 ```
 
-Then, inside Codex, run `/hooks` — review the Beezi entries and trust **all** of them. There is one
-per lifecycle event Beezi registers, and the `install` you just ran printed exactly that list back
-to you, so trust what it named rather than a number from this page. Codex will not run
-a hook it has not been shown, and trust is recorded against each hook's **hash**, so repeat both
-steps after a plugin upgrade.
+Then, inside Codex, run `/hooks` — review the Beezi entries and trust **all** of them. This is the
+one step that cannot be automated: Codex has no non-interactive way to grant trust. There is one
+entry per lifecycle event Beezi registers, and `install` and `status` both print that list back, so
+trust what they named rather than a number from this page. Because trust is hash-keyed, it has to be
+granted again after a plugin upgrade — the upgrade itself is repaired for you, the re-trust is not.
 
 Leaving any entry untrusted fails silently — an untrusted hook simply does not run, and nothing
 reports it. Skipping `SubagentStart` / `SubagentStop`, for example, still bills subagent tokens (the
@@ -72,7 +84,7 @@ exist.
 | `login` | Link this machine, refresh the captured plan |
 | `logout` | Unlink this machine and drop its stored credentials |
 | `me` | Is this machine linked, as whom, and are the hooks installed |
-| `analytics-hooks` | Install, repair, remove, or check the analytics hooks |
+| `analytics-hooks` | Install, repair, remove, or check the analytics hooks (never asks you to run the command yourself) |
 | `track` | Checkpoint the current branch now, without hooks |
 | `analytics` | Your own spend and session summary, for 7 or 30 days |
 | `sync` | Repair history a machine missed while its hooks were untrusted |
@@ -330,8 +342,10 @@ Measured against Codex CLI 0.137.0 on Windows.
   live in the OS keyring under `beezi-codex`, so a linked machine stays linked; only machines
   falling back to the file store log in again. Anything still queued under `~/.beezi` is not sent,
   and re-reporting after the move is harmless — the server dedups by `segmentId`. Hook launchers an
-  older plugin version wrote are no longer used at all; `hooks.mjs install` rewrites the registry to
-  complete command entries (re-trust via `/hooks`) and deletes the old launcher directory.
+  older plugin version wrote are no longer used at all; the next install rewrites the registry to
+  complete command entries (re-trust via `/hooks`) and deletes the old launcher directory. Entries
+  left behind by a variant that is no longer on disk are swept at the same time, whichever variant
+  wrote them — a dead entry fails its spawn on every session, so it belongs to no working install.
 - **The keyring entry was renamed — sign in once more.** This plugin now owns the OS keyring entry
   `beezi-codex`; it previously shared `beezi-analytics` with the Claude Code plugin, where the two
   fought over refreshed tokens and over logout. A machine linked before the rename reads as *not

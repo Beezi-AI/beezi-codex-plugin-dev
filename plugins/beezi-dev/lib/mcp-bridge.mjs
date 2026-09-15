@@ -4,6 +4,7 @@ import { machineHeaders } from './machine-identity.mjs';
 import { apiBase } from './config.mjs';
 import { performLogin as _performLogin } from './login.mjs';
 import { linkStatus as _linkStatus, describeLink, describeReporting } from './link-status.mjs';
+import { ensureHooks as _ensureHooks, TRUST_STEP } from './hooks-install.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import { orDefault } from './compat.mjs';
 
@@ -398,11 +399,57 @@ export function createBridge(deps = {}) {
     writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
   }
 
+  // ── keeping the hooks installed, without asking ───────────────────────────
+  //
+  // THIS IS THE ONLY PROCESS THAT CAN DO IT. A stale hook entry points at the previous plugin
+  // version's script, so Codex's spawn fails and `session-start.mjs` never runs — the hooks cannot
+  // repair themselves, by definition of being broken. The MCP server is spawned eagerly at the
+  // start of every session, needs no trust, and lives the whole session, so it is the one Beezi
+  // code path that still executes on a machine whose hooks are dead. Every plugin upgrade produces
+  // exactly that machine.
+  //
+  // Bounded hard, because this runs inside the process that must never take the plugin down:
+  //   · once per process — a no-op check is cheap but not free, and nothing changes mid-session.
+  //   · linked only — a machine that never signed in gets no entries written on its behalf.
+  //   · synchronous and fully caught — ensureHooks() is sync fs work under a defer-on-contention
+  //     lock, so there is no promise to leak into the message loop and no error to escape it.
+  //   · a no-op when healthy — ensureHooks() refuses to rewrite identical entries, because a
+  //     rewrite changes each hook's hash and would revoke trust the user already granted.
+  //
+  // The verdict is REMEMBERED, not just the fact that it ran: the repair usually happens on the
+  // session's `initialize`, long before the user asks why nothing is tracked, and the trust step it
+  // asks for stays outstanding until they do it. A status call later in the same session has to be
+  // able to say so.
+  let healed = false;
+  let healNote = null;
+  function selfHeal() {
+    if (healed) return healNote;
+    healed = true;
+    try {
+      const result = (deps.ensureHooks || _ensureHooks)();
+      if (!result.repaired) return null;
+      const swept = result.swept && result.swept.length
+        ? ` ${result.swept.length} dead entr${result.swept.length === 1 ? 'y' : 'ies'} from an older install ${result.swept.length === 1 ? 'was' : 'were'} removed.`
+        : '';
+      // The trust step is the one half that cannot be automated, so it is the one half reported.
+      healNote = `Beezi ${result.before === 'absent' ? 'installed' : 'repaired'} the analytics hooks automatically.${swept}`
+        + ` To finish, ${TRUST_STEP} — Codex will not run a hook it has not been shown.`;
+      return healNote;
+    } catch {
+      return null;
+    }
+  }
+
   async function runStatusTool(id) {
     try {
+      // `healNote`, not another selfHeal() call: on a linked machine the repair has already run —
+      // handleMessage does it before any tool is dispatched — so `linkStatus()` below is already
+      // reading the repaired registry. On an UNLINKED machine nothing has been written, and nothing
+      // should be: hooks are installed at login, for someone who has asked for analytics.
+      const repair = healNote;
       const status = await linkStatus();
       const reporting = describeReporting(status);
-      toolText(id, [describeLink(status), reporting].filter(Boolean).join('\n'));
+      toolText(id, [describeLink(status), reporting, repair].filter(Boolean).join('\n'));
     } catch (error) {
       toolText(id, `Beezi status check failed: ${error && error.message ? error.message : String(error)}`, true);
     }
@@ -491,6 +538,10 @@ export function createBridge(deps = {}) {
       await handleUnlinked(msg, ids);
       return;
     }
+    // First message from a LINKED machine — the earliest point at which installing hooks on the
+    // user's behalf is the obviously right thing to do. Its verdict is dropped here and kept for
+    // the status tool to surface; nothing about this message's handling depends on it.
+    selfHeal();
     // Linked machines still ask for these ("re-link me", "why is nothing tracked?"); answer
     // locally rather than forwarding tools the portal does not have.
     const local = localToolCall(msg);
