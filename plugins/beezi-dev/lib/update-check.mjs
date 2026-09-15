@@ -5,26 +5,34 @@ import { beeziCodexHome, environment } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
+import { compareVersions } from './version-compare.mjs';
 
 // ── Stale-version check (G-8-4) ─────────────────────────────────────────────────────────────
 //
-// The audit called this "blocked upstream", and half of that was right: Codex's remote-marketplace
-// support is unverified (M-8-3), so NOTHING HERE UPDATES ANYTHING. What was never blocked is the
-// part that matters — the plugin has always carried its own version and nothing read it, so a user
-// running a six-month-old build had no way to find out.
+// The audit called this "blocked upstream", and half of that was right: NOTHING HERE UPDATES
+// ANYTHING. What was never blocked is the part that matters — the plugin has always carried its
+// own version and nothing read it, so a user running a six-month-old build had no way to find out.
+//
+// M-8-3 is now ANSWERED, and the answer is yes-with-a-caveat: Codex does support remote (Git)
+// marketplaces — `codex plugin marketplace add|upgrade` — but has no `plugin update` verb. See
+// updateNotice() for the command that stands in for one, and for where it came from.
 //
 // So this is a reader and a sentence, not an updater. It compares the installed version against
 // the version published in the manifest the build was stamped with (env.json updateManifestUrl,
 // written by scripts/make-variant.sh for a variant and by scripts/sync-to-github.sh for the public
-// build) and says so once a day at most.
+// build) and says so once an hour at most.
 //
 // R1: "Do not add an unverified `version` property to Codex's marketplace schema. A Beezi-owned
 // update manifest or fetching the referenced plugin manifest can serve the update checker." This
 // fetches the referenced PLUGIN manifest — `.codex-plugin/plugin.json`, which already has a
 // version because Codex's own schema puts one there. Nothing is invented.
 
-const CHECK_INTERVAL_MS = 24 * 60 * 60 * 1000;
-const FETCH_TIMEOUT_MS = 2000;
+// How long a fetched reading is trusted. One hour, matching the Claude plugin: the internal
+// pipeline publishes several times a day, so a longer window hides the very updates this exists
+// to surface. The cost is bounded by FETCH_TIMEOUT_MS, which is tightened to match — at one
+// request an hour it can land inside far more SessionStart hooks than a daily one could.
+const CHECK_INTERVAL_MS = 60 * 60 * 1000;
+const FETCH_TIMEOUT_MS = 1500;
 
 const PLUGIN_JSON_FILE = path.join(
   path.dirname(path.dirname(url.fileURLToPath(import.meta.url))),
@@ -50,54 +58,6 @@ export function installedPlugin(deps = {}) {
   if (!obj || typeof obj !== 'object') return null;
   if (typeof obj.version !== 'string' || obj.version === '') return null;
   return { name: typeof obj.name === 'string' ? obj.name : 'beezi', version: obj.version };
-}
-
-function parseVersion(value) {
-  if (typeof value !== 'string') return null;
-  const m = /^(\d+)\.(\d+)\.(\d+)(?:-([0-9A-Za-z.-]+))?(?:\+[0-9A-Za-z.-]+)?$/.exec(value.trim());
-  if (!m) return null;
-  return {
-    core: [Number(m[1]), Number(m[2]), Number(m[3])],
-    pre: m[4] === undefined ? null : m[4].split('.'),
-  };
-}
-
-function comparePre(a, b) {
-  // Semver's own rule, and the one that matters for this plugin's variants: a build stamped
-  // `0.7.0-staging.4821` is BEHIND the plain `0.7.0`, and ahead of `0.7.0-staging.4102`. Numeric
-  // identifiers compare numerically so `.10` beats `.9`, which a string compare gets backwards on
-  // every tenth internal publish.
-  if (a === null && b === null) return 0;
-  if (a === null) return 1;
-  if (b === null) return -1;
-  const len = Math.max(a.length, b.length);
-  for (let i = 0; i < len; i += 1) {
-    const x = a[i];
-    const y = b[i];
-    if (x === undefined) return -1;
-    if (y === undefined) return 1;
-    const xn = /^\d+$/.test(x);
-    const yn = /^\d+$/.test(y);
-    if (xn && yn) {
-      if (Number(x) !== Number(y)) return Number(x) < Number(y) ? -1 : 1;
-    } else if (xn !== yn) {
-      return xn ? -1 : 1; // numeric identifiers rank lower than alphanumeric ones
-    } else if (x !== y) {
-      return x < y ? -1 : 1;
-    }
-  }
-  return 0;
-}
-
-/** -1 when a < b, 0 when equal, 1 when a > b. null when either side is not a version. */
-export function compareVersions(a, b) {
-  const va = parseVersion(a);
-  const vb = parseVersion(b);
-  if (!va || !vb) return null;
-  for (let i = 0; i < 3; i += 1) {
-    if (va.core[i] !== vb.core[i]) return va.core[i] < vb.core[i] ? -1 : 1;
-  }
-  return comparePre(va.pre, vb.pre);
 }
 
 /**
@@ -139,6 +99,10 @@ function writeState(state, deps) {
  *   'current'    up to date, or ahead (a developer's local build)
  *   'skipped'    checked recently, no manifest URL, or the version could not be established
  *
+ * A 'behind' result also carries `plugin`, the name this build answers to. Both behind branches
+ * carry it — the cached one included, so a reader of the result is never told `undefined` is out
+ * of date for a whole hour.
+ *
  * Never throws, never blocks longer than FETCH_TIMEOUT_MS, and writes nothing but its own
  * timestamp. An offline machine is `skipped`, silently: a plugin that complains about its own
  * update check is worse than one that says nothing.
@@ -150,6 +114,13 @@ export async function checkForUpdate(deps = {}) {
 
   const installed = installedPlugin(deps);
   if (!installed) return { status: 'skipped', reason: 'no-version' };
+  const behind = (latest, cached) => ({
+    status: 'behind',
+    current: installed.version,
+    latest: latest,
+    plugin: installed.name,
+    cached: cached,
+  });
 
   const state = readState(deps);
   const force = deps.force === true;
@@ -158,7 +129,7 @@ export async function checkForUpdate(deps = {}) {
     // clears the nag, and that can happen long before the next check is due.
     if (typeof state.latest === 'string') {
       const cmp = compareVersions(installed.version, state.latest);
-      if (cmp === -1) return { status: 'behind', current: installed.version, latest: state.latest, cached: true };
+      if (cmp === -1) return behind(state.latest, true);
     }
     return { status: 'skipped', reason: 'checked-recently' };
   }
@@ -183,7 +154,7 @@ export async function checkForUpdate(deps = {}) {
   if (latest === null) return { status: 'skipped', reason: 'no-published-version' };
 
   const cmp = compareVersions(installed.version, latest);
-  if (cmp === -1) return { status: 'behind', current: installed.version, latest };
+  if (cmp === -1) return behind(latest, false);
   return { status: 'current', current: installed.version, latest };
 }
 
@@ -197,9 +168,29 @@ export function environmentManifestUrl() {
   return orDefault(resolved.updateManifestUrl, null);
 }
 
-/** One line for SessionStart, or null. Says what to do, because a version number alone does not. */
+/**
+ * One line for SessionStart, or null. Names the exact command, because a version number alone is
+ * not something a user can act on.
+ *
+ * Codex has no `plugin update` verb — verified from `codex plugin --help`, which lists
+ * `add | list | marketplace | remove`, and `codex plugin marketplace --help`, which lists
+ * `add | list | upgrade | remove`. Refreshing the marketplace is the whole upgrade: Codex picks
+ * the newer build up from the refreshed snapshot, so there is nothing to re-add afterwards.
+ *
+ * Emitted WITHOUT a marketplace name, deliberately. Measured: `codex plugin marketplace upgrade
+ * beezi` answers "Error: marketplace `beezi` is not configured as a Git marketplace" — a
+ * marketplace can be present in the plugin cache and absent from config.toml, which is exactly the
+ * state a clone-installed build leaves behind. The bare form ("omit MARKETPLACE_NAME to upgrade
+ * all configured Git marketplaces") cannot hit that, and refreshing the others costs nothing.
+ *
+ * That same measurement is why the clone caveat is stated: `upgrade` touches GIT marketplaces
+ * only, so for a clone install it reports nothing and the real step is a pull. Better said here
+ * than discovered when the command appears to do nothing.
+ */
 export function updateNotice(result) {
   if (!result || result.status !== 'behind') return null;
   return `Beezi: version ${result.latest} is published; this machine runs ${result.current}.`
-    + ' Update the plugin from the marketplace you installed it from.';
+    + ' Run `codex plugin marketplace upgrade`, then start a new Codex thread to apply it.'
+    + ' (Installed from a local clone? Pull it instead: `marketplace upgrade` only refreshes Git'
+    + ' marketplaces.)';
 }
