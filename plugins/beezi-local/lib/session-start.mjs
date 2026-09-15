@@ -376,7 +376,7 @@ export async function runSessionStart(input, deps = {}) {
 
   // The stale-version check (G-8-4). Last, and deliberately after everything that reports
   // analytics: it is the only thing here the user can act on outside this session, and it must
-  // never be the reason a checkpoint did not flush. At most one request a day, bounded at 2s,
+  // never be the reason a checkpoint did not flush. At most one request an hour, bounded at 1.5s,
   // and silent on every outcome except a published version newer than this one.
   try {
     const update = updateNotice(await checkForUpdate({ fetchImpl }));
