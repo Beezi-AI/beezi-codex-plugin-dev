@@ -317,13 +317,28 @@ export function credentialRevision(creds) {
   return creds && creds[REVISION] || null;
 }
 
+// Retry only an already committed OS store; fresh installs should not wait
+// for an entry that does not exist. The environment guard requires sync reads.
+function readCommittedCredential(backend, deps) {
+  const read = () => backend.available() ? backend.get() : null;
+  let raw = read();
+  if (!['credman', 'keychain', 'secret-service'].includes(backend.name)) return raw;
+  const sleep = deps.sleepImpl || (ms => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms));
+  for (const delay of [100, 250]) {
+    if (raw) break;
+    sleep(delay);
+    raw = read();
+  }
+  return raw;
+}
+
 export async function getCredentials(deps = {}) {
   const control = readControl();
   if (control) {
     if (control.beezi_env !== BEEZI_ENV || control.backend === null) return null;
     const backend = backends(deps).find(b => b.name === control.backend);
-    if (!backend || !backend.available()) throw unavailable('Committed credential backend unavailable');
-    const raw = backend.get();
+    if (!backend) throw unavailable('Committed credential backend unavailable');
+    const raw = readCommittedCredential(backend, deps);
     const creds = raw && parseCredentials(raw);
     if (!creds || creds.beezi_revision !== control.revision) {
       throw unavailable('Committed credentials temporarily unavailable');
@@ -401,8 +416,9 @@ export function readRawCredential(deps = {}) {
   if (control) {
     if (control.backend === null) return null;
     const backend = backends(deps).find(b => b.name === control.backend);
-    if (!backend || !backend.available()) throw unavailable('Committed credential backend unavailable');
-    const raw = backend.get();
+    if (!backend) throw unavailable('Committed credential backend unavailable');
+    const raw = readCommittedCredential(backend, deps);
+    if (!raw) throw unavailable('Committed credentials could not be read; check access to the credential store and try again later');
     let parsed;
     try { parsed = JSON.parse(raw); } catch { throw unavailable('Invalid committed credentials'); }
     if (!parsed || parsed.beezi_revision !== control.revision) throw unavailable('Credential revision mismatch');
