@@ -70,9 +70,36 @@ export const HOOK_TIMEOUT_SEC = 10;
 export const HOOK_COMMAND = 'node';
 
 // Older plugin versions wrote per-event launcher scripts (`beezi-<script>.cmd` / `.sh`) into
-// hookLauncherDir() and registered those as the command. The prefix and the dir survive only to
-// recognise and clean up those installs.
+// hookLauncherDir() and registered those as the command. Those baked an ABSOLUTE node path and went
+// stale on every Node upgrade. The prefix survives only to recognise and clean up those installs.
 const LAUNCHER_PREFIX = 'beezi-';
+// …and those are the only two extensions they ever had. The filter is load-bearing, not cosmetic:
+// LAUNCHER_FILE below also starts with `beezi-`, and a "simplification" to the prefix alone would
+// make every install delete the live launcher it had just written.
+const LEGACY_LAUNCHER_EXTENSIONS = ['.cmd', '.sh'];
+
+// ── the stable launcher (the thing hooks.json actually names) ────────────────
+//
+// ONE file per environment, at a path that never moves. Every registered entry runs
+// `node "<launcherDir>/beezi-hook.mjs" <script-name>`, and the launcher finds the newest installed
+// plugin version for itself at spawn time.
+//
+// WHY THIS EXISTS: Codex keys hook TRUST to each entry's hash. While the entries named the
+// versioned plugin cache directory (`~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/…`),
+// every plugin upgrade moved that path, every upgrade therefore rewrote all five entries, and every
+// upgrade sent the user back to `/hooks` to re-trust hooks they had already trusted — with analytics
+// silently dead in between. Indirecting through a fixed path makes an upgrade change NOTHING in the
+// registry.
+//
+// It is NOT the old per-event launcher design coming back. Those baked an absolute interpreter path
+// and one file per event; this is one file, invoked by the same PATH-resolved `node` as before, and
+// it resolves the plugin version at runtime instead of at install time.
+export const LAUNCHER_FILE = 'beezi-hook.mjs';
+
+/** The single launcher this environment's entries point at. */
+export function launcherPath(launcherDir = hookLauncherDir()) {
+  return path.join(launcherDir, LAUNCHER_FILE);
+}
 
 // ── owner identity (G-1-7) ──────────────────────────────────────────────────
 //
@@ -120,12 +147,17 @@ function quoteCommandArgument(value) {
 // Codex 0.154.0 on Windows accepts `arguments` in hooks.json but does not pass them to command
 // hooks. Keep the interpreter PATH-resolved, but put the complete invocation in `command`.
 //
+// `node "<launcher>" <script-name>`: the QUOTED path is the stable launcher, and the script name
+// follows as a bare token (it is one of SCRIPT_NAMES — no spaces, nothing to quote). Nothing in the
+// string names a plugin version, which is the whole point: an upgrade leaves every entry, and so
+// every entry's trust hash, untouched.
+//
 // THE UNSUFFIXED BUILD WRITES NO TAG. Production ownership remains implicit, and "absent means
 // production" matches env.json's own convention in lib/paths.mjs. It also makes R1's "recognise
 // legacy unsuffixed entries only in the unsuffixed migration path" fall out by construction: an
 // untagged, unlabelled legacy entry can only ever resolve to 'beezi'.
-export function hookCommand(scriptPath, owner = hookOwner()) {
-  const parts = [HOOK_COMMAND, quoteCommandArgument(scriptPath)];
+export function hookCommand(launcherFile, scriptName, owner = hookOwner()) {
+  const parts = [HOOK_COMMAND, quoteCommandArgument(launcherFile), String(scriptName)];
   if (owner !== UNSUFFIXED_OWNER) parts.push(OWNER_FLAG + owner);
   return parts.join(' ');
 }
@@ -169,8 +201,11 @@ function ownerFromCommand(handler) {
   return match ? match[1] : null;
 }
 
-// Read both the corrected composite-command form and the broken 0.8.x `arguments` form so install
-// and uninstall can migrate existing entries without losing ownership information.
+// The QUOTED path inside a `node "<path>" …` command — today the stable launcher, on an entry this
+// build has not rewritten yet the versioned `…/scripts/<name>.mjs`. Both forms are read, plus the
+// broken 0.8.x `arguments` form, so install and uninstall can migrate existing entries without
+// losing ownership information. What follows the quoted path (the script name, the owner tag) is
+// not parsed here: no caller needs it, and command equality is what `hooksStatus` compares.
 function handlerScript(handler) {
   if (!handler || typeof handler !== 'object') return null;
   if (Array.isArray(handler.arguments) && handler.arguments.length) {
@@ -218,9 +253,20 @@ function handlerOwner(handler, launcherDir) {
 
   const script = handlerScript(handler);
   if (script !== null) {
-    // Ours by construction: <...beezi...>/scripts/<one of SCRIPT_NAMES>. Both anchors are
-    // needed — a user's own checkpoint.mjs may share the name, and a beezi-flavoured path alone
-    // (say, a repo checkout with "beezi" in it) is not proof either.
+    // The current untagged production form: our launcher, in OUR launcher dir. Both halves are
+    // needed and both are exact — hookLauncherDir() is namespaced per environment, so a sibling
+    // variant asking this question compares against its own dir and correctly answers "not mine",
+    // and a file of the user's that happens to be called beezi-hook.mjs elsewhere is not claimed.
+    // This is what keeps production recognisable after the user rewords its label in /hooks.
+    if (
+      path.basename(script) === LAUNCHER_FILE
+      && path.resolve(path.dirname(script)) === path.resolve(launcherDir)
+    ) return UNSUFFIXED_OWNER;
+
+    // The pre-launcher form, still in registries this build has not rewritten yet:
+    // <...beezi...>/scripts/<one of SCRIPT_NAMES>. Both anchors are needed — a user's own
+    // checkpoint.mjs may share the name, and a beezi-flavoured path alone (say, a repo checkout
+    // with "beezi" in it) is not proof either. Kept so those entries can be MIGRATED.
     if (
       SCRIPT_NAMES.indexOf(path.basename(script)) !== -1
       && path.basename(path.dirname(script)) === 'scripts'
@@ -321,6 +367,11 @@ const DEFAULT_SCRIPTS_DIR = path.join(
   'scripts',
 );
 
+// The launcher we install is a verbatim copy of the one shipped in this plugin version. Injectable
+// so tests can point at a fixture without a build step — the same reason `owner`, `hooksFile` and
+// `launcherDir` are.
+const DEFAULT_LAUNCHER_SOURCE = path.join(DEFAULT_SCRIPTS_DIR, 'hook-launcher.mjs');
+
 // The exact command for the read-only action, absolute and copy-pasteable. Derived rather than
 // hand-written: a message that reaches the MCP tool is read by a model that will try to RUN what it
 // is given, and a relative path — or worse, a `<plugin>` placeholder — resolves to nothing from the
@@ -330,10 +381,14 @@ export function statusCommand(scriptsDir = DEFAULT_SCRIPTS_DIR) {
 }
 
 // The `{ hooks: { <Event>: [ { matcher, hooks: [handler] } ] } }` fragment for Beezi's events.
-// `owner` is injectable for the same reason `hooksFile` and `launcherDir` are: lib/paths.mjs
-// freezes the environment at module load, so a both-orders variant matrix would otherwise need one
-// child process per variant.
-export function buildHookEntries({ scriptsDir = DEFAULT_SCRIPTS_DIR, owner = hookOwner() } = {}) {
+//
+// Derived from `launcherDir` and `owner` ALONE. No plugin path, no version, nothing that an upgrade
+// can move — two installs of different plugin versions produce byte-identical entries, which is
+// what stops an upgrade revoking hook trust. `owner` is injectable for the same reason `hooksFile`
+// and `launcherDir` are: lib/paths.mjs freezes the environment at module load, so a both-orders
+// variant matrix would otherwise need one child process per variant.
+export function buildHookEntries({ launcherDir = hookLauncherDir(), owner = hookOwner() } = {}) {
+  const launcher = launcherPath(launcherDir);
   const out = {};
   for (const { event, script } of BEEZI_HOOKS) {
     out[event] = [
@@ -342,7 +397,7 @@ export function buildHookEntries({ scriptsDir = DEFAULT_SCRIPTS_DIR, owner = hoo
         hooks: [
           {
             type: 'command',
-            command: hookCommand(path.join(scriptsDir, script), owner),
+            command: hookCommand(launcher, script, owner),
             statusMessage: ownerLabel(owner),
             timeout: HOOK_TIMEOUT_SEC,
           },
@@ -351,6 +406,84 @@ export function buildHookEntries({ scriptsDir = DEFAULT_SCRIPTS_DIR, owner = hoo
     ];
   }
   return out;
+}
+
+// ── keeping the launcher file current ───────────────────────────────────────
+//
+// The registry is frozen across upgrades; the launcher file is NOT. It is plugin code, shipped in
+// the version being installed, so every install and every ensureHooks() overwrites it with the
+// current bytes. That split is the whole design: the thing Codex hashes never changes, the thing
+// that carries the logic always does.
+
+function readFileOrNull(file) {
+  try { return fs.readFileSync(file); } catch { return null; }
+}
+
+/**
+ * 'current' | 'stale' | 'missing' — the installed launcher against the one this build ships.
+ *
+ * An UNREADABLE SOURCE reads as 'current' whenever a launcher is on disk. We cannot tell whether it
+ * differs, and guessing 'stale' would make every caller rewrite a file it has nothing better to
+ * write. With no launcher on disk either, 'missing' is still the truthful answer.
+ */
+function launcherState(launcherDir, launcherSource) {
+  const installed = readFileOrNull(launcherPath(launcherDir));
+  if (installed === null) return 'missing';
+  const source = readFileOrNull(launcherSource);
+  if (source === null) return 'current';
+  return source.equals(installed) ? 'current' : 'stale';
+}
+
+/**
+ * Replace the launcher with this build's copy. Returns whether anything was written.
+ *
+ * WHY renameSync HERE, when lib/single-instance-lock.mjs states at length that on Windows a rename
+ * is not an exclusivity signal: exclusion is not what it is being asked for. Every caller of this
+ * already holds the `codex-hooks` lock, so there is exactly one writer. The rename is used only for
+ * ATOMIC REPLACEMENT — a hook spawned mid-write must never see a half-copied launcher — and for
+ * that its return value is not being interpreted as "I won" at all.
+ *
+ * The retry is Windows-specific and real: a hook process may have the file open, and Windows then
+ * fails the replace with EPERM/EBUSY rather than swapping underneath it. A few immediate retries
+ * cover the microseconds a short-lived hook holds it; past that we give up and leave the existing
+ * launcher in place, because the next session tries again.
+ */
+function writeLauncher(launcherDir, launcherSource) {
+  const source = readFileOrNull(launcherSource);
+  if (source === null) return false;
+
+  fs.mkdirSync(launcherDir, { recursive: true });
+  const target = launcherPath(launcherDir);
+  const temp = path.join(launcherDir, `.${LAUNCHER_FILE}.${process.pid}.tmp`);
+  fs.writeFileSync(temp, source);
+  for (let attempt = 0; attempt < 5; attempt += 1) {
+    try {
+      fs.renameSync(temp, target);
+      return true;
+    } catch (error) {
+      const code = error && error.code;
+      if (code !== 'EPERM' && code !== 'EBUSY' && code !== 'EACCES') break;
+    }
+  }
+  removeFileSync(temp);
+  return false;
+}
+
+/**
+ * Delete the per-event launchers a pre-0.9 install left in this dir — and NOTHING else.
+ *
+ * It used to be `removeDirSync(launcherDir)`, which is no longer possible: the dir now holds the
+ * live launcher this very install just wrote. The extension filter is what separates them, since
+ * `beezi-hook.mjs` matches the `beezi-` prefix too.
+ */
+function sweepLegacyLaunchers(launcherDir) {
+  let names;
+  try { names = fs.readdirSync(launcherDir); } catch { return; }
+  for (const name of names) {
+    if (name.indexOf(LAUNCHER_PREFIX) !== 0) continue;
+    if (LEGACY_LAUNCHER_EXTENSIONS.indexOf(path.extname(name)) === -1) continue;
+    removeFileSync(path.join(launcherDir, name));
+  }
 }
 
 // The events a registry currently carries THIS OWNER's handlers for. A sibling variant's events
@@ -445,6 +578,10 @@ function writeRegistry(hooksFile, registry) {
 function isDeadLegacyLauncher(handler) {
   if (!handler || typeof handler !== 'object') return false;
   if (Array.isArray(handler.arguments) && handler.arguments.length) return false;
+  // THE LINE THAT EXCLUDES THE CURRENT LAUNCHER. A legacy entry named the launcher directly, with
+  // no interpreter and no quoting, so it has no quoted script; ours is always `node "<launcher>"
+  // <script>` and returns a path here. Without this, a launcher dir deleted by hand would look like
+  // five dead legacy entries and the sweep would strip a live install.
   if (handlerScript(handler) !== null) return false;
 
   const command = typeof handler.command === 'string' ? handler.command : handler.commandWindows;
@@ -535,34 +672,46 @@ function withRegistry(fn) {
 }
 
 export function installHooks({
-  scriptsDir = DEFAULT_SCRIPTS_DIR,
   hooksFile = codexHooksFile(),
   launcherDir = hookLauncherDir(),
+  launcherSource = DEFAULT_LAUNCHER_SOURCE,
   owner = hookOwner(),
 } = {}) {
   const run = withRegistry(() => {
+    // THE LAUNCHER IS WRITTEN FIRST, before anything reads the registry. Every entry we write names
+    // it, so the dead-entry scan below would otherwise classify this owner's own entries as orphans
+    // and report them as `swept` when they were merely replaced. With the file already on disk,
+    // `swept` names only genuine cross-owner orphans.
+    const launcherWritten = writeLauncher(launcherDir, launcherSource);
+
     const existing = readRegistry(hooksFile);
     const before = brokenBeeziEntries(existing, launcherDir);
     // The sweep runs BEFORE the merge, never after. Afterwards it would stat the entries this very
-    // call just wrote and delete them all if the scripts dir is not on disk — an install that
-    // silently produces an empty registry.
+    // call just wrote and delete them all if the launcher is not on disk — an install that silently
+    // produces an empty registry.
     writeRegistry(hooksFile, mergeHooks(
       removeDeadBeeziEntries(existing, launcherDir),
-      buildHookEntries({ scriptsDir, owner }),
+      buildHookEntries({ launcherDir, owner }),
       launcherDir,
       owner,
     ));
 
-    // Launchers are no longer written; sweep away the ones an older version left. The directory is
-    // hookLauncherDir(), which is namespaced per environment, so it is exclusively THIS variant's by
-    // construction and removing it wholesale cannot reach a sibling's.
-    removeDirSync(launcherDir);
-    return before;
+    // Clear out the per-event launchers an older version left beside ours. Only those files: the
+    // directory itself is now live state, not a leftover.
+    sweepLegacyLaunchers(launcherDir);
+    return { before, launcherWritten };
   });
 
   // `swept` is what the sweep actually cleared, computed from the registry as it was BEFORE the
   // write, so a caller can name the orphans it removed rather than the ones it left.
-  return { hooksFile, owner, events: BEEZI_EVENTS, swept: run.skipped ? [] : run.value, skipped: !!run.skipped };
+  return {
+    hooksFile,
+    owner,
+    events: BEEZI_EVENTS,
+    swept: run.skipped ? [] : run.value.before,
+    launcherRefreshed: run.skipped ? false : run.value.launcherWritten,
+    skipped: !!run.skipped,
+  };
 }
 
 export function uninstallHooks({
@@ -586,6 +735,8 @@ export function uninstallHooks({
         writeRegistry(hooksFile, stripped);
       }
     }
+    // The whole dir, launcher included: nothing of this environment's is left behind, and
+    // hookLauncherDir() is namespaced per environment so this cannot reach a sibling's launcher.
     removeDirSync(launcherDir);
     return removed;
   });
@@ -596,42 +747,90 @@ export function uninstallHooks({
  * Bring the hooks to a working state WITHOUT asking the user to run anything.
  *
  * The one entry point every caller that merely *noticed* a bad install should use, instead of
- * printing an install command for the user to run by hand. An upgrade moves the plugin's scripts out
- * from under the registry on its own, so "stale" is the NORMAL state after one, not an accident.
+ * printing an install command for the user to run by hand.
  *
- * Idempotent by refusing to write when there is nothing to fix, and that refusal is load-bearing
- * rather than an optimisation: Codex keys hook trust to each entry's HASH, so a pointless rewrite
- * of identical entries would revoke the trust the user has already granted. `installed` with no
- * dead entries is therefore a hard no-op.
+ * TWO INDEPENDENT REPAIRS, and keeping them independent is the point:
+ *
+ *   · the REGISTRY is refused a rewrite whenever there is nothing to fix. That refusal is
+ *     load-bearing rather than an optimisation: Codex keys hook trust to each entry's HASH, so a
+ *     pointless rewrite of identical entries would revoke the trust the user has already granted.
+ *   · the LAUNCHER file is refreshed whenever its bytes are not this build's. It is plugin code,
+ *     Codex hashes nothing about it, and the registry entry that names it does not change.
+ *
+ * So the expected outcome after a plugin upgrade is now `repaired: false, launcherRefreshed: true`:
+ * new code, same entries, no re-trust. `stale` used to be the normal post-upgrade state; it is not
+ * any more, and an entry that still reads `stale` is one written by a pre-launcher version, which
+ * costs exactly one final re-trust to migrate.
+ *
+ * THE LAUNCHER IS REFRESHED FIRST, before the registry is judged. Every entry points at it, so a
+ * missing launcher makes all five read as dead, and judging first would rewrite a perfectly good
+ * registry — revoking trust over a file we were about to put back anyway.
  *
  * What it cannot do is grant the trust — there is no non-interactive way to, and `repaired: true`
  * is precisely the signal a caller needs to tell the user to run `/hooks` once.
  */
 export function ensureHooks(options = {}) {
-  const before = hooksStatus(options);
+  const initial = hooksStatus(options);
+
+  let launcherRefreshed = false;
+  if (initial.launcher !== 'current') {
+    const launcherDir = options.launcherDir || hookLauncherDir();
+    const launcherSource = options.launcherSource || DEFAULT_LAUNCHER_SOURCE;
+    const run = withRegistry(() => writeLauncher(launcherDir, launcherSource));
+    // Contention is not success. Another Beezi process is writing the same bytes, but this one did
+    // not, and a caller that reports "refreshed" for a write that did not happen is lying.
+    if (run.skipped) {
+      return {
+        repaired: false, launcherRefreshed: false, before: initial.state, state: initial.state,
+        swept: [], status: initial, skipped: true,
+      };
+    }
+    launcherRefreshed = !!run.value;
+  }
+
+  const before = launcherRefreshed ? hooksStatus(options) : initial;
   const dead = before.broken.length > 0;
   if (before.state === 'installed' && !dead) {
-    return { repaired: false, before: before.state, state: before.state, swept: [], status: before };
+    return {
+      repaired: false, launcherRefreshed, before: before.state, state: before.state,
+      swept: [], status: before,
+    };
   }
 
   const result = installHooks(options);
   if (result.skipped) {
-    return { repaired: false, before: before.state, state: before.state, swept: [], status: before, skipped: true };
+    return {
+      repaired: false, launcherRefreshed, before: before.state, state: before.state,
+      swept: [], status: before, skipped: true,
+    };
   }
   const after = hooksStatus(options);
-  return { repaired: true, before: before.state, state: after.state, swept: result.swept, status: after };
+  return {
+    repaired: true,
+    launcherRefreshed: launcherRefreshed || result.launcherRefreshed,
+    before: before.state,
+    state: after.state,
+    swept: result.swept,
+    status: after,
+  };
 }
 
-// Is the current install complete and pointing at scripts the current plugin version actually has?
-// Everything is read from the registry alone — there are no launcher files left to compare against,
-// and the interpreter is bare `node` on PATH, which cannot be verified from here. A plugin upgrade
-// moves the versioned cache directory out from under the registered script paths, so a stale
-// install is the expected failure and is named as such rather than reported as "not installed".
-// `state` is the classifier callers should branch on.
+// Is the current install complete, and is it in the launcher form?
+//
+// `state` is driven by the REGISTRY ALONE — `installed | stale | partial | absent` — and is the
+// classifier callers branch on. It no longer moves with the plugin version: the expected entries
+// are derived from `launcherDir` and `owner`, neither of which an upgrade touches, so `stale` now
+// means one thing only — an entry written by a version that registered the versioned script path
+// (or the broken 0.8.x `arguments` form, or a per-event legacy launcher), all of which install
+// migrates in one write.
+//
+// `launcher` is reported ALONGSIDE it, never folded into it: the file's freshness and the entries'
+// correctness are independent, they are repaired independently, and only one of them costs a
+// re-trust. The interpreter is still bare `node` on PATH and cannot be verified from here.
 export function hooksStatus({
-  scriptsDir = DEFAULT_SCRIPTS_DIR,
   hooksFile = codexHooksFile(),
   launcherDir = hookLauncherDir(),
+  launcherSource = DEFAULT_LAUNCHER_SOURCE,
   owner = hookOwner(),
 } = {}) {
   const registry = readJson(hooksFile, null);
@@ -653,11 +852,10 @@ export function hooksStatus({
     }
     if (!handlers.length) { missingEvents.push(event); continue; }
     registered.push(event);
-    // Current means new-format and pointing at this plugin version's script. A legacy launcher or
-    // the broken node-plus-arguments form fails this check, which is what routes old
-    // installs through `stale` → "run install to repair" → migration.
-    const expected = path.join(scriptsDir, script);
-    const expectedCommand = hookCommand(expected, owner);
+    // Current means the launcher form, byte for byte. A versioned script path, a legacy per-event
+    // launcher or the broken node-plus-arguments form all fail this check, which is what routes an
+    // old install through `stale` → "run install to repair" → migration, once.
+    const expectedCommand = hookCommand(launcherPath(launcherDir), script, owner);
     const current = handlers.some((h) => h.command === expectedCommand && !('arguments' in h));
     if (!current) staleEvents.push(event);
   }
@@ -674,5 +872,16 @@ export function hooksStatus({
   // healthy install of ours does not preclude — that gap is the whole reason this scan exists.
   const broken = brokenBeeziEntries(registry, launcherDir);
 
-  return { hooksFile, owner, state, complete, registered, missingEvents, staleEvents, broken };
+  return {
+    hooksFile,
+    owner,
+    state,
+    complete,
+    registered,
+    missingEvents,
+    staleEvents,
+    broken,
+    launcher: launcherState(launcherDir, launcherSource),
+    launcherFile: launcherPath(launcherDir),
+  };
 }

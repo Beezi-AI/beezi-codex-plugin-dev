@@ -405,8 +405,9 @@ export function createBridge(deps = {}) {
   // version's script, so Codex's spawn fails and `session-start.mjs` never runs — the hooks cannot
   // repair themselves, by definition of being broken. The MCP server is spawned eagerly at the
   // start of every session, needs no trust, and lives the whole session, so it is the one Beezi
-  // code path that still executes on a machine whose hooks are dead. Every plugin upgrade produces
-  // exactly that machine.
+  // code path that still executes on a machine whose hooks are dead. Entries name a stable
+  // launcher, so an upgrade no longer produces that machine; a deleted data root or a legacy
+  // versioned-path install still does.
   //
   // Bounded hard, because this runs inside the process that must never take the plugin down:
   //   · once per process — a no-op check is cheap but not free, and nothing changes mid-session.

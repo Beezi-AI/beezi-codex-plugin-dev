@@ -101,7 +101,7 @@ test('skill — carries the hard boundary against the one-time import', () => {
 
 test('skill — carries the trust-gap framing and points at the cause, not just the symptom', () => {
   assert.match(skill, /trusts them in `\/hooks`/);
-  assert.match(skill, /upgrade invalidates that\s+trust/);
+  assert.match(skill, /Trust survives a plugin upgrade/);
   assert.match(skill, /analytics-hooks/);
 });
 

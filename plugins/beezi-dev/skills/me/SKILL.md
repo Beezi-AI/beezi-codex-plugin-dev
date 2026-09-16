@@ -56,9 +56,10 @@ answer says so explicitly when the hooks are installed but nothing is arriving. 
 linked, hooks installed, still no data — is the platform's most common failure, and the trust step
 is the fix.
 
-The other reporting verdicts name their own remedy: hooks **not installed** and **hooks pointing at
-an older plugin version** (after an upgrade) both print the exact install command to run, followed
-by re-trusting via `/hooks`; an **incomplete install** does the same. When the link could not be
+The other reporting verdicts name their own remedy: hooks **not installed** and an **out-of-date
+hook launcher** both print the exact install command to run; an **incomplete install** does the
+same. Only a verdict that says the registry entries themselves were rewritten needs the user back
+in `/hooks` — a refreshed launcher leaves the entries, and their trust, alone. When the link could not be
 verified, reporting status is reported as *unknown* rather than broken — queued reports are retried
 automatically once the API is reachable. The `analytics-hooks` skill covers the install/repair side.
 

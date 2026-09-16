@@ -51,5 +51,5 @@ and this manual step stops being necessary.
 ## When to suggest `sync` instead
 
 This skill only ever saves **the session it is run from**. History that is already missing — sessions
-that ran while the hooks were untrusted, stale after an upgrade, or offline — is the `sync` skill's
+that ran while the hooks were untrusted, not installed, or offline — is the `sync` skill's
 job, and is not a reason to re-run this one.
