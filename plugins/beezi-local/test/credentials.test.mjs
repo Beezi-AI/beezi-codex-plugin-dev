@@ -9,7 +9,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  getCredentials, setCredentials, deleteCredentials, SERVICE, serviceFor, preserveMigrationCredential,
+  getCredentials, setCredentials, deleteCredentials, SERVICE, serviceFor, preserveMigrationCredential, readRawCredential,
 } from '../lib/credentials.mjs';
 import { BEEZI_ENV } from '../lib/paths.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
@@ -31,6 +31,93 @@ const creds = (accessToken) => ({
 
 // Stored access_token, or null — the round-trip observable in these tests.
 const storedToken = async (deps) => (await getCredentials(deps))?.access_token ?? null;
+
+test('an inaccessible Windows credential store is not reported as a revision mismatch', async (t) => {
+  tmpHome(t);
+  const run = winRun();
+  await setCredentials(creds('at'), { platform: 'win32', run });
+  assert.throws(() => readRawCredential({
+    platform: 'win32', run: () => ({ ok: false, stdout: '' }),
+  }), /Committed credentials could not be read; check access to the credential store/);
+  assert.equal(JSON.parse(readRawCredential({ platform: 'win32', run })).access_token, 'at');
+});
+
+const nativeReadCases = [
+  { platform: 'win32', makeRun: () => winRun(), isRead: args => args.at(-1).includes('CredRead') },
+  { platform: 'darwin', makeRun: () => macRun(new Map()), isRead: args => args[0] === 'find-generic-password' },
+  { platform: 'linux', makeRun: () => secretToolRun(new Map(), true), isRead: args => args[0] === 'lookup' },
+  { platform: 'linux', makeRun: () => secretToolRun(new Map(), true), isRead: args => args[0] === '--version', probe: true },
+];
+
+for (const { platform, makeRun, isRead, probe } of nativeReadCases) {
+for (const reader of [getCredentials, readRawCredential]) {
+  for (const recover of [true, false]) {
+    test(`${reader.name}: bounded ${platform} ${probe ? 'probe' : 'read'} retries, recovery=${recover}`, async (t) => {
+      const dir = tmpHome(t);
+      const backing = makeRun();
+      await setCredentials(creds('at'), { platform, run: backing });
+      const authorityPath = path.join(dir, 'credential-control.json');
+      const authority = fs.readFileSync(authorityPath, 'utf-8');
+      let reads = 0;
+      const waits = [];
+      const deps = {
+        platform, sleepImpl: ms => waits.push(ms),
+        run: (file, args, input) => {
+          if (isRead(args)) {
+            reads++;
+            if (!recover || reads < 3) return { ok: false, stdout: '' };
+          }
+          return backing(file, args, input);
+        },
+      };
+      if (recover) {
+        const result = await reader(deps);
+        assert.equal((typeof result === 'string' ? JSON.parse(result) : result).access_token, 'at');
+      } else {
+        await assert.rejects(async () => reader(deps), { code: 'CREDENTIALS_UNAVAILABLE' });
+      }
+      assert.equal(reads, 3);
+      assert.deepEqual(waits, [100, 250]);
+      assert.equal(fs.readFileSync(authorityPath, 'utf-8'), authority);
+      assert.equal(fs.existsSync(credsPath(dir)), false, 'never fall back to a file');
+    });
+  }
+}
+}
+
+for (const { platform, makeRun, isRead } of nativeReadCases.filter(c => !c.probe)) {
+test(`${platform} readable revision mismatches are not retried`, async (t) => {
+  tmpHome(t);
+  const backing = makeRun();
+  await setCredentials(creds('at'), { platform, run: backing });
+  let reads = 0;
+  const deps = {
+    platform, sleepImpl: () => assert.fail('must not wait for a revision mismatch'),
+    run: (file, args, input) => {
+      const result = backing(file, args, input);
+      if (isRead(args)) {
+        reads++;
+        result.stdout = JSON.stringify({ ...JSON.parse(result.stdout), beezi_revision: 'stale' });
+      }
+      return result;
+    },
+  };
+  assert.throws(() => readRawCredential(deps), /Credential revision mismatch/);
+  await assert.rejects(getCredentials(deps), { code: 'CREDENTIALS_UNAVAILABLE' });
+  assert.equal(reads, 2);
+});
+}
+
+test('a readable credential with a different revision still blocks raw reads', async (t) => {
+  const dir = tmpHome(t);
+  const deps = { platform: 'unknown' };
+  await setCredentials(creds('at'), deps);
+  const stored = JSON.parse(fs.readFileSync(credsPath(dir), 'utf-8'));
+  const credential = JSON.parse(stored.token);
+  credential.beezi_revision = 'stale';
+  fs.writeFileSync(credsPath(dir), JSON.stringify({ token: JSON.stringify(credential) }));
+  assert.throws(() => readRawCredential(deps), /Credential revision mismatch/);
+});
 
 // ── fake OS tools (in-memory), injected via deps.run ──────────────────────────
 
