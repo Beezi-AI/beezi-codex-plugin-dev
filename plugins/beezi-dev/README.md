@@ -187,6 +187,15 @@ Codex writes one rollout transcript per session at
   `origin` — a directory that isn't a repo, or a repo without a remote — is still reported, under a
   synthetic `local:<folder>` remote. Only the folder name travels, never the path around it, and the
   `local:` prefix keeps it from ever canonicalizing onto a real remote server-side.
+- **Project instructions** are observed independently for every segment's repository root. Codex
+  selects a non-empty root `AGENTS.override.md` first, then `AGENTS.md`; an empty file remains a real
+  zero-line result when there is no non-empty candidate. Reports carry
+  `project_instructions_status` as `present`, `missing`, or `unknown`. The established
+  `claude_md_lines` field remains for compatibility and, on Codex reports, contains the line count
+  of that selected AGENTS source only when status is `present`. File contents and filesystem paths
+  are never sent. Historical imports collect the current root file and status in the same way as
+  live reports. These describe the repository at collection time, not its historical contents.
+  Already queued reports retain the values captured when they were created.
 - **Operations** are categorized from `function_call` / `custom_tool_call` records. MCP calls
   surface as bare function names, but the matching `event_msg/mcp_tool_call_end` names the server
   (`payload.invocation.server`) and joins back by `call_id` — so `by_server` carries real names, and
@@ -222,11 +231,15 @@ Codex writes one rollout transcript per session at
     `wait_agent` while its agents run, so they describe the same seconds. Summing them turned 431s of
     real time into 1117s.
 
-The report payload and idempotency contract are unchanged from the Claude plugin, so the server
-upserts are identical. Subagent segments scope the id by agent —
+The report fields and idempotency contract are shared with the Claude plugin, so the server upserts
+are identical. Subagent segments scope the id by agent —
 `segmentId = "<session_id>:<agent_id>:<fromLine>-<toLine>"` versus
 `"<session_id>:<fromLine>-<toLine>"` for the main thread — because the server keys on
 `segmentId::model` and two agents starting at their own fork boundaries otherwise collide.
+
+The API must be deployed before a collector release that sends `project_instructions_status`.
+Session-report DTOs reject unknown keys, so an older API rejects the whole payload rather than
+ignoring the new field.
 
 ## Billing source and plan capture
 

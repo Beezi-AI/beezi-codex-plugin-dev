@@ -35,6 +35,7 @@ import { acquireLock, withLockAsync, sessionLock, sharedLock } from './single-in
 import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './diagnostics.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot, knownOrigin, originFromGitConfig } from './repo-map.mjs';
 import { mergeIntervals, subtractIntervals, totalMs, claimIntervals } from './active-time.mjs';
+import { probeProjectInstructions } from './project-instructions.mjs';
 import { readAgents as _readAgents, writeAgent as _writeAgent } from './subagent-state.mjs';
 import {
   inspectSubagentRollout as _inspectSubagentRollout,
@@ -122,37 +123,6 @@ function detectTimezone() {
   } catch {
     return null;
   }
-}
-
-// Size of the repo's standing instructions, in `wc -l` lines. A repo's AGENTS.md is prepended to
-// every prompt run inside it, so it is a per-repo floor on what each turn costs before the user
-// types a word — an attribute of the repository, which is why only the ROOT file is measured.
-// Nested and user-global instruction files add to the real prompt but belong to no repo.
-//
-// Null when absent or unreadable, so the caller OMITS the field rather than collapsing "no file"
-// into "empty file" (which is a real, distinct 0).
-//
-// ON THE WIRE THIS IS `claude_md_lines` (G-3-7 Option A). That key is already whitelisted on the
-// shared /sessions/report and /sessions/backfill DTOs because the Claude client sends it, and
-// `forbidNonWhitelisted` is key-level, not agent-level. A vendor-neutral name would be cleaner, but
-// an unknown key 400s the whole payload and flushQueue treats a 400 as permanent — it DELETES the
-// rejected segment (REVIEW R4) — so nothing new may be sent before the DTO accepts it. On an
-// `X-Beezi-Agent: codex` row this field means AGENTS.md; that is a decoding rule, not an ambiguity.
-// R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
-function agentsMdLines(repoRoot) {
-  // Typed, not merely truthy. This runs OUTSIDE the per-segment try/catch, and
-  // `path.join(<truthy non-string>, …)` throws ERR_INVALID_ARG_TYPE — which would escape
-  // enqueueSegments and abort the whole window with the cursor unadvanced, re-processing it
-  // forever. That is the exact failure the try/catch below it exists to prevent, so this must not
-  // be able to reach path.join at all. Same shape as the guards in canonicalizeAgents.
-  if (typeof repoRoot !== 'string' || !repoRoot) return null;
-  let text;
-  try { text = fs.readFileSync(path.join(repoRoot, 'AGENTS.md'), 'utf-8'); } catch { return null; }
-  if (text === '') return 0;
-  const parts = text.split('\n');
-  // A trailing newline leaves one empty final element; anything else is a real last line, and
-  // `wc -l` semantics still count it.
-  return parts[parts.length - 1] === '' ? parts.length - 1 : parts.length;
 }
 
 // How long a checkpoint run may spend before it must be finished. Codex kills a hook at the
@@ -479,10 +449,10 @@ async function runLockedCheckpoint(lock, ctx) {
   const rootCache = new Map();
   const remoteCache = new Map();
   const timelineCache = new Map();
-  // root→AGENTS.md line count. Read once per repo root, not once per segment: a window that spans
-  // twenty segments of one repo would otherwise open the same file twenty times inside a hook
-  // budget. Cached even when null, so an absent file costs one failed open for the whole run.
-  const agentsMdCache = new Map();
+  // root→project instruction observation. Read once per repo root, not once per segment: a window
+  // that spans twenty segments of one repo would otherwise repeat the same filesystem probes inside
+  // a hook budget. Missing and unknown answers are cached too.
+  const projectInstructionsCache = new Map();
 
   // Persisted known-root map: seeds resolution (prefix match) and gets refreshed with any root→origin
   // we learn this checkpoint. A best-effort hint — a load failure yields an empty map, not a throw.
@@ -491,12 +461,11 @@ async function runLockedCheckpoint(lock, ctx) {
 
   const repoRootOf = (dir) => resolveRepoRoot(gitImpl, dir, rootCache, map);
 
-  const agentsMdLinesOf = (root) => {
-    if (!root) return null;
-    if (agentsMdCache.has(root)) return agentsMdCache.get(root);
-    const lines = agentsMdLines(root);
-    agentsMdCache.set(root, lines);
-    return lines;
+  const projectInstructionsOf = (root) => {
+    if (projectInstructionsCache.has(root)) return projectInstructionsCache.get(root);
+    const observation = probeProjectInstructions(root);
+    projectInstructionsCache.set(root, observation);
+    return observation;
   };
 
   const branchOf = (root, ms) => {
@@ -644,9 +613,10 @@ async function runLockedCheckpoint(lock, ctx) {
       const remote = orDefault(resolveRemote(seg.repoRoot), localRemote(orDefault(seg.repoRoot, cwd)));
       // Nothing left to name the work by — only reachable when the session has no cwd either.
       if (!remote) { skipped.noRemote += 1; continue; }
-      // The segment's OWN repo root, not the session cwd: a window that spans two repos must
-      // describe the standing instructions each part actually ran under.
-      const mdLines = agentsMdLinesOf(seg.repoRoot);
+      // Read the current instructions at the segment's OWN repo root, not the session cwd.
+      // Historical imports use the same observation as live reports: this describes the file
+      // available at collection time, not a reconstruction of its contents when the segment ran.
+      const projectInstructions = projectInstructionsOf(seg.repoRoot);
       // A subagent runs its own context window, so the parent's occupancy is not its own and these
       // three never ship on a non-main segment. The server already nulls them there
       // (`session-report.service.ts` in the hb-ai-agent-portal repo), so this is hygiene rather
@@ -668,9 +638,13 @@ async function runLockedCheckpoint(lock, ctx) {
           ...accountIdentity,
           session_name: sessionName,
           ...(timezone ? { timezone } : {}),
-          // Omitted, never nulled: "no AGENTS.md" and "an empty AGENTS.md" are different facts, and
-          // 0 is the honest answer only for the second. See agentsMdLines on the key's name.
-          ...(mdLines != null ? { claude_md_lines: mdLines } : {}),
+          // `claude_md_lines` is the established cross-agent wire field. On a Codex report it is
+          // the line count of the selected root AGENTS file. The status key is a newer backend-first
+          // addition: an older strict DTO rejects it rather than ignoring it.
+          project_instructions_status: projectInstructions.status,
+          ...(projectInstructions.status === 'present'
+            ? { claude_md_lines: projectInstructions.lineCount }
+            : {}),
           ...(extra || {}),
           ...segStats,
           // After the spread, deliberately: seg.stats carries the un-deduped scalar.
