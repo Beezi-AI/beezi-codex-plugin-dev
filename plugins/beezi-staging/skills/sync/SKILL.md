@@ -1,6 +1,6 @@
 ---
 name: sync
-description: Upload past Codex sessions to Beezi analytics, skipping anything Beezi already has. Use when a period is missing from the user's analytics — because the hooks were never trusted, went stale after a plugin upgrade, or the machine was offline — or when the user asks to sync, backfill, re-upload, or repair their Beezi history.
+description: Upload past Codex sessions to Beezi analytics, skipping anything Beezi already has. Use when a period is missing from the user's analytics — because the hooks were never trusted or installed, or the machine was offline — or when the user asks to sync, backfill, re-upload, or repair their Beezi history.
 ---
 
 # Beezi: sync past sessions
@@ -11,13 +11,14 @@ running it twice uploads nothing twice and running it often is safe.
 
 ## Why a Codex user needs this
 
-Codex hooks do not run until the user trusts them in `/hooks`, and a plugin upgrade invalidates that
-trust by hash. So the normal Codex lifecycle includes stretches where sessions were never reported —
-between installing the plugin and trusting the hooks, and again after every upgrade until the user
-re-trusts them. This is the command that fills those stretches in.
+Codex hooks do not run until the user trusts them in `/hooks`. So the normal Codex lifecycle
+includes stretches where sessions were never reported — between installing the plugin and trusting
+the hooks, and any period the machine was offline or the hooks were removed. This is the command
+that fills those stretches in. (Trust survives a plugin upgrade, so upgrading no longer opens such
+a gap.)
 
 It repairs the symptom. Point the user at the `analytics-hooks` skill as well, so the hooks are
-trusted and the gap stops reopening — otherwise they will be back here after the next upgrade.
+installed and trusted and the gap stops reopening.
 
 ## This is NOT the one-time import, and must never be used as a way around it
 
@@ -80,6 +81,6 @@ Never echo a token.
 
 ## When to suggest the hooks instead
 
-If the user is running this repeatedly, the cause is almost always untrusted or stale hooks. Send
+If the user is running this repeatedly, the cause is almost always untrusted or missing hooks. Send
 them to the `analytics-hooks` skill: with hooks installed and trusted, sessions report themselves
 and sync goes back to being a repair tool rather than a routine one.

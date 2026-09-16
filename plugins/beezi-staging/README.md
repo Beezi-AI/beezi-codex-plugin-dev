@@ -47,8 +47,22 @@ Codex loads a plugin's `skills/` and `.mcp.json`, but **not** its `hooks.json` �
 - the `me` skill repairs them before it reports.
 
 A healthy install is never rewritten. That is deliberate rather than an optimisation: Codex keys
-hook trust to each entry's **hash**, so rewriting identical entries would revoke trust you had
-already granted.
+hook trust to each entry's **hash**, so rewriting an entry would revoke trust you had already
+granted.
+
+The entries do not name a plugin version. Each one runs a small launcher the installer keeps at a
+fixed path — `~/.beezi-codex/hooks/beezi-hook.mjs`, or `~/.beezi-codex-<env>/hooks/beezi-hook.mjs`
+on a `dev` / `staging` / `local` variant — and passes it the name of the lifecycle script to run:
+
+```
+node "C:\Users\me\.beezi-codex\hooks\beezi-hook.mjs" session-start.mjs
+```
+
+The launcher then finds the newest plugin version installed under
+`~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/` and runs that version's script. An
+upgrade refreshes the launcher's own bytes; the registry entry is untouched, so its hash — and your
+trust — is too. `node` is taken from your `PATH` for the same reason, so a Node upgrade does not
+move it either.
 
 You can still drive it by hand — ask Codex to *"set up Beezi analytics"* (the `analytics-hooks`
 skill), or run it yourself; `codex plugin list` prints the plugin root, call it `$P`:
@@ -58,11 +72,19 @@ node "$P/scripts/hooks.mjs" install   # a no-op when the install is already curr
 node "$P/scripts/hooks.mjs" status    # read-only
 ```
 
+`status` also prints where the launcher lives, whether its copy is current, and which installed
+plugin version it currently resolves to.
+
 Then, inside Codex, run `/hooks` — review the Beezi entries and trust **all** of them. This is the
 one step that cannot be automated: Codex has no non-interactive way to grant trust. There is one
 entry per lifecycle event Beezi registers, and `install` and `status` both print that list back, so
-trust what they named rather than a number from this page. Because trust is hash-keyed, it has to be
-granted again after a plugin upgrade — the upgrade itself is repaired for you, the re-trust is not.
+trust what they named rather than a number from this page. You do this **once** — a plugin upgrade
+does not send you back here.
+
+Two things still cost a re-trust, both one-off. A machine carrying the old version-path entries has
+them rewritten to the launcher form on its first session after this release: that one upgrade needs
+trust granted again, and no upgrade after it does. And setting or changing `BEEZI_CODEX_HOME` moves
+the launcher, which changes the entries.
 
 Leaving any entry untrusted fails silently — an untrusted hook simply does not run, and nothing
 reports it. Skipping `SubagentStart` / `SubagentStop`, for example, still bills subagent tokens (the
@@ -102,9 +124,12 @@ Three things about that command are deliberate:
 - **A new Codex thread is required.** Skills and the MCP server are loaded once per thread, so the
   running session keeps the old build until it is restarted.
 
-Then **re-trust the hooks**: the upgrade moves the hook scripts, so the entries are rewritten and
-Codex's hash-keyed trust no longer matches. The rewrite happens for you; granting trust again in
-`/hooks` does not — see "Analytics needs the hooks installed and trusted" above.
+**The hooks do not need re-trusting.** The registry entries name a fixed launcher rather than a
+plugin version, so an upgrade rewrites the launcher's bytes and leaves each entry — and its hash —
+exactly as trusted. The one exception is the upgrade *to* this release: a machine whose entries
+still carry an older version's script paths has them rewritten to the launcher form on its first
+session afterwards, so that upgrade — and only that one — asks for trust again in `/hooks`. See
+"Analytics needs the hooks installed and trusted" above.
 
 ## Entry points
 
@@ -303,7 +328,7 @@ distinctly from the Claude Code plugin.
 | `BEEZI_API_URL` | `https://beezi-api-prod.azurewebsites.net/api` | Beezi API base |
 | `BEEZI_MCP_URL` | `<BEEZI_API_URL>/mcp` | MCP endpoint |
 | `BEEZI_ENV` | unset (production) | `dev`/`staging`/`local` selects the namespace: data root, keyring entry, hook owner |
-| `BEEZI_CODEX_HOME` | `~/.beezi-codex` | Queue / state / credentials |
+| `BEEZI_CODEX_HOME` | `~/.beezi-codex` | Queue / state / credentials, and the hook launcher |
 | `CODEX_HOME` | `~/.codex` | Rollout transcripts, auth store |
 | `BEEZI_CODEX_WATCHER` | unset (off) | `1`/`true`/`yes`/`on`/`enabled` starts the rollout watcher in the MCP server |
 | `BEEZI_CODEX_APP_SERVER` | unset (on) | `0`/`false`/`off`/`no` skips the `codex app-server` plan probe entirely |
@@ -409,11 +434,13 @@ Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
   migrated out of `~/.beezi` — copying it in is precisely the mixing this avoids. The credentials
   live in the OS keyring under `beezi-codex`, so a linked machine stays linked; only machines
   falling back to the file store log in again. Anything still queued under `~/.beezi` is not sent,
-  and re-reporting after the move is harmless — the server dedups by `segmentId`. Hook launchers an
-  older plugin version wrote are no longer used at all; the next install rewrites the registry to
-  complete command entries (re-trust via `/hooks`) and deletes the old launcher directory. Entries
-  left behind by a variant that is no longer on disk are swept at the same time, whichever variant
-  wrote them — a dead entry fails its spawn on every session, so it belongs to no working install.
+  and re-reporting after the move is harmless — the server dedups by `segmentId`. The hook launcher
+  lives in this root too, at `hooks/beezi-hook.mjs`, so `BEEZI_CODEX_HOME` moves it and the registry
+  entries that name it — costing one re-trust when you change it. The per-event `beezi-<script>`
+  shims a much older version wrote into that same directory are gone: the next install deletes them
+  along with the registry entries that pointed at them. Entries left behind by a variant that is no
+  longer on disk are swept at the same time, whichever variant wrote them — a dead entry fails its
+  spawn on every session, so it belongs to no working install.
 - **The keyring entry was renamed — sign in once more.** This plugin now owns the OS keyring entry
   `beezi-codex`; it previously shared `beezi-analytics` with the Claude Code plugin, where the two
   fought over refreshed tokens and over logout. A machine linked before the rename reads as *not
@@ -425,7 +452,9 @@ Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
 - **Hooks require one-time trust.** Installed hooks register as `enabled: true` but
   `trustStatus: "untrusted"`, and untrusted hooks do not execute. There is no non-interactive way
   to grant trust; `--dangerously-bypass-hook-trust` prints its warning but did not make hooks run
-  under `codex exec`.
+  under `codex exec`. "One-time" is what the design guarantees rather than an observation: an
+  upgrade changes only the launcher file the entries point at, so the entry bytes Codex hashes are
+  unchanged and there is nothing for it to distrust.
 - **`SessionEnd` is not registered.** It is out of scope for this release, and the reason is
   `Stop`: that hook already runs the same checkpoint, timeline included, at every turn end, so a
   `SessionEnd` entry would cost you one more hook to review and trust for work already done.
@@ -440,8 +469,11 @@ Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
   later checkpoint of that session, or for the `track` skill.
 - **Plugin-root variable.** For hooks, Codex exports `PLUGIN_ROOT` and `PLUGIN_DATA`, plus
   `CLAUDE_PLUGIN_ROOT` / `CLAUDE_PLUGIN_DATA` for compatibility. The installer does not rely on any
-  of them — it resolves the plugin from its own module path and writes each script's quoted absolute
-  path into the registry entry's `command`.
+  of them — it writes the launcher's quoted absolute path plus the lifecycle script's bare name into
+  the registry entry's `command`, and the launcher resolves the plugin itself, from the Codex plugin
+  cache. That holds even for an install run out of a source checkout: the entry it writes still
+  resolves to the cached build, which is why the dev flow copies changed files into the installed
+  variant rather than pointing hooks at the checkout.
 - **Codex's native MCP OAuth is not usable here.** `codex mcp login` and the `AuthRequired`
   handshake only apply to `streamable_http` servers; a stdio server reports
   `authStatus: "unsupported"`. Switching transports would authenticate drafting into Codex's own

@@ -3,14 +3,17 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import url from 'node:url';
 import {
   BEEZI_HOOKS,
   BEEZI_STATUS_MESSAGE,
+  LAUNCHER_FILE,
   buildHookEntries,
   hookCommand,
   hookOwner,
   hooksStatus,
   installHooks,
+  launcherPath,
   removeBeeziHooks,
   uninstallHooks,
 } from '../lib/hooks-install.mjs';
@@ -30,39 +33,27 @@ const PROD = 'beezi';
 const STAGING = 'beezi-staging';
 const DEV = 'beezi-dev';
 
+const HERE = path.dirname(url.fileURLToPath(import.meta.url));
+const LAUNCHER_SOURCE = path.join(HERE, 'fixtures', 'hooks', 'launcher.mjs.txt');
+
 function tmpdir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-hookown-'));
 }
 
-// The real install layout, measured on a live machine:
-//   ~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/scripts
-// The plugin segment carries the variant name, and the version segment moves on every upgrade —
-// which is exactly why ownership cannot be anchored on the script path alone.
-function variantScriptsDir(root, owner, version = '0.7.0') {
-  const marketplace = owner === PROD ? 'beezi' : 'beezi-internal';
-  return path.join(root, 'plugins', 'cache', marketplace, owner, version, 'scripts');
-}
-
 // Each variant's launcher dir is hookLauncherDir() = ~/.beezi-codex<suffix>/hooks, already
-// namespaced by G-2-2. Mirrored here so the legacy-migration path is exercised per variant.
+// namespaced by G-2-2 — and now the ONLY thing a registered command names. Two variants therefore
+// cannot collide on a command string, and neither can two versions of the same variant.
 function variantLauncherDir(root, owner) {
   return path.join(root, owner === PROD ? '.beezi-codex' : `.beezi-codex-${owner.slice('beezi-'.length)}`, 'hooks');
 }
 
-/**
- * Materialise a variant's five hook scripts on disk.
- *
- * Not decoration: install sweeps registry entries whose target file is MISSING, across owners, so
- * a variant whose scripts were never written would read as abandoned and be cleared by the next
- * variant's install. An installed variant has its scripts — that is what "installed" means — and a
- * bench that skips this is testing a machine that cannot exist.
- */
-function materialise(o) {
-  fs.mkdirSync(o.scriptsDir, { recursive: true });
-  for (const { script } of BEEZI_HOOKS) {
-    fs.writeFileSync(path.join(o.scriptsDir, script), '// stub\n');
-  }
-  return o;
+// The real pre-launcher install layout, measured on a live machine:
+//   ~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/scripts
+// Only entries that still name it are built from this now; it is the migration source, not a
+// destination. The version segment moving on every upgrade is precisely what the launcher removes.
+function variantScriptsDir(root, owner, version = '0.7.0') {
+  const marketplace = owner === PROD ? 'beezi' : 'beezi-internal';
+  return path.join(root, 'plugins', 'cache', marketplace, owner, version, 'scripts');
 }
 
 const USER_HOOK = { type: 'command', command: '/usr/local/bin/audit' };
@@ -96,9 +87,13 @@ function bench(t) {
   t.after(() => { try { fs.rmSync(root, { recursive: true, force: true }); } catch { /* best effort */ } });
   const hooksFile = path.join(root, '.codex', 'hooks.json');
   fs.mkdirSync(path.dirname(hooksFile), { recursive: true });
-  const opts = (owner, version) => materialise({
-    scriptsDir: variantScriptsDir(root, owner, version),
+  // `launcherSource` is not optional in a bench. Every entry names the launcher, so a variant
+  // installed without one leaves entries pointing at a file that does not exist — which the next
+  // variant's install correctly reads as an abandoned orphan and sweeps. The coexistence claims
+  // below would then fail for a reason that has nothing to do with ownership.
+  const opts = (owner) => ({
     launcherDir: variantLauncherDir(root, owner),
+    launcherSource: LAUNCHER_SOURCE,
     hooksFile,
     owner,
   });
@@ -113,30 +108,33 @@ test('hookOwner() is the plugin name, and the unsuffixed build resolves to it', 
 
 test('the unsuffixed build writes a composite command with no owner tag or relabel', () => {
   // Load-bearing: a changed entry is an entry Codex asks the user to re-trust through /hooks.
-  // Production keeps its historical implicit owner even though this bug fix changes the command.
-  const scriptsDir = variantScriptsDir('/r', PROD);
-  const entries = buildHookEntries({ scriptsDir, owner: PROD });
+  const launcherDir = variantLauncherDir('/r', PROD);
+  const entries = buildHookEntries({ launcherDir, owner: PROD });
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = entries[event][0].hooks[0];
-    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), PROD));
+    assert.equal(handler.command, hookCommand(launcherPath(launcherDir), script, PROD));
+    assert.equal(handler.command.indexOf('--beezi-owner='), -1, 'production ownership stays implicit');
+    assert.ok(handler.command.indexOf(LAUNCHER_FILE) !== -1, handler.command);
     assert.ok(!('arguments' in handler), 'no separate arguments on production');
     assert.equal(handler.statusMessage, BEEZI_STATUS_MESSAGE);
   }
 });
 
 test('a named variant tags its command and namespaces the label', () => {
-  const scriptsDir = variantScriptsDir('/r', STAGING);
-  const entries = buildHookEntries({ scriptsDir, owner: STAGING });
+  const launcherDir = variantLauncherDir('/r', STAGING);
+  const entries = buildHookEntries({ launcherDir, owner: STAGING });
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = entries[event][0].hooks[0];
-    assert.equal(handler.command, hookCommand(path.join(scriptsDir, script), STAGING));
+    assert.equal(handler.command, hookCommand(launcherPath(launcherDir), script, STAGING));
     assert.match(handler.command, / --beezi-owner=beezi-staging$/);
+    // The script name sits between the quoted launcher and the tag.
+    assert.ok(handler.command.indexOf(`" ${script} --beezi-owner=`) !== -1, handler.command);
     assert.ok(!('arguments' in handler));
     // Visible in /hooks, so two installed variants are distinguishable while being reviewed —
     // the same reason the variant builder namespaces interface.displayName.
     assert.equal(handler.statusMessage, 'Beezi analytics (staging)');
   }
-  const dev = buildHookEntries({ scriptsDir: variantScriptsDir('/r', DEV), owner: DEV });
+  const dev = buildHookEntries({ launcherDir: variantLauncherDir('/r', DEV), owner: DEV });
   assert.equal(dev.Stop[0].hooks[0].statusMessage, 'Beezi analytics (dev)');
   assert.match(dev.Stop[0].hooks[0].command, / --beezi-owner=beezi-dev$/);
 });
@@ -171,21 +169,36 @@ test('install staging then prod: the other order behaves identically', (t) => {
   assert.deepEqual(registry.hooks.PreCompact[0].hooks, [USER_HOOK]);
 });
 
-test('upgrading one variant leaves the sibling on its own scripts', (t) => {
+test('each variant owns its own launcher file, in its own namespaced dir', (t) => {
+  const { opts } = bench(t);
+  installHooks(opts(PROD));
+  installHooks(opts(STAGING));
+
+  assert.ok(fs.existsSync(launcherPath(opts(PROD).launcherDir)));
+  assert.ok(fs.existsSync(launcherPath(opts(STAGING).launcherDir)));
+
+  // Uninstalling one takes only its own launcher: hookLauncherDir() is namespaced, so the whole-dir
+  // removal cannot reach a sibling's.
+  uninstallHooks(opts(STAGING));
+  assert.ok(!fs.existsSync(opts(STAGING).launcherDir));
+  assert.ok(fs.existsSync(launcherPath(opts(PROD).launcherDir)));
+  assert.equal(hooksStatus(opts(PROD)).state, 'installed');
+});
+
+test('upgrading one variant changes nothing in the registry, for either variant', (t) => {
   const { hooksFile, opts } = bench(t);
-  installHooks(opts(STAGING, '0.7.0-staging.41'));
-  installHooks(opts(PROD, '0.7.0'));
+  installHooks(opts(STAGING));
+  installHooks(opts(PROD));
+  const before = fs.readFileSync(hooksFile, 'utf-8');
 
-  // Prod moves to a new versioned cache directory; staging did not move.
-  installHooks(opts(PROD, '0.8.0'));
+  // What an upgrade of prod used to do: move to a new versioned cache directory and rewrite five
+  // entries. Now there is nothing version-shaped in the registry for it to move.
+  installHooks(opts(PROD));
 
-  assert.equal(hooksStatus(opts(PROD, '0.8.0')).state, 'installed');
-  assert.equal(hooksStatus(opts(STAGING, '0.7.0-staging.41')).state, 'installed',
-    'the sibling is still current — an upgrade of one variant is not a downgrade of the other');
-  const registry = readRegistry(hooksFile);
-  for (const { event } of BEEZI_HOOKS) {
-    assert.equal(registry.hooks[event].length, 2, 'the old prod entry was replaced, not duplicated');
-  }
+  assert.equal(fs.readFileSync(hooksFile, 'utf-8'), before, 'byte for byte, both variants');
+  assert.equal(hooksStatus(opts(PROD)).state, 'installed');
+  assert.equal(hooksStatus(opts(STAGING)).state, 'installed',
+    'an upgrade of one variant is not a downgrade of the other');
 });
 
 test('uninstalling staging keeps prod and the user hook, and keeps the file', (t) => {
@@ -249,21 +262,28 @@ test('a sibling install does not make an uninstalled variant report as installed
   assert.equal(hooksStatus(opts(STAGING)).state, 'installed');
 });
 
-test("a variant's entry is claimed by its tag even after the user rewords the label", (t) => {
+test('an untagged launcher entry is prod’s, a tagged one is the variant’s — even unlabelled', (t) => {
   const { hooksFile, opts } = bench(t);
   installHooks(opts(PROD));
   installHooks(opts(STAGING));
 
-  // The install flow invites the user into /hooks, so a hand-edited label is a real state.
+  // The install flow invites the user into /hooks, so a hand-edited label is a real state. Strip
+  // it entirely and BOTH owners must still be recognised: staging by its tag, production by the
+  // launcher-dir anchor that replaced the old versioned-script-path one.
   const edited = readRegistry(hooksFile);
   for (const groups of Object.values(edited.hooks)) {
     for (const group of groups) {
-      for (const handler of group.hooks) handler.statusMessage = 'my analytics';
+      for (const handler of group.hooks) delete handler.statusMessage;
     }
   }
   fs.writeFileSync(hooksFile, JSON.stringify(edited, null, 2));
 
-  // The tag survives the rewording, so prod's uninstall still cannot reach staging's entries.
+  assert.equal(handlersOf(edited, PROD, opts(PROD).launcherDir).length, BEEZI_HOOKS.length);
+  assert.equal(handlersOf(edited, STAGING, opts(STAGING).launcherDir).length, BEEZI_HOOKS.length);
+  assert.deepEqual(handlersOf(edited, STAGING, opts(STAGING).launcherDir)
+    .filter((h) => h.command.indexOf('--beezi-owner=beezi-staging') === -1), []);
+
+  // …so prod's uninstall still cannot reach staging's entries.
   uninstallHooks(opts(PROD));
   const registry = readRegistry(hooksFile);
   for (const { event } of BEEZI_HOOKS) {
@@ -274,7 +294,6 @@ test("a variant's entry is claimed by its tag even after the user rewords the la
 
 test('legacy unsuffixed entries are recognised only by the unsuffixed owner', (t) => {
   const { hooksFile, opts } = bench(t);
-  const legacyLauncherDir = variantLauncherDir(opts(PROD).launcherDir, PROD);
   // What the shipped 0.6.x installer left behind: launcher scripts under ~/.beezi-codex/hooks,
   // no `arguments`, and a label the user may since have reworded away.
   const hooks = {};
@@ -284,7 +303,6 @@ test('legacy unsuffixed entries are recognised only by the unsuffixed owner', (t
   }
   fs.mkdirSync(opts(PROD).launcherDir, { recursive: true });
   fs.writeFileSync(hooksFile, JSON.stringify({ hooks }, null, 2));
-  assert.ok(legacyLauncherDir);
 
   // Staging must not adopt — or delete — a legacy install that predates variants.
   const stagingStatus = hooksStatus(opts(STAGING));
@@ -301,17 +319,28 @@ test('legacy unsuffixed entries are recognised only by the unsuffixed owner', (t
   for (const { event, script } of BEEZI_HOOKS) {
     assert.equal(registry.hooks[event].length, 1, 'converted in place, not duplicated');
     assert.equal(registry.hooks[event][0].hooks[0].command,
-      hookCommand(path.join(opts(PROD).scriptsDir, script), PROD));
+      hookCommand(launcherPath(opts(PROD).launcherDir), script, PROD));
   }
 });
 
-test("a staging install does not adopt production's untagged current-format entries", (t) => {
-  const { hooksFile, opts } = bench(t);
-  installHooks(opts(PROD));
+test("a staging install does not adopt production's untagged versioned-path entries", (t) => {
+  // The migration case with two variants present: prod is still on the old form, staging installs.
+  const { root, hooksFile, opts } = bench(t);
+  const prodScripts = variantScriptsDir(root, PROD);
+  fs.mkdirSync(prodScripts, { recursive: true });
+  const hooks = {};
+  for (const { event, script } of BEEZI_HOOKS) {
+    fs.writeFileSync(path.join(prodScripts, script), '// stub\n');
+    hooks[event] = [{
+      matcher: '.*',
+      hooks: [{ type: 'command', command: `node "${path.join(prodScripts, script)}"`, timeout: 10 }],
+    }];
+  }
+  fs.writeFileSync(hooksFile, JSON.stringify({ hooks }, null, 2));
   const before = readRegistry(hooksFile);
 
-  // Everything staging can see of prod is an untagged handler whose path says `beezi`. Under the
-  // old recogniser this was "ours"; it must now resolve to the unsuffixed owner alone.
+  // Everything staging can see of prod is an untagged handler whose path says `beezi`. It must
+  // resolve to the unsuffixed owner alone.
   assert.deepEqual(handlersOf(before, STAGING, opts(STAGING).launcherDir), []);
   assert.equal(handlersOf(before, PROD, opts(PROD).launcherDir).length, BEEZI_HOOKS.length);
 
@@ -320,8 +349,8 @@ test("a staging install does not adopt production's untagged current-format entr
   for (const { event, script } of BEEZI_HOOKS) {
     assert.equal(after.hooks[event].length, 2);
     assert.equal(after.hooks[event][0].hooks[0].command,
-      hookCommand(path.join(opts(PROD).scriptsDir, script), PROD),
-      "prod's entry is unchanged, byte for byte");
+      `node "${path.join(prodScripts, script)}"`,
+      "prod's entry is unchanged, byte for byte — staging does not migrate it");
   }
 });
 

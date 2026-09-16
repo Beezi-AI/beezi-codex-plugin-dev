@@ -16,8 +16,13 @@ import { ensureHooks, TRUST_STEP } from '../lib/hooks-install.mjs';
 function healHooks() {
   try {
     const result = ensureHooks();
-    if (!result.repaired) return null;
-    return `  Analytics hooks were ${result.before === 'absent' ? 'installed' : 'repaired'} just now — to finish, ${TRUST_STEP}.`;
+    if (result.repaired) {
+      return `  Analytics hooks were ${result.before === 'absent' ? 'installed' : 'repaired'} just now — to finish, ${TRUST_STEP}.`;
+    }
+    // A launcher-only refresh changes no registry entry, so no re-trust is owed — but the hook
+    // state printed above was captured before the file came back, and this line reconciles it.
+    if (result.launcherRefreshed) return '  The hook launcher was refreshed just now — no re-trust needed.';
+    return null;
   } catch {
     return null;
   }
