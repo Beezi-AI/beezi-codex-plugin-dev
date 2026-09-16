@@ -96,6 +96,80 @@ test('persistState:false writes no session state and ignores a live cursor', asy
   assert.equal(fs.readFileSync(path.join(stateDir(), 's1.json'), 'utf-8'), before, 'state file untouched');
 });
 
+test('historical parent and subagent payloads collect current instructions from their own roots', async (t) => {
+  const home = tmpHome(t);
+  const parentRoot = path.join(home, 'parent-repo');
+  const childRoot = path.join(home, 'child-repo');
+  fs.mkdirSync(parentRoot);
+  fs.mkdirSync(childRoot);
+  fs.mkdirSync(path.join(parentRoot, '.git'));
+  fs.mkdirSync(path.join(childRoot, '.git'));
+  fs.writeFileSync(path.join(parentRoot, 'AGENTS.md'), 'today\nparent\n');
+  fs.writeFileSync(path.join(childRoot, 'AGENTS.override.md'), 'today\nchild\noverride\n');
+  const childPath = path.join(home, 'child.jsonl');
+  fs.writeFileSync(childPath, '\n');
+  const sunk = [];
+
+  await runCheckpoint(
+    { session_id: 's1', cwd: home },
+    deps(home, [seg({ repoRoot: parentRoot })], {
+      computeDelta: (p) => ({
+        nextCursor: 4,
+        segments: [seg({ repoRoot: p === childPath ? childRoot : parentRoot })],
+        apiErrorEvents: [],
+      }),
+      readAgents: () => ({ a1: { agent_id: 'a1', transcriptPath: childPath } }),
+      inspectSubagentRollout: () => ({
+        forkBoundaryLine: 0,
+        agentNickname: 'Darwin',
+        spawnDepth: 1,
+        ownThreadId: 'a1',
+        parentThreadId: 's1',
+      }),
+    }),
+    backfillOptions({ sink: (p) => sunk.push(p) }),
+  );
+
+  assert.equal(sunk.length, 2, 'one child and one parent payload');
+  assert.deepEqual(
+    sunk.map((payload) => ({
+      subagent: payload.is_subagent === true,
+      status: payload.project_instructions_status,
+      lines: payload.claude_md_lines,
+    })).sort((a, b) => Number(a.subagent) - Number(b.subagent)),
+    [
+      { subagent: false, status: 'present', lines: 2 },
+      { subagent: true, status: 'present', lines: 3 },
+    ],
+  );
+});
+
+for (const fixture of [
+  { name: 'empty current file', file: '', status: 'present', lines: 0 },
+  { name: 'missing current file', status: 'missing' },
+  { name: 'unavailable repository', unavailable: true, status: 'unknown' },
+]) {
+  test(`historical instruction collection reports ${fixture.name}`, async (t) => {
+    const home = tmpHome(t);
+    const root = path.join(home, 'repo');
+    if (!fixture.unavailable) {
+      fs.mkdirSync(root);
+      fs.mkdirSync(path.join(root, '.git'));
+      if (fixture.file !== undefined) fs.writeFileSync(path.join(root, 'AGENTS.md'), fixture.file);
+    }
+    const sunk = [];
+    await runCheckpoint(
+      { session_id: 's1', cwd: home },
+      deps(home, [seg({ repoRoot: root })]),
+      backfillOptions({ sink: (payload) => sunk.push(payload) }),
+    );
+    assert.equal(sunk.length, 1);
+    assert.equal(sunk[0].project_instructions_status, fixture.status);
+    assert.equal(sunk[0].claude_md_lines, fixture.lines);
+    assert.equal('claude_md_lines' in sunk[0], fixture.lines !== undefined);
+  });
+}
+
 // G-3-3. lib/session-audit.mjs threads `startCursor` into every runCheckpoint call: 0 for the
 // one-time import, and the server's confirmed contiguous prefix for a coverage-driven replay.
 // This pins the half that must NOT move — the import's from-zero read is identical whether the

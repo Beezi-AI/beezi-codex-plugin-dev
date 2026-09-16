@@ -510,32 +510,44 @@ test('the session id is recorded inside the state file, not only as its name', a
   assert.equal(readState('s1').cwd, home, 'alongside the cwd mapping it already kept');
 });
 
-// ─── standing-instructions size stamp (G-3-7) ───────────────────────────────
+// ─── project-instruction observation ────────────────────────────────────────
 //
-// A repo's AGENTS.md is prepended to every prompt run inside it, so its size is a per-repo floor on
-// what a turn costs before the user types anything. It rides the ALREADY-WHITELISTED
-// `claude_md_lines` key (Option A): forbidNonWhitelisted is key-level, an unknown key 400s the whole
-// payload, and this drain treats a 400 as permanent — it deletes the segment. Nothing new goes on
-// the wire.
+// Root AGENTS instructions are a per-repo floor on what a turn costs before the user types anything.
+// The established `claude_md_lines` field carries the selected source's count, while the explicit
+// status distinguishes an absent file from a probe that could not make a trustworthy observation.
+// The API's strict whitelist must accept that new key before this collector is released.
 
 // A repo root the resolvers will actually hand back, so seg.repoRoot names a real directory.
 const withRepo = (home, body) => {
   const root = path.join(home, 'repo');
   fs.mkdirSync(root, { recursive: true });
+  fs.mkdirSync(path.join(root, '.git'), { recursive: true });
   if (body !== null) fs.writeFileSync(path.join(root, 'AGENTS.md'), body);
   return root;
 };
+
+test('a non-empty root override is the reported instruction source', async (t) => {
+  const home = tmpHome(t);
+  const root = withRepo(home, 'fallback\nrules\n');
+  fs.writeFileSync(path.join(root, 'AGENTS.override.md'), 'override\n');
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+
+  assert.equal(queued()[0].project_instructions_status, 'present');
+  assert.equal(queued()[0].claude_md_lines, 1, 'the higher-precedence override supplies the legacy count');
+});
 
 test('a repo with standing instructions reports their size', async (t) => {
   const home = tmpHome(t);
   const root = withRepo(home, '# Rules\nalways\nnever\n');
   await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+  assert.equal(queued()[0].project_instructions_status, 'present');
   assert.equal(queued()[0].claude_md_lines, 3);
 });
 
-test('a final line with no trailing newline still counts', async (t) => {
+test('CRLF and a final unterminated line preserve the measured line count', async (t) => {
   const home = tmpHome(t);
-  const root = withRepo(home, '# Rules\nalways\nnever');
+  const root = withRepo(home, '# Rules\r\nalways\r\nnever');
   await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
   assert.equal(queued()[0].claude_md_lines, 3, 'wc -l semantics, not a naive split');
 });
@@ -544,15 +556,84 @@ test('an empty AGENTS.md is zero lines, which is a real answer', async (t) => {
   const home = tmpHome(t);
   const root = withRepo(home, '');
   await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+  assert.equal(queued()[0].project_instructions_status, 'present');
   assert.equal(queued()[0].claude_md_lines, 0);
 });
 
-test('a repo with no AGENTS.md omits the key rather than nulling it', async (t) => {
+test('an empty override yields to a non-empty AGENTS.md', async (t) => {
+  const home = tmpHome(t);
+  const root = withRepo(home, 'fallback\nrules\n');
+  fs.writeFileSync(path.join(root, 'AGENTS.override.md'), '');
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+
+  assert.equal(queued()[0].project_instructions_status, 'present');
+  assert.equal(queued()[0].claude_md_lines, 2);
+});
+
+test('an empty override still counts as present when AGENTS.md is absent', async (t) => {
+  const home = tmpHome(t);
+  const root = withRepo(home, null);
+  fs.writeFileSync(path.join(root, 'AGENTS.override.md'), '');
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+
+  assert.equal(queued()[0].project_instructions_status, 'present');
+  assert.equal(queued()[0].claude_md_lines, 0);
+});
+
+test('a repo with neither root instruction file reports missing without a count', async (t) => {
   const home = tmpHome(t);
   const root = withRepo(home, null);
   await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
-  // "no file" and "empty file" are different facts; null would collapse them, and an unreadable
-  // file must not report a fabricated 0 either.
+  assert.equal(queued()[0].project_instructions_status, 'missing');
+  assert.equal('claude_md_lines' in queued()[0], false);
+});
+
+test('a directory that is not a repository reports unknown rather than missing', async (t) => {
+  const home = tmpHome(t);
+  const root = path.join(home, 'not-a-repo');
+  fs.mkdirSync(root);
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+
+  assert.equal(queued()[0].project_instructions_status, 'unknown');
+  assert.equal('claude_md_lines' in queued()[0], false);
+});
+
+test('nested, global, and custom instruction files do not turn a missing root probe into present', async (t) => {
+  const home = tmpHome(t);
+  const root = withRepo(home, null);
+  fs.mkdirSync(path.join(root, 'nested'));
+  fs.writeFileSync(path.join(root, 'nested', 'AGENTS.md'), 'nested\n');
+  fs.mkdirSync(process.env.CODEX_HOME, { recursive: true });
+  fs.writeFileSync(path.join(process.env.CODEX_HOME, 'AGENTS.md'), 'global\n');
+  fs.writeFileSync(path.join(root, 'PROJECT.md'), 'custom\n');
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+
+  assert.equal(queued()[0].project_instructions_status, 'missing');
+  assert.equal('claude_md_lines' in queued()[0], false);
+});
+
+test('an unreadable higher-precedence candidate reports unknown without falling back', async (t) => {
+  const home = tmpHome(t);
+  const root = withRepo(home, 'fallback\n');
+  const override = path.join(root, 'AGENTS.override.md');
+  const realRead = fs.readFileSync;
+  fs.readFileSync = function patched(p, ...rest) {
+    if (p === override) {
+      const error = new Error('permission denied');
+      error.code = 'EACCES';
+      throw error;
+    }
+    return realRead.call(this, p, ...rest);
+  };
+  t.after(() => { fs.readFileSync = realRead; });
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: root })]));
+
+  assert.equal(queued()[0].project_instructions_status, 'unknown');
   assert.equal('claude_md_lines' in queued()[0], false);
 });
 
@@ -561,6 +642,7 @@ test('each repo in a multi-repo window describes its own standing instructions',
   const a = withRepo(home, 'one\ntwo\n');
   const b = path.join(home, 'repo-b');
   fs.mkdirSync(b, { recursive: true });
+  fs.mkdirSync(path.join(b, '.git'));
   fs.writeFileSync(path.join(b, 'AGENTS.md'), 'only\n');
 
   await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [
@@ -572,15 +654,17 @@ test('each repo in a multi-repo window describes its own standing instructions',
   assert.deepEqual(byRoot, { 's1:1-2': 2, 's1:3-4': 1 });
 });
 
-test('the AGENTS.md of one repo is read once, not once per segment', async (t) => {
+test('the root instruction candidates of one repo are probed once, not once per segment', async (t) => {
   const home = tmpHome(t);
   const root = withRepo(home, 'one\n');
-  // Three segments of one repo inside a hook budget must not become three opens of one file.
-  const file = path.join(root, 'AGENTS.md');
-  let reads = 0;
+  const candidates = new Set([
+    path.join(root, 'AGENTS.override.md'),
+    path.join(root, 'AGENTS.md'),
+  ]);
+  const reads = new Map();
   const realRead = fs.readFileSync;
   fs.readFileSync = function patched(p, ...rest) {
-    if (p === file) reads += 1;
+    if (candidates.has(p)) reads.set(p, (reads.get(p) || 0) + 1);
     return realRead.call(this, p, ...rest);
   };
   t.after(() => { fs.readFileSync = realRead; });
@@ -592,18 +676,17 @@ test('the AGENTS.md of one repo is read once, not once per segment', async (t) =
   ]));
 
   assert.equal(queued().length, 3);
-  assert.equal(reads, 1, 'memoized per repo root');
+  assert.deepEqual([...reads.values()], [1, 1], 'each candidate is opened once per repo root');
 });
 
-test('a segment with a null repoRoot reports no size and is billed normally', async (t) => {
+test('a segment with a null repoRoot reports unknown without a count and is billed normally', async (t) => {
   const home = tmpHome(t);
-  // The size stamp is read OUTSIDE the per-segment try/catch, so it must be incapable of throwing
-  // for any repoRoot the delta can produce (a string or null). It is typed rather than merely
-  // truthy for that reason — path.join throws ERR_INVALID_ARG_TYPE on a truthy non-string, and an
-  // escape here would abort the whole window with the cursor unadvanced.
+  // The probe is read outside the per-segment try/catch, so no root must become an observation
+  // instead of throwing and aborting the whole window with the cursor unadvanced.
   await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ repoRoot: null })]));
 
   assert.equal(queued().length, 1);
+  assert.equal(queued()[0].project_instructions_status, 'unknown');
   assert.equal('claude_md_lines' in queued()[0], false, 'no repo, so no repo attribute');
   assert.equal(readState('s1').cursor, 4);
 });
@@ -611,10 +694,12 @@ test('a segment with a null repoRoot reports no size and is billed normally', as
 for (const failure of ['queue', 'state']) {
   test(`durable transaction resumes exact payloads after ${failure} failure and transcript growth`, async t => {
     const home = tmpHome(t);
+    const root = withRepo(home, 'captured\n');
     const published = [];
     let writes = 0;
     const first = await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [
-      seg({ fromLine: 1, toLine: 2 }), seg({ fromLine: 3, toLine: 4 }),
+      seg({ repoRoot: root, fromLine: 1, toLine: 2 }),
+      seg({ repoRoot: root, fromLine: 3, toLine: 4 }),
     ], failure === 'state' ? { saveState: () => { throw new Error('disk full'); } } : {}), {
       skipFlush: true, sink: payload => {
         writes += 1;
@@ -625,6 +710,9 @@ for (const failure of ['queue', 'state']) {
     assert.equal(first.outcome, 'failed');
     assert.equal(fs.existsSync(path.join(stateDir(), 's1.json')), false);
     const tx = JSON.parse(fs.readFileSync(path.join(home, 'checkpoint-transactions', 's1.json')));
+    assert.equal(tx.payloads[0].project_instructions_status, 'present');
+    assert.equal(tx.payloads[0].claude_md_lines, 1);
+    fs.writeFileSync(path.join(root, 'AGENTS.override.md'), 'new\ncurrent\ncontent\n');
     const resumed = [];
     const result = await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg({ toLine: 99 })], {
       computeDelta: () => { throw new Error('must resume before reading newer transcript data'); },

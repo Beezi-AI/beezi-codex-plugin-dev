@@ -135,6 +135,39 @@ test('two agents with identical line windows get distinct segment ids', async (t
   assert.equal(new Set(subs.map((p) => p.from_line + '-' + p.to_line)).size, 1, 'their line windows really do coincide');
 });
 
+test('parent and subagent segments use their own repo instruction observations', async (t) => {
+  const home = tmpHome(t);
+  const parentRoot = path.join(home, 'parent-repo');
+  const childRoot = path.join(home, 'child-repo');
+  fs.mkdirSync(parentRoot);
+  fs.mkdirSync(childRoot);
+  fs.mkdirSync(path.join(parentRoot, '.git'));
+  fs.mkdirSync(path.join(childRoot, '.git'));
+  fs.writeFileSync(path.join(parentRoot, 'AGENTS.md'), 'parent\nrules\n');
+  fs.writeFileSync(path.join(childRoot, 'AGENTS.override.md'), 'child\n');
+  const childPath = subagentRollout(home, 'agent-a');
+  writeAgent('parent-1', 'agent-a', { started_at: at(0), transcriptPath: childPath });
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
+    computeDelta: (p) => ({
+      nextCursor: 5,
+      segments: [seg({
+        repoRoot: p === childPath ? childRoot : parentRoot,
+        fromLine: p === childPath ? 4 : 1,
+        toLine: 5,
+      })],
+      apiErrorEvents: [],
+    }),
+  }));
+
+  const child = queued().find((p) => p.is_subagent);
+  const parent = queued().find((p) => !p.is_subagent);
+  assert.equal(child.project_instructions_status, 'present');
+  assert.equal(child.claude_md_lines, 1);
+  assert.equal(parent.project_instructions_status, 'present');
+  assert.equal(parent.claude_md_lines, 2);
+});
+
 test('a subagent payload carries no key the server would reject', async (t) => {
   const home = tmpHome(t);
   writeAgent('parent-1', 'agent-a', { started_at: at(0), transcriptPath: subagentRollout(home, 'agent-a') });
@@ -146,7 +179,7 @@ test('a subagent payload carries no key the server would reject', async (t) => {
   const allowed = new Set([
     'segmentId', 'sessionId', 'remote', 'branch', 'from_line', 'to_line',
     'billing_source', 'subscription_type', 'rate_limit_tier', 'subscription_plan', 'third_party_provider',
-    'session_name', 'timezone', 'claude_md_lines',
+    'session_name', 'timezone', 'claude_md_lines', 'project_instructions_status',
     'is_subagent', 'agent_id', 'agent_type', 'agent_name', 'spawn_depth',
     'models', 'token_total', 'token_input', 'token_output', 'token_cache',
     'duration_sec', 'code_changes', 'operations', 'started_at', 'ended_at',
