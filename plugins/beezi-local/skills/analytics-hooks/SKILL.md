@@ -19,16 +19,18 @@ by an old version are all things you do for them.
 | to know the current state, or asks why analytics are empty | call the **`beezi_status` tool** |
 | to stop reporting | `node "<plugin-root>/scripts/hooks.mjs" uninstall` |
 
-`install` is the answer to every broken state — **absent**, **stale**, **partial**, or a registry
-full of dead entries from a variant that is no longer installed. It removes this variant's old
+`install` is the answer to every broken state — **absent**, an **out-of-date launcher**, **partial**,
+or a registry full of dead entries from a variant that is no longer installed. It removes this variant's old
 entries and any Beezi entry whose script file is gone, then writes the current ones. It **changes
 nothing when the install is already healthy**: Codex keys hook trust to each entry's hash, so a
 pointless rewrite would revoke trust the user already granted. Use `install --force` only if they
 ask for a rewrite. If `beezi_status` reports anything other than healthy, run `install` straight
 away rather than reporting the problem back and waiting for permission.
 
-Upgrades repair themselves — entries carry the absolute path of a plugin version's hook scripts, so
-an upgrade leaves them `stale`, and the MCP server, `login` and `me` all fix that on their own.
+Entries do not carry a plugin version: they run a launcher at a fixed path
+(`~/.beezi-codex[-<env>]/hooks/beezi-hook.mjs`) which picks up the newest installed version itself,
+so an upgrade needs no repair and no re-trust. `install` still refreshes that launcher's copy, and
+the MCP server, `login` and `me` all do so on their own.
 
 **The one step that is still theirs.** When an install or repair actually wrote something, say this
 once:
@@ -36,8 +38,11 @@ once:
 > Run `/hooks` in Codex, review the Beezi entries, and trust them.
 
 There is no non-interactive way to grant trust — do not try to bypass it, and do not claim analytics
-are working until the user confirms. Trust is hash-keyed, so it must be repeated after any change,
-including an upgrade. When `install` reports nothing changed, existing trust is intact: do not send
+are working until the user confirms. Trust is hash-keyed, so it must be repeated whenever an entry
+actually changes — which an upgrade no longer does. One case remains: a machine whose entries still
+carry an older version's script paths has them rewritten to the launcher form the first time this
+version installs, and that rewrite does need trust granted once more. When `install` reports nothing
+changed, existing trust is intact: do not send
 them to `/hooks` for no reason, mention it only if analytics still are not arriving. Being linked is
 the other half — see the `me` and `login` skills.
 

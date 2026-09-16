@@ -143,7 +143,10 @@ export function describeReporting(status) {
     case 'absent':
       return withBroken('Analytics are NOT being reported: the hooks are not installed. Beezi installs them for you — then run /hooks in Codex and trust the Beezi entries.');
     case 'stale':
-      return withBroken('Analytics are NOT being reported: the hooks point at an older plugin version. Beezi repairs them for you — then re-trust via /hooks.');
+      // `stale` no longer means "an upgrade moved the plugin" — the entries name a fixed launcher,
+      // so an upgrade leaves them alone. It now means entries written by a version that registered
+      // the plugin path directly, which is a one-off migration and a one-off re-trust.
+      return withBroken('Analytics are NOT being reported: the hooks were registered by an older plugin version. Beezi rewrites them for you — then re-trust via /hooks, once.');
     case 'partial':
       return withBroken('Analytics may not be reported: the hook install is incomplete. Beezi repairs it for you — then re-trust via /hooks.');
     default:
