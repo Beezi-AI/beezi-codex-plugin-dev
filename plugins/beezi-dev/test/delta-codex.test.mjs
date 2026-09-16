@@ -66,6 +66,50 @@ test('accumulates token increments from cumulative totals, mapping components', 
   });
 });
 
+test('cache writes partition input across efforts and cursor windows without double counting', () => {
+  const usage = (ts, input, cached, written, output) => {
+    const record = tokens(ts, input, cached, output);
+    record.payload.info.total_token_usage.cache_write_input_tokens = written;
+    return record;
+  };
+  const high = turn('/repoA', 'gpt-6-astra', '2026-01-01T00:00:01.000Z');
+  high.payload.effort = 'high';
+  const medium = turn('/repoA', 'gpt-6-astra', '2026-01-01T00:00:04.000Z');
+  medium.payload.effort = 'medium';
+  const records = [
+    meta('/repoA'), high,
+    usage('2026-01-01T00:00:02.000Z', 100, 40, 30, 10),
+    usage('2026-01-01T00:00:03.000Z', 100, 40, 30, 10), // duplicate snapshot
+    medium,
+    usage('2026-01-01T00:00:05.000Z', 180, 60, 70, 30),
+  ];
+  const file = writeRollout(records);
+  const full = computeDelta(file, 0, identityResolvers).segments[0].stats;
+  const m = full.models['gpt-6-astra'];
+  const first = { token_input: 30, token_output: 10, token_cache_read: 40, token_cache_creation: 30, requests: 1 };
+  const second = { token_input: 20, token_output: 20, token_cache_read: 20, token_cache_creation: 40, requests: 1 };
+  assert.deepEqual(m, {
+    token_input: 50, token_output: 30, token_cache_read: 60, token_cache_creation: 70, requests: 2,
+    by_effort: { high: first, medium: second },
+  });
+  assert.equal(full.token_cache, 130);
+  assert.equal(full.token_total, 210); // input + output, with cache tokens counted once
+  const resumed = computeDelta(file, 4, identityResolvers).segments[0].stats;
+  assert.deepEqual(resumed.models['gpt-6-astra'], { ...second, by_effort: { medium: second } });
+  assert.equal(resumed.token_total, 100);
+});
+
+test('a request consisting entirely of cache writes still counts as one request', () => {
+  const record = tokens('2026-01-01T00:00:02.000Z', 100, 0, 0);
+  record.payload.info.total_token_usage.cache_write_input_tokens = 100;
+  const file = writeRollout([meta('/repoA'), record]);
+  const stats = computeDelta(file, 0, identityResolvers).segments[0].stats;
+  assert.equal(stats.models.unknown.token_input, 0);
+  assert.equal(stats.models.unknown.token_cache_creation, 100);
+  assert.equal(stats.models.unknown.requests, 1);
+  assert.equal(stats.token_total, 100);
+});
+
 test('cursor baseline: a second window only bills the new increment', () => {
   const records = [
     meta('/repoA'),
