@@ -38,6 +38,23 @@ function recorder() {
   };
 }
 
+test('a queued report replays its captured instruction observation unchanged', async (t) => {
+  tmpHome(t);
+  const captured = {
+    segmentId: 's:1-4',
+    sessionId: 's',
+    project_instructions_status: 'present',
+    claude_md_lines: 7,
+  };
+  write('seg.json', JSON.stringify(captured));
+  const { posted, fetchImpl } = recorder();
+
+  const result = await flushQueue('tok', { fetchImpl });
+
+  assert.deepEqual(posted, [captured]);
+  assert.equal(result.flushed, 1);
+});
+
 test('a .tmp left by a hard-killed writer is neither read nor posted', async (t) => {
   tmpHome(t);
   write('seg-1.json', JSON.stringify({ segmentId: 's:1' }));
