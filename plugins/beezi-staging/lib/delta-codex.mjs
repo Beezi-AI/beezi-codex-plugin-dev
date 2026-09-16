@@ -17,7 +17,9 @@ import { rateLimitObservationFromRecord } from './rate-limits-codex.mjs';
 //   total_tokens          = input_tokens + output_tokens
 //   cached_input_tokens  ⊆ input_tokens                 (a subset — cache hits within input)
 //   reasoning_output_tokens ⊆ output_tokens             (a breakdown of output — not added on top)
-// So we map: token_input = Δ(input − cached), token_cache_read = Δ(cached), token_output = Δ(output).
+// Cache writes are also a subset of input, disjoint from cache reads (OpenAI prompt-caching
+// usage accounting). Codex maps input_tokens_details.cache_write_tokens to cache_write_input_tokens.
+// So ordinary input = Δ(input) − Δ(cached) − Δ(cacheWrite); each cache leg is priced separately.
 //
 // cwd (and thus repo) is authoritative per turn: `session_meta.cwd` seeds it, `turn_context.cwd`
 // updates it as the session cd's, and a shell tool's `arguments.workdir` refines it. The current
@@ -78,7 +80,7 @@ function effortFromRecord(rec) {
   return null;
 }
 
-// { input, cached, output } cumulative totals from a token_count event, or null.
+// { input, cached, cacheWrite, output } cumulative totals from a token_count event, or null.
 function totalsFromRecord(rec) {
   const p = rec && rec.payload;
   if (!rec || rec.type !== 'event_msg' || !p || p.type !== 'token_count') return null;
@@ -87,6 +89,7 @@ function totalsFromRecord(rec) {
   return {
     input: u.input_tokens || 0,
     cached: u.cached_input_tokens || 0,
+    cacheWrite: u.cache_write_input_tokens || 0,
     output: u.output_tokens || 0,
   };
 }
@@ -275,7 +278,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   let activeEffort = 'unknown';
   let activeRoot = null;
   // Cumulative baseline (the last token_count total we've seen, including pre-window history).
-  let prev = { input: 0, cached: 0, output: 0 };
+  let prev = { input: 0, cached: 0, cacheWrite: 0, output: 0 };
 
   // Canary, not a parser. `token_usage_record` is a second, per-request token source that appeared
   // on CLI 0.153 (870 records across 16/201 local rollouts) and is entirely unread here. If a build
@@ -406,9 +409,10 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     if (totals) {
       const dInput = Math.max(0, totals.input - prev.input);
       const dCached = Math.max(0, totals.cached - prev.cached);
+      const dCacheWrite = Math.max(0, totals.cacheWrite - prev.cacheWrite);
       const dOutput = Math.max(0, totals.output - prev.output);
       prev = totals;
-      const nonCachedInput = Math.max(0, dInput - dCached);
+      const nonCachedInput = Math.max(0, dInput - dCached - dCacheWrite);
       if (dInput > 0 || dOutput > 0) {
         if (run.models[activeModel] === undefined || run.models[activeModel] === null) {
           run.models[activeModel] = emptyBucket();
@@ -427,6 +431,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
           buckets[b].token_input += nonCachedInput;
           buckets[b].token_output += dOutput;
           buckets[b].token_cache_read += dCached;
+          buckets[b].token_cache_creation += dCacheWrite;
           buckets[b].requests += 1;
         }
       }
