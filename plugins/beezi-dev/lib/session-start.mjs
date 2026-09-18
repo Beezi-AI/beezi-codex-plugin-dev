@@ -13,7 +13,7 @@ import {
   pruneRepoMap,
   originFromGitConfig,
 } from './repo-map.mjs';
-import { stateDir } from './paths.mjs';
+import { codexAuthFile, stateDir } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { pruneStale } from './prune.mjs';
 import { withLock, sessionLock } from './single-instance-lock.mjs';
@@ -150,6 +150,15 @@ async function isTokenRejected(token, fetchImpl) {
 // Shorter than the module's own default: this one is spent inside a hook budget, at most weekly.
 const APP_SERVER_TIMEOUT_MS = 5000;
 
+function readAuthFileMtimeMs() {
+  try {
+    const value = fs.statSync(codexAuthFile()).mtimeMs;
+    return Number.isFinite(value) ? value : null;
+  } catch {
+    return null;
+  }
+}
+
 // Returns an optional systemMessage string (or null). Never throws for expected failures.
 export async function runSessionStart(input, deps = {}) {
   const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
@@ -166,6 +175,7 @@ export async function runSessionStart(input, deps = {}) {
   // as an escape to the developer's own ~/.codex.
   const readAccountViaAppServer = orDefault(deps.readAccountViaAppServer, _readAccountViaAppServer);
   const syncAccount = orDefault(deps.syncAccount, _syncAccountIfNeeded);
+  const readAuthMtime = orDefault(deps.readAuthFileMtimeMs, readAuthFileMtimeMs);
   // Threaded rather than read inside the ladder: step 1 of resolveSource is an environment lookup
   // (`resolveSource` in billing-config.mjs) and a caller with a resolved environment must be able
   // to hand it over instead of having the host's consulted behind its back (G-10-1 L3).
@@ -234,10 +244,10 @@ export async function runSessionStart(input, deps = {}) {
   // a disk failure must not break session start.
   let billingConfig = null;
   let billingSource = BillingSource.UNKNOWN;
-  // Whether the auto-capture below actually wrote a config. Only the capture sets it: the
-  // syncBillingSource realignment preserves the plan fields, so it cannot move the check-in
-  // payload, and forcing on it would defeat the resync gate for no news.
-  let billingCaptured = false;
+  // Whether the auto-capture below learned information outside an auth-file change that needs an
+  // immediate check-in. Auth-file validation relies on the payload hash, so a token-only rewrite
+  // does not create network traffic; a true first sync has no matching marker and posts anyway.
+  let forceAccountSync = false;
   try {
     billingConfig = readBillingConfig();
     billingSource = resolveSource(billingConfig, env);
@@ -246,6 +256,16 @@ export async function runSessionStart(input, deps = {}) {
       writeBillingConfig(synced);
       billingConfig = synced;
     }
+
+    // Codex rewrites auth.json when the signed-in ChatGPT account changes or its credentials are
+    // refreshed. A fresh plan must not hide that newer identity until the weekly plan probe: only
+    // a timestamp already attached to a successful capture counts as validated.
+    const authFileMtimeMs = readAuthMtime();
+    const validatedAuthMtimeMs = (billingConfig || {}).authFileMtimeMs;
+    const authFileChanged = typeof authFileMtimeMs === 'number'
+      && (typeof validatedAuthMtimeMs !== 'number' || authFileMtimeMs > validatedAuthMtimeMs);
+    const authChangeNeedsProbe = authFileChanged
+      && (billingSource === BillingSource.SUBSCRIPTION || billingSource === BillingSource.UNKNOWN);
 
     // Capture the ChatGPT plan ourselves rather than waiting to be asked. Nothing on the automatic
     // path used to read it, so a machine whose user never invoked the login skill reported
@@ -270,7 +290,7 @@ export async function runSessionStart(input, deps = {}) {
     // because THAT TRIO EXCLUDED THE MACHINE TIER 1 EXISTS FOR. With credentials in the OS keychain
     // there is no ~/.codex/auth.json, so the ladder answers `unknown`, `isStale` returns false for
     // every non-subscription source, and the capture that would have resolved it never ran.
-    if (shouldProbeAccount(billingConfig, billingSource, Date.now(), { isStale })) {
+    if (authChangeNeedsProbe || shouldProbeAccount(billingConfig, billingSource, Date.now(), { isStale })) {
       // `resolveSource` and `env` travel with it (G-10-1 L1/L3). Without them the capture reached
       // billing-capture.mjs's MODULE-LEVEL resolveSource and the real process.env, so the inner
       // resolution could contradict the outer one on the line above — a machine resolved here as
@@ -291,9 +311,16 @@ export async function runSessionStart(input, deps = {}) {
         },
       });
       if (config) {
-        writeBillingConfig(config);
-        billingConfig = config;
-        billingCaptured = true;
+        // Advance the marker only after capture succeeded. A transient app-server/auth read failure
+        // therefore retries on the next session instead of sealing the stale account indefinitely.
+        const captured = typeof authFileMtimeMs === 'number'
+          ? { ...config, authFileMtimeMs }
+          : config;
+        writeBillingConfig(captured);
+        billingConfig = captured;
+        // A changed auth file already changes the payload hash when the identity or plan changed.
+        // Do not force its check-in: a token-only refresh should remain a zero-network event.
+        forceAccountSync = !authChangeNeedsProbe;
         // RE-RESOLVE on the config we just wrote. The capture can teach the ladder something it
         // did not know a moment ago — step 4b reads the `authType` only a live app-server reading
         // can record — and on a machine with no auth.json that is the difference between
@@ -329,11 +356,11 @@ export async function runSessionStart(input, deps = {}) {
   //                                  and the module falls through to the id_token decode, which is
   //                                  the correct answer for a machine with no config.
   //
-  // `force` is near-redundant here — an account or plan change already moves the payload hash on
-  // its own — and is set only when the capture above wrote something, so a machine that just
-  // learned its plan reports it in the same run rather than waiting out the resync interval.
+  // `force` is reserved for periodic/non-file captures. An auth-file revalidation already moves the
+  // payload hash when account or plan changed; leaving force false keeps token-only refreshes
+  // network-free while still propagating an account switch in this run.
   try {
-    await syncAccount(token, { force: billingCaptured }, {
+    await syncAccount(token, { force: forceAccountSync }, {
       fetchImpl,
       readCodexAccount,
       readBillingConfig: () => billingConfig,

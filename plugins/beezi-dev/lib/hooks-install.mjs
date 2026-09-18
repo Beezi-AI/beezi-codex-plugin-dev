@@ -60,7 +60,7 @@ const MATCH_ALL = '.*';
 // The timeout Codex records for each Beezi hook. Exported because the hooks themselves have to
 // finish inside it — Codex kills what overruns and reports the kill as a failed hook — so the
 // checkpoint's own budget is derived from this number rather than guessed alongside it.
-export const HOOK_TIMEOUT_SEC = 10;
+export const HOOK_TIMEOUT_SEC = 20;
 
 // The interpreter for every hook entry: bare `node`, resolved from the hook's PATH at spawn time.
 // Deliberately not process.execPath — an absolute interpreter path goes stale the moment the user
@@ -856,7 +856,9 @@ export function hooksStatus({
     // launcher or the broken node-plus-arguments form all fail this check, which is what routes an
     // old install through `stale` → "run install to repair" → migration, once.
     const expectedCommand = hookCommand(launcherPath(launcherDir), script, owner);
-    const current = handlers.some((h) => h.command === expectedCommand && !('arguments' in h));
+    const current = handlers.some((h) => h.command === expectedCommand
+      && h.timeout === HOOK_TIMEOUT_SEC
+      && !('arguments' in h));
     if (!current) staleEvents.push(event);
   }
 

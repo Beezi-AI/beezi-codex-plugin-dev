@@ -27,9 +27,9 @@ import {
 // The C-in-MCP rollout watcher (G-1-1, Branch A), under REVIEW.md §R2/§R3.
 // R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 //
-// SHIPPED OFF: nothing starts unless `BEEZI_CODEX_WATCHER` names one of TRUE_VALUES below.
-// scripts/mcp.mjs states the opt-in rationale and holds the gate that keeps this module unimported
-// on an un-opted machine; test/watcher-optin.test.mjs pins that startWatcher() then touches nothing.
+// ON BY DEFAULT: `BEEZI_CODEX_WATCHER` can explicitly disable this path with a false value below.
+// scripts/mcp.mjs holds the matching pre-import gate, so an opted-out machine loads none of this
+// module graph; test/watcher-optin.test.mjs pins that startWatcher() then touches nothing.
 //
 // This process has NO session identity (the MCP server's `initialize` carries none), so DISCOVERY IS
 // THE ONLY PATH and the election lock is load-bearing. R2 forbids a directory-mtime gate and a
@@ -82,19 +82,17 @@ import {
 // checkpoint the previous tenant's tails. Binding this file alone would not fix it — the cursor is
 // the unbound thing. Reported, untested. Write-up: docs/plans/2026-09-15-comment-archive.md.
 //
-// ── The opt-in ──────────────────────────────────────────────────────────────────────────────
+// ── The opt-out ─────────────────────────────────────────────────────────────────────────────
 
-/** The documented opt-in. Absent or anything outside TRUE_VALUES means the watcher never starts. */
+/** The documented opt-out. The watcher starts unless this names an explicit false value. */
 export const WATCHER_ENV_VAR = 'BEEZI_CODEX_WATCHER';
 
-// An allowlist rather than a truthiness test: `BEEZI_CODEX_WATCHER=0` and `=false` are things a
-// user types to turn something OFF, and both are truthy strings.
-const TRUE_VALUES = Object.freeze(['1', 'true', 'yes', 'on', 'enabled']);
+const FALSE_VALUES = Object.freeze(['0', 'false', 'no', 'off', 'disabled']);
 
 export function isWatcherEnabled(env) {
   const raw = (env || {})[WATCHER_ENV_VAR];
-  if (typeof raw !== 'string') return false;
-  return TRUE_VALUES.indexOf(raw.trim().toLowerCase()) !== -1;
+  if (typeof raw !== 'string') return true;
+  return FALSE_VALUES.indexOf(raw.trim().toLowerCase()) === -1;
 }
 
 // ── Defaults ────────────────────────────────────────────────────────────────────────────────
