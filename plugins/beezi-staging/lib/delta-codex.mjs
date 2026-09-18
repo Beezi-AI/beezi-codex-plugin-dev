@@ -170,12 +170,19 @@ function classifyError({ info, code, status, text }) {
   return 'unknown';
 }
 
-// One reportable event from an error record, or null when it is transient or not an error at all.
+// One reportable event from either the legacy `error` record or Codex 0.154's
+// `task_complete.error` record, or null when it is transient or not an error at all.
 function apiErrorFromRecord(rec) {
   const p = rec && rec.payload;
-  if (!rec || rec.type !== 'event_msg' || !p || p.type !== 'error') return null;
-  const info = typeof p.codex_error_info === 'string' ? p.codex_error_info : null;
-  const { code, status, text } = parseErrorMessage(p.message);
+  if (!rec || rec.type !== 'event_msg' || !p) return null;
+  const failure = p.type === 'error'
+    ? p
+    : p.type === 'task_complete' && p.error && typeof p.error === 'object'
+      ? p.error
+      : null;
+  if (!failure) return null;
+  const info = typeof failure.codex_error_info === 'string' ? failure.codex_error_info : null;
+  const { code, status, text } = parseErrorMessage(failure.message);
   if (isTransientApiError({ info, code, status })) return null;
   return {
     error: classifyError({ info, code, status, text }),

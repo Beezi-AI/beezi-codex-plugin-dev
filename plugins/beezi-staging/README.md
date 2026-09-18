@@ -343,7 +343,7 @@ distinctly from the Claude Code plugin.
 | `BEEZI_ENV` | unset (production) | `dev`/`staging`/`local` selects the namespace: data root, keyring entry, hook owner |
 | `BEEZI_CODEX_HOME` | `~/.beezi-codex` | Queue / state / credentials, and the hook launcher |
 | `CODEX_HOME` | `~/.codex` | Rollout transcripts, auth store |
-| `BEEZI_CODEX_WATCHER` | unset (off) | `1`/`true`/`yes`/`on`/`enabled` starts the rollout watcher in the MCP server |
+| `BEEZI_CODEX_WATCHER` | unset (on) | Rollout watcher in the MCP server; `0`/`false`/`no`/`off`/`disabled` turns it off |
 | `BEEZI_CODEX_APP_SERVER` | unset (on) | `0`/`false`/`off`/`no` skips the `codex app-server` plan probe entirely |
 | `BEEZI_CODEX_CLI` | `codex` | Path to the Codex CLI, for a machine where it is not on the hook process's PATH |
 | `OPENAI_API_KEY` | unset | Not ours — read only as billing evidence: an exported key means the machine bills per token |
@@ -357,10 +357,11 @@ hooks answer the same question differently and neither reports it. A sandboxed s
 not inherit `BEEZI_API_URL` when the server did — which is why every link answer reports the
 `apiBase` it was computed against.
 
-`BEEZI_CODEX_WATCHER` is the opt-in for analytics that do not depend on hooks being trusted: with
-it set, the MCP server periodically reads the rollouts Codex has already written and checkpoints
-what is new. It is off by default, and an un-opted machine loads none of the watcher's code at
-all — the gate sits before the import.
+The rollout watcher covers analytics events that cannot depend on a lifecycle hook, including a
+usage-limit failure for which Codex does not fire `Stop`. The MCP server periodically reads the
+rollouts Codex has already written and checkpoints what is new. It is on by default;
+`BEEZI_CODEX_WATCHER=0` (or another explicit false value above) disables it and loads none of the
+watcher's code at all — the gate sits before the import.
 
 ## The production cutover
 

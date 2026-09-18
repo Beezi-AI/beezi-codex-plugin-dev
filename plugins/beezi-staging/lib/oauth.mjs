@@ -10,7 +10,7 @@ import { base64urlEncode, orDefault } from './compat.mjs';
 const TIMEOUT_MS = 15000;
 
 // Refresh also runs inside hooks, which Codex kills at the timeout they registered with —
-// HOOK_TIMEOUT_SEC = 10 in lib/hooks-install.mjs, written into ~/.codex/hooks.json by our own
+// HOOK_TIMEOUT_SEC = 20 in lib/hooks-install.mjs, written into ~/.codex/hooks.json by our own
 // installer. The refresh must give up well inside that budget: a kill landing after the server
 // rotated the refresh token but before the replacement is persisted leaves the stored token
 // permanently dead, and every later refresh then reports a revoked grant. Kept as a literal
