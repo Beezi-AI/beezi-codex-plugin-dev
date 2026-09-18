@@ -133,6 +133,7 @@ test('buildHookEntries puts the complete invocation in command', () => {
     assert.equal(HOOK_COMMAND, 'node', 'interpreter comes from PATH, never an absolute path');
     assert.ok(!('arguments' in handler), 'Codex 0.154.0 does not pass this field to command hooks');
     assert.equal(handler.statusMessage, BEEZI_STATUS_MESSAGE);
+    assert.equal(handler.timeout, 20, 'analytics hooks need enough time to finish network-backed work');
     assert.ok(!('commandWindows' in handler), 'one command works on every platform');
   }
 });
@@ -440,6 +441,25 @@ test('hooksStatus reports a legacy launcher-style install as stale', () => {
   const status = hooksStatus(opts);
   assert.equal(status.state, 'stale');
   assert.equal(status.staleEvents.length, BEEZI_HOOKS.length);
+});
+
+test('hooksStatus marks entries with the old 10-second timeout stale so ensureHooks upgrades them', () => {
+  const { opts } = bench();
+  installHooks(opts);
+
+  const registry = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  for (const { event } of BEEZI_HOOKS) registry.hooks[event][0].hooks[0].timeout = 10;
+  fs.writeFileSync(opts.hooksFile, JSON.stringify(registry, null, 2));
+
+  const before = hooksStatus(opts);
+  assert.equal(before.state, 'stale');
+  assert.deepEqual(before.staleEvents.sort(), BEEZI_HOOKS.map((h) => h.event).sort());
+
+  const result = ensureHooks(opts);
+  assert.equal(result.repaired, true);
+  const upgraded = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  for (const { event } of BEEZI_HOOKS) assert.equal(upgraded.hooks[event][0].hooks[0].timeout, 20);
+  assert.equal(hooksStatus(opts).state, 'installed');
 });
 
 test('hooksStatus reports broken node-plus-arguments entries as stale and install migrates them', () => {

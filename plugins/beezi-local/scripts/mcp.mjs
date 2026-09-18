@@ -42,32 +42,33 @@ async function maybeExit() {
   await exitClean(0);
 }
 
-// ── The rollout watcher (G-1-1, Branch A) — OFF unless explicitly opted in ───────────────────
+// ── The rollout watcher (G-1-1, Branch A) — ON unless explicitly opted out ────────────────────
 //
 // The variable name and the accepted values below are `WATCHER_ENV_VAR` and `isWatcherEnabled`
 // from lib/rollout-watcher.mjs, which is the authority on both. They are repeated here for ONE
-// reason: this check runs before the dynamic import, so an un-opted machine never loads the
+// reason: this check runs before the dynamic import, so an opted-out machine never loads the
 // watcher's module graph — checkpoint, session-audit, coverage and the lock primitive — at all.
 // Importing the module to ask it would defeat the gate.
 //
-// It is an allowlist, not a truthiness test, for the same reason isWatcherEnabled is one:
+// It is an explicit false-value list, not a truthiness test, for the same reason
+// isWatcherEnabled uses one:
 // `BEEZI_CODEX_WATCHER=0` and `=false` are what a user types to turn something OFF, and both are
 // truthy strings. Anything else about the decision belongs in startWatcher(), and
 // test/watcher-optin.test.mjs asserts the two copies cannot drift.
 //
-// `.mcp.json` now forwards BEEZI_CODEX_WATCHER, so this gate is the only one left: the production
-// cutover it was sequenced behind has shipped (G-1-2, R1). Default still OFF — a machine gets a
-// watcher when it asks for one. What is gone is the second lock that made asking impossible.
+// `.mcp.json` forwards BEEZI_CODEX_WATCHER. The watcher now defaults ON because it is the only
+// timely delivery path when a terminal Codex API error does not fire Stop. Explicit false values
+// keep the original zero-load opt-out available.
 // R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
 //
 // The plan's release order puts delivery automation after the production cutover and its guarded
 // migration (repo-root docs/plans/2026-09-10-codex-gap-closure-plan.md, "Release order"), so
-// shipping this opt-in is the requirement, not a precaution.
+// shipping this delivery path is the requirement, not a precaution.
 const watcherFlag = process.env.BEEZI_CODEX_WATCHER;
-const watcherOptedIn = typeof watcherFlag === 'string'
-  && ['1', 'true', 'yes', 'on', 'enabled'].indexOf(watcherFlag.trim().toLowerCase()) !== -1;
+const watcherEnabled = typeof watcherFlag !== 'string'
+  || ['0', 'false', 'no', 'off', 'disabled'].indexOf(watcherFlag.trim().toLowerCase()) === -1;
 
-if (watcherOptedIn) {
+if (watcherEnabled) {
   // Dynamic, and its failure is swallowed: analytics must never be the reason ticket drafting
   // stops working, and this file's stdout belongs to JSON-RPC — a stray write corrupts the stream.
   // Each tick rechecks migration before pruning or capturing, including after a refusal.

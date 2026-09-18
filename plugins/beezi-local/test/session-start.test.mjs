@@ -390,6 +390,177 @@ test('auto-capture does not re-read auth.json when the plan is fresh', async (t)
   assert.equal(read, 0);
 });
 
+test('a newer auth.json refreshes the account before check-in even when the plan is fresh', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const sync = syncSpy();
+  let probes = 0;
+  const existing = {
+    version: 1,
+    source: 'subscription',
+    subscriptionType: 'plus',
+    plan: 'plus',
+    accountId: 'account-A',
+    email: 'a@example.com',
+    capturedAt: new Date().toISOString(),
+    authFileMtimeMs: 100,
+  };
+
+  await runSessionStart(
+    { session_id: 'account-switch', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => existing,
+      writeBillingConfig: () => {},
+      isStale: () => false,
+      readAuthFileMtimeMs: () => 200,
+      readAccountViaAppServer: async () => {
+        probes += 1;
+        return {
+          ok: true,
+          reason: 'ok',
+          authType: 'chatgpt',
+          subscriptionType: 'pro',
+          plan: 'pro',
+          accountId: 'account-B',
+          email: 'b@example.com',
+        };
+      },
+      readCodexAccount: () => null,
+      syncAccount: sync,
+    },
+  );
+
+  assert.equal(probes, 1, 'the newer auth file must trigger live account discovery');
+  const checkedIn = sync.calls[0].deps.readBillingConfig();
+  assert.equal(checkedIn.accountId, 'account-B');
+  assert.equal(checkedIn.email, 'b@example.com');
+  assert.equal(checkedIn.authFileMtimeMs, 200);
+  assert.equal(sync.calls[0].options.force, false,
+    'the changed account moves the payload hash; an unchanged token refresh must stay network-free');
+});
+
+test('an already validated auth.json does not trigger account discovery', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  let probes = 0;
+  await runSessionStart(
+    { session_id: 'unchanged-auth', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => ({
+        version: 1,
+        source: 'subscription',
+        plan: 'plus',
+        capturedAt: new Date().toISOString(),
+        authFileMtimeMs: 200,
+      }),
+      writeBillingConfig: () => {},
+      isStale: () => false,
+      readAuthFileMtimeMs: () => 200,
+      readAccountViaAppServer: async () => { probes += 1; return liveAppServer(); },
+      readCodexAccount: () => null,
+      syncAccount: async () => ({ synced: false }),
+    },
+  );
+  assert.equal(probes, 0);
+});
+
+test('the first mtime validation does not force a token-only account check-in', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const sync = syncSpy();
+  const existing = {
+    version: 1,
+    source: 'subscription',
+    subscriptionType: 'plus',
+    plan: 'plus',
+    accountId: 'account-A',
+    email: 'a@example.com',
+    capturedAt: new Date().toISOString(),
+  };
+
+  await runSessionStart(
+    { session_id: 'first-mtime-validation', cwd: null },
+    {
+      getAccessToken: async () => 'tok',
+      fetchImpl,
+      gitImpl: noGit,
+      resolveSource: () => 'subscription',
+      readBillingConfig: () => existing,
+      writeBillingConfig: () => {},
+      isStale: () => false,
+      readAuthFileMtimeMs: () => 200,
+      readAccountViaAppServer: async () => ({
+        ok: true,
+        reason: 'ok',
+        authType: 'chatgpt',
+        subscriptionType: 'plus',
+        plan: 'plus',
+        accountId: 'account-A',
+        email: 'a@example.com',
+      }),
+      readCodexAccount: () => null,
+      syncAccount: sync,
+    },
+  );
+
+  assert.equal(sync.calls[0].options.force, false,
+    'the unchanged payload hash may suppress the migration check-in');
+});
+
+test('a failed auth.json revalidation leaves its old marker so the next session retries', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  let stored = {
+    version: 1,
+    source: 'subscription',
+    subscriptionType: 'plus',
+    plan: 'plus',
+    accountId: 'account-A',
+    capturedAt: new Date().toISOString(),
+    authFileMtimeMs: 100,
+  };
+  let probes = 0;
+  const deps = {
+    getAccessToken: async () => 'tok',
+    fetchImpl,
+    gitImpl: noGit,
+    resolveSource: () => 'subscription',
+    readBillingConfig: () => stored,
+    writeBillingConfig: (config) => { stored = config; },
+    isStale: () => false,
+    readAuthFileMtimeMs: () => 200,
+    readAccountViaAppServer: async () => {
+      probes += 1;
+      if (probes === 1) return { ok: false, reason: 'unavailable' };
+      return {
+        ok: true,
+        reason: 'ok',
+        authType: 'chatgpt',
+        subscriptionType: 'pro',
+        plan: 'pro',
+        accountId: 'account-B',
+      };
+    },
+    readCodexAccount: () => null,
+    syncAccount: async () => ({ synced: false }),
+  };
+
+  await runSessionStart({ session_id: 'retry-1', cwd: null }, deps);
+  assert.equal(stored.authFileMtimeMs, 100, 'a failed validation must not seal the newer file');
+  await runSessionStart({ session_id: 'retry-2', cwd: null }, deps);
+  assert.equal(probes, 2);
+  assert.equal(stored.accountId, 'account-B');
+  assert.equal(stored.authFileMtimeMs, 200);
+});
+
 test('a throwing readCodexAccount does not break session start', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
@@ -709,7 +880,7 @@ test('a billing read that throws leaves the check-in with no config, not a stale
   assert.equal(sync.calls[0].deps.readBillingConfig(), null);
 });
 
-test('a plan captured this run FORCES the check-in, so it is reported without waiting a week', async (t) => {
+test('a plan captured after an auth.json change relies on its changed payload hash', async (t) => {
   withCodexAuth(t, { auth_mode: 'chatgpt' });
   tmpHome(t);
   const { fetchImpl } = router();
@@ -728,7 +899,8 @@ test('a plan captured this run FORCES the check-in, so it is reported without wa
       syncAccount: sync,
     },
   );
-  assert.equal(sync.calls[0].options.force, true);
+  assert.equal(sync.calls[0].options.force, false,
+    'the new plan changes the payload hash without forcing token-only refreshes to POST');
 });
 
 test('an ordinary session start does NOT force — the payload hash is gate enough', async (t) => {

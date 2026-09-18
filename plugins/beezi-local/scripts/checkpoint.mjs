@@ -55,7 +55,7 @@ if (!boundary && !heartbeat) process.exit(0);
   // emitTimeline on the HEARTBEAT path only, and it is the whole point of the heartbeat: it stands
   // in for a Stop that may never come, so it must ship what a turn end ships — the one flag drives
   // the subagent sweep, the timeline POST and the rate-limit drain. Measured on this machine, Node
-  // v24.11.1, so the 7.5 s budget is a real bound rather than a hope: the sweep is 22 ms filtered
+  // v24.11.1, so the 17.5 s budget is a real bound rather than a hope: the sweep is 22 ms filtered
   // to the session start (456 ms over all 204 local rollouts unfiltered, and capped at
   // maxReads = 500 file opens), computeDelta over the largest local rollout — 12.2 MB, 1306 lines
   // — is 231 ms, and computeSessionTimeline over the same file is 165 ms. Everything after that is

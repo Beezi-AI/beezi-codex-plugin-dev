@@ -10,9 +10,8 @@ import {
 } from '../lib/rollout-watcher.mjs';
 import { locksDir } from '../lib/single-instance-lock.mjs';
 
-// G-1-1 ships DARK. The plan's release order puts delivery automation after the production
-// cutover and its guarded migration, so the requirement this file exists to pin is not "the
-// watcher can be turned off" — it is "an un-opted machine does nothing at all".
+// Terminal Codex API failures do not fire Stop, so the watcher is now their default delivery path.
+// These tests also pin the explicit opt-out: it must load nothing and touch nothing.
 //
 // "Nothing at all" is asserted three ways, because each catches a different way of getting it
 // wrong: no timer is armed (a resident loop), no filesystem call is made (a scan or a state read),
@@ -32,16 +31,16 @@ function tmp(t, prefix) {
 function explodingFs() {
   return new Proxy({}, {
     get(_target, prop) {
-      return () => { throw new Error(`the watcher touched fs.${String(prop)} on an un-opted machine`); };
+      return () => { throw new Error(`the watcher touched fs.${String(prop)} on an opted-out machine`); };
     },
   });
 }
 
-test('1. an un-opted machine arms no timer, touches no filesystem and takes no lock', () => {
+test('1. an opted-out machine arms no timer, touches no filesystem and takes no lock', () => {
   const armed = [];
   const locked = [];
   const handle = startWatcher({
-    env: {}, // BEEZI_CODEX_WATCHER absent
+    env: { [WATCHER_ENV_VAR]: '0' },
     fs: explodingFs(),
     setTimeoutImpl: (fn, ms) => { armed.push(ms); return { fake: true }; },
     clearTimeoutImpl: () => {},
@@ -54,26 +53,27 @@ test('1. an un-opted machine arms no timer, touches no filesystem and takes no l
 
   assert.equal(handle.started, false, 'startWatcher must report that it did not start');
   assert.equal(handle.reason, 'disabled');
-  assert.deepEqual(armed, [], 'no timer may be armed on an un-opted machine');
-  assert.deepEqual(locked, [], 'no lock may be taken on an un-opted machine');
+  assert.deepEqual(armed, [], 'no timer may be armed on an opted-out machine');
+  assert.deepEqual(locked, [], 'no lock may be taken on an opted-out machine');
   assert.doesNotThrow(() => handle.stop(), 'stop() on a watcher that never started is a no-op');
 });
 
-test('2. the opt-in vocabulary is an allowlist, not a truthiness test', () => {
+test('2. the watcher defaults on and recognizes explicit opt-out values', () => {
   for (const on of ['1', 'true', 'TRUE', 'yes', 'on', 'enabled', ' true ']) {
     assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: on }), true, `${JSON.stringify(on)} must enable`);
   }
   // Every one of these is a truthy JavaScript string. A `if (env.X)` gate would start the watcher
   // on a machine whose owner typed the value that means "off".
-  for (const off of ['0', 'false', 'no', 'off', '', 'maybe', 'disabled']) {
+  for (const off of ['0', 'false', 'no', 'off', 'disabled']) {
     assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: off }), false, `${JSON.stringify(off)} must not enable`);
   }
-  assert.equal(isWatcherEnabled({}), false, 'absent means off');
-  assert.equal(isWatcherEnabled(undefined), false, 'no env at all means off');
-  assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: 1 }), false, 'a non-string never enables');
+  assert.equal(isWatcherEnabled({}), true, 'absent means on');
+  assert.equal(isWatcherEnabled(undefined), true, 'no env object means on');
+  assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: '' }), true, 'an empty value does not opt out');
+  assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: 'maybe' }), true, 'only an explicit off value opts out');
 });
 
-test('3. an un-opted machine leaves the data root untouched on a REAL filesystem', (t) => {
+test('3. an opted-out machine leaves the data root untouched on a REAL filesystem', (t) => {
   const home = tmp(t, 'watcher-optin-home-');
   const codex = tmp(t, 'watcher-optin-codex-');
   const previousHome = process.env.BEEZI_CODEX_HOME;
@@ -95,7 +95,7 @@ test('3. an un-opted machine leaves the data root untouched on a REAL filesystem
     `${JSON.stringify({ type: 'session_meta', payload: { id: '11111111-2222-3333-4444-555555555555', cwd: codex } })}\n`,
   );
 
-  const handle = startWatcher({ env: {} });
+  const handle = startWatcher({ env: { [WATCHER_ENV_VAR]: 'false' } });
   t.after(() => handle.stop());
 
   assert.equal(handle.started, false);
@@ -104,11 +104,11 @@ test('3. an un-opted machine leaves the data root untouched on a REAL filesystem
   assert.deepEqual(fs.readdirSync(home), [], 'the data root must be untouched');
 });
 
-test('4. scripts/mcp.mjs starts no watcher when the machine has not opted in', (t) => {
+test('4. scripts/mcp.mjs starts no watcher when the machine explicitly opts out', (t) => {
   const home = tmp(t, 'watcher-mcp-home-');
   const codex = tmp(t, 'watcher-mcp-codex-');
   const env = { ...process.env, BEEZI_CODEX_HOME: home, CODEX_HOME: codex };
-  delete env[WATCHER_ENV_VAR];
+  env[WATCHER_ENV_VAR] = 'off';
   delete env.NODE_TEST_CONTEXT;
 
   // stdin closes immediately: the server must leave of its own accord. A resident tick timer that
@@ -124,11 +124,11 @@ test('4. scripts/mcp.mjs starts no watcher when the machine has not opted in', (
   assert.equal(fs.existsSync(path.join(home, 'watcher.json')), false, 'no watermark was written');
 });
 
-test('5. scripts/mcp.mjs still exits cleanly with the watcher opted in — the timer is cleared, never unref\'d', (t) => {
+test('5. scripts/mcp.mjs defaults the watcher on and clears its timer at shutdown', (t) => {
   const home = tmp(t, 'watcher-mcp-on-home-');
   const codex = tmp(t, 'watcher-mcp-on-codex-');
   const env = { ...process.env, BEEZI_CODEX_HOME: home, CODEX_HOME: codex };
-  env[WATCHER_ENV_VAR] = '1';
+  delete env[WATCHER_ENV_VAR];
   delete env.NODE_TEST_CONTEXT;
 
   // The G-10-2 shape, in the one place a resident loop could reintroduce it: `unref()` would let
@@ -144,8 +144,8 @@ test('5. scripts/mcp.mjs still exits cleanly with the watcher opted in — the t
   assert.equal(run.stdout, '', 'the watcher must never write to the JSON-RPC channel');
 });
 
-test('6. the literal gate in scripts/mcp.mjs cannot drift from isWatcherEnabled', () => {
-  // scripts/mcp.mjs decides by literal name AND literal value list, so an un-opted machine never
+test('6. the literal opt-out gate in scripts/mcp.mjs cannot drift from isWatcherEnabled', () => {
+  // scripts/mcp.mjs decides by literal name AND literal value list, so an opted-out machine never
   // even loads the watcher's module graph — asking the module would defeat the gate. Both copies
   // are pinned here, in both directions: the file's list must be exactly the vocabulary
   // isWatcherEnabled accepts, no wider and no narrower.
@@ -158,56 +158,36 @@ test('6. the literal gate in scripts/mcp.mjs cannot drift from isWatcherEnabled'
   assert.match(source, /watcher\.stop\(\)/, 'the shutdown path must stop the watcher');
 
   const literal = /\[((?:\s*'[a-z0-9]+'\s*,?)+)\]\.indexOf\(/.exec(source);
-  assert.ok(literal, 'scripts/mcp.mjs must decide against an inline allowlist of accepted values');
+  assert.ok(literal, 'scripts/mcp.mjs must decide against an inline list of opt-out values');
   const inline = literal[1].split(',').map((v) => v.trim().replace(/'/g, '')).filter(Boolean);
 
-  // Not wider: every value the file accepts, the module accepts too. A value only the file
-  // honours loads the whole watcher graph and then has startWatcher() refuse it.
+  // Every value the script treats as off must also disable the module.
   for (const value of inline) {
     assert.equal(
-      isWatcherEnabled({ [WATCHER_ENV_VAR]: value }), true,
-      `scripts/mcp.mjs accepts ${JSON.stringify(value)} but isWatcherEnabled does not`,
+      isWatcherEnabled({ [WATCHER_ENV_VAR]: value }), false,
+      `scripts/mcp.mjs disables ${JSON.stringify(value)} but isWatcherEnabled does not`,
     );
   }
-  // Not narrower: every value the module accepts, the file imports for. A value only the module
-  // honours is an opt-in that is silently ignored, which is the worse direction.
-  for (const value of ['1', 'true', 'yes', 'on', 'enabled']) {
+  // Every value the module treats as off must prevent the script's dynamic import.
+  for (const value of ['0', 'false', 'no', 'off', 'disabled']) {
     assert.ok(
       inline.indexOf(value) !== -1,
-      `isWatcherEnabled accepts ${JSON.stringify(value)} but scripts/mcp.mjs would not import`,
+      `isWatcherEnabled disables ${JSON.stringify(value)} but scripts/mcp.mjs would still import`,
     );
   }
-  // And the off-vocabulary is in neither — the whole point of an allowlist over truthiness.
-  for (const off of ['0', 'false', 'no', 'off', 'disabled']) {
-    assert.equal(inline.indexOf(off), -1, `${JSON.stringify(off)} must never enable the watcher`);
-    assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: off }), false);
+  // Ordinary truthy and unknown values are not opt-outs.
+  for (const on of ['1', 'true', 'yes', 'on', 'enabled', 'maybe']) {
+    assert.equal(inline.indexOf(on), -1, `${JSON.stringify(on)} must not opt out`);
+    assert.equal(isWatcherEnabled({ [WATCHER_ENV_VAR]: on }), true);
   }
 });
 
-test('7. .mcp.json and the module agree about whether Codex can forward the opt-in', () => {
-  // `env_vars` is an ALLOWLIST: Codex passes only the variables named there into the stdio server.
-  // Today it does not name this one, so the opt-in cannot reach a Codex-spawned MCP process at all
-  // — the second, independent lock on a feature the release order says ships dark.
-  //
-  // This assertion holds on BOTH sides of that flip, deliberately. Pinning the absence would make
-  // the correct next step of the plan turn the suite red; what actually needs protecting is that
-  // the two never disagree. The one-line diff when the gate is crossed is:
-  //     .mcp.json  "env_vars": [..., "BEEZI_CODEX_WATCHER"]
-  // and this test then requires the module header to stop claiming the variable is unreachable.
+test('7. .mcp.json and the module agree about whether Codex can forward the opt-out', () => {
+  // `env_vars` is an allowlist. Without this entry, Codex silently discards the user's opt-out.
   const config = JSON.parse(fs.readFileSync(path.join(PLUGIN_ROOT, '.mcp.json'), 'utf-8'));
   const declared = config.mcpServers.beezi.env_vars;
   assert.ok(Array.isArray(declared), '.mcp.json must declare an env_vars allowlist');
-  const forwarded = declared.indexOf(WATCHER_ENV_VAR) !== -1;
-
-  const header = fs.readFileSync(path.join(PLUGIN_ROOT, 'lib', 'rollout-watcher.mjs'), 'utf-8');
-  const claimsUnreachable = /does not list this one/.test(header);
-  assert.equal(
-    forwarded,
-    !claimsUnreachable,
-    forwarded
-      ? 'BEEZI_CODEX_WATCHER is now forwarded — update lib/rollout-watcher.mjs, which still says it is not'
-      : 'lib/rollout-watcher.mjs must record that Codex does not forward BEEZI_CODEX_WATCHER yet',
-  );
+  assert.ok(declared.indexOf(WATCHER_ENV_VAR) !== -1, 'Codex must forward the watcher opt-out');
 });
 
 test('8. a value that means OFF does not even load the watcher\'s module graph', (t) => {

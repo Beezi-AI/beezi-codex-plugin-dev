@@ -180,6 +180,32 @@ test('a usage-limit error is reported as a rate limit', () => {
   assert.equal(apiErrorEvents[0].occurredAt, '2026-01-01T00:00:02.000Z');
 });
 
+test('a task_complete usage-limit error from Codex 0.154 is reported as a rate limit', () => {
+  const terminalError = {
+    timestamp: '2026-08-06T20:04:35.739Z',
+    type: 'event_msg',
+    payload: {
+      type: 'task_complete',
+      turn_id: '019fd8ab-9eb4-74f3-b863-0003ecd68a95',
+      last_agent_message: null,
+      error: {
+        message: "You've hit your usage limit. Upgrade to Plus to continue using Codex.",
+        codex_error_info: 'usage_limit_exceeded',
+      },
+      duration_ms: 121917,
+    },
+  };
+  const file = withPrelude(terminalError, terminalError);
+
+  const { apiErrorEvents } = computeDelta(file, 0, identityResolvers);
+  assert.deepEqual(apiErrorEvents, [{
+    error: 'rate_limit',
+    details: 'usage_limit_exceeded',
+    text: "You've hit your usage limit. Upgrade to Plus to continue using Codex.",
+    occurredAt: '2026-08-06T20:04:35.739Z',
+  }], 'duplicate terminal records in the same minute collapse to one portal event');
+});
+
 test('an overloaded-model error is dropped as transient', () => {
   // Codex retries these itself; reporting them buries the durable failures.
   const file = withPrelude(errorRec(
