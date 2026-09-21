@@ -10,6 +10,13 @@ import { fail, plural } from '../lib/cli.mjs';
 // running the login skill again resumes an interrupted upload. Flags (--dry-run / --since /
 // --force) remain for manual `node scripts/backfill.mjs` runs only.
 
+// The 30-day window is a hard floor, not a resume point: a re-run will not pick these up later,
+// so the upload has to say so once rather than leave the user waiting for a run that never comes.
+const OLD_SESSIONS_SUFFIX =
+  'ran more than 30 days ago — Beezi only imports the last 30 days, and they will not be uploaded later.';
+const OLD_SESSIONS_NOTE =
+  'Beezi only imports the last 30 days; older sessions will not be uploaded later.';
+
 async function main() {
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   const options = parseArgs(process.argv.slice(2));
@@ -98,7 +105,9 @@ async function main() {
     const bits = [];
     if (result.alreadyImported > 0) bits.push(`${plural(result.alreadyImported, 'session')} already uploaded`);
     if (result.liveTracked > 0) bits.push(`${result.liveTracked} already tracked live`);
+    if (result.tooOld > 0) bits.push(`${result.tooOld} older than 30 days`);
     console.log(`✓ Beezi: nothing new to upload${bits.length ? ` (${bits.join(', ')})` : ''}.`);
+    if (result.tooOld > 0) console.log(`  ${OLD_SESSIONS_NOTE}`);
     if (result.finalized) console.log('✓ Beezi: your history pull is finalized.');
     return;
   }
@@ -143,6 +152,9 @@ async function main() {
   }
   console.log(parts.join(' '));
 
+  if (result.tooOld > 0) {
+    console.log(`  ${plural(result.tooOld, 'session')} ${OLD_SESSIONS_SUFFIX}`);
+  }
   // Every candidate that produced nothing to upload. These used to be invisible: the run said it
   // read N sessions and uploaded fewer, with no account of the difference.
   if (result.empty > 0) {

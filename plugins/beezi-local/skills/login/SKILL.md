@@ -145,7 +145,8 @@ node "<plugin-root>/scripts/backfill.mjs" --via login
 ```
 
 It is the one-time upload of this machine's past Codex sessions into Beezi and can take several
-minutes; it prints progress lines as it goes. Report its output verbatim — progress and final
+minutes; it prints progress lines as it goes. It covers the **last 30 days only** — older sessions
+are out of scope for this import and for the `sync` skill alike, and no later run reaches them. Report its output verbatim — progress and final
 summary, or the error line. It is safe on every login: already-uploaded sessions are skipped, and
 if it says nothing new to upload, tell the user their history is up to date. If some sessions could
 not be delivered, tell the user that running this login skill again later resumes the upload where

@@ -538,6 +538,25 @@ test('12. --since drops rollouts older than the cutoff', async () => {
   assert.equal(result.candidates, 1);
 });
 
+// The 30-day window (MAX_SESSION_AGE_MS). Unlike --since it is policy, not a flag, so it counts
+// what it dropped and it must NOT turn the run into a scoped one that never seals.
+test('12b. drops rollouts older than the 30-day window and still finalizes', async () => {
+  const NOW = 100 * 24 * 60 * 60 * 1000;
+  const { deps } = makeDeps({
+    now: () => NOW,
+    listRollouts: () => [
+      rollout('ancient', NOW - 31 * 24 * 60 * 60 * 1000),
+      rollout('recent', NOW - 2 * 24 * 60 * 60 * 1000),
+    ],
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 1);
+  assert.equal(result.finalized, true, 'a capped run is not a scoped run');
+});
+
 test('13. skips a rollout too large to parse safely', async () => {
   const { deps } = makeDeps({
     listRollouts: () => [{ ...rollout('huge'), size: 128 * 1024 * 1024 }],

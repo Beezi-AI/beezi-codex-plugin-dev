@@ -9,6 +9,10 @@ Uploads this machine's past Codex sessions to Beezi, resuming each one from exac
 Beezi already has it. It asks the server how far each session reaches before it sends anything, so
 running it twice uploads nothing twice and running it often is safe.
 
+**It reaches back 30 days and no further.** Sessions that ran longer ago are never uploaded, by
+this command or by the `login` skill's one-time import — the window is the same for both. If the
+run reports sessions skipped for age, tell the user plainly that a later run will not pick them up.
+
 ## Why a Codex user needs this
 
 Codex hooks do not run until the user trusts them in `/hooks`. So the normal Codex lifecycle

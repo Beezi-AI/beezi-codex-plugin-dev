@@ -77,6 +77,16 @@ const AUDIT_TIMEOUT_MS = 60_000;
 // boundaries than the next live report — double-counted spend. Skip and let the user rerun.
 const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
 
+// How far back either history path will reach. A rollout older than this is never uploaded, in
+// EITHER mode — the one-time import and the repair pass share the window so a session cannot be
+// in scope for one command and out of scope for the other.
+//
+// This is deliberately NOT expressed as a default `--since`: `shouldFinalize` treats a non-null
+// `sinceMs` as a scoped run and refuses to seal, so defaulting it would leave every login's pull
+// permanently unfinalized. It is policy, applied in the candidate loop, and it stacks with an
+// explicit `--since` rather than replacing it (two independent skips give `max(sinceMs, cutoff)`).
+export const MAX_SESSION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
 const SINCE_FORMAT = /^\d{4}-\d{2}-\d{2}$/;
 
 // The repeatable repair pass (G-3-3). Everything that differs from the one-time import hangs off
@@ -327,6 +337,8 @@ function emptyAuditResult(options = {}) {
     // Sessions whose history this run deliberately did not touch because it could not prove a
     // non-overlapping start line. Visible, retryable, and never silently downgraded to a scan
     // from zero.
+    // Rollouts older than MAX_SESSION_AGE_MS. Never uploaded, never retried by a re-run.
+    tooOld: 0,
     deferred: 0,
     deferredUnavailable: 0,
     deferredGap: 0,
@@ -475,6 +487,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const liveMode = trackingValid && (tracking || {}).trackingMode === TrackingMode.LIVE;
   const linkCutoffMs = liveMode ? linkedAtMs(tracking, deps) : null;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
+  const ageCutoffMs = now() - MAX_SESSION_AGE_MS;
 
   const candidates = [];
   for (const entry of all) {
@@ -498,6 +511,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       continue;
     }
     if (!syncMode && !options.force && isImported(ledger, entry.sessionId)) { result.alreadyImported += 1; continue; }
+    // The 30-day window (MAX_SESSION_AGE_MS). Counted, not silently dropped: `candidates === 0`
+    // otherwise prints "nothing new to upload" on a machine that plainly has older history.
+    if (entry.mtimeMs < ageCutoffMs) { result.tooOld += 1; continue; }
     if (options.sinceMs != null && entry.mtimeMs < options.sinceMs) continue;
     if (entry.size > MAX_TRANSCRIPT_BYTES) { result.oversize += 1; continue; }
     candidates.push(entry);
