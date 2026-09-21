@@ -317,6 +317,11 @@ Pro split: the $200 tier kept the name `pro` and became 20×, and the new $100 5
 `prolite`. Anything left unmapped normalizes to `unknown`, which never settles — so the
 "refresh your plan" nudge would fire on every session with no way for the user to end it.
 
+Both history paths — the login skill's one-time import and the repeatable `sync` — reach back
+**30 days** and no further. A rollout older than that is skipped with a visible count and is never
+picked up by a later run; the window is shared deliberately, so a session cannot be in scope for
+one command and out of scope for the other.
+
 New or unfinished historical backfills register and snapshot the current ChatGPT account before
 upload, then attach its `account_uuid` to every imported report, including subagent reports. This
 attributes history to the account active during the import; it does not reconstruct the plan or

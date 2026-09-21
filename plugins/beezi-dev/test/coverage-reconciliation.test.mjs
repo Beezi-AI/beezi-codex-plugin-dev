@@ -145,6 +145,51 @@ function makeDeps(over = {}) {
 
 const sync = (h, options = {}) => runAudit(h.deps, { mode: SYNC_MODE, ...options });
 
+// The 30-day window is shared policy, not a backfill-only rule: a session out of scope for the
+// one-time import must be out of scope here too, or the two commands disagree about the same file.
+test('the 30-day window applies to sync as well, and is never reconciled', async () => {
+  const NOW = 100 * 24 * 60 * 60 * 1000;
+  const asked = [];
+  const h = makeDeps({
+    deps: {
+      now: () => NOW,
+      listRollouts: () => [
+        rollout('ancient', { mtimeMs: NOW - 31 * 24 * 60 * 60 * 1000 }),
+        rollout('recent', { mtimeMs: NOW - 2 * 24 * 60 * 60 * 1000 }),
+      ],
+      fetchCoverageImpl: async (ids) => { asked.push(...ids); return new Map(); },
+    },
+  });
+
+  const result = await sync(h);
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 1);
+  assert.deepEqual(asked, ['recent'], 'the server is never asked about an out-of-window session');
+});
+
+// When the window empties the candidate list there is no coverage call at all, so `coverageKnown`
+// must stay null: sync.mjs prints a NETWORK failure on `false`, and "we never asked" is not that.
+test('a machine with only out-of-window history does not report a coverage failure', async () => {
+  const NOW = 100 * 24 * 60 * 60 * 1000;
+  let asked = 0;
+  const h = makeDeps({
+    deps: {
+      now: () => NOW,
+      listRollouts: () => [rollout('ancient', { mtimeMs: NOW - 60 * 24 * 60 * 60 * 1000 })],
+      fetchCoverageImpl: async () => { asked += 1; return new Map(); },
+    },
+  });
+
+  const result = await sync(h);
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 0);
+  assert.equal(asked, 0, 'no candidates means no coverage request');
+  assert.equal(result.coverageKnown, null, 'not false — sync would call that a network failure');
+  assert.equal(result.sessionsImported, 0);
+});
+
 // ─── R2 case list ───────────────────────────────────────────────────────────────────────────
 
 test('R2/no hooks trusted — a session the server has never seen replays from line 0', async () => {

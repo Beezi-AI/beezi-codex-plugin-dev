@@ -11,6 +11,9 @@ import { fail, plural } from '../lib/cli.mjs';
 // only what is missing above that point, so it is safe to run as often as the user likes and it
 // neither consumes nor reopens the one-time backfill's seal.
 //
+// It reaches back 30 days and no further: MAX_SESSION_AGE_MS in lib/session-audit.mjs is shared
+// policy, so a session out of scope for the one-time import is out of scope here too.
+//
 // It takes NO FLAGS, and both refusals below are mechanical enforcement of that:
 //
 //   --since filters on the transcript's modification time, which says when a session last RAN, not
@@ -25,8 +28,8 @@ function parseSyncArgs(argv) {
   for (const flag of argv) {
     if (flag === '--since') {
       fail(
-        'Beezi: sync takes no --since. It uploads exactly what Beezi is missing, whenever those '
-        + 'sessions ran. Run it with no flags.',
+        'Beezi: sync takes no --since. It uploads exactly what Beezi is missing from the last 30 '
+        + 'days, wherever in that window those sessions ran. Run it with no flags.',
       );
     }
     if (flag === '--force') {
@@ -126,7 +129,13 @@ async function main() {
       + 'later run. Details below; run sync again afterwards.',
     );
   } else if (result.sessionsImported === 0) {
-    console.log('✓ Beezi: everything is already uploaded.');
+    // Qualified when the window bit, because the unqualified phrase is the one the skill teaches
+    // the model to read as final — and "everything" would be a false claim about older history.
+    console.log(
+      result.tooOld > 0
+        ? '✓ Beezi: everything from the last 30 days is already uploaded.'
+        : '✓ Beezi: everything is already uploaded.',
+    );
   } else {
     console.log(
       `✓ Beezi: uploaded ${plural(result.sessionsImported, 'session')} `
@@ -134,6 +143,13 @@ async function main() {
     );
   }
 
+  // The window is a hard floor on this path too: unlike a deferral, a later run will not reach them.
+  if (result.tooOld > 0) {
+    console.log(
+      `  ${plural(result.tooOld, 'session')} ran more than 30 days ago — sync only reaches back 30 `
+      + 'days, so they will not be uploaded by a later run either.',
+    );
+  }
   if (result.pendingDrained > 0) {
     console.log(`  ${plural(result.pendingDrained, 'saved report')} were delivered before the check.`);
   }
