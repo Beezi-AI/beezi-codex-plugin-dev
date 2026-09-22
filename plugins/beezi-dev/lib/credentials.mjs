@@ -1,8 +1,15 @@
-import { execFileSync } from 'child_process';
+// A DEFAULT import, not `import { execFileSync }`. For a core module the default binding IS the
+// object tools/hermetic-env.mjs patches, so a test that reaches defaultRun below is RECORDED as an
+// escape; a named binding is snapshotted at instantiation and walks straight past the guard. That
+// is how `npm test` came to add a keyed keychain entry and delete the developer's own pre-0.13
+// `beezi-codex/token` login while reporting zero failures.
+import childProcess from 'child_process';
 import fs from 'fs';
 import path from 'path';
 import crypto from 'crypto';
-import { credentialsFile, environment, BEEZI_ENV } from './paths.mjs';
+import {
+  legacyCredentialsFile, credentialsFile, accountDir, beeziCodexHome, environment, BEEZI_ENV,
+} from './paths.mjs';
 import { readJson, writeJsonDurable } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { withLock, sharedLock } from './single-instance-lock.mjs';
@@ -20,7 +27,33 @@ import { withLock, sharedLock } from './single-instance-lock.mjs';
 // it reaches the PowerShell templates below, which interpolate SERVICE as literal script text.
 export const SERVICE = `beezi-codex${environment.envSuffix()}`;
 
-const ACCOUNT = 'token';
+// The keyring `account` attribute a pre-0.13 install used: one entry for the whole machine. From
+// 0.13 on the account KEY takes that slot, so each linked Beezi account owns an entry of its own
+// and two accounts can never read each other. This name survives for the one-time migration in
+// lib/accounts.mjs — and, while it is deciding which environment a ROOT belongs to,
+// lib/env-migration.mjs through LEGACY_SUBJECT below. No other caller may reach it.
+const LEGACY_ACCOUNT = 'token';
+
+/**
+ * The pre-0.13 machine-wide credential, named as a SUBJECT the migration functions below accept.
+ *
+ * lib/env-migration.mjs migrates ROOTS, and a root is in one of two shapes: pre-0.13, holding the
+ * single machine-wide entry, or keyed, holding one entry per linked account. It has to be able to
+ * name either, so `readRawCredential`, `deleteRawCredential`, `preserveMigrationCredential` and
+ * `tombstoneMigrationCredential` take a subject — an 8-hex account key, or this.
+ *
+ * A Symbol, not a string: the only other way to name a subject is a key read out of accounts.json,
+ * which the user can edit, so a symbol is what guarantees no edited value can ever select the
+ * legacy entry. `getCredentials`/`setCredentials`/`deleteCredentials` stay keyed-only and reject it.
+ */
+export const LEGACY_SUBJECT = Symbol('beezi pre-0.13 credential subject');
+
+// The keyring account attribute a subject uses, validated. LEGACY_SUBJECT is the one value that
+// bypasses assertAccountKey, and it cannot be forged: see above.
+function assertSubject(subject) {
+  if (subject === LEGACY_SUBJECT) return LEGACY_ACCOUNT;
+  return environment.assertAccountKey(subject);
+}
 
 // The environment the stored credentials were issued under, persisted alongside them.
 //
@@ -54,7 +87,7 @@ const POWERSHELL = process.env.SystemRoot
 // { ok, stdout } so callers can fall back to the file store on any failure.
 function defaultRun(file, args, input) {
   try {
-    const stdout = execFileSync(file, args, {
+    const stdout = childProcess.execFileSync(file, args, {
       input: orDefault(input, undefined),
       encoding: 'utf-8',
       stdio: ['pipe', 'pipe', 'ignore'],
@@ -77,39 +110,47 @@ function tokenFrom(r) {
 
 // ── file store: the always-available fallback, and where the Windows DPAPI
 //    ciphertext is kept (0600; on Windows the user profile ACL also applies). ──
+//
+// Parameterised by PATH rather than by key, because the two chains below differ in exactly that:
+// a keyed account keeps its file under accounts/<key>/, while the pre-0.13 entry's file is the
+// root-level credentials.json it has always been.
 
-function fileRead() {
-  return readJson(credentialsFile());
+function fileRead(file) {
+  return readJson(file);
 }
 
-function fileWrite(obj) {
-  writeJsonDurable(credentialsFile(), obj);
+function fileWrite(file, obj) {
+  writeJsonDurable(file, obj);
 }
 
-function fileDelete() {
-  try { fs.unlinkSync(credentialsFile()); } catch { /* already absent */ }
+function fileDelete(file) {
+  try { fs.unlinkSync(file); } catch { /* already absent */ }
 }
 
 // ── backends. Each: { available(), get() -> string|null, set(token) -> boolean, delete() }.
+//
+// `account` is the keyring entry's account attribute — an 8-hex account key, or LEGACY_ACCOUNT for
+// the pre-0.13 entry. It reaches argv and, on Windows, PowerShell script text, so every exported
+// function validates it through environment.assertAccountKey() before a backend is built.
 
-function macBackend(run, service = SERVICE) {
+function macBackend(run, account, service = SERVICE) {
   return {
     available: () => true, // `security` ships with macOS
     get() {
-      return tokenFrom(run('security', ['find-generic-password', '-s', service, '-a', ACCOUNT, '-w']));
+      return tokenFrom(run('security', ['find-generic-password', '-s', service, '-a', account, '-w']));
     },
     set(token) {
-      return run('security', ['add-generic-password', '-U', '-s', service, '-a', ACCOUNT, '-w', token]).ok
+      return run('security', ['add-generic-password', '-U', '-s', service, '-a', account, '-w', token]).ok
         ? 'the macOS keychain' : false;
     },
     delete() {
-      run('security', ['delete-generic-password', '-s', service, '-a', ACCOUNT]);
+      run('security', ['delete-generic-password', '-s', service, '-a', account]);
     },
   };
 }
 
-function secretToolBackend(run, service = SERVICE) {
-  const attrs = ['service', service, 'account', ACCOUNT];
+function secretToolBackend(run, account, service = SERVICE) {
+  const attrs = ['service', service, 'account', account];
   return {
     available: () => run('secret-tool', ['--version']).ok, // libsecret often absent
     get() {
@@ -162,6 +203,10 @@ public struct CREDENTIAL {
 
 // Reads the secret from stdin (never an argv element, so it can't leak via the process list),
 // writes a GENERIC credential with LOCAL_MACHINE persistence, prints 'OK' on success.
+//
+// `$c.TargetName` is the KEY (see credTarget below) and carries the account; `$c.UserName` is
+// descriptive metadata only — it is what the user sees beside the entry in Credential Manager, and
+// CredRead/CredDelete never look at it.
 const CRED_WRITE = `$in=[Console]::In.ReadToEnd()
 Add-Type @"
 using System; using System.Runtime.InteropServices;
@@ -174,7 +219,7 @@ $bytes=[Text.Encoding]::Unicode.GetBytes($in)
 $blob=[Runtime.InteropServices.Marshal]::AllocHGlobal($bytes.Length)
 [Runtime.InteropServices.Marshal]::Copy($bytes,0,$blob,$bytes.Length)
 $c=New-Object BeeziCredW+CREDENTIAL
-$c.Type=1; $c.TargetName='${SERVICE}'; $c.UserName='${ACCOUNT}'
+$c.Type=1; $c.TargetName='${SERVICE}'; $c.UserName='${LEGACY_ACCOUNT}'
 $c.CredentialBlob=$blob; $c.CredentialBlobSize=$bytes.Length; $c.Persist=2
 $ok=[BeeziCredW]::CredWrite([ref]$c,0)
 [Runtime.InteropServices.Marshal]::FreeHGlobal($blob)
@@ -210,62 +255,132 @@ public class BeeziCredD {
 "@
 [void][BeeziCredD]::CredDelete('${SERVICE}',1,0)`;
 
-function credManBackend(run, service = SERVICE) {
+/**
+ * The Credential Manager target name for one account.
+ *
+ * THE ACCOUNT HAS TO BE IN THE TARGET. A Windows generic credential is identified by TargetName +
+ * Type; `UserName` is payload the API carries along, not part of the key. CredRead and CredDelete
+ * take only a target, so keying by UserName would give every account on the machine one shared
+ * entry: the second setCredentials() would overwrite the first, one deleteCredentials() would
+ * unlink both, and an uncommitted read for account B would hand back account A's blob (the env
+ * stamp is all parseCredentials checks, and both accounts share it).
+ *
+ * The LEGACY entry keeps the bare service name, because that is the target a pre-0.13 install
+ * actually wrote — suffix it and readLegacyCredential stops finding it and the one-time migration
+ * sees an unlinked machine. `assertAccountKey` bounds a real key to /^[0-9a-f]{8}$/, which cannot
+ * collide with LEGACY_ACCOUNT ('token' is not hex).
+ */
+function credTarget(service, account) {
+  return account === LEGACY_ACCOUNT ? service : `${service}:${account}`;
+}
+
+// The target and the account both reach the script as literal PowerShell text inside single-quoted
+// literals, so both are substituted the way the service name always was. SERVICE is validated
+// against a three-name allowlist at module load and the account by environment.assertAccountKey()
+// before any exported function builds a backend, so neither can carry a quote; `:` is a
+// conventional Credential Manager target separator and is quote-free. The `'…'` quoting around
+// LEGACY_ACCOUNT makes the UserName substitution a single unambiguous occurrence.
+function credScript(template, service, account) {
+  return template
+    .split(SERVICE).join(credTarget(service, account))
+    .split(`'${LEGACY_ACCOUNT}'`).join(`'${account}'`);
+}
+
+function credManBackend(run, account, service = SERVICE) {
   return {
     available: () => true, // advapi32 + PowerShell ship with Windows; failures fall through
     get() {
-      return tokenFrom(powershell(run, CRED_READ.split(SERVICE).join(service)));
+      return tokenFrom(powershell(run, credScript(CRED_READ, service, account)));
     },
     set(token) {
-      const r = powershell(run, CRED_WRITE.split(SERVICE).join(service), token);
+      const r = powershell(run, credScript(CRED_WRITE, service, account), token);
       return r.ok && r.stdout.trim() === 'OK' ? 'the Windows Credential Manager' : false;
     },
     delete() {
-      powershell(run, CRED_DELETE.split(SERVICE).join(service));
+      powershell(run, credScript(CRED_DELETE, service, account));
     },
   };
 }
 
-function dpapiFileBackend(run) {
+function dpapiFileBackend(run, file) {
   return {
     available: () => true, // PowerShell ships with Windows; DPAPI failures fall back below
     get() {
-      const obj = fileRead();
+      const obj = fileRead(file);
       if (!obj) return null;
       if (typeof obj.enc === 'string') return tokenFrom(powershell(run, DPAPI_DEC, obj.enc));
       return typeof obj.token === 'string' ? obj.token : null; // plaintext (DPAPI was down at set)
     },
     set(token) {
       const r = powershell(run, DPAPI_ENC, token);
-      if (r.ok && r.stdout.trim()) { fileWrite({ enc: r.stdout.trim() }); return 'Windows DPAPI (encrypted at rest)'; }
-      fileWrite({ token }); // DPAPI unavailable → plaintext, still 0600
+      if (r.ok && r.stdout.trim()) { fileWrite(file, { enc: r.stdout.trim() }); return 'Windows DPAPI (encrypted at rest)'; }
+      fileWrite(file, { token }); // DPAPI unavailable → plaintext, still 0600
       return 'a restricted local file';
     },
-    delete: fileDelete,
+    delete() { fileDelete(file); },
   };
 }
 
-function fileBackend() {
+function fileBackend(file) {
   return {
     available: () => true,
     get() {
-      const obj = fileRead();
+      const obj = fileRead(file);
       return obj && typeof obj.token === 'string' ? obj.token : null;
     },
-    set(token) { fileWrite({ token }); return 'a restricted local file'; },
-    delete: fileDelete,
+    set(token) { fileWrite(file, { token }); return 'a restricted local file'; },
+    delete() { fileDelete(file); },
   };
 }
 
-// Preferred backend chain for the platform; the plaintext file is always the tail.
-function backends(deps) {
+// Preferred backend chain for the platform; the plaintext file is always the tail. Everything that
+// distinguishes one account from another is the pair (keyring account attribute, file-store path),
+// so the keyed chain and the legacy chain share every backend implementation.
+//
+// Built fresh per call and closed over nothing module-level: linkedSessions() reads N accounts
+// concurrently, and a memoized chain or a cached blob here would let one account's read answer
+// another's.
+function chainFor(deps, account, file) {
   const run = deps.run || defaultRun;
   const platform = deps.platform || process.platform;
-  const file = { name: 'file', ...fileBackend() };
-  if (platform === 'darwin') return [{ name: 'keychain', ...macBackend(run) }, file];
-  if (platform === 'linux') return [{ name: 'secret-service', ...secretToolBackend(run) }, file];
-  if (platform === 'win32') return [{ name: 'credman', ...credManBackend(run) }, { name: 'dpapi-file', ...dpapiFileBackend(run) }, file];
-  return [file];
+  const tail = { name: 'file', ...fileBackend(file) };
+  if (platform === 'darwin') return [{ name: 'keychain', ...macBackend(run, account) }, tail];
+  if (platform === 'linux') return [{ name: 'secret-service', ...secretToolBackend(run, account) }, tail];
+  if (platform === 'win32') return [{ name: 'credman', ...credManBackend(run, account) }, { name: 'dpapi-file', ...dpapiFileBackend(run, file) }, tail];
+  return [tail];
+}
+
+/** Where one subject's file store lives: under accounts/<key>/, or the pre-0.13 root-level file. */
+function subjectCredentialsFile(subject) {
+  return subject === LEGACY_SUBJECT ? legacyCredentialsFile() : credentialsFile(subject);
+}
+
+/**
+ * One subject's chain: its own keyring entry, its own file store.
+ *
+ * For an account key that is its entry under accounts/<key>/. For LEGACY_SUBJECT it is the single
+ * machine-wide entry named 'token' beside the root-level credentials.json — buildable only by
+ * readLegacyCredential/deleteLegacyCredential and the raw migration functions at the foot of this
+ * module. A KEYED read must never fall back to it: that would resurrect a deleted account's token
+ * under a new key.
+ */
+function backends(subject, deps) {
+  return chainFor(deps, assertSubject(subject), subjectCredentialsFile(subject));
+}
+
+function legacyBackends(deps) {
+  return backends(LEGACY_SUBJECT, deps);
+}
+
+// Existing installations are read in place until their first successful write; thereafter the
+// control record selects one backend and an older fallback can never become authoritative.
+function readThrough(chain) {
+  for (const b of chain) {
+    if (!b.available()) continue;
+    const raw = b.get();
+    if (raw) return raw;
+  }
+  return null;
 }
 
 // The backends store an opaque string. Since the Clerk OAuth migration that
@@ -290,7 +405,12 @@ function parseCredentials(raw) {
 }
 
 const REVISION = Symbol('credential revision');
-const controlFile = () => path.join(path.dirname(credentialsFile()), 'credential-control.json');
+// The authority record sits beside the subject's file store: under accounts/<key>/ for an account,
+// at the data root for the pre-0.13 machine-wide entry — which is where a pre-0.13 install wrote
+// it, and so where that install's own reader still looks.
+const controlFile = (subject) => (subject === LEGACY_SUBJECT
+  ? path.join(beeziCodexHome(), 'credential-control.json')
+  : path.join(accountDir(subject), 'credential-control.json'));
 
 function unavailable(message, code = 'CREDENTIALS_UNAVAILABLE') {
   const error = new Error(message);
@@ -298,9 +418,9 @@ function unavailable(message, code = 'CREDENTIALS_UNAVAILABLE') {
   return error;
 }
 
-function readControl() {
+function readControl(key) {
   let raw;
-  try { raw = fs.readFileSync(controlFile(), 'utf-8'); } catch (error) {
+  try { raw = fs.readFileSync(controlFile(key), 'utf-8'); } catch (error) {
     if (error.code === 'ENOENT') return null;
     throw unavailable('Credential control record cannot be read');
   }
@@ -332,11 +452,12 @@ function readCommittedCredential(backend, deps) {
   return raw;
 }
 
-export async function getCredentials(deps = {}) {
-  const control = readControl();
+export async function getCredentials(key, deps = {}) {
+  environment.assertAccountKey(key);
+  const control = readControl(key);
   if (control) {
     if (control.beezi_env !== BEEZI_ENV || control.backend === null) return null;
-    const backend = backends(deps).find(b => b.name === control.backend);
+    const backend = backends(key, deps).find(b => b.name === control.backend);
     if (!backend) throw unavailable('Committed credential backend unavailable');
     const raw = readCommittedCredential(backend, deps);
     const creds = raw && parseCredentials(raw);
@@ -347,21 +468,15 @@ export async function getCredentials(deps = {}) {
     Object.defineProperty(creds, REVISION, { value: control.revision });
     return creds;
   }
-  // Existing installations are read in place until their first successful write. Thereafter
-  // the control record selects one backend; an older fallback can never become authoritative.
-  for (const b of backends(deps)) {
-    if (!b.available()) continue;
-    const raw = b.get();
-    if (raw) return parseCredentials(raw);
-  }
-  return null;
+  const raw = readThrough(backends(key, deps));
+  return raw ? parseCredentials(raw) : null;
 }
 
 // The one read-modify-write wrapper for the credential store: rank-4 `credential` lock, an
 // optimistic revision check, and a fresh revision handed to the mutation.
-function mutateCredentials(options, fn) {
+function mutateCredentials(key, options, fn) {
   const result = withLock({ ...sharedLock('credentials'), kind: 'credential' }, { migrationPermit: options.migrationPermit }, lock => {
-    const control = readControl();
+    const control = readControl(key);
     if ('expectedRevision' in options && options.expectedRevision !== (control && control.revision || null)) {
       throw unavailable('Credentials changed during refresh', 'CREDENTIALS_SUPERSEDED');
     }
@@ -374,29 +489,70 @@ function mutateCredentials(options, fn) {
 
 // Returns a human-readable description of where the credentials were actually stored, so the caller
 // can report accurately (keychain vs a local file) instead of always claiming the keychain.
-export async function setCredentials(creds, deps = {}, options = {}) {
-  return mutateCredentials(options, (revision, lock) => {
+export async function setCredentials(key, creds, deps = {}, options = {}) {
+  environment.assertAccountKey(key);
+  return mutateCredentials(key, options, (revision, lock) => {
     const raw = JSON.stringify({ ...creds, [ENV_STAMP]: BEEZI_ENV, beezi_revision: revision });
-    for (const b of backends(deps)) {
+    for (const b of backends(key, deps)) {
       if (!b.available()) continue;
       const where = b.set(raw);
       if (!where) continue;
       if (!lock.verify().ok) throw unavailable('Credential lock was lost');
-      writeJsonDurable(controlFile(), { version: 1, revision, backend: b.name, beezi_env: BEEZI_ENV });
+      writeJsonDurable(controlFile(key), { version: 1, revision, backend: b.name, beezi_env: BEEZI_ENV });
       return where;
     }
     throw unavailable('No credential backend accepted the write');
   });
 }
 
-export async function deleteCredentials(deps = {}, options = {}) {
-  return mutateCredentials(options, (revision) => {
+export async function deleteCredentials(key, deps = {}, options = {}) {
+  environment.assertAccountKey(key);
+  return mutateCredentials(key, options, (revision) => {
     // A tombstone prevents stale native-store copies or delayed refreshes reviving a logout.
-    writeJsonDurable(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
-    for (const b of backends(deps)) {
+    writeJsonDurable(controlFile(key), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
+    for (const b of backends(key, deps)) {
       if (b.available()) { try { b.delete(); } catch { /* ignore */ } }
     }
   });
+}
+
+/**
+ * The pre-0.13 entry, read through the legacy chain.
+ *
+ * Read by the one-time migration in lib/accounts.mjs and by nothing else: a keyed caller that fell
+ * back to this would resurrect a deleted account's token under a new key. The environment stamp is
+ * still enforced, so a staging-issued legacy blob is not adopted by the production namespace.
+ *
+ * "UNREADABLE" AND "NEVER LINKED" MUST NOT LOOK THE SAME HERE. defaultRun collapses a locked
+ * keychain, an absent secret-tool and a killed spawn all to { ok: false } and then to null, which is
+ * byte-identical to an unlinked machine — and the migration reads that null as "nothing to migrate",
+ * returns an empty index, and the next login publishes one. From then on readIndex short-circuits on
+ * the published index, the migration never runs again, and the legacy entry is stranded for good.
+ * Nothing is deleted, but the login this whole task exists to preserve is orphaned.
+ *
+ * The authority record is what closes it, exactly as it does for a keyed subject in
+ * readRawCredential below: an install that ever committed its credential has a record naming the
+ * backend that holds it, so a committed backend answering with nothing is a failure, not an absence.
+ * An install that predates the record still cannot tell the two apart — that residue is real and is
+ * covered in test/accounts-migration.test.mjs.
+ */
+export async function readLegacyCredential(deps = {}) {
+  const control = readControl(LEGACY_SUBJECT);
+  if (control) {
+    // A tombstone is an authoritative logout, which IS "not linked".
+    if (control.backend === null) return null;
+    const backend = legacyBackends(deps).find(b => b.name === control.backend);
+    if (!backend) throw unavailable('Committed credential backend unavailable');
+    const raw = readCommittedCredential(backend, deps);
+    if (!raw) throw unavailable('Saved Beezi authorization could not be read; check access to the credential store and try again later');
+    return parseCredentials(raw);
+  }
+  const raw = readThrough(legacyBackends(deps));
+  return raw ? parseCredentials(raw) : null;
+}
+
+export async function deleteLegacyCredential(deps = {}) {
+  for (const backend of legacyBackends(deps)) backend.delete();
 }
 
 
@@ -411,11 +567,12 @@ export async function deleteCredentials(deps = {}, options = {}) {
  * Synchronous, because the guard that calls it runs before anything else in a hook and has no
  * business awaiting. Every backend get() is synchronous already.
  */
-export function readRawCredential(deps = {}) {
-  const control = readControl();
+export function readRawCredential(subject, deps = {}) {
+  assertSubject(subject);
+  const control = readControl(subject);
   if (control) {
     if (control.backend === null) return null;
-    const backend = backends(deps).find(b => b.name === control.backend);
+    const backend = backends(subject, deps).find(b => b.name === control.backend);
     if (!backend) throw unavailable('Committed credential backend unavailable');
     const raw = readCommittedCredential(backend, deps);
     if (!raw) throw unavailable('Committed credentials could not be read; check access to the credential store and try again later');
@@ -424,12 +581,7 @@ export function readRawCredential(deps = {}) {
     if (!parsed || parsed.beezi_revision !== control.revision) throw unavailable('Credential revision mismatch');
     return raw;
   }
-  for (const b of backends(deps)) {
-    if (!b.available()) continue;
-    const raw = b.get();
-    if (raw) return raw;
-  }
-  return null;
+  return readThrough(backends(subject, deps));
 }
 
 /**
@@ -443,18 +595,19 @@ export function readRawCredential(deps = {}) {
  * could revive is the same hazard here as at logout, and the tombstone revision is what closes
  * it.
  */
-export function deleteRawCredential(deps = {}) {
+export function deleteRawCredential(subject, deps = {}) {
+  assertSubject(subject);
   try {
-    mutateCredentials({ migrationPermit: deps.migrationPermit }, (revision) => {
-      writeJsonDurable(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
-      for (const b of backends(deps)) {
+    mutateCredentials(subject, { migrationPermit: deps.migrationPermit }, (revision) => {
+      writeJsonDurable(controlFile(subject), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
+      for (const b of backends(subject, deps)) {
         if (b.available()) { try { b.delete(); } catch { /* try the rest, then verify */ } }
       }
     });
   } catch {
     return false;
   }
-  for (const b of backends(deps)) {
+  for (const b of backends(subject, deps)) {
     if (b.available() && b.get()) return false;
   }
   return true;
@@ -466,31 +619,55 @@ export function serviceFor(env) {
   return `beezi-codex${suffix}`;
 }
 
+/**
+ * Where ANOTHER root keeps one subject's file store / authority record.
+ *
+ * Both are derived from the live accessors rather than re-spelled as 'accounts/<key>/…', so the
+ * per-account layout stays defined in exactly one place (lib/paths.mjs) and a later rename cannot
+ * leave a hardcoded copy pointing at a directory nothing reads. lib/env-migration.mjs composes the
+ * source and destination sides of the cutover through these.
+ */
+export function subjectCredentialsPath(root, subject) {
+  return path.join(root, path.relative(beeziCodexHome(), subjectCredentialsFile(subject)));
+}
+
+export function subjectAuthorityPath(root, subject) {
+  return path.join(root, path.relative(beeziCodexHome(), controlFile(subject)));
+}
+
 // Destination credential and authority are committed together while both migration barriers
 // are held. Native credentials never fall back to plaintext here.
-export function preserveMigrationCredential(raw, destination, deps = {}) {
+//
+// The authority goes where the DESTINATION install's readControl() will look for it — under that
+// root's accounts/<key>/ for an account, at its root for the pre-0.13 subject. Put it anywhere else
+// and the preserved install falls through to the uncommitted read path, silently losing the
+// revision and tombstone protection.
+export function preserveMigrationCredential(subject, raw, destination, deps = {}) {
+  const account = assertSubject(subject);
   const run = deps.run || defaultRun;
   const platform = deps.platform || process.platform;
   const revision = crypto.randomBytes(16).toString('hex');
   const token = JSON.stringify({ ...JSON.parse(raw), beezi_env: 'staging', beezi_revision: revision });
-  const backend = platform === 'darwin' ? { name: 'keychain', ...macBackend(run, serviceFor('staging')) }
-    : platform === 'linux' ? { name: 'secret-service', ...secretToolBackend(run, serviceFor('staging')) }
-      : platform === 'win32' ? { name: 'credman', ...credManBackend(run, serviceFor('staging')) } : null;
+  const backend = platform === 'darwin' ? { name: 'keychain', ...macBackend(run, account, serviceFor('staging')) }
+    : platform === 'linux' ? { name: 'secret-service', ...secretToolBackend(run, account, serviceFor('staging')) }
+      : platform === 'win32' ? { name: 'credman', ...credManBackend(run, account, serviceFor('staging')) } : null;
+  const authority = subjectAuthorityPath(destination, subject);
   if (!backend || !backend.available() || !backend.set(token) || backend.get() !== token) {
-    writeJsonDurable(path.join(destination, 'credential-control.json'), {
+    writeJsonDurable(authority, {
       version: 1, revision, backend: null, beezi_env: 'staging',
     });
     return false;
   }
-  writeJsonDurable(path.join(destination, 'credential-control.json'), {
+  writeJsonDurable(authority, {
     version: 1, revision, backend: backend.name, beezi_env: 'staging',
   });
   return true;
 }
 
-export function tombstoneMigrationCredential(deps = {}) {
-  return mutateCredentials({ migrationPermit: deps.migrationPermit }, revision => {
-    writeJsonDurable(controlFile(), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
-    return readControl().backend === null;
+export function tombstoneMigrationCredential(subject, deps = {}) {
+  assertSubject(subject);
+  return mutateCredentials(subject, { migrationPermit: deps.migrationPermit }, revision => {
+    writeJsonDurable(controlFile(subject), { version: 1, revision, backend: null, beezi_env: BEEZI_ENV });
+    return readControl(subject).backend === null;
   });
 }

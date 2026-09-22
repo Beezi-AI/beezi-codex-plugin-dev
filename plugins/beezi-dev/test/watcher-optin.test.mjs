@@ -45,7 +45,7 @@ test('1. an opted-out machine arms no timer, touches no filesystem and takes no 
     setTimeoutImpl: (fn, ms) => { armed.push(ms); return { fake: true }; },
     clearTimeoutImpl: () => {},
     acquireLockImpl: (target) => { locked.push(target); throw new Error('no lock may be taken'); },
-    getAccessToken: async () => { throw new Error('no token may be read'); },
+    linkedSessions: async () => { throw new Error('no account may be resolved'); },
     runCheckpoint: async () => { throw new Error('no checkpoint may run'); },
     runAudit: async () => { throw new Error('no audit may run'); },
     pruneStale: () => { throw new Error('no prune may run'); },

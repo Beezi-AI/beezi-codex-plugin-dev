@@ -333,16 +333,17 @@ export function computeSessionTimeline(transcriptPath, sessionId = null, deps = 
 // POST the session timeline to Beezi. Session-scoped (upserted by sessionId). The result is read:
 // `runLockedCheckpoint` in checkpoint.mjs destructures `{ reported }` and branches on it, so a
 // `reported: false` reason has to stay accurate.
-export async function postSessionTimeline(payload, token, deps = {}) {
+export async function postSessionTimeline(payload, session, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   if (!payload || !payload.sessionId || !Array.isArray(payload.periods)) {
     return { reported: false, reason: 'missing-fields' };
   }
-  if (!token) return { reported: false, reason: 'no-token' };
+  // { token, clientId }, never a bare token — see lib/http.mjs sessionOf.
+  if (!session || !session.token) return { reported: false, reason: 'no-token' };
   try {
     // timeoutMs travels through: the caller may be running against a hook deadline and needs this
     // request bounded by what is left of it, not by the default.
-    const res = await postJson(`${apiBase()}${ENDPOINTS.sessionsTimeline}`, token, payload, {
+    const res = await postJson(`${apiBase()}${ENDPOINTS.sessionsTimeline}`, session, payload, {
       fetchImpl,
       ...(deps.timeoutMs === undefined ? {} : { timeoutMs: deps.timeoutMs }),
     });

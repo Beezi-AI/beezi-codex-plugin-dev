@@ -7,6 +7,13 @@ import { queueDir } from '../lib/paths.mjs';
 import { findSubagentRollouts } from '../lib/subagent-codex.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // G-7-1, end to end: a subagent spawned by ANOTHER SUBAGENT reaches the queue.
 //
@@ -23,8 +30,8 @@ import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 const tmpHome = (t) => sandboxHome(t, 'beezi-nest-');
 
-const queued = () => fs.readdirSync(queueDir()).map((f) =>
-  JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));
+const queued = () => fs.readdirSync(queueDir(KEY)).map((f) =>
+  JSON.parse(fs.readFileSync(path.join(queueDir(KEY), f), 'utf-8')));
 
 const T0 = Date.parse('2026-08-06T19:41:50.000Z');
 const at = (ms) => new Date(T0 + ms).toISOString();
@@ -68,7 +75,7 @@ const parentSeg = () => ({
 // The parent's delta is stubbed; every agent rollout runs through the REAL computeDelta, because the
 // point of the fix is the numbers the grandchild produces, not merely that it was listed.
 const deps = (home, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); }, // keep the payloads on disk
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 'parent-1' }),
   computeDelta: (p, from, resolvers) => (p.indexOf('rollout-2026') === -1

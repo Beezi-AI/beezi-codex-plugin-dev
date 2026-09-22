@@ -5,7 +5,7 @@ import { withCodexAuth, underCodexAuth } from '../tools/hermetic-env.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseArgs, buildConfig, shouldKeepExisting, captureFromCodexAccount } from '../lib/billing-capture.mjs';
-import { readCodexAuthSignals } from '../lib/codex-account.mjs';
+import { readCodexAuthSignals } from '../lib/chatgpt-auth.mjs';
 
 // Force the subscription branch deterministically: a CODEX_HOME with no auth.json, so step 4 of
 // the ladder (billing-config.mjs:110-118) has nothing to say and the selfReported declaration at
@@ -111,7 +111,7 @@ const account = (over = {}) => () => ({ authMode: 'chatgpt', subscriptionType: '
 // still leaves the answer up to the machine the suite happens to run on.
 test('captureFromCodexAccount records a valid claim as-is', async (t) => {
   withCodexAuth(t, { auth_mode: 'chatgpt' });
-  const { config, reason } = await captureFromCodexAccount({ via: 'login', env: {}, deps: { readAccountViaAppServer: noProbe, readCodexAccount: account() } });
+  const { config, reason } = await captureFromCodexAccount({ via: 'login', env: {}, deps: { readAccountViaAppServer: noProbe, readChatgptAuth: account() } });
   assert.equal(reason, 'captured');
   assert.equal(config.plan, 'pro_20x');
   assert.equal(config.capturedBy, 'login');
@@ -123,7 +123,7 @@ test('captureFromCodexAccount keeps the expiry of an expired claim but not its p
   const { config, reason } = await captureFromCodexAccount({
     via: 'login',
     env: {},
-    deps: { readAccountViaAppServer: noProbe, readCodexAccount: account({ subscriptionType: 'free', plan: 'free', expiresAt }) },
+    deps: { readAccountViaAppServer: noProbe, readChatgptAuth: account({ subscriptionType: 'free', plan: 'free', expiresAt }) },
   });
   assert.equal(reason, 'expired-claim');
   assert.equal(config.plan, 'unknown', 'a six-week-stale "free" must not be believed');
@@ -132,7 +132,7 @@ test('captureFromCodexAccount keeps the expiry of an expired claim but not its p
 
 test('captureFromCodexAccount reports an absent account rather than writing one', async () => {
   assert.deepEqual(
-    await captureFromCodexAccount({ via: 'login', deps: { readAccountViaAppServer: noProbe, readCodexAccount: () => null } }),
+    await captureFromCodexAccount({ via: 'login', deps: { readAccountViaAppServer: noProbe, readChatgptAuth: () => null } }),
     { config: null, reason: 'no-account', tier: 'none' },
   );
 });
@@ -144,7 +144,7 @@ test('captureFromCodexAccount reports an absent account rather than writing one'
 test('the source ladder resolves from the account, with no auth.json on disk', async () => {
   await underCodexAuth(null, async () => {
     const { config } = await captureFromCodexAccount({
-      via: 'login', env: {}, deps: { readAccountViaAppServer: noProbe, readCodexAccount: account() },
+      via: 'login', env: {}, deps: { readAccountViaAppServer: noProbe, readChatgptAuth: account() },
     });
     assert.equal(config.source, 'subscription');
     assert.equal(config.plan, 'pro_20x');
@@ -166,7 +166,7 @@ test('a machine whose auth_mode is null resolves by its stored key, not to unkno
     const fromAccount = await captureFromCodexAccount({
       via: 'login',
       env: {},
-      deps: { readAccountViaAppServer: noProbe, readCodexAccount: account({ authMode: null, hasStoredApiKey: true }) },
+      deps: { readAccountViaAppServer: noProbe, readChatgptAuth: account({ authMode: null, hasStoredApiKey: true }) },
     });
     assert.equal(fromAccount.config.source, 'openai_api_key', 'not "unknown"');
     assert.equal(fromAccount.config.plan, null, 'a key bills per token — there is no tier to state');
@@ -177,7 +177,7 @@ test('a machine whose auth_mode is null resolves by its stored key, not to unkno
       env: {},
       deps: {
         readAccountViaAppServer: noProbe,
-        readCodexAccount: account({ authMode: null, hasStoredApiKey: true }),
+        readChatgptAuth: account({ authMode: null, hasStoredApiKey: true }),
         readCodexAuthSignals: readCodexAuthSignals,
       },
     });
@@ -193,7 +193,7 @@ test('an injected resolveSource reaches the inner resolution too', async () => {
     const { config } = await captureFromCodexAccount({
       via: 'session-start',
       env: {},
-      deps: { readAccountViaAppServer: noProbe, readCodexAccount: account(), resolveSource: () => 'subscription' },
+      deps: { readAccountViaAppServer: noProbe, readChatgptAuth: account(), resolveSource: () => 'subscription' },
     });
     assert.equal(config.source, 'subscription', 'the injected ladder decided, not the file on disk');
     assert.equal(config.plan, 'pro_20x');
@@ -214,7 +214,7 @@ test('captureFromCodexAccount never overwrites a self-reported plan with unknown
   const { config, reason } = await captureFromCodexAccount({
     via: 'refresh',
     existing: { source: 'subscription', plan: 'team', selfReported: true },
-    deps: { readAccountViaAppServer: noProbe, readCodexAccount: account({ subscriptionType: null, plan: 'unknown' }) },
+    deps: { readAccountViaAppServer: noProbe, readChatgptAuth: account({ subscriptionType: null, plan: 'unknown' }) },
   });
   assert.equal(reason, 'kept-self-reported');
   assert.equal(config, null);
@@ -241,7 +241,7 @@ test('a live app-server answer outranks the auth.json decode', async () => {
     const { config, tier } = await captureFromCodexAccount({
       via: 'login',
       env: {},
-      deps: { readAccountViaAppServer: liveProbe(), readCodexAccount: account() },
+      deps: { readAccountViaAppServer: liveProbe(), readChatgptAuth: account() },
     });
     assert.equal(tier, 'app-server');
     assert.equal(config.plan, 'plus', 'the live reading, not the id_token claim');
@@ -261,7 +261,7 @@ test('the expired-claim rule is not applied to a live reading', async () => {
       deps: {
         readAccountViaAppServer: liveProbe(),
         // auth.json's own claim is six weeks expired — irrelevant once Codex itself answered.
-        readCodexAccount: account({ subscriptionType: 'free', plan: 'free', expiresAt }),
+        readChatgptAuth: account({ subscriptionType: 'free', plan: 'free', expiresAt }),
       },
     });
     assert.equal(reason, 'captured');
@@ -275,7 +275,7 @@ test('a machine with no auth.json at all still captures a plan from the app serv
     const { config, tier } = await captureFromCodexAccount({
       via: 'login',
       env: {},
-      deps: { readAccountViaAppServer: liveProbe(), readCodexAccount: () => null },
+      deps: { readAccountViaAppServer: liveProbe(), readChatgptAuth: () => null },
     });
     assert.equal(tier, 'app-server');
     assert.equal(config.source, 'subscription', 'the auth type is the only signal there is');
@@ -288,7 +288,7 @@ test('the account id and address are persisted with the plan', async () => {
     const { config } = await captureFromCodexAccount({
       via: 'login',
       env: {},
-      deps: { readAccountViaAppServer: liveProbe(), readCodexAccount: () => null },
+      deps: { readAccountViaAppServer: liveProbe(), readChatgptAuth: () => null },
     });
     // Without this the id would exist only for the one session that ran the probe — it runs at
     // most weekly, behind isStale().
@@ -304,7 +304,7 @@ test('a capture that learns no identity keeps the one already recorded', async (
       via: 'session-start',
       env: {},
       existing,
-      deps: { readAccountViaAppServer: noProbe, readCodexAccount: account({ accountId: null, email: null }) },
+      deps: { readAccountViaAppServer: noProbe, readChatgptAuth: account({ accountId: null, email: null }) },
     });
     assert.equal(config.accountId, 'known-uuid');
     assert.equal(config.email, 'known@example.com');
@@ -327,7 +327,7 @@ test('an oversized account id is dropped, never truncated into another account',
       env: {},
       deps: {
         readAccountViaAppServer: liveProbe({ accountId: 'x'.repeat(65) }),
-        readCodexAccount: () => null,
+        readChatgptAuth: () => null,
       },
     });
     assert.equal(config.accountId, null);
@@ -341,7 +341,7 @@ test('a probe that throws falls through to the auth.json tier instead of failing
       env: {},
       deps: {
         readAccountViaAppServer: async () => { throw new Error('spawn exploded'); },
-        readCodexAccount: account(),
+        readChatgptAuth: account(),
       },
     });
     assert.equal(tier, 'auth-json');
@@ -356,7 +356,7 @@ test('an app-server api-key machine captures no subscription plan', async () => 
       env: {},
       deps: {
         readAccountViaAppServer: liveProbe({ authType: 'apikey', plan: null, subscriptionType: null, email: null }),
-        readCodexAccount: () => null,
+        readChatgptAuth: () => null,
       },
     });
     assert.equal(reason, 'no-account', 'a key bills per token — there is no tier to state');

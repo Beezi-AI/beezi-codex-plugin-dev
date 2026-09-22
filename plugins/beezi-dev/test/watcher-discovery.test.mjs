@@ -10,6 +10,13 @@ import {
 } from '../lib/rollout-watcher.mjs';
 import { pruneStale } from '../lib/prune.mjs';
 import { makeMachine as sandboxMachine, uuid } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The pass resolves every linked account and hands the whole list to runCheckpoint, which fans the
+// one delta out into each of their queues. `linkedSessions` is therefore the seam that says
+// whether this machine is linked at all.
+const SESSION = accountSession(TEST_KEY, 'token');
+
 
 // R2's discovery traps, one test each, plus the observation watermark's contract.
 //
@@ -45,7 +52,7 @@ function passDeps(overrides) {
   const calls = { checkpoints: [], audits: [], prunes: 0, yields: 0 };
   const deps = {
     now: () => 1_000_000,
-    getAccessToken: async () => 'token',
+    linkedSessions: async () => [SESSION],
     runCheckpoint: async (input, _deps, options) => {
       calls.checkpoints.push({ input, options });
       return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], skipped: {}, rateLimits: null, agents: {} };
@@ -387,7 +394,7 @@ test('15. an unlinked machine does no work and reports it, rather than erroring 
   const m = makeMachine(t);
   writeRollout(m, { id: uuid(95), records: [parentMeta(uuid(95))] });
   const { deps, calls } = passDeps({
-    getAccessToken: async () => null,
+    linkedSessions: async () => [],
     runCheckpoint: async () => { throw new Error('must not run unlinked'); },
   });
   const out = await runWatchPass(deps, { sessionsDir: m.sessionsDir });

@@ -1,4 +1,6 @@
-import { execFileSync } from 'child_process';
+// A DEFAULT import, not a named one: tools/hermetic-env.mjs patches the child_process object, and
+// a named binding is snapshotted at instantiation and bypasses that guard entirely.
+import childProcess from 'child_process';
 import { orDefault } from './compat.mjs';
 
 // A branch is tracked only when it carries a `.../task-<id>` segment. The capture group
@@ -6,7 +8,7 @@ import { orDefault } from './compat.mjs';
 export const TASK_BRANCH_RE = /\/(task-[a-zA-Z0-9_-]+)/;
 
 export function git(args, cwd) {
-  return execFileSync('git', args, {
+  return childProcess.execFileSync('git', args, {
     cwd,
     encoding: 'utf-8',
     // Swallow git's stderr. Probing a directory that isn't a repo is routine here (the

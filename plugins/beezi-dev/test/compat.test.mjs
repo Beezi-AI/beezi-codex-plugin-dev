@@ -148,7 +148,7 @@ test('base64urlDecode accepts padding its own encoder strips', () => {
 
 // PINNED, NOT ENDORSED. base64 length mod 4 === 1 is not a decodable shape, and Buffer.from does
 // not say so — it drops the dangling character. A caller handing it a truncated JWT segment
-// (lib/codex-account.mjs:19 is the live one) gets short bytes and a JSON.parse failure rather
+// (lib/chatgpt-auth.mjs:19 is the live one) gets short bytes and a JSON.parse failure rather
 // than a decode error, and nothing else in the repo documents that.
 test('base64urlDecode silently discards a dangling character (length mod 4 === 1)', () => {
   const truncated = 'YWJjZ'; // 'YWJjZA' ('abcd') with its last character lopped off.
@@ -181,7 +181,7 @@ test('base64urlDecode coerces a non-string argument instead of throwing', () => 
   assert.strictEqual(base64urlDecode(12345).toString('hex'), 'd76df8');
 });
 
-// The production use: lib/codex-account.mjs:19 decodes a JWT payload segment. A payload of 3n+1
+// The production use: lib/chatgpt-auth.mjs:19 decodes a JWT payload segment. A payload of 3n+1
 // bytes puts the two-pad branch on that live path, which is the branch a naive implementation
 // (one that only handles the single-pad case) gets wrong.
 test('a JWT payload segment of 3n+1 bytes round-trips through both helpers', () => {

@@ -4,6 +4,7 @@ import { orDefault } from './compat.mjs';
 import path from 'path';
 import { computeDelta as _computeDelta } from './delta-codex.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
+import { linkedSessions as _linkedSessions } from './accounts.mjs';
 import { queueDir, stateDir, beeziCodexHome } from './paths.mjs';
 import { git, currentBranch, resolveOriginRemote } from './git.mjs';
 import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } from './reflog.mjs';
@@ -15,7 +16,7 @@ import { HOOK_TIMEOUT_SEC } from './hooks-install.mjs';
 import { postSessionError } from './session-error-report.mjs';
 import { computeSessionTimeline, postSessionTimeline } from './session-timeline-codex.mjs';
 import { recordRateLimitObservations } from './rate-limits-codex.mjs';
-import { readAccountIdentity } from './account-identity.mjs';
+import { readChatgptIdentity } from './chatgpt-identity.mjs';
 import { drainRateLimitSnapshots as _drainRateLimitSnapshots } from './usage-report-codex.mjs';
 import { isApiKeyBillingEvidence, isSubscriptionBillingEvidence } from './billing.mjs';
 import {
@@ -56,12 +57,23 @@ function saveState(id, state) {
   writeJsonDurable(path.join(stateDir(), `${id}.json`), state);
 }
 
-function enqueue(payload) {
+// ONE payload, one copy per account that is allowed to receive it.
+//
+// The delta is computed once and the same bytes are written into every allowed account's queue,
+// because the work happened once and every linked workspace is owed the same account of it. The
+// copies then live independent lives: each drains under its own bearer, and one tenant's 403 or
+// 404 is a verdict on that tenant's copy alone.
+//
+// `keys` is the ALLOWED set, not the linked set — an account whose tracking policy is dark gets
+// nothing enqueued at all, which is what keeps a dark tenant's queue from growing for three days
+// only to expire (see QUEUE_HOLD_MS).
+export function enqueue(keys, payload) {
   // 0600: these payloads carry session_name (prompt text), remote, and branch.
   //
   // safeFileName, not a targeted replace: a subagent segmentId embeds an agent id that arrived on a
   // hook payload, so this name is partly untrusted input.
-  writeJsonDurable(path.join(queueDir(), `${safeFileName(payload.segmentId, { max: 200 })}.json`), payload);
+  const name = `${safeFileName(payload.segmentId, { max: 200 })}.json`;
+  for (const key of keys) writeJsonDurable(path.join(queueDir(key), name), payload);
 }
 
 const transactionFile = id => path.join(beeziCodexHome(), 'checkpoint-transactions', `${safeFileName(id)}.json`);
@@ -284,10 +296,6 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   const now = orDefault(deps.now, Date.now);
   const deadline = options.budgetMs ? now() + options.budgetMs : null;
   const timeLeft = () => (deadline === null ? null : deadline - now());
-  // Where a built payload goes. The history import collects them in memory and batches them
-  // itself; letting it fall through to the disk queue would drip-feed hundreds of segments to
-  // the single-report endpoint on the next hook, bypassing the batch route's whole-session dedupe.
-  const emit = orDefault(options.sink, enqueue);
   const collectedErrors = [];
   // Why segments did not become reports. A caller that gets zero reports cannot otherwise tell a
   // session that genuinely holds no usage (a transcript with no assistant tokens — nothing to
@@ -364,7 +372,7 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
   }
   try {
     return await runLockedCheckpoint(acquired.handle, {
-      deps, options, sessionId, transcript_path, cwd, now, deadline, timeLeft, emit,
+      deps, options, sessionId, transcript_path, cwd, now, deadline, timeLeft,
       collectedErrors, skipped, emptyResult,
     });
   } catch {
@@ -377,25 +385,69 @@ export async function runCheckpoint(input, deps = {}, options = {}) {
 }
 
 // Keep the session writer excluded from the drain through coverage and checkpoint commit.
-export async function reconcileSession(sessionId, token, fn, deps = {}) {
+//
+// EVERY REPORTING account has to be clean before the caller's boundary decision runs, not just
+// one: the question this answers is "does the server already hold everything this machine built
+// for this session", and one account with an undrained queue makes that answer wrong for that
+// tenant. The accounts are drained SERIALLY — flushQueue takes `shared:queue-<key>`, rank 3, and
+// two of those at once in one process is a 'lock-order' refusal rather than a wait.
+//
+// REPORTING, not linked. The filter is the same one runLockedCheckpoint applies to build its
+// `targets`, and it is here rather than at the caller so every future caller inherits it — the
+// invariant it protects ("an account whose tracking policy is dark gets nothing enqueued at all",
+// stated at `enqueue` above) is broken by this function's own transaction-resume path otherwise.
+// A dark account also cannot answer the drain question at all: it receives no payloads, so its
+// queue is HELD rather than drained and flushQueue reports `trackingDisabled` unconditionally,
+// which read as "not drained" lets one dark workspace stop the live one beside it from ever being
+// established. The filtered list is handed to `fn` as well, so the caller's own per-account work
+// cannot reach for the unfiltered one by accident.
+export async function reconcileSession(sessionId, sessions, fn, deps = {}) {
+  const liveAllowed = orDefault(deps.isLiveTrackingAllowed, isLiveTrackingAllowed);
+  // Fail OPEN on an unreadable policy, the posture lib/tracking.mjs documents: the server's guard
+  // is the real boundary, and treating an unreadable cache as dark would stop reporting outright.
+  const reporting = sessions.filter((session) => {
+    try { return liveAllowed(session.key, deps) !== false; } catch { return true; }
+  });
+  // Nothing is reporting, so there is no boundary to establish — and the transaction below must
+  // NOT be read: committing it would emit its payloads into zero queues and then unlink it, which
+  // is the one way this function could destroy work. runLockedCheckpoint returns `gated` before
+  // its own transaction read for exactly the same reason.
+  if (reporting.length === 0) return { outcome: 'deferred', reason: 'tracking-disabled' };
+
   const acquired = acquireLock(sessionLock(sessionId), { leaseMs: SESSION_LOCK_LEASE_MS });
   if (!acquired.ok) return { outcome: 'deferred', reason: 'session-busy' };
   try {
+    const keys = reporting.map((s) => s.key);
     const pending = readTransaction(sessionId);
     if (pending) {
-      commitTransaction(pending, acquired.handle, enqueue, deps, true);
+      commitTransaction(pending, acquired.handle, (payload) => enqueue(keys, payload), deps, true);
       return { outcome: 'deferred', reason: 'transaction-resumed' };
     }
-    const drained = await orDefault(deps.flushQueue, flushQueue)(token, deps);
-    if (!drained || drained.lockSkipped || drained.trackingDisabled || drained.failed || drained.deferred || drained.unreadable) {
-      return { outcome: 'deferred', reason: 'pending-not-drained' };
+    const flush = orDefault(deps.flushQueue, flushQueue);
+    for (const session of reporting) {
+      const drained = await flush(session.key, session, deps);
+      if (!drained || drained.lockSkipped || drained.trackingDisabled || drained.deferred || drained.unreadable) {
+        return { outcome: 'deferred', reason: 'pending-not-drained' };
+      }
+      // A 404/405 is the ROUTE being absent, not a verdict on the payload: drainQueue keeps those
+      // files and still counts them in `failed`, so the user is told — but they must not block
+      // reconciliation. A server with no report route holds no coverage for those segments to be
+      // stale against, and on an ACTIVE machine the live account keeps writing fresh queue files,
+      // so the 14-day prune never arrives and this session would never be established again.
+      // `routeAbsent` is why the emptiness check below is skipped too: those files are on disk by
+      // design, and the line above has already established that nothing else failed.
+      const routeAbsent = orDefault(drained.routeAbsent, 0);
+      if (orDefault(drained.failed, 0) - routeAbsent > 0) {
+        return { outcome: 'deferred', reason: 'pending-not-drained' };
+      }
+      if (routeAbsent > 0) continue;
+      let files;
+      try { files = fs.readdirSync(queueDir(session.key)); }
+      catch (error) { if (error.code !== 'ENOENT') throw error; files = []; }
+      if (files.length) return { outcome: 'deferred', reason: 'pending-not-drained' };
     }
-    let files;
-    try { files = fs.readdirSync(queueDir()); }
-    catch (error) { if (error.code !== 'ENOENT') throw error; files = []; }
-    if (files.length) return { outcome: 'deferred', reason: 'pending-not-drained' };
     if (!stillOwnsSession(acquired.handle)) return { outcome: 'deferred', reason: 'ownership-lost' };
-    return await fn(acquired.handle);
+    return await fn(acquired.handle, reporting);
   } catch { return { outcome: 'deferred', reason: 'reconciliation-unavailable' }; }
   finally { acquired.handle.release(); }
 }
@@ -405,10 +457,10 @@ export async function reconcileSession(sessionId, token, fn, deps = {}) {
 // had already computed before the lock was taken.
 async function runLockedCheckpoint(lock, ctx) {
   const {
-    deps, options, sessionId, transcript_path, cwd, now, deadline, timeLeft, emit,
+    deps, options, sessionId, transcript_path, cwd, now, deadline, timeLeft,
     collectedErrors, skipped, emptyResult,
   } = ctx;
-  const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
+  const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
   const gitImpl = orDefault(deps.gitImpl, git);
   const computeDelta = orDefault(deps.computeDelta, _computeDelta);
   const fetchImpl = deps.fetchImpl || fetchCompat;
@@ -416,17 +468,29 @@ async function runLockedCheckpoint(lock, ctx) {
   const payloads = [];
   const children = [];
 
-  let token = null;
-  try { token = await getAccessToken(); } catch { return emptyResult(); }
-  if (!token) return emptyResult();
+  // Every account this machine can currently produce a token for. An account that cannot is
+  // already dropped by linkedSessions — a transient credential failure costs one account, not the
+  // whole checkpoint.
+  let sessions;
+  try { sessions = await listSessions(deps); } catch { return emptyResult(); }
+  if (!sessions || sessions.length === 0) return emptyResult();
 
-  // Tenant gate: audit-mode workspaces never track live — the server would 403 every report
-  // anyway (TrackingEnabledGuard), this just spares the work and the noise. `gated` lets the
-  // track script tell "tracking is off" apart from "nothing new". The history import passes
-  // skipLiveTrackingGate — an explicit flag, never inferred from the sink seam.
-  if (options.skipLiveTrackingGate !== true && !isLiveTrackingAllowed()) {
-    return { ...emptyResult(), gated: true };
-  }
+  // Tenant gate, now PER ACCOUNT: audit-mode workspaces never track live — the server would 403
+  // every report anyway (TrackingEnabledGuard), this just spares the work and the noise. The delta
+  // is computed when AT LEAST ONE account allows it, and only the allowed ones receive it; a dark
+  // tenant sitting beside a live one must not silence the live one. `gated` (no account allows it)
+  // lets the track script tell "tracking is off" apart from "nothing new". The history import
+  // passes skipLiveTrackingGate — an explicit flag, never inferred from the sink seam.
+  const targets = options.skipLiveTrackingGate === true
+    ? sessions
+    : sessions.filter((session) => isLiveTrackingAllowed(session.key));
+  if (targets.length === 0) return { ...emptyResult(), gated: true };
+  const targetKeys = targets.map((session) => session.key);
+
+  // Where a built payload goes. The history import collects them in memory and batches them
+  // itself; letting it fall through to the disk queue would drip-feed hundreds of segments to
+  // the single-report endpoint on the next hook, bypassing the batch route's whole-session dedupe.
+  const emit = options.sink ? options.sink : (payload) => enqueue(targetKeys, payload);
 
   if (durable) {
     try {
@@ -549,7 +613,12 @@ async function runLockedCheckpoint(lock, ctx) {
   // about to advance past, so a checkpoint that bails later must not leave them unread. Local file
   // write only — the drain that posts them runs at turn end.
   if (options.persistState !== false && rateLimitObservations.length) {
-    try { recordRateLimitObservations(rateLimitObservations); } catch {
+    try {
+      // One debounce decision, one row per allowed account. A queue this could not append to is
+      // reported rather than thrown — see the contract on recordRateLimitObservations.
+      const queued = recordRateLimitObservations(rateLimitObservations, targetKeys);
+      if (queued && queued.skippedKeys && queued.skippedKeys.length) skipped.rateLimitDeferred = true;
+    } catch {
       skipped.rateLimitDeferred = true;
       return emptyResult(); // keep the cursor so observations are retried
     }
@@ -586,8 +655,9 @@ async function runLockedCheckpoint(lock, ctx) {
     { now: now(), readCodexAuthSignals: deps.readCodexAuthSignals },
   );
 
-  // Explicit historical replays cannot infer their owner from today's sign-in.
-  const accountIdentity = options.persistState === false ? {} : readAccountIdentity(deps);
+  // The CHATGPT sign-in these numbers belong to — not a Beezi account, which is what `account`
+  // means from 0.13 on. Explicit historical replays cannot infer their owner from today's sign-in.
+  const chatgptIdentity = options.persistState === false ? {} : readChatgptIdentity(deps);
 
   let enqueued = 0;
   // The last enqueued payload becomes the "anchor" we can replay to push a later rename.
@@ -635,7 +705,7 @@ async function runLockedCheckpoint(lock, ctx) {
           from_line: seg.fromLine,
           to_line: seg.toLine,
           ...billingFields,
-          ...accountIdentity,
+          ...chatgptIdentity,
           session_name: sessionName,
           ...(timezone ? { timezone } : {}),
           // `claude_md_lines` is the established cross-agent wire field. On a Codex report it is
@@ -714,18 +784,30 @@ async function runLockedCheckpoint(lock, ctx) {
         undelivered.push(...pending.slice(i));
         break;
       }
-      const { reported } = await postSessionError(
-        {
-          sessionId,
-          error: orDefault(event.error, 'unknown'),
-          errorDetails: orDefault(event.details, null),
-          lastAssistantMessage: orDefault(event.text, null),
-          occurredAt: orDefault(event.occurredAt, new Date().toISOString()),
-        },
-        token,
-        { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
-      );
-      if (!reported) undelivered.push(event);
+      const errorPayload = {
+        sessionId,
+        error: orDefault(event.error, 'unknown'),
+        errorDetails: orDefault(event.details, null),
+        lastAssistantMessage: orDefault(event.text, null),
+        occurredAt: orDefault(event.occurredAt, new Date().toISOString()),
+      };
+      // Every linked workspace is owed the failure, and the parked set is machine-level, so an
+      // event is only retired once EVERY account took it. A retry can therefore re-post to an
+      // account that already accepted one — which was always true of a request whose response was
+      // lost, so the route already has to tolerate it; losing an error report for one tenant
+      // because another was unreachable would not be.
+      let deliveredEverywhere = true;
+      for (const session of targets) {
+        const left = timeLeft();
+        if (left !== null && left <= 0) { deliveredEverywhere = false; break; }
+        const { reported } = await postSessionError(
+          errorPayload,
+          session,
+          { fetchImpl, ...(left === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, left) }) },
+        );
+        if (!reported) deliveredEverywhere = false;
+      }
+      if (!deliveredEverywhere) undelivered.push(event);
     }
     // Bounded: a session that cannot reach the server must not grow its state file without limit.
     const next = undelivered.slice(-MAX_PENDING_ERRORS);
@@ -753,14 +835,22 @@ async function runLockedCheckpoint(lock, ctx) {
         // Skipped rather than started when the budget is already gone: the signature is only
         // recorded on a confirmed send, so the next turn re-derives and retries this same payload.
         if (sig !== state.sentTimelineSig && (timeLeft() === null || timeLeft() > 0)) {
-          const remaining = timeLeft();
-          const { reported } = await postSessionTimeline(
-            { sessionId, ...timeline },
-            token,
-            { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
-          );
+          // The signature is machine-level, so it may only be remembered once every account has
+          // the timeline: sealing it after a partial round would leave the accounts that missed
+          // out with no timeline until the derived content changed again.
+          let reportedEverywhere = true;
+          for (const session of targets) {
+            const remaining = timeLeft();
+            if (remaining !== null && remaining <= 0) { reportedEverywhere = false; break; }
+            const { reported } = await postSessionTimeline(
+              { sessionId, ...timeline },
+              session,
+              { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
+            );
+            if (!reported) reportedEverywhere = false;
+          }
           // Only remember the signature on a confirmed send, so a failed post retries next turn.
-          if (reported) {
+          if (reportedEverywhere) {
             state.sentTimelineSig = sig;
             stateDirty = true;
           }
@@ -793,15 +883,19 @@ async function runLockedCheckpoint(lock, ctx) {
       // up to 40 queued rows, so a cap alone bounds each request while the loop as a whole runs
       // well past the hook kill — taking the state write and flushQueue below down with it.
       if (remaining === null || remaining > 0) {
-        const drained = await drainRateLimits(token, {
-          fetchImpl,
-          ...(deadline === null ? {} : { deadline, now, timeoutMs: POST_TIMEOUT_MS }),
-        });
-        if (drained) {
-          rateLimits = {
-            posted: orDefault(drained.posted, 0),
-            deferred: orDefault(drained.deferred, 0),
-          };
+        // ONE deadline for all the accounts, not one each: the drains share the hook budget
+        // rather than multiplying it, and whatever the budget cuts off stays queued per account.
+        for (const session of targets) {
+          const left = timeLeft();
+          if (left !== null && left <= 0) break;
+          const drained = await drainRateLimits(session.key, session, {
+            fetchImpl,
+            ...(deadline === null ? {} : { deadline, now, timeoutMs: POST_TIMEOUT_MS }),
+          });
+          if (!drained) continue;
+          if (rateLimits === null) rateLimits = { posted: 0, deferred: 0 };
+          rateLimits.posted += orDefault(drained.posted, 0);
+          rateLimits.deferred += orDefault(drained.deferred, 0);
         }
       }
     } catch { /* best-effort */ }
@@ -876,16 +970,55 @@ async function runLockedCheckpoint(lock, ctx) {
 
   // The import owns its own batched delivery, so it must not drain the live queue per session —
   // that would add unrelated HTTP calls mid-import and muddy its summary.
-  const flush = options.skipFlush
-    ? null
-    : await flushQueue(token, { fetchImpl, now, ...(deadline === null ? {} : { deadline }) });
+  //
+  // SERIAL over the accounts, sharing one deadline: flushQueue takes `shared:queue-<key>`, and two
+  // rank-3 locks under different names at once in one process is a 'lock-order' refusal, which
+  // would silently skip an account's drain rather than defer it.
+  const flushes = [];
+  if (!options.skipFlush) {
+    for (const session of targets) {
+      const drained = await flushQueue(session.key, session,
+        { fetchImpl, now, ...(deadline === null ? {} : { deadline }) });
+      flushes.push({ key: session.key, ...drained });
+    }
+  }
   // `agents` is the merged sidecar+sweep map — the import builds the session timeline from it
   // instead of re-reading (possibly pruned) sidecars.
+  // `flush` is the machine-wide summary (one account's numbers when one is linked, which is what
+  // every existing reader means by it); `flushes` is the per-account breakdown the track flow
+  // words one line per account from.
   return {
     outcome: agentResults.childDeferred ? 'deferred' : 'committed',
     reason: agentResults.childDeferred ? 'child-coverage-unavailable' : null, committedBoundaries,
-    enqueued, flush, sessionErrors: collectedErrors, skipped, rateLimits, agents: agentResults.agents,
+    enqueued, flush: options.skipFlush ? null : mergeFlushResults(flushes), flushes,
+    sessionErrors: collectedErrors, skipped, rateLimits, agents: agentResults.agents,
   };
+}
+
+// The accounts' drains folded into one summary. Counters add, flags OR, and the first error stands
+// — a caller asking "did the flush work" wants the worst answer any account gave, not an average.
+function mergeFlushResults(results) {
+  const merged = {
+    flushed: 0, rejected: 0, failed: 0, deferred: 0, expired: 0,
+    quarantined: 0, salvaged: 0, unreadable: 0, unnamed: 0, routeAbsent: 0,
+    trackingDisabled: false, lastError: null,
+  };
+  const counters = ['flushed', 'rejected', 'failed', 'deferred', 'expired',
+    'quarantined', 'salvaged', 'unreadable', 'unnamed', 'routeAbsent'];
+  for (const one of results) {
+    if (!one) continue;
+    for (const counter of counters) merged[counter] += orDefault(one[counter], 0);
+    if (one.trackingDisabled) merged.trackingDisabled = true;
+    if (one.lockSkipped) {
+      merged.lockSkipped = true;
+      merged.lockReason = orDefault(merged.lockReason, one.lockReason);
+    }
+    if (one.trackingDisabledWrite && !merged.trackingDisabledWrite) {
+      merged.trackingDisabledWrite = one.trackingDisabledWrite;
+    }
+    if (merged.lastError === null) merged.lastError = orDefault(one.lastError, null);
+  }
+  return merged;
 }
 
 // Once tracking is off, queued reports are held for this long: a tenant that converts to paid
@@ -925,10 +1058,16 @@ function sweepHeldQueue(dir, result, now) {
 // the directory at all; `lockReason` carries the primitive's refusal. `trackingDisabledWrite` is
 // present only when the server sent a dark-mode verdict.
 // Write-up: docs/plans/2026-09-15-comment-archive.md.
-export async function flushQueue(token, deps = {}) {
+export async function flushQueue(key, session, deps = {}) {
   const result = {
     flushed: 0, rejected: 0, failed: 0, deferred: 0, expired: 0,
     quarantined: 0, salvaged: 0, unreadable: 0, unnamed: 0,
+    // A SUBSET of `failed`, not an alternative to it. These files were refused because the route
+    // was not there, which is a different fact from a server error even though the outcome for the
+    // file is the same (kept, retried) — and the user still has to be told, which is why `failed`
+    // counts them too. Carried as a counter rather than folded into `lastError` because
+    // reconcileSession needs the COUNT: "is every leftover a 404" is the question it asks.
+    routeAbsent: 0,
     trackingDisabled: false, lastError: null,
   };
   // What the drain LEARNED about the tenant, carried out of the critical section rather than acted
@@ -937,23 +1076,28 @@ export async function flushQueue(token, deps = {}) {
   // rather than being retryable, so the dark-mode verdict would be lost every single time.
   const verdict = { disabledByServer: false, reason: null };
 
-  // ONE rank-3 `shared:queue` lock around the WHOLE drain (G-8-3 / R3). Every file in queue/ is
-  // read, POSTed and then unlinked, and two passes over the same directory interleave those three
-  // steps: the losing pass re-POSTs a segment the winner already deleted (idempotent server-side,
-  // merely wasteful) and, worse, its `unlinkSync` can remove a file the other pass has not judged
-  // yet. `result.unreadable` — "a concurrent flush already unlinked it" — is that race, counted.
+  // ONE rank-3 `shared:queue-<key>` lock around the WHOLE drain (G-8-3 / R3). Every file in that
+  // account's queue/ is read, POSTed and then unlinked, and two passes over the same directory
+  // interleave those three steps: the losing pass re-POSTs a segment the winner already deleted
+  // (idempotent server-side, merely wasteful) and, worse, its `unlinkSync` can remove a file the
+  // other pass has not judged yet. `result.unreadable` — "a concurrent flush already unlinked it"
+  // — is that race, counted.
+  //
+  // THE NAME CARRIES THE KEY, so two accounts never serialise against each other across processes
+  // — and so a caller must never run two flushes at once IN one process: both are rank 3 under
+  // different names, which is refused as 'lock-order' rather than waited out. Every fan-out site
+  // drains the accounts one after another.
   //
   // The lock lives HERE, inside, so every caller is serialized without having to know: the two hook
-  // paths through runCheckpoint, the CLI drain, and the bare caller in lib/session-start.mjs, which
-  // runs flushQueue concurrently with announceRepo inside one Promise.all.
+  // paths through runCheckpoint, the CLI drain, and the bare caller in lib/session-start.mjs.
   //
   // Contention DEFERS rather than blocks. Nothing is lost by skipping — the files stay on disk and
   // the next checkpoint drains them — and a hook has a few milliseconds and no right to make the
   // holder wait.
   const run = await withLockAsync(
-    sharedLock('queue'),
+    sharedLock(`queue-${key}`),
     { leaseMs: QUEUE_LOCK_LEASE_MS },
-    () => drainQueue(token, deps, result, verdict),
+    () => drainQueue(key, session, deps, result, verdict),
   );
   if (!run.ok) {
     result.lockSkipped = true;
@@ -969,7 +1113,7 @@ export async function flushQueue(token, deps = {}) {
     // re-records the verdict, but 'lock-order' would mean the release ordering above had broken
     // and every dark-mode verdict on this machine was being dropped in silence.
     try {
-      result.trackingDisabledWrite = markTrackingDisabled(verdict.reason);
+      result.trackingDisabledWrite = markTrackingDisabled(key, verdict.reason);
       if (result.trackingDisabledWrite.reason === 'lock-order') {
         recordIssue({
           code: DIAGNOSTIC_CODES.STATE_WRITE_FAILED,
@@ -983,7 +1127,7 @@ export async function flushQueue(token, deps = {}) {
 
 // The drain itself. Split out of flushQueue so the lock above wraps it whole without re-indenting
 // a hundred lines of judgement that has not changed.
-async function drainQueue(token, deps, result, verdict) {
+async function drainQueue(key, session, deps, result, verdict) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const now = orDefault(deps.now, Date.now);
   const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
@@ -994,11 +1138,12 @@ async function drainQueue(token, deps, result, verdict) {
   const deadline = orDefault(deps.deadline, null);
   const onRequestTimeout = orDefault(deps.onRequestTimeout, () => {});
 
-  const dir = queueDir();
+  const dir = queueDir(key);
 
   // Dark workspace: no readdir-and-post loop, just the hold-window sweep. Files stay for
-  // QUEUE_HOLD_MS in case the tenant converts to paid, then expire.
-  if (!isLiveTrackingAllowed()) {
+  // QUEUE_HOLD_MS in case the tenant converts to paid, then expire. One tenant going dark says
+  // nothing about the others — only this account's queue is held.
+  if (!isLiveTrackingAllowed(key)) {
     result.trackingDisabled = true;
     sweepHeldQueue(dir, result, now());
     return;
@@ -1021,20 +1166,24 @@ async function drainQueue(token, deps, result, verdict) {
     return;
   }
 
-  // A 401 here is usually an access token that expired between the checkpoint's getAccessToken()
-  // and this flush, not a revoked link — expires_at is only our estimate. Renew once, machine-wide,
-  // and reuse the replacement for the rest of the queue. A file that still 401s afterwards is kept,
-  // never dropped: an unjudged report must not be destroyed on a verdict we aren't sure of.
+  // A 401 here is usually an access token that expired between the checkpoint's own token read and
+  // this flush, not a revoked link — expires_at is only our estimate. Renew once for THIS ACCOUNT
+  // and reuse the replacement for the rest of its queue. A file that still 401s afterwards is
+  // kept, never dropped: an unjudged report must not be destroyed on a verdict we aren't sure of.
+  //
+  // The renewal is keyed: a bare getAccessToken() would refuse outright now, and a renewal that
+  // reached for "the" token would hand this account's queue another account's bearer.
   let renewed = false;
   const renewToken = async () => {
     if (renewed) return null;
     renewed = true;
     // The renewal is itself a network round trip; skip it once the budget is gone.
     if (deadline !== null && now() >= deadline) return null;
-    const next = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
-    if (!next || next === token) return null;
-    token = next;
-    return next;
+    const next = await getAccessToken(key, {}, { forceRefresh: true }).catch(() => null);
+    if (!next || next === session.token) return null;
+    // The client id is unchanged by a refresh — only the bearer moves.
+    session = { ...session, token: next };
+    return session;
   };
 
   for (const [index, file] of files.entries()) {
@@ -1099,11 +1248,11 @@ async function drainQueue(token, deps, result, verdict) {
     if (perRequest !== undefined) onRequestTimeout(perRequest);
 
     try {
-      const post = (bearer) => postJson(reportUrl, bearer, payload, {
+      const post = (as) => postJson(reportUrl, as, payload, {
         fetchImpl,
         ...(perRequest === undefined ? {} : { timeoutMs: perRequest }),
       });
-      let res = await post(token);
+      let res = await post(session);
       if (res.status === 401) {
         const next = await renewToken();
         if (next) res = await post(next);
@@ -1135,6 +1284,16 @@ async function drainQueue(token, deps, result, verdict) {
         }
         result.failed += 1;
         result.lastError = orDefault((body || {}).message, `HTTP ${res.status}`);
+      } else if (res.status === 404 || res.status === 405) {
+        // NOT a verdict on the payload. A 404 is "this route is not here" — an older server, a
+        // proxy in front of the API, an apiBase pointed somewhere else — and deleting a real
+        // segment's tokens and cost over a missing route is unrecoverable. lib/audit-flush.mjs
+        // already treats 404/405 as UNSUPPORTED_SERVER and retryable for exactly this reason; the
+        // queue drain was the outlier. Kept, counted failed, and expired by pruneStale at 14 days
+        // if the route never appears.
+        result.failed += 1;
+        result.routeAbsent += 1;
+        result.lastError = `HTTP ${res.status}`;
       } else if (res.status < 500) {
         // Permanent rejection — drop the file, but remember why.
         result.rejected += 1;

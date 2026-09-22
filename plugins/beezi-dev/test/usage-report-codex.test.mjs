@@ -5,6 +5,12 @@ import { withCodexAuth } from '../tools/hermetic-env.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { drainRateLimitSnapshots } from '../lib/usage-report-codex.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The drain is per account: it reads that account's queue, posts under that account's bearer and
+// client id, and clears only what that account's server confirmed.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 const ROW = (pct) => ({
   fetched_at: `2026-09-09T1${pct}:00:00.000Z`,
@@ -25,8 +31,8 @@ function harness(rows, statuses) {
       // Stubbed so no test ever reads the developer's real ~/.codex/auth.json. Identity is
       // exercised on its own below, against fixtures.
       usageIdentityFields: () => ({}),
-      readPendingRateLimits: () => rows,
-      clearPendingRateLimits: (posted) => { cleared = posted; },
+      readPendingRateLimits: (key) => { assert.equal(key, KEY, 'the drain reads its own account queue'); return rows; },
+      clearPendingRateLimits: (key, posted) => { assert.equal(key, KEY); cleared = posted; },
       fetchImpl: (url, init) => {
         calls.push({ url, body: JSON.parse(init.body) });
         const status = statuses[n];
@@ -40,7 +46,7 @@ function harness(rows, statuses) {
 
 test('posts every pending row and clears them all', async () => {
   const h = harness([ROW(1), ROW(2)], [200, 200]);
-  const res = await drainRateLimitSnapshots('tok', h.deps);
+  const res = await drainRateLimitSnapshots(KEY, SESSION, h.deps);
   assert.equal(res.posted, 2);
   // The rows themselves, not a count: the queue is re-read inside clearPending and a concurrent
   // append at MAX_PENDING evicts from the front, shifting every index left.
@@ -50,7 +56,7 @@ test('posts every pending row and clears them all', async () => {
 
 test('one row per request, sent verbatim when there is no identity to add', async () => {
   const h = harness([ROW(1)], [200]);
-  await drainRateLimitSnapshots('tok', h.deps);
+  await drainRateLimitSnapshots(KEY, SESSION, h.deps);
   assert.deepEqual(h.calls[0].body, ROW(1));
 });
 
@@ -58,7 +64,7 @@ test('one row per request, sent verbatim when there is no identity to add', asyn
 // row queued behind it — the exact silent-loss mode the Claude plugin's drain was built to avoid.
 test('a rejection stops the drain and keeps the unsent rows', async () => {
   const h = harness([ROW(1), ROW(2), ROW(3)], [200, 400, 200]);
-  const res = await drainRateLimitSnapshots('tok', h.deps);
+  const res = await drainRateLimitSnapshots(KEY, SESSION, h.deps);
   assert.equal(res.posted, 1);
   assert.deepEqual(h.cleared(), [ROW(1)], 'only the confirmed row is dropped');
   assert.equal(h.calls.length, 2, 'the drain stops rather than pushing past a rejection');
@@ -66,7 +72,7 @@ test('a rejection stops the drain and keeps the unsent rows', async () => {
 
 test('a network error on the first row clears nothing', async () => {
   const h = harness([ROW(1), ROW(2)], ['throw', 200]);
-  const res = await drainRateLimitSnapshots('tok', h.deps);
+  const res = await drainRateLimitSnapshots(KEY, SESSION, h.deps);
   assert.equal(res.posted, 0);
   assert.equal(h.cleared(), null, 'clearPending must not be called at all');
 });
@@ -75,17 +81,17 @@ test('a network error on the first row clears nothing', async () => {
 // — the case where it matters most, because a non-2xx keeps the failed row and its whole tail —
 // reported `deferred: 0` and looked identical to an empty queue.
 test('rows left behind are counted whatever stopped the drain', async () => {
-  const rejected = await drainRateLimitSnapshots('tok', harness([ROW(1), ROW(2), ROW(3)], [200, 400, 200]).deps);
+  const rejected = await drainRateLimitSnapshots(KEY, SESSION, harness([ROW(1), ROW(2), ROW(3)], [200, 400, 200]).deps);
   assert.deepEqual(
     { posted: rejected.posted, deferred: rejected.deferred, reason: rejected.reason },
     { posted: 1, deferred: 2, reason: 'rejected' },
   );
-  const offline = await drainRateLimitSnapshots('tok', harness([ROW(1), ROW(2)], ['throw']).deps);
+  const offline = await drainRateLimitSnapshots(KEY, SESSION, harness([ROW(1), ROW(2)], ['throw']).deps);
   assert.deepEqual(
     { posted: offline.posted, deferred: offline.deferred, reason: offline.reason },
     { posted: 0, deferred: 2, reason: 'network' },
   );
-  const clean = await drainRateLimitSnapshots('tok', harness([ROW(1)], [200]).deps);
+  const clean = await drainRateLimitSnapshots(KEY, SESSION, harness([ROW(1)], [200]).deps);
   assert.deepEqual(
     { posted: clean.posted, deferred: clean.deferred, reason: clean.reason },
     { posted: 1, deferred: 0, reason: 'drained' },
@@ -94,11 +100,11 @@ test('rows left behind are counted whatever stopped the drain', async () => {
 
 test('no token and no rows are both quiet no-ops', async () => {
   const h = harness([ROW(1)], [200]);
-  assert.deepEqual(await drainRateLimitSnapshots(null, h.deps), { posted: 0, reason: 'no-token' });
+  assert.deepEqual(await drainRateLimitSnapshots(KEY, null, h.deps), { posted: 0, reason: 'no-token' });
   assert.equal(h.calls.length, 0);
 
   const empty = harness([], []);
-  assert.deepEqual(await drainRateLimitSnapshots('tok', empty.deps), { posted: 0, reason: 'empty' });
+  assert.deepEqual(await drainRateLimitSnapshots(KEY, SESSION, empty.deps), { posted: 0, reason: 'empty' });
 });
 
 // ─── budget ───────────────────────────────────────────────────────────────────────────────────
@@ -109,7 +115,7 @@ test('no token and no rows are both quiet no-ops', async () => {
 test('the deadline stops the drain mid-queue and defers the rest', async () => {
   const h = harness([ROW(1), ROW(2), ROW(3), ROW(4)], [200, 200, 200, 200]);
   let clock = 0;
-  const res = await drainRateLimitSnapshots('tok', {
+  const res = await drainRateLimitSnapshots(KEY, SESSION, {
     ...h.deps,
     now: () => clock,
     deadline: 1000,
@@ -126,7 +132,7 @@ test('the deadline stops the drain mid-queue and defers the rest', async () => {
 // lost, and the next drain picks up exactly where this one stopped.
 test('a drain with no deadline still empties the whole queue', async () => {
   const h = harness([ROW(1), ROW(2), ROW(3)], [200, 200, 200]);
-  const res = await drainRateLimitSnapshots('tok', h.deps);
+  const res = await drainRateLimitSnapshots(KEY, SESSION, h.deps);
   assert.equal(res.posted, 3);
   assert.equal(res.deferred, 0);
 });
@@ -135,7 +141,7 @@ test('a hung request is cut to what the deadline has left, not the full per-requ
   const h = harness([ROW(1)], []);
   let requested = false;
   const startedAt = Date.now();
-  const res = await drainRateLimitSnapshots('tok', {
+  const res = await drainRateLimitSnapshots(KEY, SESSION, {
     ...h.deps,
     deadline: Date.now() + 50,
     timeoutMs: 3000,
@@ -168,7 +174,7 @@ const subscriptionBilling = { source: 'subscription', subscriptionType: 'plus', 
 test('carries the Codex account id and email, plus the resolved plan', (t) => {
   withCodexAuth(t, { auth_mode: 'chatgpt' });
   const f = usageIdentityFields({
-    readCodexAccount: () => account(),
+    readChatgptAuth: () => account(),
     readBillingConfig: () => subscriptionBilling,
     env: {},
   });
@@ -182,7 +188,7 @@ test('carries the Codex account id and email, plus the resolved plan', (t) => {
 // which breaks the drain WITHOUT clearing, stalling every row behind it.
 test('never lets a non-whitelisted billing key onto the wire', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account(),
+    readChatgptAuth: () => account(),
     readBillingConfig: () => subscriptionBilling,
   });
   const allowed = [
@@ -197,7 +203,7 @@ test('never lets a non-whitelisted billing key onto the wire', () => {
 
 test('an unknown field is omitted, never nulled — the server reads a null as a claim', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account({ accountId: null, email: null }),
+    readChatgptAuth: () => account({ accountId: null, email: null }),
     readBillingConfig: () => null,
   });
   assert.equal('account_uuid' in f, false);
@@ -206,7 +212,7 @@ test('an unknown field is omitted, never nulled — the server reads a null as a
 
 test('an oversized value is dropped rather than sent to 400 the row', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account({ accountId: 'x'.repeat(65), email: 'e'.repeat(330) }),
+    readChatgptAuth: () => account({ accountId: 'x'.repeat(65), email: 'e'.repeat(330) }),
     readBillingConfig: () => null,
   });
   assert.equal('account_uuid' in f, false, 'account_uuid is @MaxLength(64)');
@@ -215,7 +221,7 @@ test('an oversized value is dropped rather than sent to 400 the row', () => {
 
 test('an unreadable auth.json degrades to no identity rather than throwing', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => { throw new Error('unreadable'); },
+    readChatgptAuth: () => { throw new Error('unreadable'); },
     readBillingConfig: () => { throw new Error('unreadable'); },
   });
   assert.deepEqual(f, {});
@@ -223,7 +229,7 @@ test('an unreadable auth.json degrades to no identity rather than throwing', () 
 
 test('the drain preserves captured identity and leaves historical ownership unknown', async () => {
   const h = harness([{ ...ROW(1), account_uuid: 'captured-account' }, ROW(2)], [200, 200]);
-  await drainRateLimitSnapshots('tok', {
+  await drainRateLimitSnapshots(KEY, SESSION, {
     ...h.deps,
     usageIdentityFields: () => ({ account_uuid: 'acct-1', five_hour_pct: 999 }),
   });
@@ -234,7 +240,7 @@ test('the drain preserves captured identity and leaves historical ownership unkn
 
 test('an unrecognised plan is omitted rather than reported as the literal "unknown"', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account({ plan: 'unknown', subscriptionType: null }),
+    readChatgptAuth: () => account({ plan: 'unknown', subscriptionType: null }),
     readBillingConfig: () => ({ source: 'subscription', plan: 'unknown', subscriptionType: null, rateLimitTier: null }),
   });
   assert.equal('subscription_plan' in f, false);
@@ -246,7 +252,7 @@ test('an unrecognised plan is omitted rather than reported as the literal "unkno
 test('a stale unknown plan on disk falls back to the live id_token', (t) => {
   withCodexAuth(t, { auth_mode: 'chatgpt' }); // L1 — the fallback only runs under a subscription resolution
   const f = usageIdentityFields({
-    readCodexAccount: () => account({ plan: 'plus', subscriptionType: 'plus' }),
+    readChatgptAuth: () => account({ plan: 'plus', subscriptionType: 'plus' }),
     readBillingConfig: () => ({ source: 'subscription', plan: 'unknown', subscriptionType: null, rateLimitTier: null }),
     env: {},
   });
@@ -257,7 +263,7 @@ test('a stale unknown plan on disk falls back to the live id_token', (t) => {
 test('a real plan on disk still wins over the live read', (t) => {
   withCodexAuth(t, { auth_mode: 'chatgpt' }); // L1 — as above
   const f = usageIdentityFields({
-    readCodexAccount: () => account({ plan: 'plus', subscriptionType: 'plus' }),
+    readChatgptAuth: () => account({ plan: 'plus', subscriptionType: 'plus' }),
     readBillingConfig: () => ({ source: 'subscription', plan: 'pro_20x', subscriptionType: 'pro_20x', rateLimitTier: null }),
     env: {},
   });
@@ -270,7 +276,7 @@ test('an api-key machine reports no plan even when auth.json still holds one', (
   // An exported key is what the process will actually bill against, so the resolver reports
   // api-key regardless of a leftover ChatGPT sign-in on disk.
   const f = usageIdentityFields({
-    readCodexAccount: () => account({ plan: 'plus', subscriptionType: 'plus' }),
+    readChatgptAuth: () => account({ plan: 'plus', subscriptionType: 'plus' }),
     readBillingConfig: () => ({ source: 'subscription', plan: 'unknown', subscriptionType: null, rateLimitTier: null }),
     env: { OPENAI_API_KEY: 'sk-live-not-a-real-key' },
   });
@@ -286,7 +292,7 @@ const observed = (plan) => () => (plan == null ? null : { plan, observedAt: '202
 // not check, and no token freshness — it is a value the server already wrote into a log on disk.
 test('the observed plan_type outranks the plan captured from the id_token', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account(),
+    readChatgptAuth: () => account(),
     readBillingConfig: () => ({ source: 'subscription', plan: 'free', subscriptionType: 'free', rateLimitTier: null }),
     readObservedPlan: observed('plus'),
     env: {},
@@ -301,7 +307,7 @@ test('the observed plan_type outranks the plan captured from the id_token', () =
 // billing-config.mjs:25-27 and session-start.mjs:221 both go out of their way to protect it.
 test('a self-reported plan still beats the observed plan_type', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account(),
+    readChatgptAuth: () => account(),
     readBillingConfig: () => ({
       source: 'subscription', plan: 'team', subscriptionType: 'team', rateLimitTier: null,
       selfReported: true,
@@ -317,7 +323,7 @@ test('a self-reported plan still beats the observed plan_type', () => {
 // fall straight through and change nothing at all.
 test('no observed plan leaves the existing two-rung fallback exactly as it was', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account({ plan: 'plus', subscriptionType: 'plus' }),
+    readChatgptAuth: () => account({ plan: 'plus', subscriptionType: 'plus' }),
     readBillingConfig: () => ({ source: 'subscription', plan: 'unknown', subscriptionType: null, rateLimitTier: null }),
     readObservedPlan: observed(null),
     env: {},
@@ -329,7 +335,7 @@ test('no observed plan leaves the existing two-rung fallback exactly as it was',
 // and rung 2 must not go around the resolver's refusal to state one.
 test('the observed plan_type is not stamped onto an api-key machine', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account(),
+    readChatgptAuth: () => account(),
     readBillingConfig: () => null,
     readObservedPlan: observed('plus'),
     env: { OPENAI_API_KEY: 'sk-live-not-a-real-key' },
@@ -346,7 +352,7 @@ test('the observed plan_type is not stamped onto an api-key machine', () => {
 // a subscription plan for work a key was paying for.
 test('a clock function in deps never reaches the billing ladder as its epoch', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account(),
+    readChatgptAuth: () => account(),
     readBillingConfig: () => ({
       source: 'subscription', plan: 'plus', subscriptionType: 'plus', rateLimitTier: null,
       apiKeyEvidenceAt: new Date(Date.now() - 60 * 60 * 1000).toISOString(),
@@ -363,7 +369,7 @@ test('a clock function in deps never reaches the billing ladder as its epoch', (
 // simply thrown away.
 test('an epoch now IS threaded, and an expired stamp stops vouching', () => {
   const f = usageIdentityFields({
-    readCodexAccount: () => account(),
+    readChatgptAuth: () => account(),
     readBillingConfig: () => ({
       source: 'subscription', plan: 'plus', subscriptionType: 'plus', rateLimitTier: null,
       apiKeyEvidenceAt: '2026-09-01T00:00:00.000Z',
@@ -381,7 +387,7 @@ test('step 4 of the ladder is answered from the account already read, not a seco
   // No auth.json anywhere (the sandbox CODEX_HOME is empty) and no injected signals reader — the
   // resolution can only have come from the account object this function already had in hand.
   const chatgpt = usageIdentityFields({
-    readCodexAccount: () => account({ authMode: 'chatgpt' }),
+    readChatgptAuth: () => account({ authMode: 'chatgpt' }),
     readBillingConfig: () => billing,
     env: {},
   });
@@ -389,7 +395,7 @@ test('step 4 of the ladder is answered from the account already read, not a seco
   // auth_mode is null under a ChatGPT sign-in, so hasStoredApiKey is the only thing that can tell a
   // machine holding a key apart — and it is carried on the account for exactly that reason.
   const keyed = usageIdentityFields({
-    readCodexAccount: () => account({ authMode: null, hasStoredApiKey: true }),
+    readChatgptAuth: () => account({ authMode: null, hasStoredApiKey: true }),
     readBillingConfig: () => billing,
     env: {},
   });

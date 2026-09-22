@@ -13,6 +13,12 @@ import {
   readObservedPlan,
   sanitizeLimit,
 } from '../lib/rate-limits-codex.mjs';
+import { linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The debounce series and the observed plan stay MACHINE-level — the reading describes the ChatGPT
+// account Codex is signed into, not a Beezi tenant. What is per account is DELIVERY: every linked
+// workspace is owed the same row, into its own queue, cleared under its own lock.
+const KEY = TEST_KEY;
 
 function useTmpHome(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'codex-rate-limits-test-'));
@@ -21,6 +27,7 @@ function useTmpHome(t) {
     delete process.env.BEEZI_CODEX_HOME;
     fs.rmSync(dir, { recursive: true, force: true });
   });
+  linkAccount(dir, KEY);
   return dir;
 }
 
@@ -143,24 +150,24 @@ const obs = (pct, at, limitId = 'codex') => ({
 
 test('an immaterial move inside the floor window is not queued', (t) => {
   useTmpHome(t);
-  assert.equal(recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')]).recorded, 1);
-  assert.equal(recordRateLimitObservations([obs(12, '2026-09-09T10:05:00.000Z')]).recorded, 0);
-  assert.equal(readPendingRateLimits().length, 1);
+  assert.equal(recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY]).recorded, 1);
+  assert.equal(recordRateLimitObservations([obs(12, '2026-09-09T10:05:00.000Z')], [KEY]).recorded, 0);
+  assert.equal(readPendingRateLimits(KEY).length, 1);
 });
 
 test('an unchanged reading is queued again once the 15-minute floor passes', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')]);
-  assert.equal(recordRateLimitObservations([obs(10, '2026-09-09T10:15:00.000Z')]).recorded, 1);
-  assert.equal(readPendingRateLimits().length, 2);
+  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY]);
+  assert.equal(recordRateLimitObservations([obs(10, '2026-09-09T10:15:00.000Z')], [KEY]).recorded, 1);
+  assert.equal(readPendingRateLimits(KEY).length, 2);
 });
 
 // Five local rollouts carry both a `codex` and a `premium` bucket. One shared baseline would let
 // one series' reading suppress the other's.
 test('each limit_id debounces against its own baseline', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z', 'codex')]);
-  const other = recordRateLimitObservations([obs(10, '2026-09-09T10:01:00.000Z', 'premium')]);
+  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z', 'codex')], [KEY]);
+  const other = recordRateLimitObservations([obs(10, '2026-09-09T10:01:00.000Z', 'premium')], [KEY]);
   assert.equal(other.recorded, 1, 'a different limit_id is a different series, not a repeat');
 });
 
@@ -178,8 +185,8 @@ test('a queued row carries exactly the seven keys the API whitelists, and never 
     limitId: 'codex',
     planType: 'plus',
     raw: { limit_id: 'codex', plan_type: 'plus' },
-  }]);
-  const [row] = readPendingRateLimits();
+  }], [KEY]);
+  const [row] = readPendingRateLimits(KEY);
   assert.deepEqual(Object.keys(row).sort(), [
     'fetched_at', 'five_hour_pct', 'five_hour_resets_at', 'limits', 'raw',
     'seven_day_pct', 'seven_day_resets_at',
@@ -227,8 +234,8 @@ test('a 30-day window survives in limits[] instead of dropping the whole reading
   assert.ok(o, 'the reading used to be discarded for want of a client-side write');
   assert.equal(o.monthly.pct, 4);
 
-  recordRateLimitObservations([o]);
-  const [row] = readPendingRateLimits();
+  recordRateLimitObservations([o], [KEY]);
+  const [row] = readPendingRateLimits(KEY);
   assert.equal(row.five_hour_pct, null, 'a 30-day number must never be written into the 5h column');
   assert.equal(row.seven_day_pct, null);
   assert.equal(row.limits.length, 1);
@@ -251,8 +258,8 @@ test('a float percent travels the way the columns already travel it', (t) => {
     primary: { used_percent: 56.00000000000001, window_minutes: 43200, resets_at: 1788987264 },
     secondary: win(4.5, 300),
   }));
-  recordRateLimitObservations([o]);
-  const [row] = readPendingRateLimits();
+  recordRateLimitObservations([o], [KEY]);
+  const [row] = readPendingRateLimits(KEY);
   assert.equal(row.five_hour_pct, 4.5, 'the column sends the float and the server rounds on ingest');
   assert.equal(row.limits[0].percent, 56.00000000000001, 'and so does the nested entry');
 });
@@ -261,8 +268,8 @@ test('a float percent travels the way the columns already travel it', (t) => {
 // would hand the backend a duplicate view of numbers it already has in the columns.
 test('a reading with only 5h/7d windows sends no limits entry at all', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')]);
-  assert.equal(readPendingRateLimits()[0].limits, null);
+  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY]);
+  assert.equal(readPendingRateLimits(KEY)[0].limits, null);
 });
 
 test('raw round-trips the untranslated block and nothing else', (t) => {
@@ -279,8 +286,8 @@ test('raw round-trips the untranslated block and nothing else', (t) => {
     rate_limit_reached_type: null,
   };
   const o = rateLimitObservationFromRecord(tokenCount(block));
-  recordRateLimitObservations([o]);
-  const [row] = readPendingRateLimits();
+  recordRateLimitObservations([o], [KEY]);
+  const [row] = readPendingRateLimits(KEY);
   assert.deepEqual(Object.keys(row.raw).sort(), [
     'credits', 'limit_id', 'plan_type', 'primary', 'rate_limit_reached_type',
     'secondary', 'spend_control_reached',
@@ -301,8 +308,8 @@ test('a block carrying none of the named keys yields raw null rather than an emp
   useTmpHome(t);
   const o = rateLimitObservationFromRecord(tokenCount({ primary: win(5, 300) }));
   assert.ok(o.raw && o.raw.primary, 'primary is one of the named keys');
-  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')]); // hand-built, no raw
-  assert.equal(readPendingRateLimits()[0].raw, null);
+  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY]); // hand-built, no raw
+  assert.equal(readPendingRateLimits(KEY)[0].raw, null);
 });
 
 // ─── G-2-3: plan_type is a plan source, and it lives on the observation, never on the row ──────
@@ -320,7 +327,7 @@ const planned = (at, planType, pct = 10) => ({ ...obs(pct, at), planType });
 test('the observed plan is normalized through the one tier table', (t) => {
   useTmpHome(t);
   // Codex still calls the $200 tier `pro`; the API prices it as pro_20x.
-  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'pro')]);
+  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'pro')], [KEY]);
   assert.equal(readObservedPlan().plan, 'pro_20x');
 });
 
@@ -328,7 +335,7 @@ test('the observed plan is normalized through the one tier table', (t) => {
 // stale — the failure `go` used to cause. A tier we cannot price is simply not recorded.
 test('a plan_type the tier table does not know is not written', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'mystery')]);
+  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'mystery')], [KEY]);
   assert.equal(readObservedPlan(), null);
 });
 
@@ -336,9 +343,9 @@ test('a plan_type the tier table does not know is not written', (t) => {
 // carry no plan, and treating that as "no plan" would report nothing for most sessions.
 test('a plan_type: null observation leaves the stored plan standing rather than clearing it', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'plus')]);
+  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'plus')], [KEY]);
   assert.equal(readObservedPlan().plan, 'plus');
-  recordRateLimitObservations([planned('2026-09-09T11:00:00.000Z', null, 40)]);
+  recordRateLimitObservations([planned('2026-09-09T11:00:00.000Z', null, 40)], [KEY]);
   assert.equal(readObservedPlan().plan, 'plus', 'a silent build must not erase a known plan');
 });
 
@@ -346,24 +353,24 @@ test('a plan_type: null observation leaves the stored plan standing rather than 
 // the event the refresh flow exists to catch, which happened without anyone running refresh.
 test('a plan change is captured even when the reading itself is debounced away', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'free')]);
-  const res = recordRateLimitObservations([planned('2026-09-09T10:05:00.000Z', 'plus', 11)]);
+  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'free')], [KEY]);
+  const res = recordRateLimitObservations([planned('2026-09-09T10:05:00.000Z', 'plus', 11)], [KEY]);
   assert.equal(res.recorded, 0, 'a 1-point move inside the floor is not worth a row');
   assert.equal(readObservedPlan().plan, 'plus', 'but the plan change is worth remembering');
 });
 
 test('an older observation never drags the observed plan backwards', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([planned('2026-09-09T11:00:00.000Z', 'plus')]);
-  recordRateLimitObservations([planned('2026-09-09T09:00:00.000Z', 'free', 60)]);
+  recordRateLimitObservations([planned('2026-09-09T11:00:00.000Z', 'plus')], [KEY]);
+  recordRateLimitObservations([planned('2026-09-09T09:00:00.000Z', 'free', 60)], [KEY]);
   assert.equal(readObservedPlan().plan, 'plus');
 });
 
 test('the observed plan survives a drain', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'plus')]);
-  clearPendingRateLimits(readPendingRateLimits());
-  assert.equal(readPendingRateLimits().length, 0);
+  recordRateLimitObservations([planned('2026-09-09T10:00:00.000Z', 'plus')], [KEY]);
+  clearPendingRateLimits(KEY, readPendingRateLimits(KEY));
+  assert.equal(readPendingRateLimits(KEY).length, 0);
   assert.equal(readObservedPlan().plan, 'plus', 'the plan outlives the queue it was observed with');
 });
 
@@ -374,9 +381,9 @@ test('the monthly window debounces against its own baseline', (t) => {
     monthly: { pct, resetsAt: 1788987264, windowMinutes: 43200 },
     limitId: 'codex',
   });
-  assert.equal(recordRateLimitObservations([monthly(4, '2026-09-09T10:00:00.000Z')]).recorded, 1);
-  assert.equal(recordRateLimitObservations([monthly(5, '2026-09-09T10:05:00.000Z')]).recorded, 0);
-  assert.equal(recordRateLimitObservations([monthly(20, '2026-09-09T10:06:00.000Z')]).recorded, 1);
+  assert.equal(recordRateLimitObservations([monthly(4, '2026-09-09T10:00:00.000Z')], [KEY]).recorded, 1);
+  assert.equal(recordRateLimitObservations([monthly(5, '2026-09-09T10:05:00.000Z')], [KEY]).recorded, 0);
+  assert.equal(recordRateLimitObservations([monthly(20, '2026-09-09T10:06:00.000Z')], [KEY]).recorded, 1);
 });
 
 test('clearing drops only the confirmed prefix', (t) => {
@@ -385,19 +392,19 @@ test('clearing drops only the confirmed prefix', (t) => {
     obs(10, '2026-09-09T10:00:00.000Z'),
     obs(20, '2026-09-09T10:30:00.000Z'),
     obs(30, '2026-09-09T11:00:00.000Z'),
-  ]);
-  assert.equal(readPendingRateLimits().length, 3);
-  clearPendingRateLimits(readPendingRateLimits().slice(0, 2));
-  const rest = readPendingRateLimits();
+  ], [KEY]);
+  assert.equal(readPendingRateLimits(KEY).length, 3);
+  clearPendingRateLimits(KEY, readPendingRateLimits(KEY).slice(0, 2));
+  const rest = readPendingRateLimits(KEY);
   assert.equal(rest.length, 1);
   assert.equal(rest[0].five_hour_pct, 30);
 });
 
 test('the debounce baseline survives a drain', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')]);
-  clearPendingRateLimits(readPendingRateLimits());
-  const after = recordRateLimitObservations([obs(11, '2026-09-09T10:05:00.000Z')]);
+  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY]);
+  clearPendingRateLimits(KEY, readPendingRateLimits(KEY));
+  const after = recordRateLimitObservations([obs(11, '2026-09-09T10:05:00.000Z')], [KEY]);
   assert.equal(after.recorded, 0, 'draining must not reopen the floor window');
 });
 
@@ -409,19 +416,19 @@ test('clearing survives an eviction that shifts the queue under it', (t) => {
   const posted = [];
   for (let i = 0; i < 40; i++) {
     const at = new Date(Date.UTC(2026, 8, 9, 0, 0, 0) + i * 3600_000).toISOString();
-    recordRateLimitObservations([obs(i, at)]);
+    recordRateLimitObservations([obs(i, at)], [KEY]);
   }
-  posted.push(...readPendingRateLimits());
+  posted.push(...readPendingRateLimits(KEY));
   assert.equal(posted.length, 40, 'the queue starts full at MAX_PENDING');
 
   // Another process records five more while the 40 above are being posted.
   for (let i = 0; i < 5; i++) {
     const at = new Date(Date.UTC(2026, 8, 11, 0, 0, 0) + i * 3600_000).toISOString();
-    recordRateLimitObservations([obs(50 + i, at)]);
+    recordRateLimitObservations([obs(50 + i, at)], [KEY]);
   }
-  clearPendingRateLimits(posted);
+  clearPendingRateLimits(KEY, posted);
 
-  const rest = readPendingRateLimits();
+  const rest = readPendingRateLimits(KEY);
   assert.equal(rest.length, 5, 'only the five unposted rows are left');
   for (const row of rest) {
     assert.ok(row.five_hour_pct >= 50, `${row.fetched_at} was never posted and must survive`);
@@ -433,12 +440,48 @@ test('clearing survives an eviction that shifts the queue under it', (t) => {
 // baseline backwards and reopen the 15-minute window early.
 test('an out-of-order observation never moves the debounce baseline backwards', (t) => {
   useTmpHome(t);
-  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')]);
+  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY]);
   // Older than what is already recorded, and material against it (a 15-point move), so it is
   // queued — but it must not become the baseline.
-  assert.equal(recordRateLimitObservations([obs(25, '2026-09-09T09:50:00.000Z')]).recorded, 1);
+  assert.equal(recordRateLimitObservations([obs(25, '2026-09-09T09:50:00.000Z')], [KEY]).recorded, 1);
   // Immaterial against the 10:00 reading and inside 15 minutes of it. Had the older row moved the
   // baseline, this would read as a 14-point move against pct 25 with the floor already reopened.
-  const after = recordRateLimitObservations([obs(11, '2026-09-09T10:05:00.000Z')]);
+  const after = recordRateLimitObservations([obs(11, '2026-09-09T10:05:00.000Z')], [KEY]);
   assert.equal(after.recorded, 0, 'the baseline is the newest reading, not the last one written');
+});
+
+// ─── the fan-out: one reading, one debounce decision, one queue per account ───────────────────
+
+// The split this module went through in 0.13. The series must stay machine-level or the 5-point
+// gate and the 15-minute floor would be re-opened once per linked workspace; the QUEUE must be per
+// account or one tenant's successful drain would clear rows the other has not sent.
+test('one material reading lands in every account queue, and each clears independently', (t) => {
+  const home = useTmpHome(t);
+  const OTHER = '99887766';
+  linkAccount(home, OTHER);
+
+  const recorded = recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY, OTHER]);
+  assert.equal(recorded.recorded, 1, 'one reading, decided once');
+  assert.deepEqual(recorded.skippedKeys, [], 'both queues took it');
+  assert.equal(readPendingRateLimits(KEY).length, 1);
+  assert.equal(readPendingRateLimits(OTHER).length, 1);
+
+  clearPendingRateLimits(KEY, readPendingRateLimits(KEY));
+
+  assert.equal(readPendingRateLimits(KEY).length, 0, 'the account that posted is clear');
+  assert.equal(readPendingRateLimits(OTHER).length, 1, 'the other account still owes its row');
+});
+
+// The debounce is a property of the READING, not of a tenant: adding a second linked account must
+// not make the same rollout line material all over again.
+test('a second account does not re-open the debounce for a reading already seen', (t) => {
+  const home = useTmpHome(t);
+  const OTHER = '99887766';
+  linkAccount(home, OTHER);
+
+  recordRateLimitObservations([obs(10, '2026-09-09T10:00:00.000Z')], [KEY]);
+  const again = recordRateLimitObservations([obs(12, '2026-09-09T10:05:00.000Z')], [KEY, OTHER]);
+
+  assert.equal(again.recorded, 0, 'immaterial and inside the floor, for every account');
+  assert.equal(readPendingRateLimits(OTHER).length, 0, 'nothing was invented for the new account');
 });

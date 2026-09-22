@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { beeziCodexHome, codexSessionsDir, queueDir, stateDir } from './paths.mjs';
+import { listAccountsSync } from './accounts.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { scanRecords } from './session-name-codex.mjs';
 import { orDefault } from './compat.mjs';
@@ -319,7 +320,7 @@ function poisonedStateEntries(dir) {
   return out;
 }
 
-// Poisoned entries in queueDir(). A queue filename is safeFileName(segmentId), and a segmentId is
+// Poisoned entries in one account's queue. A queue filename is safeFileName(segmentId), and a segmentId is
 // `<sessionId>:<from>-<to>` (or `<sessionId>:<agentId>:<from>-<to>`) with `:` mapped to `_` — so a
 // report from a session named `null` is exactly `null_...json`. A real session id is a UUID and
 // can never produce that prefix.
@@ -344,7 +345,16 @@ function poisonedQueueEntries(dir) {
 export function quarantinePoisonedSessionState(deps = {}) {
   const now = orDefault(deps.now, Date.now);
   const result = { moved: [], failed: [], dir: null };
-  const entries = poisonedStateEntries(stateDir()).concat(poisonedQueueEntries(queueDir()));
+  // Every account's queue, and the one machine-level state directory. The quarantine tree itself
+  // stays machine-level: a poisoned report is a plugin defect, not a tenant's business, and an
+  // operator repairing one wants them in one place. listAccountsSync keeps this synchronous and
+  // keeps a quarantine sweep from triggering the one-time migration.
+  let entries = poisonedStateEntries(stateDir());
+  try {
+    for (const account of listAccountsSync()) {
+      entries = entries.concat(poisonedQueueEntries(queueDir(account.key)));
+    }
+  } catch { /* an unreadable index quarantines no queue file, which moves nothing */ }
   if (entries.length === 0) return result;
 
   // One directory per sweep, so a second poisoned `null.json` can never overwrite the first one

@@ -57,12 +57,15 @@ test('a sign-in that beats the grace period leaves no timer armed', { timeout: 1
   const out = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: "ok" }),
     url: 'https://api.test/api/mcp',
-    getAccessToken: async () => null,
+    // The account resolution is injected for the same reason everything else here is: an unlinked
+    // machine is the state under test, and the real lookup would read an accounts index.
+    getDefaultKey: async () => null,
+    listAccounts: async () => [],
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
     logError: () => {},
     loginGraceMs: GRACE_MS,
-    performLogin: async () => ({ type: 'linked', account: 'Dev', storedIn: '/c/creds' }),
+    performLogin: async () => ({ outcome: 'linked', key: 'a1b2c3d4', account: { name: 'Dev' }, storedIn: '/c/creds' }),
   });
 
   await bridge.handleMessage(LOGIN_CALL);
@@ -96,7 +99,13 @@ test('the grace path settles when its timer is the only handle in the loop', { t
     'const out = [];',
     'const bridge = createBridge({ checkEnvironment: () => ({ status: "ok" }),',
     "  url: 'https://api.test/api/mcp',",
-    '  getAccessToken: async () => null,',
+    // This child inherits the sandbox ROOTS but not the GUARD: tools/hermetic-env.mjs rewrites
+    // HOME/USERPROFILE/CODEX_HOME/BEEZI_CODEX_HOME on the parent's process.env and the spawn below
+    // passes no `env`, so the roots come through — but nothing in the child fails it for escaping
+    // one. The account resolution is injected so the bridge does no index work here at all, which
+    // is also what keeps this child's event loop empty enough to reproduce the hang it exists for.
+    '  getDefaultKey: async () => null,',
+    '  listAccounts: async () => [],',
     "  fetchImpl: async () => { throw new Error('must not reach the network'); },",
     '  write: (line) => out.push(line),',
     '  logError: () => {},',

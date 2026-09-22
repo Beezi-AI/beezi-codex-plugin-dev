@@ -5,6 +5,13 @@ import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir, billingConfigFile, repoMapFile, trackingStateFile } from '../lib/paths.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // The history import's contract with runCheckpoint: payloads go to the sink and nowhere near the
 // live queue, nothing persists (state, agent cursors, billing evidence), errors are buffered, the
@@ -41,7 +48,7 @@ const seg = (over = {}) => ({
 });
 
 const deps = (home, segments, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('no HTTP in a backfill checkpoint'); },
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 's1' }),
   computeDelta: () => ({ nextCursor: 4, segments, apiErrorEvents: [] }),
@@ -74,7 +81,7 @@ test('payloads go to the sink; the live queue never sees them and no flush runs'
   assert.equal(fetched, 0, 'no HTTP at all from the checkpoint');
   assert.equal(sunk.length, 1);
   assert.equal(sunk[0].segmentId, 's1:1-4');
-  assert.ok(!fs.existsSync(queueDir()) || fs.readdirSync(queueDir()).length === 0, 'live queue untouched');
+  assert.ok(!fs.existsSync(queueDir(KEY)) || fs.readdirSync(queueDir(KEY)).length === 0, 'live queue untouched');
 });
 
 test('persistState:false writes no session state and ignores a live cursor', async (t) => {
@@ -306,7 +313,8 @@ test('sweepSubagents finds children without emitTimeline, bills them through the
 
 test('the live tracking gate blocks a dark-mode checkpoint unless explicitly skipped', async (t) => {
   const home = tmpHome(t);
-  fs.writeFileSync(trackingStateFile(), JSON.stringify({ version: 1, trackingMode: 'backfill_only' }));
+  fs.mkdirSync(path.dirname(trackingStateFile(KEY)), { recursive: true });
+  fs.writeFileSync(trackingStateFile(KEY), JSON.stringify({ version: 1, trackingMode: 'backfill_only' }));
 
   const gated = await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg()]));
   assert.equal(gated.gated, true);

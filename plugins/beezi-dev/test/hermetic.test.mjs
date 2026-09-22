@@ -168,12 +168,20 @@ test('L1 — the same read INSIDE the sandbox is not a violation', (t) => {
 // which is also the direct evidence that a run never writes to ~/.codex or ~/.beezi-codex.
 test('L2 — every root lib/paths.mjs resolves is inside the sandbox', () => {
   const roots = Object.entries(paths).filter(([, v]) => typeof v === 'function');
-  assert.ok(roots.length >= 15, `expected the full path surface, found ${roots.length}`);
+  // The EXACT count, not a floor that stopped meaning anything as the surface grew (it said 15
+  // while there were 29). A new accessor has to be added here deliberately, which is the point:
+  // this sweep is the evidence that no root escapes the sandbox, and an accessor nobody added to
+  // the count is an accessor nobody proved anything about.
+  assert.equal(roots.length, 26, `the path surface changed — add the new accessor's reasoning here`);
   // The two roots a run must never touch, named rather than the whole home: on Windows the temp
   // directory sits under %USERPROFILE%, so "not under the home" would also forbid the sandbox.
   const forbidden = [path.join(REAL_HOME, '.codex'), path.join(REAL_HOME, '.beezi-codex')];
+  // Keyed accessors REFUSE a missing key, so the sweep supplies one rather than skipping them:
+  // an account directory that escaped the sandbox would be exactly as damaging as a root that
+  // did, and skipping them would quietly shrink the surface this test proves.
+  const PROBE_KEY = '0123abcd';
   for (const [name, fn] of roots) {
-    const resolved = fn();
+    const resolved = fn.length > 0 ? fn(PROBE_KEY) : fn();
     assert.ok(inside(resolved, SANDBOX), `${name}() → ${resolved} escaped the sandbox`);
     for (const root of forbidden) {
       assert.equal(inside(resolved, root), false, `${name}() → ${resolved} is the real ${root}`);
@@ -211,25 +219,33 @@ test('every fs call lib/ and scripts/ actually make is guarded', () => {
   assert.deepEqual(unguarded, [], 'add these to FS_SYNC_GUARDS in tools/hermetic-env.mjs');
 });
 
-test('no lib/ or scripts/ module takes a NAMED fs import', () => {
-  // The backstop patches the `fs` object. `import fs from 'fs'` on a core module hands back that
-  // very object, so the patch lands. A named import is a binding snapshotted when the module is
-  // instantiated, and a preload cannot reach it — measured on Node 24: patching cp.execFileSync in
-  // an --import preload leaves a LATER module's `import { execFileSync }` pointing at the original.
-  // So a named fs import anywhere in lib/ or scripts/ would walk straight past the guard.
+test('no lib/ or scripts/ module takes a NAMED fs or child_process import', () => {
+  // The backstop patches the `fs` and `child_process` objects. `import fs from 'fs'` on a core
+  // module hands back that very object, so the patch lands. A named import is a binding snapshotted
+  // when the module is instantiated, and a preload cannot reach it — measured on Node 24: patching
+  // cp.execFileSync in an --import preload leaves a LATER module's `import { execFileSync }`
+  // pointing at the original. So a named import of either module anywhere in lib/ or scripts/ would
+  // walk straight past the guard.
+  //
+  // child_process was added to this ban after `npm test` was measured adding a keyed keychain entry
+  // and DELETING the developer's own pre-0.13 `beezi-codex`/`token` login, with zero failures
+  // reported: lib/credentials.mjs took `import { execFileSync }`, so every `security` call it made
+  // was invisible to the backstop. Recording is not preventing — a recorded call still runs — but a
+  // recorded call fails the run, which is what stops the next one shipping unnoticed.
   const offenders = [];
   for (const [name, src] of [...sources('lib'), ...sources('scripts')]) {
-    if (/import\s*\{[^}]*\}\s*from\s*['"](?:node:)?fs(?:\/promises)?['"]/.test(src)) offenders.push(name);
+    if (/import\s*\{[^}]*\}\s*from\s*['"](?:node:)?(?:fs(?:\/promises)?|child_process)['"]/.test(src)) offenders.push(name);
   }
-  assert.deepEqual(offenders, [], 'a named fs import bypasses the hermeticity backstop');
+  assert.deepEqual(offenders, [], 'a named fs or child_process import bypasses the hermeticity backstop');
 });
 
 test('every subprocess call site in lib/ is behind an injectable seam, and no test reaches one', () => {
-  // child_process is the one channel the backstop CANNOT close: lib/credentials.mjs, lib/git.mjs
-  // and lib/login.mjs all use named imports, which a preload cannot patch (see above). The guard
-  // in tools/hermetic-env.mjs still catches a default-import or require() call site, but these two
-  // assertions are what actually protect the native keyring, the real git config and the browser
-  // launcher — so they are structural, and they are the honest answer to R6's caveat.
+  // The backstop now SEES every subprocess call site — the ban above keeps them all on the default
+  // import — but seeing is not stopping: tools/hermetic-env.mjs records the call and then calls
+  // through, so a recorded `security` delete has already happened by the time the run goes red.
+  // These two assertions are what actually protect the native keyring, the real git config and the
+  // browser launcher, and they are the honest answer to R6's caveat; the backstop is the net that
+  // catches whatever gets past them, once.
   const SEAMS = {
     // deps.run || defaultRun (credentials.mjs:233) — every credentials test injects `run`.
     'lib/credentials.mjs': /deps\.run\s*\|\|/,

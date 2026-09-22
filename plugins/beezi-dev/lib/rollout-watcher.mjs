@@ -9,11 +9,10 @@ import { isUsableSessionId, listRolloutFiles as _listRolloutFiles, ROLLOUT_HEAD_
 import { readRolloutHead as _readRolloutHead, subagentIdentityFrom as _subagentIdentityFrom } from './subagent-codex.mjs';
 import { runCheckpoint as _runCheckpoint, reconcileSession } from './checkpoint.mjs';
 import { runAudit as _runAudit, SYNC_MODE } from './session-audit.mjs';
-import { getAccessToken as _getAccessToken } from './token.mjs';
+import { linkedSessions as _linkedSessions } from './accounts.mjs';
 import { pruneStale as _pruneStale } from './prune.mjs';
 import { readTrackingState, isLiveTrackingAllowed } from './tracking.mjs';
 import { loadLedger as _loadLedger, ledgerDelivered } from './audit-ledger.mjs';
-import { getMachineClientId } from './machine-identity.mjs';
 import {
   fetchCoverage as _fetchCoverage,
   loadCoverageCheckpoints as _loadCoverageCheckpoints,
@@ -596,13 +595,15 @@ function emptyPass(reason) {
  * process must never do is take the MCP bridge down with it.
  */
 export async function runWatchPass(deps = {}, options = {}) {
-  if (shouldCheckEnvironment(deps, 'getAccessToken', 'hookMayProceed')
+  // `linkedSessions` is this module's real-work seam now that the pass resolves accounts rather
+  // than one token — a test that stands in for it is standing in for the whole operation.
+  if (shouldCheckEnvironment(deps, 'linkedSessions', 'hookMayProceed')
     && !(deps.hookMayProceed || hookMayProceed)()) {
     return emptyPass('environment-blocked');
   }
   const nowFn = orDefault(deps.now, Date.now);
   const shouldStop = orDefault(deps.shouldStop, () => false);
-  const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
+  const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
   const runCheckpoint = orDefault(deps.runCheckpoint, _runCheckpoint);
   const runAudit = orDefault(deps.runAudit, _runAudit);
   const pruneStale = orDefault(deps.pruneStale, _pruneStale);
@@ -626,13 +627,13 @@ export async function runWatchPass(deps = {}, options = {}) {
     dirty = true;
   }
 
-  let token = null;
+  let sessions = [];
   try {
-    token = await getAccessToken();
+    sessions = orDefault(await listSessions(deps), []);
   } catch {
-    token = null;
+    sessions = [];
   }
-  if (!token) {
+  if (sessions.length === 0) {
     // Unlinked. Quiet by design — the option-C constraint: ticket drafting must keep working when
     // analytics cannot, and an unlinked machine must not produce one error per tick forever.
     if (dirty) saveObservations(record);
@@ -669,10 +670,22 @@ export async function runWatchPass(deps = {}, options = {}) {
   result.cooling = plan.cooling;
 
   // The live-capture gate. An audit-only or disabled tenant gets no live checkpoint from the
-  // watcher, exactly as flushQueue refuses one from a hook. Fail-open on a missing/corrupt cache,
-  // the same posture lib/tracking.mjs documents — the server's guard is the real boundary.
+  // watcher, exactly as flushQueue refuses one from a hook. It asks whether ANY linked account
+  // still allows live capture — runCheckpoint gates the accounts individually, so one dark tenant
+  // must not stop the pass for the live one beside it. Fail-open on a missing/corrupt cache, the
+  // same posture lib/tracking.mjs documents — the server's guard is the real boundary.
+  //
+  // The state is READ here and handed to the predicate rather than left for it to re-open: one
+  // read per account either way, and an unreadable cache has to throw somewhere this try can catch
+  // it — which is what makes the fail-open posture a property of this pass and not of whichever
+  // reader happens to be wired in.
   let live = true;
-  try { live = liveAllowed(trackingState()) !== false; } catch { live = true; }
+  try {
+    live = sessions.some((session) => {
+      const state = trackingState(session.key, deps);
+      return liveAllowed(session.key, { ...deps, readTrackingStateImpl: () => state }) !== false;
+    });
+  } catch { live = true; }
 
   const checkpointOne = async (sessionId, entry, extra, sessionHandle) => {
     // Null for a SYNTHETIC entry (a child-scheduled root whose own file this pass never stat'ed).
@@ -729,22 +742,42 @@ export async function runWatchPass(deps = {}, options = {}) {
   if (live && plan.fresh.length > 0 && !shouldStop()) {
     for (const entry of plan.fresh.slice(0, orDefault(options.maxEstablish, MAX_ESTABLISH_PER_PASS))) {
       if (shouldStop()) break;
-      const reconciled = await (deps.reconcileSession || reconcileSession)(entry.sessionId, token, async sessionHandle => {
-        const coverage = await fetchCoverage([entry.sessionId], token, {}, {});
-        const identity = getMachineClientId();
-        const ledger = loadLedger(identity);
-        const coverageRecord = loadCoverage(currentBinding(identity));
-        const verdict = decideReplay(entry.sessionId, {
-          coverage, checkpointLine: checkpointLineFor(coverageRecord, entry.sessionId),
-          localCursor: 0, ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
-        });
-        if (verdict.decision === ReplayDecision.DEFER) return { outcome: 'deferred', reason: verdict.reason };
+      const reconciled = await (deps.reconcileSession || reconcileSession)(entry.sessionId, sessions, async (sessionHandle, reporting) => {
+        // ONE boundary for the machine, and it has to be safe for every REPORTING account: the
+        // delta is computed once and enqueued into all of them, so a start line proven against one
+        // tenant would overlap another tenant's stored prefix — and overlap is forbidden, never
+        // reconciled (lib/session-coverage.mjs). The MAXIMUM proven boundary overlaps nobody; a
+        // session any of them cannot answer for defers whole, because an unprovable boundary for
+        // one account is an unprovable boundary for the payload they all share.
+        //
+        // `reporting` is the list reconcileSession filtered, not this pass's `sessions`. A DARK
+        // account receives none of this delta, so its coverage answer says nothing about where the
+        // replay may start — and letting it defer would be the same veto one level down.
+        //
+        // The identity is each account's own client id, carried on its session — the
+        // process-global this used to read is gone, and with several accounts linked it would
+        // have bound one account's ledger under another's id.
+        let startCursor = 0;
+        let deferred = null;
+        for (const session of reporting) {
+          const coverage = await fetchCoverage([entry.sessionId], session, {}, {});
+          const identity = orDefault(session.clientId, null);
+          const ledger = loadLedger(session.key, identity);
+          const coverageRecord = loadCoverage(session.key, currentBinding(identity));
+          const verdict = decideReplay(entry.sessionId, {
+            coverage, checkpointLine: checkpointLineFor(coverageRecord, entry.sessionId),
+            localCursor: 0, ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
+          });
+          if (verdict.decision === ReplayDecision.DEFER) { deferred = verdict.reason; break; }
+          if (verdict.startCursor > startCursor) startCursor = verdict.startCursor;
+        }
+        if (deferred !== null) return { outcome: 'deferred', reason: deferred };
         const ok = await checkpointOne(entry.sessionId, entry, {
-          startCursor: verdict.startCursor, sweepSubagents: false, recovery: true,
+          startCursor, sweepSubagents: false, recovery: true,
         }, sessionHandle);
         if (ok) result.established += 1;
         return { outcome: ok ? 'committed' : 'deferred' };
-      }, { flushQueue: deps.flushQueue });
+      }, { flushQueue: deps.flushQueue, isLiveTrackingAllowed: liveAllowed });
       if (reconciled.outcome !== 'committed') {
         if (reconciled.reason === DeferReason.GAP) result.deferredGap += 1;
         else result.deferredUnavailable += 1;
@@ -760,8 +793,17 @@ export async function runWatchPass(deps = {}, options = {}) {
     // and a concurrent /beezi:sync simply refuses this one as 'run-in-progress'. It drains the
     // queue first, consults coverage, honours an audit-only tenant and never seals or reopens the
     // one-time backfill (R2). None of that is reimplemented here.
+    //
+    // ONE RUN PER ACCOUNT, and `history` is therefore a list. The repair pass uploads to the
+    // account it was given (lib/session-audit.mjs auditSession), so a machine with two linked
+    // workspaces needs two passes or the second one never has its history repaired. Serial: each
+    // run takes the rank-1 `run-backfill` lock and must have released it before the next asks.
+    const histories = [];
     try {
-      result.history = await runAudit({}, { mode: SYNC_MODE });
+      for (const session of sessions) {
+        histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key }));
+      }
+      result.history = histories;
     } catch {
       result.errors += 1;
       result.history = null;

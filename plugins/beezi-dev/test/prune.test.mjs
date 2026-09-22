@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { pruneStale, LOCK_STALE_AGE_MS } from '../lib/prune.mjs';
+import { linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
 import { writeJsonSecure, safeFileName } from '../lib/fs-store.mjs';
 import {
   acquireLock, electionLock, sessionLock, locksDir, forgetHeldLocks, MAX_HOLDER_LEASE_MS,
@@ -25,8 +26,13 @@ function stateDir(homeDir) {
   return path.join(homeDir, 'state');
 }
 
+// The queue moved under accounts/<key>/ when the layout became per-account, and pruneStale sweeps
+// every linked account's. Linking one is therefore part of the fixture: a queue whose account is
+// not in the index is not swept, which is the safe direction but not what this file is testing.
+const KEY = TEST_KEY;
+
 function queueDir(homeDir) {
-  return path.join(homeDir, 'queue');
+  return path.join(homeDir, 'accounts', KEY, 'queue');
 }
 
 function writeFile(dir, name, content = '{}') {
@@ -47,6 +53,7 @@ function ageFile(p, ageMs, now = Date.now()) {
 test('1. prunes old state file (mtime 15 days ago)', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
   const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
@@ -64,6 +71,7 @@ test('1. prunes old state file (mtime 15 days ago)', (t) => {
 test('2. keeps recent state file (mtime now)', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
 
@@ -80,6 +88,7 @@ test('2. keeps recent state file (mtime now)', (t) => {
 test('3. prunes old queue file, keeps recent queue file', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
   const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;
@@ -102,6 +111,7 @@ test('3. prunes old queue file, keeps recent queue file', (t) => {
 test('4. missing dirs → no throw', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
   // Neither state/ nor queue/ exist in homeDir
 
   assert.doesNotThrow(() => pruneStale(Date.now()));
@@ -206,6 +216,7 @@ test('safeFileName reduces untrusted input to one harmless path component', () =
 test('the audit ledger and tracking state at the home root survive pruning', (t) => {
   const homeDir = makeTmpDir(t);
   setHome(homeDir);
+  linkAccount(homeDir, KEY);
 
   const now = Date.now();
   const fifteenDaysMs = 15 * 24 * 60 * 60 * 1000;

@@ -5,6 +5,12 @@ import path from 'node:path';
 import { flushQueue } from '../lib/checkpoint.mjs';
 import { queueDir } from '../lib/paths.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { linkAccount, accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One account's queue: every payload, every quarantine and every counter below belongs to it
+// alone, and a sibling account's drain can neither see nor delete any of it.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 // The drain used to `fs.readdirSync(dir)` with no filter and `readJson(...) == null ? continue`.
 // Two consequences, both silent:
@@ -19,12 +25,13 @@ import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 // empty directory rather than from "no directory".
 function tmpHome(t) {
   const dir = sandboxHome(t, 'beezi-quarantine-');
-  fs.mkdirSync(queueDir(), { recursive: true });
+  linkAccount(dir, KEY);
+  fs.mkdirSync(queueDir(KEY), { recursive: true });
   return dir;
 }
 
-const write = (name, text) => fs.writeFileSync(path.join(queueDir(), name), text);
-const listing = () => fs.readdirSync(queueDir()).sort();
+const write = (name, text) => fs.writeFileSync(path.join(queueDir(KEY), name), text);
+const listing = () => fs.readdirSync(queueDir(KEY)).sort();
 
 // Records every payload that reached the wire, so "not posted" is asserted rather than assumed.
 function recorder() {
@@ -49,7 +56,7 @@ test('a queued report replays its captured instruction observation unchanged', a
   write('seg.json', JSON.stringify(captured));
   const { posted, fetchImpl } = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted, [captured]);
   assert.equal(result.flushed, 1);
@@ -63,7 +70,7 @@ test('a .tmp left by a hard-killed writer is neither read nor posted', async (t)
   write(`seg-2.json.${process.pid}.tmp`, '{"segmentId":"s:2","tok');
   const { posted, fetchImpl } = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted.map((p) => p.segmentId), ['s:1'], 'only the .json is postable');
   assert.equal(result.flushed, 1);
@@ -77,17 +84,17 @@ test('an unparseable queue file is quarantined, counted, and never re-read', asy
   write('bad.json', 'not json at all');
   const first = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl: first.fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl: first.fetchImpl });
 
   assert.equal(result.quarantined, 1);
   assert.equal(result.flushed, 1, 'the corrupt neighbour does not stop the drain');
   assert.match(String(result.lastError), /quarantined unparseable queue file bad\.json/);
   assert.deepEqual(listing(), ['bad.json.corrupt'], 'the bytes stay where an operator can read them');
-  assert.equal(fs.readFileSync(path.join(queueDir(), 'bad.json.corrupt'), 'utf-8'), 'not json at all');
+  assert.equal(fs.readFileSync(path.join(queueDir(KEY), 'bad.json.corrupt'), 'utf-8'), 'not json at all');
 
   // The whole point: the next flush must not pick it up again.
   const second = recorder();
-  const again = await flushQueue('tok', { fetchImpl: second.fetchImpl });
+  const again = await flushQueue(KEY, SESSION, { fetchImpl: second.fetchImpl });
   assert.deepEqual(second.posted, []);
   assert.equal(again.quarantined, 0, 'a .corrupt is outside the drain, so it is not re-quarantined');
   assert.equal(again.unreadable, 0);
@@ -101,7 +108,7 @@ test('a torn write is salvaged and posted when the prefix still names its segmen
   write('torn.json', '{"segmentId":"s:torn","token_total":15}{"segmentId":"s:old","token_tot');
   const { posted, fetchImpl } = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted, [{ segmentId: 's:torn', token_total: 15 }]);
   assert.equal(result.salvaged, 1);
@@ -117,7 +124,7 @@ test('a salvaged prefix with no segmentId is quarantined rather than posted', as
   write('anon.json', '{"token_total":15}{"segmentId":"s:old"');
   const { posted, fetchImpl } = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted, []);
   assert.equal(result.quarantined, 1);
@@ -131,11 +138,11 @@ test('a file that cannot be read is left alone, not quarantined', async (t) => {
   // an AV scanner — which is exactly what the rename retry in fs-store exists for — would
   // permanently remove a good payload from the drain. A directory gives a deterministic,
   // cross-platform read failure (EISDIR) with no chmod games.
-  fs.mkdirSync(path.join(queueDir(), 'locked.json'));
+  fs.mkdirSync(path.join(queueDir(KEY), 'locked.json'));
   write('good.json', JSON.stringify({ segmentId: 's:good' }));
   const { posted, fetchImpl } = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted.map((p) => p.segmentId), ['s:good']);
   assert.equal(result.unreadable, 1);
@@ -152,7 +159,7 @@ test('deferred counts postable reports, not dirents', async (t) => {
   let nowMs = 1_000_000;
   const fetchImpl = async () => { nowMs += 3000; return { status: 200, json: async () => ({}) }; };
 
-  const result = await flushQueue('tok', { fetchImpl, now: () => nowMs, deadline: nowMs + 4000 });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl, now: () => nowMs, deadline: nowMs + 4000 });
 
   assert.equal(result.flushed, 2);
   assert.equal(result.deferred, 1, 'one report is left, not one report plus four .tmp files');
@@ -176,7 +183,7 @@ test('a report queued under an unnamed session is neither posted nor deleted', a
     return { status: 400, json: async () => ({ message: 'sessionId must be a string' }) };
   };
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted.map((p) => p.segmentId), ['s:good'], 'the unnamed one never reached the wire');
   assert.equal(result.unnamed, 1);
@@ -184,7 +191,7 @@ test('a report queued under an unnamed session is neither posted nor deleted', a
   assert.equal(listing().includes('good.json'), false, 'and a genuinely rejected report is still deleted');
   assert.deepEqual(listing(), ['null_1-18.json'], 'left on disk for the quarantine sweep to relocate');
   assert.deepEqual(
-    JSON.parse(fs.readFileSync(path.join(queueDir(), 'null_1-18.json'), 'utf-8')),
+    JSON.parse(fs.readFileSync(path.join(queueDir(KEY), 'null_1-18.json'), 'utf-8')),
     poisoned,
     'byte-identical: nothing about it was rewritten either',
   );
@@ -197,7 +204,7 @@ test('the string "undefined" is judged by name, not by shape', async (t) => {
   write('undefined_1-2.json', JSON.stringify({ segmentId: 'undefined:1-2', sessionId: 'undefined' }));
   const { posted, fetchImpl } = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted, []);
   assert.equal(result.unnamed, 1);
@@ -212,7 +219,7 @@ test('a payload that carries no sessionId at all is still posted', async (t) => 
   write('seg.json', JSON.stringify({ segmentId: 's:1' }));
   const { posted, fetchImpl } = recorder();
 
-  const result = await flushQueue('tok', { fetchImpl });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.deepEqual(posted.map((p) => p.segmentId), ['s:1']);
   assert.equal(result.unnamed, 0);

@@ -1,6 +1,12 @@
-import { spawn as _spawn } from 'child_process';
+// A DEFAULT import, not a named one: tools/hermetic-env.mjs patches the child_process object, and
+// a named binding is snapshotted at instantiation and bypasses that guard entirely.
+import childProcess from 'child_process';
 import { canonicalPlan } from './billing.mjs';
 import { orDefault, readString } from './compat.mjs';
+
+// Read off the namespace at CALL time, not at import time, so the default `deps.spawn` is whatever
+// the object holds when the probe actually runs.
+const _spawn = (file, args, options) => childProcess.spawn(file, args, options);
 
 // Ask Codex itself which account it is using, instead of decoding the snapshot it left in
 // ~/.codex/auth.json.
@@ -17,7 +23,7 @@ import { orDefault, readString } from './compat.mjs';
 // optional. The values matched auth.json exactly on that machine (`plus`, the same uuid, the same
 // address) — so this path is not better DATA, it is a better CHANNEL: Codex may hold its
 // credentials in the OS keychain or only in its own memory, and a machine like that has no plan in
-// auth.json at all. lib/codex-account.mjs stays as the fallback tier for the same reason the
+// auth.json at all. lib/chatgpt-auth.mjs stays as the fallback tier for the same reason the
 // command calls itself `[experimental]`.
 //
 // A SHORT-LIVED HELPER, not a persistent client. It is spawned at most weekly, behind the same
@@ -283,7 +289,7 @@ export function readAccountViaAppServer(deps = {}) {
 }
 
 // Fold the live answer and the auth.json decode into ONE account object, shaped exactly like
-// lib/codex-account.mjs's return so every consumer downstream is unchanged.
+// lib/chatgpt-auth.mjs's return so every consumer downstream is unchanged.
 //
 // Live wins for the things it actually knows — plan, tier, account id, address — and defers for the
 // things it does not report: `hasStoredApiKey` is a fact about auth.json's contents, and the billing

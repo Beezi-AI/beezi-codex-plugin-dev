@@ -398,7 +398,9 @@ test('migration — a root bound to staging refuses to serve a production build'
   const source = sandbox(t, 'src-mismatch');
   legacyRoot(source);
   fs.writeFileSync(path.join(source, 'environment.json'), JSON.stringify({ version: 1, env: 'staging', apiOrigin: STAGING_API_ORIGIN }));
-  const result = ensureEnvironmentMigrated({ env: '', home: () => source });
+  // readRawCredential is stubbed even though the binding alone decides this verdict: unstubbed it
+  // reads the DEVELOPER'S OWN keychain, which is what tools/hermetic-env.mjs now records.
+  const result = ensureEnvironmentMigrated({ env: '', home: () => source, readRawCredential: () => null });
   assert.equal(result.status, 'blocked');
   assert.equal(result.reason, 'binding-mismatch');
 });
@@ -482,17 +484,21 @@ test('status — reports the binding and the migration, and never a token', (t) 
 // production namespace is adopted, unstamped, by the production build.
 
 // Forces the file backend: no native helper answers, which is also the real shape on a box with
-// no libsecret. The file it reads and writes is credentialsFile(), inside the hermetic sandbox.
+// no libsecret. The file it reads and writes is this account's credentialsFile(<key>), inside the
+// hermetic sandbox.
 const FILE_STORE_DEPS = { platform: 'linux', run: () => ({ ok: false, stdout: '' }) };
+const ACCOUNT_KEY = 'a1b2c3d4';
+const storeFile = () => credentialsFile(ACCOUNT_KEY);
 
 function withStoredCredential(t, raw) {
-  fs.writeFileSync(credentialsFile(), JSON.stringify({ token: raw }));
-  t.after(() => { try { fs.rmSync(credentialsFile(), { force: true }); } catch { /* gone */ } });
+  fs.mkdirSync(path.dirname(storeFile()), { recursive: true });
+  fs.writeFileSync(storeFile(), JSON.stringify({ token: raw }));
+  t.after(() => { try { fs.rmSync(storeFile(), { force: true }); } catch { /* gone */ } });
 }
 
 test('credentials — the real reader returns the blob unparsed, stamp and all', (t) => {
   withStoredCredential(t, stagingCredential);
-  const raw = readRawCredential(FILE_STORE_DEPS);
+  const raw = readRawCredential(ACCOUNT_KEY, FILE_STORE_DEPS);
   assert.equal(raw, stagingCredential);
   // The point of reading it raw: issuerEnvironment must see token_endpoint, which
   // getCredentials() would have filtered away by stamp long before this.
@@ -506,11 +512,11 @@ test('credentials — the real delete works INSIDE the migration run lock (lock 
   // false — leaving the staging token exactly where it must not be. Asserted, not assumed.
   withStoredCredential(t, stagingCredential);
   const outcome = withLock(runLock('env-migration'), { leaseMs: 30_000 }, () => (
-    deleteRawCredential(FILE_STORE_DEPS)
+    deleteRawCredential(ACCOUNT_KEY, FILE_STORE_DEPS)
   ));
   assert.equal(outcome.skipped, false, 'the run lock itself must be free in a fresh sandbox');
   assert.equal(outcome.value, true, 'the credential must be gone, and reported gone');
-  assert.equal(readRawCredential(FILE_STORE_DEPS), null);
+  assert.equal(readRawCredential(ACCOUNT_KEY, FILE_STORE_DEPS), null);
 });
 
 for (const record of ['environment.json', 'credentials.json', 'credential-control.json']) {

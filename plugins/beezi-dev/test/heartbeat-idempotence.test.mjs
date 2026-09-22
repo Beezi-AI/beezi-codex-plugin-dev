@@ -7,6 +7,13 @@ import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { stateDir } from '../lib/paths.mjs';
 import { acquireLock, forgetHeldLocks, sessionLock } from '../lib/single-instance-lock.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // ─────────────────────────────────────────────────────────────────────────────────────────────
 // THE MONEY QUESTION (G-3-2): a mid-turn heartbeat and the turn-end checkpoint that follows it
@@ -84,7 +91,7 @@ function rollout(home, upTo) {
 // Deliberately NOT injecting computeDelta — see the header. Everything else is stubbed so the
 // suite stays hermetic and offline.
 const deps = (file) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); },
   resolveTranscript: () => ({ transcriptPath: file, sessionId: 's1' }),
   gitImpl: () => 'https://host/org/repo.git',

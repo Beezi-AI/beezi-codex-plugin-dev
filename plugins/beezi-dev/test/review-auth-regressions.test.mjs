@@ -11,6 +11,7 @@ import { runSessionStart } from '../lib/session-start.mjs';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { usageIdentityFields } from '../lib/usage-report-codex.mjs';
 import * as diagnostics from '../lib/diagnostics.mjs';
+import { accountSession } from '../tools/account-fixtures.mjs';
 
 function home(t) {
   const before = { ...process.env };
@@ -26,46 +27,54 @@ function home(t) {
   return dir;
 }
 const gate = () => { let resolve; const promise = new Promise(r => { resolve = r; }); return { promise, resolve }; };
+// Every credential call is keyed from 0.13 on; these regressions are about one account's store.
+const KEY = 'a1b2c3d4';
+// What the index says about that account, and the session the fan-out carries for it. Both are
+// injected rather than written to disk: these cases are about the credential store and the token
+// endpoint, and a real index read would drag the one-time migration in with it.
+const ROW = { key: KEY, email: 'd@e.f', name: 'Dev', tenantName: 'W-1', clientId: 'old-client', status: 'linked' };
+const INDEXED = { listAccounts: async () => [ROW], getDefaultKey: async () => KEY };
+const SESSION = accountSession(KEY, 'synthetic-token');
 const store = { checkEnvironment: () => ({ status: 'ok' }), platform: 'unknown', run: () => { throw new Error('No native store'); } };
 const old = { client_id: 'old-client', token_endpoint: 'https://invalid.example/token', access_token: 'old-access', refresh_token: 'old-refresh', expires_at: 0 };
 const nextTokens = { access_token: 'rotated-access', refresh_token: 'rotated-refresh', expires_in: 3600 };
 
 test('F9: a stale pre-lock read does not resubmit the consumed grant', async t => {
   home(t);
-  await credentials.setCredentials(old, store);
+  await credentials.setCredentials(KEY, old, store);
   const readDone = gate(), resume = gate();
   const sent = [];
   const refreshTokens = async ({ refreshToken }) => {
     sent.push(refreshToken);
     return sent.length === 1 ? { tokens: nextTokens } : { invalidGrant: true };
   };
-  const a = getAccessToken({ ...store, refreshTokens, getCredentials: async () => {
-    const snapshot = await credentials.getCredentials(store);
+  const a = getAccessToken(KEY, { ...store, refreshTokens, getCredentials: async () => {
+    const snapshot = await credentials.getCredentials(KEY, store);
     readDone.resolve(); await resume.promise; return snapshot;
   } });
   await readDone.promise;
-  assert.equal(await getAccessToken({ ...store, refreshTokens }), 'rotated-access');
+  assert.equal(await getAccessToken(KEY, { ...store, refreshTokens }), 'rotated-access');
   resume.resolve();
   assert.equal(await a, 'rotated-access');
   assert.deepEqual(sent, ['old-refresh']);
-  assert.equal((await credentials.getCredentials(store)).access_token, 'rotated-access');
+  assert.equal((await credentials.getCredentials(KEY, store)).access_token, 'rotated-access');
 });
 
 for (const action of ['logout', 'new-login']) {
   for (const response of [{ tokens: nextTokens }, { invalidGrant: true }]) {
     test(`F10: ${action} survives an old refresh (${response.invalidGrant ? 'rejected' : 'successful'})`, async t => {
       home(t);
-      await credentials.setCredentials(old, store);
+      await credentials.setCredentials(KEY, old, store);
       const started = gate(), reply = gate();
-      const refreshing = getAccessToken({ ...store, refreshTokens: async () => {
+      const refreshing = getAccessToken(KEY, { ...store, refreshTokens: async () => {
         started.resolve(); return reply.promise;
       } });
       await started.promise;
-      await credentials.deleteCredentials(store);
-      if (action === 'new-login') await credentials.setCredentials({ ...old, client_id: 'new-client', access_token: 'new-login', expires_at: Date.now() + 3600000 }, store);
+      await credentials.deleteCredentials(KEY, store);
+      if (action === 'new-login') await credentials.setCredentials(KEY, { ...old, client_id: 'new-client', access_token: 'new-login', expires_at: Date.now() + 3600000 }, store);
       reply.resolve(response);
       await refreshing;
-      const current = await credentials.getCredentials(store);
+      const current = await credentials.getCredentials(KEY, store);
       if (action === 'logout') assert.equal(current, null);
       else {
         assert.equal(current.client_id, 'new-client');
@@ -86,26 +95,29 @@ test('F11: fallback commit remains authoritative when the old native entry retur
     if (args[0] === 'find-generic-password') return { ok: !failRead, stdout: native || '' };
     return { ok: false, stdout: '' };
   } };
-  await credentials.setCredentials(old, deps);
+  await credentials.setCredentials(KEY, old, deps);
   failRead = true;
-  await assert.rejects(credentials.getCredentials(deps), { code: 'CREDENTIALS_UNAVAILABLE' });
+  await assert.rejects(credentials.getCredentials(KEY, deps), { code: 'CREDENTIALS_UNAVAILABLE' });
   failRead = false;
   failWrite = true;
-  await credentials.setCredentials({ ...old, access_token: 'new-access' }, deps);
-  assert.equal((await credentials.getCredentials(deps)).access_token, 'new-access');
+  await credentials.setCredentials(KEY, { ...old, access_token: 'new-access' }, deps);
+  assert.equal((await credentials.getCredentials(KEY, deps)).access_token, 'new-access');
 });
 
 test('F12: transient refresh failure preserves the link and reports temporary status', async t => {
   home(t);
-  await credentials.setCredentials(old, store);
-  const auth = () => getAuthentication({ ...store, recordIssue: () => {}, refreshTokens: async () => ({ tokens: null }) });
-  const status = await linkStatus({ getAuthentication: auth, hooksStatus: () => ({ state: 'installed', registered: [] }) });
+  await credentials.setCredentials(KEY, old, store);
+  const auth = () => getAuthentication(KEY, { ...store, recordIssue: () => {}, refreshTokens: async () => ({ tokens: null }) });
+  const status = await linkStatus({ ...INDEXED, getAuthentication: auth, hooksStatus: () => ({ state: 'installed', registered: [] }) });
   assert.equal(status.state, 'unreachable');
   assert.equal(status.authState, 'unavailable');
   assert.match(describeLink(status), /temporarily/);
-  const banner = await runSessionStart({}, { getAuthentication: auth });
+  // The account is LINKED in the index but produced no session this run, which is exactly the
+  // state that used to be reported as 'this machine is not linked'. getAuthentication is what
+  // session start asks for the reason.
+  const banner = await runSessionStart({}, { ...INDEXED, linkedSessions: async () => [], getAuthentication: auth });
   assert.match(banner, /temporarily/);
-  assert.ok(await credentials.getCredentials(store));
+  assert.ok(await credentials.getCredentials(KEY, store));
 });
 
 test('F13: live sessions and quota identity agree; explicit history does not guess an owner', async t => {
@@ -119,7 +131,7 @@ test('F13: live sessions and quota identity agree; explicit history does not gue
     { type: 'event_msg', timestamp: '2026-01-01T00:00:02Z', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cached_input_tokens: 0 } } } },
   ];
   fs.writeFileSync(file, rows.map(JSON.stringify).join('\n') + '\n');
-  const deps = { getAccessToken: async () => 'synthetic-token', env: {}, gitImpl: () => null,
+  const deps = { linkedSessions: async () => [SESSION], env: {}, gitImpl: () => null,
     resolveTranscript: () => ({ sessionId: 'review-session', transcriptPath: file }), readAgents: () => ({}), findSubagentRollouts: () => [] };
   const payloads = [];
   const opts = { skipFlush: true, drainRateLimits: false, sink: p => payloads.push(p) };
@@ -138,10 +150,10 @@ test('F14: rate-limited diagnostics survive and can be delivered by a later drai
   diagnostics.recordIssue({ code: diagnostics.DIAGNOSTIC_CODES.TOKEN_REFRESH_FAILED });
   const files = () => fs.readdirSync(diagnostics.diagnosticsDir()).filter(n => n.endsWith('.json'));
   assert.equal(files().length, 1);
-  const limited = await diagnostics.flushDiagnostics('token', { postJsonImpl: async () => ({ status: 429 }) });
+  const limited = await diagnostics.flushDiagnostics(accountSession(KEY, 'token'), { postJsonImpl: async () => ({ status: 429 }) });
   assert.equal(limited.deleted, 0);
   assert.equal(files().length, 1);
-  const retry = await diagnostics.flushDiagnostics('token', { postJsonImpl: async () => ({ status: 200 }) });
+  const retry = await diagnostics.flushDiagnostics(accountSession(KEY, 'token'), { postJsonImpl: async () => ({ status: 200 }) });
   assert.equal(retry.sent, 1);
   assert.equal(files().length, 0);
 });

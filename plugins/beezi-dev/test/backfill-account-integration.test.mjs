@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { runAudit } from '../lib/session-audit.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 
 const PARENT = '11111111-1111-4111-8111-111111111111';
 const CHILD = '22222222-2222-4222-8222-222222222222';
@@ -29,7 +30,11 @@ function response(status, body, { malformed = false } = {}) {
 function writeRollout(file, records) {
   fs.mkdirSync(path.dirname(file), { recursive: true });
   fs.writeFileSync(file, records.map((record) => JSON.stringify(record)).join('\n') + '\n');
-  fs.utimesSync(file, new Date(T0), new Date(T0));
+  // mtime must land between ACTIVE_SESSION_WINDOW_MS (30 min) and MAX_SESSION_AGE_MS (30 days):
+  // newer reads as a session still being written, older as out of scope. A T0-pinned mtime fell
+  // out of the 30-day window once the wall clock passed 2026-08-31.
+  const mtime = new Date(Date.now() - 24 * 60 * 60 * 1000);
+  fs.utimesSync(file, mtime, mtime);
 }
 
 function isolatedHistory(t) {
@@ -94,8 +99,16 @@ function isolatedHistory(t) {
   ]);
 }
 
+const SESSION = accountSession(TEST_KEY, 'beezi-token');
+
 const deps = (fetchImpl) => ({
-  getAccessToken: async () => 'beezi-token',
+  // Not optional. runAudit drives the real checkpoint, whose repoRootOf shells out to `git` for
+  // every cwd it sees — unstubbed that reads the DEVELOPER'S OWN repository, which is what the
+  // hermetic backstop now records. resolveRepoRoot swallows a throwing gitImpl and falls through to
+  // its filesystem walk, so the synthetic roots below still resolve exactly as they did.
+  gitImpl: () => { throw new Error('not a git repository'); },
+  linkedSessions: async () => [SESSION],
+  getDefaultKey: async () => TEST_KEY,
   whoamiImpl: async () => ({ valid: true, trackingMode: 'audit', backfillCompleted: false }),
   recordWhoamiImpl: () => {},
   resolveTranscriptByCwdImpl: () => null,

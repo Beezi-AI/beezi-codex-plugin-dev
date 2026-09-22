@@ -9,6 +9,7 @@ import { queueDir, stateDir, trackingStateFile } from '../lib/paths.mjs';
 import { readTrackingState } from '../lib/tracking.mjs';
 import { grantConsent, diagnosticsDir } from '../lib/diagnostics.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { linkAccount, accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 import {
   acquireLock,
   inspectLock,
@@ -35,7 +36,18 @@ import {
 
 afterEach(() => forgetHeldLocks());
 
-const tmpHome = (t) => sandboxHome(t, { prefix: 'beezi-lockwire-', beforeCleanup: forgetHeldLocks });
+// The queue and the tracking cache are per account, and so are their locks:
+// `shared:queue-<key>` and `shared:tracking-<key>`. The RANKS are what this file is about and they
+// are unchanged — both are rank 3, so the sequential-not-nested property is exactly as load-bearing
+// as it was when there was one of each.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
+const tmpHome = (t) => {
+  const dir = sandboxHome(t, { prefix: 'beezi-lockwire-', beforeCleanup: forgetHeldLocks });
+  linkAccount(dir, KEY);
+  return dir;
+};
 
 // A holder that this process must not be able to recognise as its own.
 function heldElsewhere(target) {
@@ -45,7 +57,7 @@ function heldElsewhere(target) {
   return got.handle;
 }
 
-const listQueue = () => (fs.existsSync(queueDir()) ? fs.readdirSync(queueDir()).sort() : []);
+const listQueue = () => (fs.existsSync(queueDir(KEY)) ? fs.readdirSync(queueDir(KEY)).sort() : []);
 const statePath = (id) => path.join(stateDir(), `${id}.json`);
 const readState = (id) => JSON.parse(fs.readFileSync(statePath(id), 'utf-8'));
 const writeState = (id, state) => {
@@ -78,7 +90,7 @@ function stubTranscript(home) {
 }
 
 const deps = (home, segments, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); },
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 's1' }),
   computeDelta: () => ({ nextCursor: 4, segments, apiErrorEvents: [] }),
@@ -222,13 +234,13 @@ test("an EXPIRED lease is not a lost lock: the state write still commits", async
 
 test('a flush whose queue lock is held elsewhere reads no file and posts nothing', async (t) => {
   tmpHome(t);
-  fs.mkdirSync(queueDir(), { recursive: true });
-  fs.writeFileSync(path.join(queueDir(), 'seg-1.json'), JSON.stringify({ segmentId: 's:1', sessionId: 's1' }));
+  fs.mkdirSync(queueDir(KEY), { recursive: true });
+  fs.writeFileSync(path.join(queueDir(KEY), 'seg-1.json'), JSON.stringify({ segmentId: 's:1', sessionId: 's1' }));
   const posted = [];
   const fetchImpl = async (url, init) => { posted.push(JSON.parse(init.body)); return httpRes(200); };
 
-  const holder = heldElsewhere(sharedLock('queue'));
-  const blocked = await flushQueue('tok', { fetchImpl });
+  const holder = heldElsewhere(sharedLock(`queue-${KEY}`));
+  const blocked = await flushQueue(KEY, SESSION, { fetchImpl });
 
   assert.equal(blocked.lockSkipped, true);
   assert.equal(blocked.lockReason, 'held');
@@ -238,7 +250,7 @@ test('a flush whose queue lock is held elsewhere reads no file and posts nothing
 
   assert.equal(holder.release().ok, true);
   forgetHeldLocks();
-  const free = await flushQueue('tok', { fetchImpl });
+  const free = await flushQueue(KEY, SESSION, { fetchImpl });
   assert.equal(free.flushed, 1);
   assert.equal(posted.length, 1);
   assert.deepEqual(listQueue(), []);
@@ -246,10 +258,10 @@ test('a flush whose queue lock is held elsewhere reads no file and posts nothing
 
 test('the dark-mode verdict is written OUTSIDE the queue lock, so a 403 still reaches tracking.json', async (t) => {
   tmpHome(t);
-  fs.mkdirSync(queueDir(), { recursive: true });
-  fs.writeFileSync(path.join(queueDir(), 'seg-1.json'), JSON.stringify({ segmentId: 's:1', sessionId: 's1' }));
+  fs.mkdirSync(queueDir(KEY), { recursive: true });
+  fs.writeFileSync(path.join(queueDir(KEY), 'seg-1.json'), JSON.stringify({ segmentId: 's:1', sessionId: 's1' }));
 
-  const result = await flushQueue('tok', {
+  const result = await flushQueue(KEY, SESSION, {
     fetchImpl: async () => httpRes(403, { code: 'TRACKING_DISABLED', message: 'audit mode' }),
   });
 
@@ -258,8 +270,8 @@ test('the dark-mode verdict is written OUTSIDE the queue lock, so a 403 still re
   // the queue lock the drain holds. Called from inside the drain it would be refused with
   // 'lock-order' (permanent, never retried) and this file would never be written, so the tenant
   // would go on being hammered for every queued report forever.
-  assert.equal(fs.existsSync(trackingStateFile()), true, 'the verdict was recorded, not swallowed');
-  const state = readTrackingState();
+  assert.equal(fs.existsSync(trackingStateFile(KEY)), true, 'the verdict was recorded, not swallowed');
+  const state = readTrackingState(KEY);
   assert.equal(state.trackingMode, 'disabled');
   assert.equal(state.reason, 'audit mode');
   assert.deepEqual(listQueue(), ['seg-1.json'], 'and the files are HELD, not dropped');
@@ -267,8 +279,8 @@ test('the dark-mode verdict is written OUTSIDE the queue lock, so a 403 still re
 
 test('THE PRODUCTION PATH: session(2) → queue(3) → tracking(3) in one process', async (t) => {
   tmpHome(t);
-  fs.mkdirSync(queueDir(), { recursive: true });
-  fs.writeFileSync(path.join(queueDir(), 'seg-1.json'), JSON.stringify({ segmentId: 's:1', sessionId: 's1' }));
+  fs.mkdirSync(queueDir(KEY), { recursive: true });
+  fs.writeFileSync(path.join(queueDir(KEY), 'seg-1.json'), JSON.stringify({ segmentId: 's:1', sessionId: 's1' }));
 
   // What a Stop hook actually does: runCheckpoint holds the rank-2 session lock and calls
   // flushQueue from inside it, which takes rank-3 `queue`, releases it, and then records the
@@ -279,7 +291,7 @@ test('THE PRODUCTION PATH: session(2) → queue(3) → tracking(3) in one proces
   assert.equal(session.ok, true);
   let insideQueueLock = null;
 
-  const result = await flushQueue('tok', {
+  const result = await flushQueue(KEY, SESSION, {
     fetchImpl: async () => {
       insideQueueLock = heldLocks().map((l) => l.rank).sort();
       return httpRes(403, { code: 'TRACKING_DISABLED', message: 'audit mode' });
@@ -289,7 +301,7 @@ test('THE PRODUCTION PATH: session(2) → queue(3) → tracking(3) in one proces
   assert.deepEqual(insideQueueLock, [2, 3], 'the drain runs holding exactly session + queue');
   // If the queue lock were still held here, this write would be refused as 'lock-order'.
   assert.deepEqual(result.trackingDisabledWrite, { written: true, skipped: false, reason: null });
-  assert.equal(readTrackingState().trackingMode, 'disabled');
+  assert.equal(readTrackingState(KEY).trackingMode, 'disabled');
   assert.deepEqual(heldLocks().map((l) => l.rank), [2], 'and the queue lock was handed back');
 
   session.handle.release();
@@ -298,10 +310,10 @@ test('THE PRODUCTION PATH: session(2) → queue(3) → tracking(3) in one proces
 test('a quarantined queue file is recorded as a diagnostic, not only counted in memory', async (t) => {
   tmpHome(t);
   grantConsent();
-  fs.mkdirSync(queueDir(), { recursive: true });
-  fs.writeFileSync(path.join(queueDir(), 'bad.json'), 'not json at all');
+  fs.mkdirSync(queueDir(KEY), { recursive: true });
+  fs.writeFileSync(path.join(queueDir(KEY), 'bad.json'), 'not json at all');
 
-  const result = await flushQueue('tok', { fetchImpl: async () => httpRes(200) });
+  const result = await flushQueue(KEY, SESSION, { fetchImpl: async () => httpRes(200) });
   assert.equal(result.quarantined, 1);
 
   const events = fs.readdirSync(diagnosticsDir())
