@@ -5,6 +5,13 @@ import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // The report payload itself: what gets enqueued, under which remote and segment id, and how a
 // session rename is pushed after the fact. computeDelta is injected — the transcript parsing has
@@ -12,8 +19,8 @@ import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 const tmpHome = (t) => sandboxHome(t, 'beezi-cp-');
 
-const queued = () => fs.readdirSync(queueDir()).map((f) =>
-  JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));
+const queued = () => fs.readdirSync(queueDir(KEY)).map((f) =>
+  JSON.parse(fs.readFileSync(path.join(queueDir(KEY), f), 'utf-8')));
 const readState = (id) => JSON.parse(fs.readFileSync(path.join(stateDir(), `${id}.json`), 'utf-8'));
 const writeState = (id, state) => {
   fs.mkdirSync(stateDir(), { recursive: true });
@@ -44,7 +51,7 @@ const seg = (over = {}) => ({
 });
 
 const deps = (home, segments, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); }, // keep payloads on disk
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 's1' }),
   computeDelta: () => ({ nextCursor: 4, segments, apiErrorEvents: [] }),
@@ -58,7 +65,7 @@ test('an unlinked machine enqueues nothing and never parses a transcript', async
   const { enqueued, flush } = await runCheckpoint(
     { session_id: 's1', cwd: home },
     deps(home, [seg()], {
-      getAccessToken: async () => null,
+      linkedSessions: async () => [],
       computeDelta: () => { parsed = true; return { nextCursor: 4, segments: [], apiErrorEvents: [] }; },
     }),
   );
@@ -264,7 +271,7 @@ test('an unchanged session name does not replay the anchor every turn', async (t
     { session_id: 's1', cwd: home },
     deps(home, [seg()], { resolveSessionName: () => 'steady title' }),
   );
-  const before = fs.readdirSync(queueDir()).length;
+  const before = fs.readdirSync(queueDir(KEY)).length;
 
   await runCheckpoint(
     { session_id: 's1', cwd: home },
@@ -273,7 +280,7 @@ test('an unchanged session name does not replay the anchor every turn', async (t
       resolveSessionName: () => 'steady title',
     }),
   );
-  assert.equal(fs.readdirSync(queueDir()).length, before, 'nothing re-queued');
+  assert.equal(fs.readdirSync(queueDir(KEY)).length, before, 'nothing re-queued');
 });
 
 test('an unserializable transaction publishes nothing and preserves the cursor', async (t) => {
@@ -336,7 +343,7 @@ test('the drain is handed the hook deadline, not just a per-request timeout', as
     { session_id: 's1', cwd: home },
     deps(home, [seg()], {
       now: () => 1_000_000,
-      drainRateLimitSnapshots: async (_token, o) => { opts = o; return { posted: 0 }; },
+      drainRateLimitSnapshots: async (_key, _session, o) => { opts = o; return { posted: 0 }; },
     }),
     { drainRateLimits: true, budgetMs: 5000 },
   );
@@ -350,7 +357,7 @@ test('an unbudgeted drain is given no deadline at all', async (t) => {
   let opts = null;
   await runCheckpoint(
     { session_id: 's1', cwd: home },
-    deps(home, [seg()], { drainRateLimitSnapshots: async (_token, o) => { opts = o; return { posted: 0 }; } }),
+    deps(home, [seg()], { drainRateLimitSnapshots: async (_key, _session, o) => { opts = o; return { posted: 0 }; } }),
     { drainRateLimits: true },
   );
   assert.equal('deadline' in opts, false, 'the CLI path drains the whole queue');
@@ -452,7 +459,7 @@ test('a session that cannot be named is refused before it writes anything', asyn
   assert.equal(result.unnamedSession, true, 'reported as a refusal, not as a silent empty result');
   assert.equal(result.enqueued, 0);
   assert.ok(!fs.existsSync(path.join(stateDir(), 'null.json')), 'no state/null.json for the next session to inherit');
-  assert.equal(fs.existsSync(queueDir()) ? fs.readdirSync(queueDir()).length : 0, 0, 'and no queue/null_*.json either');
+  assert.equal(fs.existsSync(queueDir(KEY)) ? fs.readdirSync(queueDir(KEY)).length : 0, 0, 'and no queue/null_*.json either');
 });
 
 test('a reserved-word session id is refused too, not treated as a name', async (t) => {

@@ -1,11 +1,11 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  readCodexAccount,
+  readChatgptAuth,
   readCodexAuthMode,
   readCodexAuthSignals,
   normalizeCodexPlan,
-} from '../lib/codex-account.mjs';
+} from '../lib/chatgpt-auth.mjs';
 
 function jwt(payload) {
   const body = Buffer.from(JSON.stringify(payload)).toString('base64url');
@@ -21,7 +21,7 @@ function authFileWith(payload, authMode = 'chatgpt') {
 const AUTH_CLAIM = 'https://api.openai.com/auth';
 
 test('reads the account ID from the claim, falling back to tokens.account_id, without leaking tokens', () => {
-  const claimed = readCodexAccount({
+  const claimed = readChatgptAuth({
     exists: () => true,
     readFile: () => JSON.stringify({ auth_mode: 'chatgpt', tokens: {
       account_id: 'token-account', access_token: 'SECRET', refresh_token: 'SECRET',
@@ -31,7 +31,7 @@ test('reads the account ID from the claim, falling back to tokens.account_id, wi
   assert.equal(claimed.accountId, 'claim-account');
   assert.doesNotMatch(JSON.stringify(claimed), /SECRET/);
 
-  const undecodable = readCodexAccount({
+  const undecodable = readChatgptAuth({
     exists: () => true,
     readFile: () => JSON.stringify({ auth_mode: 'chatgpt', tokens: {
       account_id: 'token-account', id_token: 'invalid', access_token: 'SECRET', refresh_token: 'SECRET',
@@ -42,7 +42,7 @@ test('reads the account ID from the claim, falling back to tokens.account_id, wi
 });
 
 test('keeps the account ID even when the subscription has expired', () => {
-  const account = readCodexAccount(authFileWith({
+  const account = readChatgptAuth(authFileWith({
     exp: 1, [AUTH_CLAIM]: { chatgpt_account_id: 'claim-account', chatgpt_plan_type: 'plus' },
   }));
   assert.equal(account.accountId, 'claim-account');
@@ -56,7 +56,7 @@ test('extracts the ChatGPT plan and subscription expiry from the id_token', () =
       chatgpt_subscription_active_until: '2026-07-20T10:39:54+00:00',
     },
   });
-  const account = readCodexAccount(deps);
+  const account = readChatgptAuth(deps);
   assert.equal(account.plan, 'plus');
   assert.equal(account.subscriptionType, 'plus');
   assert.equal(account.authMode, 'chatgpt');
@@ -65,19 +65,19 @@ test('extracts the ChatGPT plan and subscription expiry from the id_token', () =
 
 test('an unknown plan type normalizes to unknown with a null subscriptionType', () => {
   const deps = authFileWith({ [AUTH_CLAIM]: { chatgpt_plan_type: 'mystery' } });
-  const account = readCodexAccount(deps);
+  const account = readChatgptAuth(deps);
   assert.equal(account.plan, 'unknown');
   assert.equal(account.subscriptionType, null);
 });
 
 test('falls back to token exp when no subscription window is present', () => {
   const deps = authFileWith({ exp: 1893456000, [AUTH_CLAIM]: { chatgpt_plan_type: 'pro' } });
-  const account = readCodexAccount(deps);
+  const account = readChatgptAuth(deps);
   assert.equal(account.expiresAt, 1893456000 * 1000);
 });
 
 test('returns null when auth.json is absent', () => {
-  const account = readCodexAccount({ exists: () => false });
+  const account = readChatgptAuth({ exists: () => false });
   assert.equal(account, null);
 });
 
@@ -91,7 +91,7 @@ test('the account carries the presence-only key signal on the decoded shape', ()
     OPENAI_API_KEY: 'sk-live-SECRET',
     tokens: { id_token: jwt({ [AUTH_CLAIM]: { chatgpt_plan_type: 'plus' } }) },
   });
-  const account = readCodexAccount({ readFile: () => content, exists: () => true, authFile: '/x' });
+  const account = readChatgptAuth({ readFile: () => content, exists: () => true, authFile: '/x' });
   assert.equal(account.plan, 'plus', 'the decoded shape — authNs was present');
   assert.equal(account.authMode, null);
   assert.equal(account.hasStoredApiKey, true);
@@ -102,12 +102,12 @@ test('the account carries the presence-only key signal on the decoded shape', ()
 // api-key machine. It is exactly the machine whose billing source only the stored key can settle.
 test('the account carries the key signal on the undecodable-id_token shape too', () => {
   const withKey = JSON.stringify({ auth_mode: null, OPENAI_API_KEY: 'sk-live-xyz', tokens: {} });
-  const keyed = readCodexAccount({ readFile: () => withKey, exists: () => true, authFile: '/x' });
+  const keyed = readChatgptAuth({ readFile: () => withKey, exists: () => true, authFile: '/x' });
   assert.equal(keyed.plan, null, 'the early-return shape — no auth claim to decode');
   assert.equal(keyed.hasStoredApiKey, true);
 
   const without = JSON.stringify({ auth_mode: null, tokens: { id_token: 'not.a.jwt' } });
-  const bare = readCodexAccount({ readFile: () => without, exists: () => true, authFile: '/x' });
+  const bare = readChatgptAuth({ readFile: () => without, exists: () => true, authFile: '/x' });
   assert.equal(bare.plan, null);
   assert.equal(bare.hasStoredApiKey, false, 'absent is false, never undefined');
 });
@@ -122,7 +122,7 @@ test('an account and readCodexAuthSignals agree on the same auth.json', () => {
     { auth_mode: null, OPENAI_API_KEY: '' },
   ]) {
     const deps = { readFile: () => JSON.stringify(auth), exists: () => true, authFile: '/x' };
-    const a = readCodexAccount(deps);
+    const a = readChatgptAuth(deps);
     const s = readCodexAuthSignals(deps);
     assert.deepEqual(
       { authMode: a.authMode, hasStoredApiKey: a.hasStoredApiKey },

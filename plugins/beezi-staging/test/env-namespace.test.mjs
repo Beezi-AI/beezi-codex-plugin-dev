@@ -74,6 +74,7 @@ function child(t, source, overrides = {}) {
 const REPORT = [
   `import * as paths from ${JSON.stringify(PATHS)};`,
   `import { SERVICE } from ${JSON.stringify(CREDENTIALS)};`,
+  "const PROBE = '0123abcd';",
   'process.stdout.write(JSON.stringify({',
   '  env: paths.BEEZI_ENV,',
   '  suffix: paths.environment.envSuffix(),',
@@ -81,9 +82,12 @@ const REPORT = [
   '  root: paths.beeziCodexHome(),',
   '  codexHome: paths.codexHome(),',
   '  stores: [',
-  '    paths.queueDir(), paths.stateDir(), paths.repoMapFile(), paths.credentialsFile(),',
-  '    paths.billingConfigFile(), paths.auditLedgerFile(), paths.usageObservationsFile(),',
-  '    paths.trackingStateFile(), paths.hookLauncherDir(),',
+  // The per-account stores take a key; a probe one is supplied rather than skipping them, or the
+  // surface this asserts the suffix over would silently shrink to the machine-level files.
+  '    paths.queueDir(PROBE), paths.stateDir(), paths.repoMapFile(), paths.credentialsFile(PROBE),',
+  '    paths.legacyCredentialsFile(),',
+  '    paths.billingConfigFile(), paths.auditLedgerFile(PROBE), paths.usageObservationsFile(),',
+  '    paths.trackingStateFile(PROBE), paths.hookLauncherDir(),',
   '  ],',
   '  pid: process.pid,',
   '}));',
@@ -219,9 +223,9 @@ test('the Credential Manager scripts name the SUFFIXED target under a variant', 
     "  return { ok: false, stdout: '' };",
     '};',
     "const deps = { platform: 'win32', run };",
-    'await getCredentials(deps);',
-    "await setCredentials({ access_token: 'a' }, deps);",
-    'await deleteCredentials(deps);',
+    "await getCredentials('a1b2c3d4', deps);",
+    "await setCredentials('a1b2c3d4', { access_token: 'a' }, deps);",
+    "await deleteCredentials('a1b2c3d4', deps);",
     'process.stdout.write(JSON.stringify({ service: SERVICE, scripts }));',
   ].join('\n');
   const res = child(t, source, { BEEZI_ENV: 'staging' });
@@ -229,24 +233,29 @@ test('the Credential Manager scripts name the SUFFIXED target under a variant', 
   assert.equal(res.json.service, 'beezi-codex-staging');
   const credMan = res.json.scripts.filter((s) => /Cred(Read|Write|Delete)/.test(s));
   assert.ok(credMan.length >= 3, `expected all three CredMan scripts, got ${credMan.length}`);
+  // The target is `<service>:<key>` since the store became keyed; the SUFFIX is what this asserts.
   for (const script of credMan) {
-    assert.ok(script.includes("'beezi-codex-staging'"), `a script kept the production target:\n${script}`);
-    assert.ok(!/'beezi-codex'/.test(script), `a script still addresses production:\n${script}`);
+    assert.ok(script.includes("'beezi-codex-staging:a1b2c3d4'"), `a script kept the production target:\n${script}`);
+    assert.ok(!/'beezi-codex[:']/.test(script), `a script still addresses production:\n${script}`);
   }
 });
 
 // ── BEEZI_CODEX_HOME is an explicit FULL root: a crossed binding must prevent upload ──────────
 
+// The file store moved under accounts/<key>/ when the credential store became keyed, so the shared
+// root these two children fight over is that account's file rather than the root-level one.
+const SHARED_KEY = 'a1b2c3d4';
+
 const WRITE_CREDS = [
   `import { setCredentials } from ${JSON.stringify(CREDENTIALS)};`,
   `import { credentialsFile, BEEZI_ENV } from ${JSON.stringify(PATHS)};`,
   "const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };",
-  'const where = await setCredentials({',
+  `const where = await setCredentials('${SHARED_KEY}', {`,
   "  client_id: 'cid', redirect_uri: 'http://127.0.0.1:1/cb',",
   "  token_endpoint: 'https://issuer.test/token', access_token: 'at', refresh_token: 'rt',",
   '  expires_at: Date.now() + 3600000,',
   '}, deps);',
-  'process.stdout.write(JSON.stringify({ where, file: credentialsFile(), env: BEEZI_ENV }));',
+  `process.stdout.write(JSON.stringify({ where, file: credentialsFile('${SHARED_KEY}'), env: BEEZI_ENV }));`,
 ].join('\n');
 
 const READ_CREDS = [
@@ -254,10 +263,10 @@ const READ_CREDS = [
   `import { getAccessToken } from ${JSON.stringify(TOKEN)};`,
   `import { credentialsFile, BEEZI_ENV } from ${JSON.stringify(PATHS)};`,
   "const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };",
-  'const creds = await getCredentials(deps);',
-  "const token = await getAccessToken({ ...deps, getCredentials: () => getCredentials(deps) });",
+  `const creds = await getCredentials('${SHARED_KEY}', deps);`,
+  `const token = await getAccessToken('${SHARED_KEY}', { ...deps, getCredentials: () => getCredentials('${SHARED_KEY}', deps) });`,
   'process.stdout.write(JSON.stringify({',
-  '  env: BEEZI_ENV, file: credentialsFile(), creds, token,',
+  `  env: BEEZI_ENV, file: credentialsFile('${SHARED_KEY}'), creds, token,`,
   '}));',
 ].join('\n');
 
@@ -271,7 +280,7 @@ test('two environments sharing one BEEZI_CODEX_HOME cannot lift each other\'s to
   const wrote = child(t, WRITE_CREDS, { BEEZI_ENV: 'staging', BEEZI_CODEX_HOME: shared });
   assert.equal(wrote.status, 0, wrote.stderr);
   assert.equal(wrote.json.env, 'staging');
-  assert.equal(wrote.json.file, path.join(shared, 'credentials.json'));
+  assert.equal(wrote.json.file, path.join(shared, 'accounts', SHARED_KEY, 'credentials.json'));
   assert.ok(fs.existsSync(wrote.json.file), 'the staging install wrote into the shared root');
 
   const staging = child(t, READ_CREDS, { BEEZI_ENV: 'staging', BEEZI_CODEX_HOME: shared });

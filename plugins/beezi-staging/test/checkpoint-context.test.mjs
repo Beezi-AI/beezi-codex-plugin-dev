@@ -7,6 +7,13 @@ import { queueDir } from '../lib/paths.mjs';
 import { writeAgent } from '../lib/subagent-state.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // G-4-4, the checkpoint half: context_peak_tokens / context_final_tokens / context_final_model ride
 // the main-agent segment and are STRIPPED from a subagent's.
@@ -23,8 +30,8 @@ import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 
 const tmpHome = (t) => sandboxHome(t, 'beezi-cpctx-');
 
-const queued = () => fs.readdirSync(queueDir()).map((f) =>
-  JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));
+const queued = () => fs.readdirSync(queueDir(KEY)).map((f) =>
+  JSON.parse(fs.readFileSync(path.join(queueDir(KEY), f), 'utf-8')));
 
 const T0 = Date.parse('2026-08-06T19:41:50.000Z');
 const at = (ms) => new Date(T0 + ms).toISOString();
@@ -98,7 +105,7 @@ const parentDelta = (segments) => (p, from, resolvers) =>
     : { nextCursor: 4, segments, apiErrorEvents: [] });
 
 const deps = (home, segments, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); }, // keep payloads on disk
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 'parent-1' }),
   computeDelta: parentDelta(segments),

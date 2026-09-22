@@ -32,8 +32,8 @@ export const TRUST_STEP = 'run /hooks in Codex, review the Beezi entries, and tr
 // neither "it works now" nor "it still does not exist" is established. See measurement task M-1-1.
 // It could not cover a SIGKILL either way, which is the case a last-chance flush would have to
 // survive. The residual is real but small: on a mid-turn kill, segments already queued on disk
-// survive and the next session's start-up flush retries them (queueDir() is machine-wide, not
-// per-project), while the tail since the last checkpoint waits for a later checkpoint of that
+// survive and the next session's start-up flush retries them (a queue is per ACCOUNT, never per
+// project), while the tail since the last checkpoint waits for a later checkpoint of that
 // session or for the manual track flow. That is a cost, not "nothing is lost".
 //
 // SubagentStart/SubagentStop record identity and timing for spawned agents. They do NOT bill them —

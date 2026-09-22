@@ -1,5 +1,5 @@
 import path from 'path';
-import { getAccessToken as _getAccessToken } from './token.mjs';
+import { linkedSessions as _linkedSessions, listAccounts as _listAccounts } from './accounts.mjs';
 import { runCheckpoint as _runCheckpoint } from './checkpoint.mjs';
 import { currentBranch as _currentBranch, taskFromBranch } from './git.mjs';
 import {
@@ -42,7 +42,13 @@ export function resolveTrackTarget(cwd, deps = {}) {
 }
 
 // The manual track flow for one session: checkpoint, flush, word the outcome.
-// Returns { ok, message } (message unprefixed); expected failures never throw.
+// Returns { ok, message, lines } (unprefixed); expected failures never throw.
+//
+// `lines` is the SAME text as `message`, split per account and each carrying its own verdict. The
+// two are not redundant: with several accounts linked, "analytics saved" and "the server rejected
+// this report" can both be true of one run, so a caller that printed one marker over the whole
+// block would label the account that succeeded a failure. `message` stays for every caller that
+// only needs the text.
 //
 // No budgetMs is passed to the checkpoint: hooks bound their network work because Codex kills an
 // overrunning hook, but a user waiting at a terminal would rather see the whole queue drained.
@@ -54,12 +60,10 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
   // one the script calls, but this is the function that turns an id into `state/<id>.json` and a
   // segmentId, so it refuses rather than trust every future caller to have checked.
   if (!isUsableSessionId(sessionId)) {
-    return {
-      ok: false,
-      message: 'Beezi: could not identify this session, so there is nothing to save it under.',
-    };
+    return refusal('Beezi: could not identify this session, so there is nothing to save it under.');
   }
-  const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
+  const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
+  const listAccounts = orDefault(deps.listAccounts, _listAccounts);
   const runCheckpoint = orDefault(deps.runCheckpoint, _runCheckpoint);
   const currentBranch = orDefault(deps.currentBranch, _currentBranch);
 
@@ -72,12 +76,35 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
   if (label === undefined || label === null) label = branch;
   if (label === undefined || label === null) label = path.basename(orDefault(cwd, '')) || cwd;
 
-  const token = await getAccessToken().catch(() => null);
-  if (!token) {
-    return { ok: false, message: 'Beezi: this machine is not linked. Sign in to Beezi first.' };
+  let sessions;
+  try { sessions = orDefault(await listSessions(deps), []); } catch { sessions = []; }
+  // "Not linked" is only true when nothing IS linked. linkedSessions() also comes back empty when
+  // every linked account's token is momentarily unusable at once — a locked keyring, expired
+  // refreshes, revoked grants — and telling a user with two accounts in the index that their
+  // machine is not linked is the same falsehood scripts/sync.mjs, scripts/backfill.mjs and the MCP
+  // bridge stopped printing. The index is the only thing that tells the two apart.
+  if (sessions.length === 0) {
+    let rows;
+    try {
+      rows = orDefault(await listAccounts(deps), []);
+    } catch (error) {
+      // A THIRD state, and collapsing it into the empty-index branch would put the falsehood
+      // straight back: readIndex throws for a migration in progress, an unreadable accounts.json
+      // and a refused lock, and none of those means nothing is linked. Same treatment
+      // lib/mcp-bridge.mjs gives its own blocked read — the error keeps its own words.
+      const detail = error && error.message ? error.message : String(error);
+      return refusal(`Beezi: could not read this machine's linked accounts: ${detail}`);
+    }
+    return refusal(rows.length === 0
+      ? 'Beezi: this machine is not linked. Sign in to Beezi first.'
+      : 'Beezi: could not use the saved credentials for any linked Beezi account. Sign in to Beezi again.');
   }
 
-  const { enqueued, flush, outcome, reason } = await runCheckpoint(
+  // ONE checkpoint, not one per account. The delta is a read of this session's transcript against
+  // a cursor that the first run would advance, so a second pass would find nothing left to bill
+  // and the later accounts would silently receive an empty report. runCheckpoint fans the one
+  // delta out into every allowed account's queue itself and hands back a drain result each.
+  const { enqueued, flushes, outcome, reason } = await runCheckpoint(
     {
       session_id: sessionId,
       transcript_path: transcriptPath,
@@ -88,19 +115,46 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
   );
 
   if (outcome !== 'committed') {
-    return { ok: false, message: `Beezi: checkpoint ${outcome || 'deferred'} (${reason || 'not committed'}); retry tracking.` };
+    return refusal(`Beezi: checkpoint ${outcome || 'deferred'} (${reason || 'not committed'}); retry tracking.`);
   }
 
-  if (flush && flush.failed) {
-    return { ok: false, message: 'Beezi: could not reach the server — analytics will be retried automatically.' };
+  // One outcome per account. With a single account linked the lines are byte-identical to what a
+  // single-account install has always printed; with several, each is named, because "saved" and
+  // "the server rejected this report" can both be true of the same run.
+  const drains = orDefault(flushes, []);
+  const many = drains.length > 1;
+  const byKey = new Map(sessions.map((session) => [session.key, session]));
+  const lines = [];
+  let ok = true;
+  for (const drain of drains) {
+    const who = byKey.get(drain.key);
+    const name = who ? orDefault(orDefault(who.tenantName, who.email), who.key) : drain.key;
+    const saved = orDefault(drain.flushed, 0);
+    let lineOk = true;
+    let text;
+    if (drain.failed) {
+      lineOk = false;
+      text = 'Beezi: could not reach the server — analytics will be retried automatically.';
+    } else if (drain.rejected) {
+      lineOk = false;
+      text = `Beezi: ${orDefault(drain.lastError, 'the server rejected this report')}.`;
+    } else if (enqueued === 0 && saved === 0) {
+      text = `Beezi: nothing new to save for ${label} — already up to date.`;
+    } else {
+      text = `Beezi: analytics saved for ${label} (${saved} segment${saved === 1 ? '' : 's'}).`;
+    }
+    if (!lineOk) ok = false;
+    lines.push({ ok: lineOk, text: many ? `${name} — ${text}` : text });
   }
-  if (flush && flush.rejected) {
-    return { ok: false, message: `Beezi: ${orDefault(flush.lastError, 'the server rejected this report')}.` };
+  if (lines.length === 0) {
+    const nothing = `Beezi: nothing new to save for ${label} — already up to date.`;
+    return { ok: true, message: nothing, lines: [{ ok: true, text: nothing }] };
   }
+  return { ok, message: lines.map((line) => line.text).join('\n'), lines };
+}
 
-  const saved = orDefault((flush || {}).flushed, 0);
-  if (enqueued === 0 && saved === 0) {
-    return { ok: true, message: `Beezi: nothing new to save for ${label} — already up to date.` };
-  }
-  return { ok: true, message: `Beezi: analytics saved for ${label} (${saved} segment${saved === 1 ? '' : 's'}).` };
+// An outcome that belongs to no account: the session could not be identified, nothing is linked, or
+// the checkpoint never committed. One line, and it is not a success.
+function refusal(message) {
+  return { ok: false, message, lines: [{ ok: false, text: message }] };
 }

@@ -3,19 +3,27 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import {
-  setMachineClientId,
-  getMachineClientId,
-  machineHeaders,
-} from '../lib/machine-identity.mjs';
+import { machineHeaders } from '../lib/machine-identity.mjs';
 import { loadLedger, saveLedger, markImported, isImported } from '../lib/audit-ledger.mjs';
 import { AGENT } from '../lib/config.mjs';
+import { linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
 
-// G-8-5. lib/machine-identity.mjs had zero coverage. It is 29 lines holding ONE module-level
-// variable — this process's OAuth client id — and that variable is the binding key for the
-// backfill ledger, where getting it wrong is a permanent, unrecoverable outcome
+// The ledger is the account's; the IDENTITY it binds to is the login's client id. These cases are
+// about the second of those, so they all use one account and vary the identity.
+const KEY = TEST_KEY;
+
+// G-8-5. lib/machine-identity.mjs had zero coverage. It USED to hold one module-level variable —
+// this process's OAuth client id — set by whoever loaded credentials and read by the HTTP helpers
+// and by the backfill ledger, where getting it wrong is a permanent, unrecoverable outcome
 // (lib/audit-ledger.mjs:15-18: a replayed ledger "would ... seal the new tenant's pull EMPTY
 // (there is no reopen)").
+//
+// That variable is GONE as of the multi-account keying. With several accounts linked, a
+// process-global would attach one account's X-Beezi-Client to another account's bearer and the
+// server would bind the wrong machine row — so the id now travels with the token, as the
+// { token, clientId } session lib/http.mjs demands. The tests below therefore pin two things: the
+// header construction, now a pure function of its argument, and the ledger hazard, which survives
+// the change because it was never about the global — it was about an identity that is null.
 //
 // HERMETICITY. machineHeaders() calls os.hostname(), which is real machine state and is not
 // injectable — `os` is a module-level import at machine-identity.mjs:1. Every test here stubs
@@ -28,111 +36,94 @@ let savedHostname;
 beforeEach(() => {
   savedHostname = os.hostname;
   os.hostname = () => FAKE_HOST;
-  // Module-level state is exactly what makes a suite order-dependent: without this, test N's
-  // client id decides test N+1's headers. Reset before AND after, so a bare `node --test` of a
-  // single test in this file starts from the same place as a full run.
-  setMachineClientId(null);
 });
 
 afterEach(() => {
   os.hostname = savedHostname;
-  setMachineClientId(null);
 });
 
-// ── 1. the X-Beezi-Client truthiness gate (machine-identity.mjs:27) ─────────────────────────────
+// ── 1. the X-Beezi-Client truthiness gate ───────────────────────────────────────────────────────
 
-test('1. machineHeaders omits X-Beezi-Client until an id is set, then carries it', () => {
-  const before = machineHeaders();
+// There is no module state left to leak, so this is now a pure input/output assertion: the SAME
+// call that omits the header for one argument carries it for another, with nothing in between.
+test('1. machineHeaders omits X-Beezi-Client without an id and carries the one it is given', () => {
+  const none = machineHeaders(null);
   assert.strictEqual(
-    Object.prototype.hasOwnProperty.call(before, 'X-Beezi-Client'),
+    Object.prototype.hasOwnProperty.call(none, 'X-Beezi-Client'),
     false,
-    'an unset id must not appear as a header at all — not as null, not as ""',
+    'an absent id must not appear as a header at all — not as null, not as ""',
   );
 
-  setMachineClientId('client-abc');
-  assert.strictEqual(machineHeaders()['X-Beezi-Client'], 'client-abc');
+  assert.strictEqual(machineHeaders('client-abc')['X-Beezi-Client'], 'client-abc');
 });
 
-// :27 is `if (clientId)`, a truthiness check rather than a null check, so an empty-string client
-// id is dropped as silently as an unset one. Pinned because the two are indistinguishable to the
-// server and only this assertion says which values reach it.
+// `if (clientId)` is a truthiness check rather than a null check, so an empty-string client id is
+// dropped as silently as an absent one. Pinned because the two are indistinguishable to the server
+// and only this assertion says which values reach it.
 test('1b. an empty-string client id is treated as absent', () => {
-  setMachineClientId('');
-  assert.strictEqual(getMachineClientId(), '', 'the value is stored verbatim — "" is not null');
   assert.strictEqual(
-    Object.prototype.hasOwnProperty.call(machineHeaders(), 'X-Beezi-Client'),
+    Object.prototype.hasOwnProperty.call(machineHeaders(''), 'X-Beezi-Client'),
     false,
-    'but the header is omitted, because :27 tests truthiness',
   );
 });
 
-// ── 2. the null normalisation lib/audit-ledger.mjs:26 branches on ───────────────────────────────
-
-// `orDefault(id, null)` at :10 is load-bearing: audit-ledger.mjs:26 is `raw.identity && identity
-// && ...`, and a stored `undefined` would behave the same there but read differently everywhere
-// that compares to null. strictEqual, not equal — under loose equality this test is vacuous.
-test('2. setMachineClientId normalises null and undefined to exactly null', () => {
-  setMachineClientId('client-abc');
-  assert.strictEqual(getMachineClientId(), 'client-abc');
-
-  setMachineClientId(undefined);
-  assert.strictEqual(getMachineClientId(), null, 'undefined becomes null, not undefined');
-  assert.notStrictEqual(getMachineClientId(), undefined);
-
-  setMachineClientId('client-abc');
-  setMachineClientId(null);
-  assert.strictEqual(getMachineClientId(), null);
-
-  // No argument at all is the shape a caller reaches when creds.client_id is missing from an
-  // older credentials file (lib/token.mjs:69 passes it straight through).
-  setMachineClientId('client-abc');
-  setMachineClientId();
-  assert.strictEqual(getMachineClientId(), null);
+// The shape every un-swept call site still has while the fan-out sweep lands. It must degrade to an
+// unattributed machine, never throw — a dead hook is worse than a missing bookkeeping header — and
+// it must not resurrect a global, because there is none to resurrect.
+test('1c. no argument at all is the same as no id', () => {
+  const headers = machineHeaders();
+  assert.strictEqual(Object.prototype.hasOwnProperty.call(headers, 'X-Beezi-Client'), false);
+  assert.strictEqual(headers['X-Beezi-Agent'], AGENT);
 });
 
-// The initial value, before anything has run. This is the state session-audit.mjs:256 reads in
-// the hazard below.
-test('2b. getMachineClientId is null before any setter call', () => {
-  assert.strictEqual(getMachineClientId(), null);
+// Two calls with two different ids must not influence one another. This is the assertion that would
+// have failed under the old module, and it is the whole reason the global was removed: one process
+// now resolves a token per account and posts each with its own client id.
+test('1d. two ids in one process do not contaminate each other', () => {
+  const a = machineHeaders('client-a');
+  const b = machineHeaders('client-b');
+  assert.strictEqual(a['X-Beezi-Client'], 'client-a');
+  assert.strictEqual(b['X-Beezi-Client'], 'client-b');
+  assert.strictEqual(machineHeaders('client-a')['X-Beezi-Client'], 'client-a', 'and re-reading is stable');
 });
 
-// ── 3. the vendor header ────────────────────────────────────────────────────────────────────────
+// ── 2. the vendor header ────────────────────────────────────────────────────────────────────────
 
 // A value assertion, not a shape one: the server attributes a machine and its analytics to the
 // Codex client off this header and nothing else. If it ever said 'claude-code', Codex sessions
 // would land in the Claude Code plugin's bucket with no other signal that anything moved.
-test('3. X-Beezi-Agent is exactly "codex"', () => {
-  assert.strictEqual(machineHeaders()['X-Beezi-Agent'], 'codex');
+test('2. X-Beezi-Agent is exactly "codex"', () => {
+  assert.strictEqual(machineHeaders(null)['X-Beezi-Agent'], 'codex');
   assert.strictEqual(AGENT, 'codex', 'and it is the config constant, not a second literal');
-  assert.strictEqual(machineHeaders()['X-Beezi-Agent'], AGENT);
+  assert.strictEqual(machineHeaders(null)['X-Beezi-Agent'], AGENT);
 });
 
-// ── 4. the host header ──────────────────────────────────────────────────────────────────────────
+// ── 3. the host header ──────────────────────────────────────────────────────────────────────────
 
-test('4. X-Beezi-Host is truncated at 255 characters', (t) => {
+test('3. X-Beezi-Host is truncated at 255 characters', (t) => {
   os.hostname = () => 'h'.repeat(400);
-  const long = machineHeaders()['X-Beezi-Host'];
+  const long = machineHeaders(null)['X-Beezi-Host'];
   assert.strictEqual(long.length, 255, 'a 400-character hostname is cut to exactly 255');
   assert.strictEqual(long, 'h'.repeat(255));
 
   // A short hostname is passed through untouched — the slice must not be a fixed-width pad.
   os.hostname = () => 'short-host';
-  assert.strictEqual(machineHeaders()['X-Beezi-Host'], 'short-host');
+  assert.strictEqual(machineHeaders(null)['X-Beezi-Host'], 'short-host');
 
-  // String() at :24 is what keeps a non-string hostname from throwing on .slice.
+  // String() is what keeps a non-string hostname from throwing on .slice.
   os.hostname = () => undefined;
-  assert.doesNotThrow(() => machineHeaders());
-  assert.strictEqual(machineHeaders()['X-Beezi-Host'], 'undefined');
+  assert.doesNotThrow(() => machineHeaders(null));
+  assert.strictEqual(machineHeaders(null)['X-Beezi-Host'], 'undefined');
   t.diagnostic('hostname stubbed throughout; the real machine name is never read');
 });
 
-test('4b. machineHeaders returns a fresh object each call', () => {
-  const a = machineHeaders();
+test('3b. machineHeaders returns a fresh object each call', () => {
+  const a = machineHeaders(null);
   a['X-Beezi-Host'] = 'mutated';
-  assert.strictEqual(machineHeaders()['X-Beezi-Host'], FAKE_HOST, 'no shared header object');
+  assert.strictEqual(machineHeaders(null)['X-Beezi-Host'], FAKE_HOST, 'no shared header object');
 });
 
-// ── 5. THE ORDERING HAZARD ──────────────────────────────────────────────────────────────────────
+// ── 4. THE LEDGER HAZARD ────────────────────────────────────────────────────────────────────────
 
 function makeHome(t) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-identity-'));
@@ -143,36 +134,32 @@ function makeHome(t) {
     else process.env.BEEZI_CODEX_HOME = prev;
     try { fs.rmSync(dir, { recursive: true, force: true }); } catch { /* best-effort */ }
   });
+  linkAccount(dir, KEY);
   return dir;
 }
 
-// The regression test for the ordering hazard this ratchet uncovered. It was written to pin the
-// BUG, then inverted in the same commit as the fix to lib/audit-ledger.mjs.
+// The regression test for the hazard this ratchet uncovered. It was written to pin the BUG, then
+// inverted in the same commit as the fix to lib/audit-ledger.mjs.
 //
-// The ordering. `clientId` is written by lib/token.mjs:69, lib/login.mjs:138 and :199, and read by
-// lib/session-audit.mjs:256 (`const identity = getMachineClientId()`), which hands it to
-// loadLedger at :285. The read is only safe because a write is supposed to have happened first —
-// session-audit.mjs:252-255 says as much ("getAccessToken primed the machine client id").
+// It USED to be an ORDERING hazard: the client id was a global, lib/session-audit.mjs read it with
+// getMachineClientId(), and the read was only safe because a write was supposed to have happened
+// first. With the global gone the ordering is gone with it, but the hazard it exposed is not — an
+// identity can still be null (no credentials, an injected token, or a credentials blob with no
+// client_id), and that is the case this pins.
 //
-// When that write did NOT happen first — no credentials, an injected getAccessToken, or a
-// credentials file with no client_id, all of which leave the id null — the OLD guard
-// (`raw.identity && identity && raw.identity !== identity`) needed BOTH sides truthy, so a null
-// identity did not fail the check: it SKIPPED it, the foreign ledger was merged, and the previous
-// tenant's imported-session set was trusted under the current login. The guard now tests only
-// `raw.identity`, so an unidentified caller discards rather than inherits.
-test('5. ORDERING HAZARD — a null client id discards a foreign ledger rather than merging it', (t) => {
+// The OLD guard (`raw.identity && identity && raw.identity !== identity`) needed BOTH sides truthy,
+// so a null identity did not fail the check: it SKIPPED it, the foreign ledger was merged, and the
+// previous tenant's imported-session set was trusted under the current login. The guard now tests
+// only `raw.identity`, so an unidentified caller discards rather than inherits.
+test('4. a null client id discards a foreign ledger rather than merging it', (t) => {
   makeHome(t);
 
   // A ledger left behind by a previous login, bound to that login's identity.
-  const previous = loadLedger('client-a');
+  const previous = loadLedger(KEY, 'client-a');
   markImported(previous, 'sess-1', { outcome: 'accepted', reports: 3 });
-  saveLedger(previous);
+  saveLedger(KEY, previous);
 
-  // The read-before-write ordering: session-audit reaches getMachineClientId() before anything
-  // has set it.
-  assert.strictEqual(getMachineClientId(), null, 'the precondition — the setter has not run');
-
-  const merged = loadLedger(getMachineClientId());
+  const merged = loadLedger(KEY, null);
 
   assert.strictEqual(
     isImported(merged, 'sess-1'),
@@ -182,39 +169,33 @@ test('5. ORDERING HAZARD — a null client id discards a foreign ledger rather t
   assert.strictEqual(merged.identity, null, 'and the foreign identity is not carried forward');
 });
 
-// The contrast, and the reason the hazard is an ORDERING one rather than a stability one: the
-// exact same ledger, the exact same call, with the write ordered before the read — and the
-// discard fires. Nothing about the ledger changed; only when setMachineClientId ran.
-test('5b. the same load with the id primed first discards the foreign ledger', (t) => {
+// The contrast: the exact same ledger, the exact same call, with a REAL identity that simply is not
+// the one the ledger was bound to — and the discard fires for the other reason. Together these two
+// say the guard covers both "no identity" and "a different identity".
+test('4b. the same load under a different client id also discards it', (t) => {
   makeHome(t);
 
-  const previous = loadLedger('client-a');
+  const previous = loadLedger(KEY, 'client-a');
   markImported(previous, 'sess-1', { outcome: 'accepted', reports: 3 });
-  saveLedger(previous);
+  saveLedger(KEY, previous);
 
-  setMachineClientId('client-b'); // what lib/token.mjs:69 does before session-audit reads.
-
-  const fresh = loadLedger(getMachineClientId());
+  const fresh = loadLedger(KEY, 'client-b');
 
   assert.strictEqual(isImported(fresh, 'sess-1'), false, 'the foreign ledger is discarded');
   assert.strictEqual(fresh.identity, 'client-b');
 });
 
-// ── 6. state isolation ──────────────────────────────────────────────────────────────────────────
+// And the case that must NOT discard, so the two above are not passing vacuously: the same identity
+// reloads its own ledger and keeps what it imported.
+test('4c. a ledger reloaded under its own identity is kept', (t) => {
+  makeHome(t);
 
-// Asserted rather than assumed: the beforeEach/afterEach reset above is the only thing standing
-// between this file and an order-dependent suite, and a reset that is quietly deleted leaves
-// every test still passing in file order while failing when run alone.
-test('6. module state does not leak out of a test', () => {
-  assert.strictEqual(getMachineClientId(), null, 'the previous test\'s id did not survive');
-  setMachineClientId('client-leaky');
-  assert.strictEqual(getMachineClientId(), 'client-leaky');
-});
+  const previous = loadLedger(KEY, 'client-a');
+  markImported(previous, 'sess-1', { outcome: 'accepted', reports: 3 });
+  saveLedger(KEY, previous);
 
-test('6b. and the leak from the previous test really was cleaned up', () => {
-  assert.strictEqual(getMachineClientId(), null);
-  assert.strictEqual(
-    Object.prototype.hasOwnProperty.call(machineHeaders(), 'X-Beezi-Client'),
-    false,
-  );
+  const again = loadLedger(KEY, 'client-a');
+
+  assert.strictEqual(isImported(again, 'sess-1'), true, 'an account still trusts its own ledger');
+  assert.strictEqual(again.identity, 'client-a');
 });

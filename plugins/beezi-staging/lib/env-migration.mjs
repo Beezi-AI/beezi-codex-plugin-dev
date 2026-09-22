@@ -13,7 +13,10 @@ import {
 import { readJson, writeJsonDurable as writeJsonSecure } from './fs-store.mjs';
 import { orDefault, removeFileSync } from './compat.mjs';
 import { runLock, withLock, acquireLock, inspectLock } from './single-instance-lock.mjs';
-import { readRawCredential, deleteRawCredential, serviceFor, preserveMigrationCredential, tombstoneMigrationCredential } from './credentials.mjs';
+import {
+  readRawCredential, deleteRawCredential, serviceFor, preserveMigrationCredential,
+  tombstoneMigrationCredential, subjectCredentialsPath, subjectAuthorityPath, LEGACY_SUBJECT,
+} from './credentials.mjs';
 
 // ── The production cutover guard (G-1-2, R1) ────────────────────────────────────────────────
 // R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
@@ -69,10 +72,10 @@ const NOT_COPIED = Object.freeze([
 // what a fresh install must get — a first run that blocked itself on migration would be a far
 // worse bug than the one this module exists to prevent.
 const DATA_ENTRIES = Object.freeze([
-  'queue', 'state', 'diagnostics', 'quarantine',
+  'queue', 'state', 'diagnostics', 'quarantine', 'accounts',
   'credentials.json', 'billing.json', 'repo-map.json', 'audit-ledger.json',
   'usage-observations.json', 'tracking.json', 'account-sync.json', 'telemetry.json',
-  'watcher.json', 'coverage.json',
+  'watcher.json', 'coverage.json', 'accounts.json', 'accounts.migration.json',
 ]);
 
 function originOf(value) {
@@ -118,6 +121,82 @@ export function issuerEnvironment(raw) {
   // A self-hosted or dev API the plugin has never shipped as a default already resolved to
   // 'unknown' above. R1: stop, do not guess.
   return issuer;
+}
+
+// ── whose credentials this root holds ───────────────────────────────────────────────────────
+//
+// A root is migrated whole, but from 0.13 on a credential belongs to an ACCOUNT. accounts.json is
+// what says which shape a root is in: present with rows means the keyed layout and one subject per
+// row; absent means the pre-0.13 layout and the single machine-wide entry. BOTH shapes occur here —
+// the environment guard runs before the accounts migration (spec decision 10), so the first run
+// after an upgrade still meets the legacy one.
+//
+// strictRecord, not a tolerant read: a corrupt accounts.json on a root that still holds accounts/
+// would otherwise fall back to the legacy subject and silently leave every keyed entry behind. It
+// is ambiguous evidence, and R1's answer to ambiguity is to stop.
+function credentialSubjects(deps) {
+  const index = strictRecord(path.join(homeOf(deps), 'accounts.json'), deps);
+  if (!index || typeof index !== 'object' || !Array.isArray(index.accounts)) return [LEGACY_SUBJECT];
+  const keys = index.accounts
+    .filter(row => row && typeof row.key === 'string' && /^[0-9a-f]{8}$/.test(row.key))
+    .map(row => row.key);
+  return keys.length ? keys : [LEGACY_SUBJECT];
+}
+
+function readSubjectRaw(subject, deps) {
+  return orDefault(deps.readRawCredential, readRawCredential)(subject, deps);
+}
+
+/** Every subject this root holds, paired with the blob it is holding (or null). */
+function readSubjects(deps) {
+  return credentialSubjects(deps).map(subject => ({ subject, raw: readSubjectRaw(subject, deps) }));
+}
+
+/**
+ * One issuer verdict for the whole root.
+ *
+ * Every subject that holds something has to name the same environment. Two that disagree make the
+ * root ambiguous, and ambiguity blocks (R1) — preserving half a machine into staging and leaving
+ * the other half pointed at production is the outcome this module exists to prevent. A subject that
+ * holds nothing does not vote.
+ */
+function rootIssuer(records) {
+  let verdict = 'unlinked';
+  for (const record of records) {
+    const issuer = issuerEnvironment(record.raw);
+    if (issuer === 'unlinked') continue;
+    if (verdict === 'unlinked') verdict = issuer;
+    else if (verdict !== issuer) return 'unknown';
+  }
+  return verdict;
+}
+
+// A subject's two files as inventory() spells them: relative to the root, '/'-separated.
+//
+// BOTH are rewritten at the destination — the blob by the hand-off and the authority record by the
+// hand-off or the tombstone loop, each with a fresh revision — so neither can be hashed against the
+// source. inventory() only skips NOT_COPIED at the TOP level, so an account's
+// accounts/<key>/credential-control.json is inventoried and copied like any other nested file; the
+// pre-0.13 subject's is at the root, where inventory() already skips it and this is a no-op.
+function subjectRels(root, subject) {
+  return [subjectCredentialsPath(root, subject), subjectAuthorityPath(root, subject)]
+    .map(file => path.relative(root, file).split(path.sep).join('/'));
+}
+
+// The subjects a migration step should act on. A resumed run whose source has already been cleaned
+// read none, so it falls back to the pre-0.13 single subject — which is what such a journal means.
+function credentialRecords(facts) {
+  if (Array.isArray(facts.credentials) && facts.credentials.length) return facts.credentials;
+  return [{ subject: LEGACY_SUBJECT, raw: orDefault(facts.raw, null) }];
+}
+
+// The journal records a subject as its key, or null for the pre-0.13 one: a Symbol is not JSON.
+function subjectFromJournal(value) {
+  return typeof value === 'string' && /^[0-9a-f]{8}$/.test(value) ? value : LEGACY_SUBJECT;
+}
+
+function subjectToJournal(subject) {
+  return subject === LEGACY_SUBJECT ? null : subject;
 }
 
 function entriesOf(dir, deps) {
@@ -371,23 +450,29 @@ function verifyCopy(from, to, deps) {
 
 // ── the credential hand-off ─────────────────────────────────────────────────────────────────
 //
+// Clear one subject from the SOURCE namespace: a hard delete when its blob was preserved at the
+// destination, a tombstone when it was retained where it is.
+function clearSubject(subject, retained, deps) {
+  if (retained) return orDefault(deps.tombstoneMigrationCredential, tombstoneMigrationCredential)(subject, deps);
+  return orDefault(deps.deleteRawCredential, deleteRawCredential)(subject, deps);
+}
+
 // Commit destination credentials and their authority before clearing the source authority.
 // Protected credentials use a native destination or remain protected behind a tombstone;
 // only an existing plaintext file may be handed off as plaintext.
-function handOffCredential(raw, destination, deps) {
+function handOffCredential(subject, raw, destination, deps) {
   const write = orDefault(deps.writeJsonSecure, writeJsonSecure);
   const read = orDefault(deps.readJson, readJson);
-  const deleteRaw = orDefault(deps.deleteRawCredential, deleteRawCredential);
-  const target = path.join(destination, 'credentials.json');
-  const sourceFile = strictRecord(path.join(homeOf(deps), 'credentials.json'), deps);
-  const sourceControl = strictRecord(path.join(homeOf(deps), 'credential-control.json'), deps);
+  const journalled = subjectToJournal(subject);
+  const target = subjectCredentialsPath(destination, subject);
+  const sourceFile = strictRecord(subjectCredentialsPath(homeOf(deps), subject), deps);
+  const sourceControl = strictRecord(subjectAuthorityPath(homeOf(deps), subject), deps);
   // Native and DPAPI stores must never become plaintext as a side effect of migration.
   if (!sourceFile || sourceFile.token !== raw || (sourceControl && sourceControl.backend !== 'file')) {
-    const preserved = orDefault(deps.preserveMigrationCredential, preserveMigrationCredential)(raw, destination, deps);
-    const credential = { preserved, retained: !preserved, cleared: false };
+    const preserved = orDefault(deps.preserveMigrationCredential, preserveMigrationCredential)(subject, raw, destination, deps);
+    const credential = { subject: journalled, preserved, retained: !preserved, cleared: false };
     writeMarker({ phase: 'prepared', from: homeOf(deps), to: destination, credential }, deps);
-    credential.cleared = preserved ? deleteRaw(deps)
-      : orDefault(deps.tombstoneMigrationCredential, tombstoneMigrationCredential)(deps);
+    credential.cleared = clearSubject(subject, !preserved, deps);
     return credential;
   }
 
@@ -401,7 +486,10 @@ function handOffCredential(raw, destination, deps) {
       const back = read(target, null);
       preserved = !!(back && typeof back.token === 'string'
         && back.token === JSON.stringify(obj));
-      if (preserved) write(path.join(destination, 'credential-control.json'), {
+      // The authority record goes beside the credential it describes, in the DESTINATION's own
+      // layout — accounts/<key>/ for an account, the root for the pre-0.13 subject. Write it at the
+      // destination root for a keyed subject and no keyed reader ever finds it.
+      if (preserved) write(subjectAuthorityPath(destination, subject), {
         version: 1, revision: obj.beezi_revision, backend: 'file', beezi_env: 'staging',
       });
     }
@@ -413,10 +501,11 @@ function handOffCredential(raw, destination, deps) {
   // not verify must stop the migration here rather than travel back as a verdict the caller has to
   // re-judge. Same message the caller raises when a hand-off comes back uncleared.
   if (!preserved) throw new Error('Credential hand-off was not verified');
-  writeMarker({ phase: 'prepared', from: homeOf(deps), to: destination, credential: { preserved: true, cleared: false } }, deps);
+  writeMarker({ phase: 'prepared', from: homeOf(deps), to: destination,
+    credential: { subject: journalled, preserved: true, cleared: false } }, deps);
   let cleared = true;
-  try { cleared = deleteRaw(deps); } catch { cleared = false; }
-  return { preserved, cleared };
+  try { cleared = orDefault(deps.deleteRawCredential, deleteRawCredential)(subject, deps); } catch { cleared = false; }
+  return { subject: journalled, preserved, cleared };
 }
 
 // ── the guard ───────────────────────────────────────────────────────────────────────────────
@@ -470,17 +559,17 @@ function ensureEnvironmentMigratedImpl(deps) {
     hasData: rootHasData(root, deps),
     issuer: 'unlinked',
   };
-  // Only read the credential when the answer can change the verdict: a bound root and a fresh
-  // root both decide without it, and on Windows the read costs a PowerShell spawn.
+  // Only read the credentials when the answer can change the verdict: a bound root and a fresh
+  // root both decide without them, and on Windows each read costs a PowerShell spawn.
   if (facts.hasData || binding) {
-    const readRaw = orDefault(deps.readRawCredential, readRawCredential);
-    let raw = null;
-    raw = readRaw(deps);
-    if (!raw && credentialFile && !(control && control.backend === null)) throw new Error('Stored credentials could not be read');
-    facts.issuer = issuerEnvironment(raw);
-    facts.raw = raw;
-    if (raw) {
-      const credential = JSON.parse(raw);
+    const records = readSubjects(deps);
+    const holder = records.find(record => record.raw) || null;
+    if (!holder && credentialFile && !(control && control.backend === null)) throw new Error('Stored credentials could not be read');
+    facts.issuer = rootIssuer(records);
+    facts.credentials = records;
+    facts.raw = holder ? holder.raw : null;
+    if (holder) {
+      const credential = JSON.parse(holder.raw);
       facts.credentialOrigin = originOf(credential.token_endpoint);
       facts.credentialEnv = credential.beezi_env;
     }
@@ -600,8 +689,14 @@ function runMigrationLocked(facts, deps) {
     const fsImpl = orDefault(deps.fs, fs);
     const existing = readMarker(deps);
     if (!existing || existing.phase === 'done') {
-      const raw = orDefault(deps.readRawCredential, readRawCredential)(deps);
-      facts = { ...facts, raw, issuer: issuerEnvironment(raw), binding: current, hasData: rootHasData(source, deps) };
+      const probed = readSubjects(deps);
+      const probedHolder = probed.find(record => record.raw) || null;
+      facts = { ...facts,
+        credentials: probed,
+        raw: probedHolder ? probedHolder.raw : null,
+        issuer: rootIssuer(probed),
+        binding: current,
+        hasData: rootHasData(source, deps) };
       const decision = classifyRoot(facts);
       if (decision.verdict === 'ok') return { status: 'ok' };
       if (!facts.forced && decision.verdict !== 'migrate') {
@@ -611,6 +706,21 @@ function runMigrationLocked(facts, deps) {
     if (existing && (path.resolve(existing.from) !== sourcePath || path.resolve(existing.to) !== destinationPath
       || ['copying', 'copied', 'prepared', 'cleared', 'done'].indexOf(existing.phase) === -1)) throw new Error('Conflicting migration journal');
     let phase = existing && typeof existing.phase === 'string' ? existing.phase : 'start';
+
+    // The cutover journal records ONE credential hand-off, and a root that can still reach this
+    // path holds one: the guard binds every root at its first entry point, long before an account
+    // can be linked there. A root that nevertheless holds two live logins cannot be preserved
+    // faithfully by this journal, so it is refused whole rather than half-moved — nothing is
+    // copied, nothing is cleared and nothing is uploaded, which is this module's failure posture.
+    if (credentialRecords(facts).filter(record => record.raw).length > 1) {
+      return {
+        status: 'blocked',
+        reason: 'multi-account-root',
+        message: 'Beezi: this machine has more than one account linked, and the one-time switch to\n'
+          + 'the production API can only hand over one sign-in. Nothing was moved and nothing is\n'
+          + 'being uploaded. Log out all but one account, then run any Beezi command again.',
+      };
+    }
 
     // A destination that already holds a staging install is not ours to overwrite. This is the
     // "simultaneous installed variants" case from R1's matrix: the machine runs the staging
@@ -651,8 +761,14 @@ function runMigrationLocked(facts, deps) {
         };
       }
       phase = 'copied';
+      // Every subject's credential file AND authority record are left out of the durable
+      // verification: the destination copies of both are rewritten with a fresh revision.
+      const handedOff = [];
+      for (const record of credentialRecords(facts)) {
+        for (const rel of subjectRels(source, record.subject)) handedOff.push(rel);
+      }
       writeMarker({ phase, from: source, to: destination,
-        verification: inventory(source, deps).filter(entry => entry.rel !== 'credentials.json') }, deps);
+        verification: inventory(source, deps).filter(entry => handedOff.indexOf(entry.rel) === -1) }, deps);
     }
 
     // Verify against the source. inventory() — which verifyCopy walks — already skips the
@@ -675,18 +791,24 @@ function runMigrationLocked(facts, deps) {
     });
 
     let credential = existing && existing.credential || { preserved: false, cleared: true };
-    if (phase === 'copied' && !facts.raw) {
-      // An authoritative logout must not revive a copied fallback credential in staging.
-      orDefault(deps.writeJsonSecure, writeJsonSecure)(path.join(destination, 'credential-control.json'), {
-        version: 1, revision: crypto.randomBytes(16).toString('hex'), backend: null, beezi_env: 'staging',
-      });
+    const records = credentialRecords(facts);
+    const holder = records.find(record => record.raw) || null;
+    if (phase === 'copied') {
+      // An authoritative logout must not revive a copied fallback credential in staging. Each
+      // subject that handed nothing over gets its own tombstone, beside where the destination will
+      // look for that subject's authority.
+      for (const record of records) {
+        if (record.raw) continue;
+        orDefault(deps.writeJsonSecure, writeJsonSecure)(subjectAuthorityPath(destination, record.subject), {
+          version: 1, revision: crypto.randomBytes(16).toString('hex'), backend: null, beezi_env: 'staging',
+        });
+      }
     }
-    if (phase === 'prepared' || (phase !== 'cleared' && facts.raw)) {
+    if (phase === 'prepared' || (phase !== 'cleared' && holder)) {
       credential = phase === 'prepared'
-        ? { ...credential, cleared: credential.retained
-          ? orDefault(deps.tombstoneMigrationCredential, tombstoneMigrationCredential)(deps)
-          : orDefault(deps.deleteRawCredential, deleteRawCredential)(deps) }
-        : handOffCredential(facts.raw, destination, deps);
+        ? { ...credential,
+          cleared: clearSubject(subjectFromJournal(credential.subject), credential.retained, deps) }
+        : handOffCredential(holder.subject, holder.raw, destination, deps);
       if (!credential.cleared || (!credential.preserved && !credential.retained)) throw new Error('Credential hand-off was not verified');
       phase = 'cleared';
       writeMarker({ phase, from: source, to: destination, credential }, deps);
@@ -788,8 +910,7 @@ export function adoptAsProduction(deps = {}) {
   const env = orDefault(deps.env, BEEZI_ENV);
   if (env !== '') return { ok: false, reason: 'not-production' };
   return withMigrationRoots(deps, () => {
-    const raw = orDefault(deps.readRawCredential, readRawCredential)(deps);
-    if (['unlinked', 'production'].indexOf(issuerEnvironment(raw)) === -1) return { ok: false, reason: 'credential-conflict' };
+    if (['unlinked', 'production'].indexOf(rootIssuer(readSubjects(deps))) === -1) return { ok: false, reason: 'credential-conflict' };
     // Called for its side effect only: readBinding throws on a malformed or conflicting
     // environment.json, and adopting a root whose binding cannot be read is exactly what must not
     // happen. The value is unused — the binding being written below replaces it.
@@ -805,10 +926,10 @@ export function adoptAsProduction(deps = {}) {
 export function preserveAndReset(deps = {}) {
   const env = orDefault(deps.env, BEEZI_ENV);
   if (env !== '') return { ok: false, reason: 'not-production' };
-  const readRaw = orDefault(deps.readRawCredential, readRawCredential);
-  let raw = null;
-  try { raw = readRaw(deps); } catch { raw = null; }
-  return runMigration({ env, raw, forced: true }, deps);
+  let records = [];
+  try { records = readSubjects(deps); } catch { records = []; }
+  const holder = records.find(record => record.raw) || null;
+  return runMigration({ env, credentials: records, raw: holder ? holder.raw : null, forced: true }, deps);
 }
 
 /**

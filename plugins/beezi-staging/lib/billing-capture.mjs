@@ -1,6 +1,6 @@
 import { BillingSource, normalizePlan, canonicalPlan, CHATGPT_PLANS } from './billing.mjs';
 import { resolveSource as _resolveSource } from './billing-config.mjs';
-import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
+import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
 import {
   readAccountViaAppServer as _readAccountViaAppServer,
   mergeAccounts,
@@ -196,7 +196,7 @@ export function shouldKeepExisting(freshConfig, existingConfig) {
 export async function captureFromCodexAccount({
   via, existing = null, env = process.env, now = new Date(), deps = {},
 } = {}) {
-  const readCodexAccount = deps.readCodexAccount || _readCodexAccount;
+  const readChatgptAuth = deps.readChatgptAuth || _readChatgptAuth;
   const probeAppServer = deps.readAccountViaAppServer || _readAccountViaAppServer;
 
   // Tier 1. Never allowed to throw or hang the caller: readAccountViaAppServer returns a typed
@@ -209,7 +209,7 @@ export async function captureFromCodexAccount({
   // Tier 2, read unconditionally: it carries `hasStoredApiKey`, which tier 1 does not report and
   // which billing-config.mjs step 4 genuinely needs (see the signals note below).
   let fileAccount = null;
-  try { fileAccount = readCodexAccount(); } catch { fileAccount = null; }
+  try { fileAccount = readChatgptAuth(); } catch { fileAccount = null; }
 
   const account = mergeAccounts(live, fileAccount);
   if (!account || !account.plan) return { config: null, reason: 'no-account', tier: 'none' };
@@ -221,7 +221,7 @@ export async function captureFromCodexAccount({
   // and it removes the window in which the two reads could disagree about the same file.
   //
   // `hasStoredApiKey` is load-bearing, not decoration: auth_mode is null under a ChatGPT sign-in
-  // (codex-account.mjs), so `resolveSource`'s stored-key rung is genuinely reached with authMode
+  // (chatgpt-auth.mjs), so `resolveSource`'s stored-key rung is genuinely reached with authMode
   // === null. Signals synthesized without it resolve a machine holding a stored key to `unknown`
   // instead of `openai_api_key`, and syncBillingSource then writes that wrong source into
   // billing.json.

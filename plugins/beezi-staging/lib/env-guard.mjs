@@ -35,8 +35,9 @@ export function checkEnvironment(deps = {}) {
 /**
  * Does this caller want the environment guard run at all?
  *
- * One predicate, two call sites (getAuthentication in lib/token.mjs, runWatchPass in
- * lib/rollout-watcher.mjs), because the triple-negated form was duplicated and read backwards.
+ * One predicate, two call sites (getAuthentication in lib/token.mjs, keyed on `getCredentials`,
+ * and runWatchPass in lib/rollout-watcher.mjs, keyed on `linkedSessions`), because the
+ * triple-negated form was duplicated and read backwards.
  * `workKey` is the module's real-work seam and `guardKey` its guard seam: a caller that injected
  * the work seam is a test standing in for the whole operation and skips the guard, UNLESS it also
  * injected a guard of its own, which is the test that wants the refusal exercised. Production

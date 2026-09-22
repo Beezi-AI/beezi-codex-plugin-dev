@@ -4,6 +4,13 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { quarantinePoisonedSessionState } from '../lib/transcript-codex.mjs';
+import { linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The queue moved under accounts/<key>/ with the keyed layout, and the sweep walks every linked
+// account's. The quarantine tree itself stays machine-level: a poisoned report is a plugin defect,
+// not a tenant's business, and an operator repairing one wants them in one place.
+const KEY = TEST_KEY;
+const QUEUE = `accounts/${KEY}/queue`;
 
 // G-3-1 cleanup. A machine that ran an older build can hold state and queue entries written by a
 // session the plugin could not name: `state/null.json`, `state/null.agents/`, `queue/null_1-18.json`.
@@ -14,6 +21,7 @@ function withBeeziHome(fn) {
   const prev = process.env.BEEZI_CODEX_HOME;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-quarantine-'));
   process.env.BEEZI_CODEX_HOME = dir;
+  linkAccount(dir, KEY);
   try { return fn(dir); } finally {
     if (prev === undefined) delete process.env.BEEZI_CODEX_HOME;
     else process.env.BEEZI_CODEX_HOME = prev;
@@ -35,13 +43,13 @@ test('moves the poisoned state file, its agent sidecars and its queued reports',
   withBeeziHome((root) => {
     write(root, 'state/null.json', { cursor: 18, cwd: 'C:/work/app', transcriptPath: 'C:/r.jsonl' });
     write(root, 'state/null.agents/agent-1.json', { cursor: 4 });
-    write(root, 'queue/null_1-18.json', { segmentId: 'null:1-18', sessionId: null, tokens: 42 });
-    write(root, 'queue/null_agent-1_1-4.json', { segmentId: 'null:agent-1:1-4', sessionId: null });
-    write(root, 'queue/undefined_1-2.json', { segmentId: 'undefined:1-2' });
+    write(root, `${QUEUE}/null_1-18.json`, { segmentId: 'null:1-18', sessionId: null, tokens: 42 });
+    write(root, `${QUEUE}/null_agent-1_1-4.json`, { segmentId: 'null:agent-1:1-4', sessionId: null });
+    write(root, `${QUEUE}/undefined_1-2.json`, { segmentId: 'undefined:1-2' });
     // Untouched neighbours: a real session's state, sidecar dir and queued report.
     write(root, `state/${SID}.json`, { cursor: 5 });
     write(root, `state/${SID}.agents/agent-9.json`, { cursor: 1 });
-    write(root, `queue/${SID}_1-5.json`, { segmentId: `${SID}:1-5` });
+    write(root, `${QUEUE}/${SID}_1-5.json`, { segmentId: `${SID}:1-5` });
 
     const result = quarantinePoisonedSessionState({ now: () => Date.parse('2026-09-10T12:00:00Z') });
 
@@ -49,20 +57,20 @@ test('moves the poisoned state file, its agent sidecars and its queued reports',
     assert.deepEqual(result.failed, []);
     assert.equal(exists(root, 'state', 'null.json'), false);
     assert.equal(exists(root, 'state', 'null.agents'), false);
-    assert.equal(exists(root, 'queue', 'null_1-18.json'), false);
-    assert.equal(exists(root, 'queue', 'undefined_1-2.json'), false);
+    assert.equal(exists(root, 'accounts', KEY, 'queue', 'null_1-18.json'), false);
+    assert.equal(exists(root, 'accounts', KEY, 'queue', 'undefined_1-2.json'), false);
 
     // Nothing else was touched.
     assert.equal(exists(root, 'state', `${SID}.json`), true);
     assert.equal(exists(root, 'state', `${SID}.agents`, 'agent-9.json'), true);
-    assert.equal(exists(root, 'queue', `${SID}_1-5.json`), true);
+    assert.equal(exists(root, 'accounts', KEY, 'queue', `${SID}_1-5.json`), true);
   });
 });
 
 test('nothing is deleted — the payloads survive intact under quarantine/', () => {
   withBeeziHome((root) => {
     const payload = { segmentId: 'null:1-18', sessionId: null, input_tokens: 42 };
-    write(root, 'queue/null_1-18.json', payload);
+    write(root, `${QUEUE}/null_1-18.json`, payload);
     write(root, 'state/null.agents/agent-1.json', { cursor: 4 });
 
     const result = quarantinePoisonedSessionState();
@@ -80,7 +88,7 @@ test('nothing is deleted — the payloads survive intact under quarantine/', () 
 test('a clean machine is a no-op and creates no quarantine directory', () => {
   withBeeziHome((root) => {
     write(root, `state/${SID}.json`, { cursor: 5 });
-    write(root, `queue/${SID}_1-5.json`, { segmentId: `${SID}:1-5` });
+    write(root, `${QUEUE}/${SID}_1-5.json`, { segmentId: `${SID}:1-5` });
 
     const result = quarantinePoisonedSessionState();
 
@@ -120,10 +128,10 @@ test('the manifest records each sweep and re-running finds nothing left to move'
 // A second poisoning after a sweep must not overwrite what the first sweep preserved.
 test('a later sweep gets its own directory rather than clobbering the earlier one', () => {
   withBeeziHome((root) => {
-    write(root, 'queue/null_1-18.json', { segmentId: 'null:1-18', first: true });
+    write(root, `${QUEUE}/null_1-18.json`, { segmentId: 'null:1-18', first: true });
     const a = quarantinePoisonedSessionState({ now: () => Date.parse('2026-09-10T12:00:00Z') });
 
-    write(root, 'queue/null_1-18.json', { segmentId: 'null:1-18', second: true });
+    write(root, `${QUEUE}/null_1-18.json`, { segmentId: 'null:1-18', second: true });
     const b = quarantinePoisonedSessionState({ now: () => Date.parse('2026-09-11T12:00:00Z') });
 
     assert.notEqual(a.dir, b.dir);
@@ -137,14 +145,14 @@ test('a later sweep gets its own directory rather than clobbering the earlier on
 test('an unusual but non-stringified id is left alone', () => {
   withBeeziHome((root) => {
     write(root, 'state/session_with_underscores.json', { cursor: 1 });
-    write(root, 'queue/nullify_1-2.json', { segmentId: 'nullify:1-2' });
+    write(root, `${QUEUE}/nullify_1-2.json`, { segmentId: 'nullify:1-2' });
     write(root, 'state/null.json.4242.tmp', '{"half":');
 
     const result = quarantinePoisonedSessionState();
 
     assert.deepEqual(result.moved, []);
     assert.equal(exists(root, 'state', 'session_with_underscores.json'), true);
-    assert.equal(exists(root, 'queue', 'nullify_1-2.json'), true);
+    assert.equal(exists(root, 'accounts', KEY, 'queue', 'nullify_1-2.json'), true);
     assert.equal(exists(root, 'state', 'null.json.4242.tmp'), true, 'a live writer’s temp is not raced');
   });
 });

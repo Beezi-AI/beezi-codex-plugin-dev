@@ -7,14 +7,21 @@ import { queueDir, stateDir } from '../lib/paths.mjs';
 import { writeAgent, readAgents, agentDir } from '../lib/subagent-state.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // The subagent half of the checkpoint: which rollouts get billed, under what segment ids, with which
 // identity fields, and how their wall clock is reconciled with the parent's.
 
 const tmpHome = (t) => sandboxHome(t, 'beezi-sac-');
 
-const queued = () => fs.readdirSync(queueDir()).map((f) =>
-  JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')));
+const queued = () => fs.readdirSync(queueDir(KEY)).map((f) =>
+  JSON.parse(fs.readFileSync(path.join(queueDir(KEY), f), 'utf-8')));
 
 const T0 = Date.parse('2026-08-06T19:41:50.000Z');
 const at = (ms) => new Date(T0 + ms).toISOString();
@@ -77,7 +84,7 @@ const parentDelta = (segments = [seg()]) => (p, from, resolvers) =>
     : { nextCursor: 4, segments, apiErrorEvents: [] });
 
 const deps = (home, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); }, // keep payloads on disk
   resolveTranscript: () => ({ transcriptPath: stubTranscript(home), sessionId: 'parent-1' }),
   computeDelta: parentDelta(),
@@ -222,11 +229,11 @@ test('a second checkpoint does not re-bill an agent already counted', async (t) 
   assert.equal(first, 1);
   assert.ok(Number.isInteger(readAgents('parent-1')['agent-a'].cursor), 'the cursor was persisted');
 
-  fs.rmSync(queueDir(), { recursive: true, force: true });
+  fs.rmSync(queueDir(KEY), { recursive: true, force: true });
   await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home, {
     computeDelta: () => ({ nextCursor: 4, segments: [], apiErrorEvents: [] }),
   }));
-  const again = fs.existsSync(queueDir()) ? queued().filter((p) => p.is_subagent).length : 0;
+  const again = fs.existsSync(queueDir(KEY)) ? queued().filter((p) => p.is_subagent).length : 0;
   assert.equal(again, 0, 'no new subagent work the second time round');
 });
 
@@ -363,9 +370,9 @@ test('a rollout that states no id of its own still bills under the dictionary ke
   const sub = queued().find((p) => p.is_subagent);
   assert.ok(sub, 'the agent is still billed, not dropped for lacking an id');
   assert.equal(sub.agent_id, evil, 'it falls back to the dictionary key');
-  for (const file2 of fs.readdirSync(queueDir())) {
-    const resolved = path.resolve(queueDir(), file2);
-    assert.equal(path.dirname(resolved), path.resolve(queueDir()), `${file2} stayed in the queue dir`);
+  for (const file2 of fs.readdirSync(queueDir(KEY))) {
+    const resolved = path.resolve(queueDir(KEY), file2);
+    assert.equal(path.dirname(resolved), path.resolve(queueDir(KEY)), `${file2} stayed in the queue dir`);
   }
   assert.ok(!fs.existsSync(path.join(home, 'evil.json')));
 });
@@ -444,9 +451,9 @@ test('an agent id from a hook payload cannot escape the queue directory either',
   // contradict each other; the residual untrusted-key path is covered by the no-own-id case above.
   assert.equal(queued().find((p) => p.is_subagent).agent_id, 'agent-a');
 
-  for (const file of fs.readdirSync(queueDir())) {
-    const resolved = path.resolve(queueDir(), file);
-    assert.equal(path.dirname(resolved), path.resolve(queueDir()), `${file} stayed in the queue dir`);
+  for (const file of fs.readdirSync(queueDir(KEY))) {
+    const resolved = path.resolve(queueDir(KEY), file);
+    assert.equal(path.dirname(resolved), path.resolve(queueDir(KEY)), `${file} stayed in the queue dir`);
   }
   assert.ok(!fs.existsSync(path.join(home, 'evil.json')));
 });

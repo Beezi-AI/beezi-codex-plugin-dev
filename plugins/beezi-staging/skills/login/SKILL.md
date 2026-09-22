@@ -15,14 +15,20 @@ a token or the contents of the credentials file.
 
 ## Logging in
 
-Logging in is four steps, in order. Step 1 links the machine; steps 2 and 3 record which ChatGPT
-plan pays for it; step 4 uploads the machine's past Codex sessions. **Do not stop after step 1** —
-a linked machine with no plan reports its usage with no plan attached, which is the single most
-common thing users report as "my analytics look wrong". **Step 4 comes last and only after the
-plan is settled**: settled means step 2 hit its stop list, or the user answered step 3's question
-(or explicitly dismissed it). Jumping to step 4 with the plan question still open is the other way
-machines end up with no plan — the backfill output reads like a finished login, so nothing ever
-comes back to ask.
+Logging in is five steps, in order. Step 1 links an account; steps 2 and 3 record which ChatGPT
+plan pays for this machine; step 4 uploads the machine's past Codex sessions; step 5 asks about the
+analytics default. **Do not stop after step 1** — a linked machine with no plan reports its usage
+with no plan attached, which is the single most common thing users report as "my analytics look
+wrong". **Step 4 comes last of the uploading steps and only after the plan is settled**: settled
+means step 2 hit its stop list, or the user answered step 3's question (or explicitly dismissed
+it). Jumping to step 4 with the plan question still open is the other way machines end up with no
+plan — the backfill output reads like a finished login, so nothing ever comes back to ask.
+
+**Several Beezi accounts can be linked at once**, and every step after the first is about ONE of
+them. Step 1 names which, on its last line, as `account=<key>` — an 8-character key. Carry that key
+through steps 2 to 5 as `--account <key>`. If step 1 printed no such line, match its output against
+the outcome list below before doing anything else: two of those outcomes mean the sign-in is still
+running, not that it failed.
 
 ### Step 1 — sign in
 
@@ -40,8 +46,43 @@ Either way a browser window opens for the user to sign in with their Beezi accou
 does not open, the output contains the URL — pass it to the user verbatim. The flow blocks until
 they finish or it times out; say so rather than assuming it failed.
 
-Report the result verbatim. If the output ends with steps for installing analytics hooks, repeat
-them — logging in alone does not start reporting analytics. The `analytics-hooks` skill covers that.
+**The browser decides which account signs in.** It signs in as whichever Beezi account it is
+already signed in as; to add a different one the user signs out of Beezi in the browser first, or
+uses a private window. The output says so before it opens, and names the accounts already linked.
+
+Report the result verbatim, then read it. There are five outcomes; only the first lets the rest of
+this flow run, and each is named by a sentence the output actually carries:
+
+- `account=<key>` on the last line — an account was linked, re-linked, or was already linked. Use
+  that key for every step below.
+- **`The sign-in is still running here`** — only the `beezi_login` tool prints this, and it is
+  ordinary rather than exceptional: the tool answers after about 25 seconds, and a real browser
+  sign-in routinely takes longer than that. **Nothing has failed.** Relay the text as given,
+  including the URL it carries, and wait — do not call the tool again, do not offer to retry, and do
+  not run steps 2 to 5 yet. When the user says they have finished in the browser, call
+  `beezi_status`; once it reports the machine linked, **get a key before continuing** — this path
+  prints none, and step 4 refuses to run without one. Run the `accounts` skill's list: every row
+  carries its key in brackets. If more than one row is listed, ask the user which account they
+  signed in as rather than guessing — the list marks the default and revoked rows, not which row is
+  new. With the key in hand, continue from step 2.
+- **`A Beezi sign-in is already in progress`** — only the `beezi_login` tool prints this, and only
+  while an earlier call of it is still waiting on the browser. It is a refusal to start a SECOND
+  sign-in, not a failed one: the first is still live. Relay the text as given and wait, exactly as
+  for the outcome above — do not call the tool again and do not run steps 2 to 5 yet. When the user
+  says they have finished in the browser, pick the key up the same way, from the `accounts` skill's
+  list.
+- **`Workspace <name> is already linked as <email>`** — the sign-in was refused because that
+  workspace already has a different account linked on this machine. Relay the message and stop; the
+  rest of the flow has nothing to run against. Logging that account out first is the `logout` skill.
+- **Anything else, with no `account=` line** — the sign-in failed. The script prints `✗ <reason>`;
+  the tool prints `Beezi sign-in failed: <reason>`. The commonest cause is the plainest: the browser
+  tab was never finished and the wait timed out. It can also be an unreachable server, a locked
+  keyring, or a pending environment migration. **Relay that line verbatim and do not diagnose it** —
+  in particular say nothing about workspaces, other accounts, or logging out. Offer to run step 1
+  again. Do not run steps 2 to 5.
+
+If the output ends with steps for installing analytics hooks, repeat them — logging in alone does
+not start reporting analytics. The `analytics-hooks` skill covers that.
 
 ### Step 2 — capture the ChatGPT plan
 
@@ -50,8 +91,12 @@ user's tier may have changed), and **including when step 1 used the `beezi_login
 links the machine but never reads the plan.
 
 ```
-node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via login
+node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via login --account <key>
 ```
+
+The plan itself is the MACHINE's — one Codex install, one subscription paying for it — so the
+questions below do not change with the number of linked accounts. `--account` only says which
+account's Beezi row to tell about it.
 
 It asks Codex itself which account it is signed in as (a short-lived `codex app-server` child
 process), and falls back to the plan label in `~/.codex/auth.json`. It may take a few seconds the
@@ -126,39 +171,61 @@ Map the answer through this table — no other values are valid:
 Then run exactly this, substituting only `<value>`:
 
 ```
-node "<plugin-root>/scripts/billing-capture.mjs" --plan <value> --via login-user
+node "<plugin-root>/scripts/billing-capture.mjs" --plan <value> --via login-user --account <key>
 ```
 
 Report its one-line output. If the user dismisses the question or answers something not in the
 table, skip the capture — the link itself already succeeded, say that and continue to step 4.
 
-### Step 4 — upload past sessions (always run this last)
+### Step 4 — upload past sessions
 
 Run this only once the plan is settled (step 2 stopped, or step 3 was answered or dismissed) —
 never while step 3's question is still waiting for a reply. With that condition met, it runs on
-every login outcome: fresh links, machines that were already linked, **and when step 1 used the
-`beezi_login` MCP tool** — that tool links the machine but never uploads history, so this step is
+every login outcome: fresh links, accounts that were already linked, **and when step 1 used the
+`beezi_login` MCP tool** — that tool links the account but never uploads history, so this step is
 still yours to run.
 
 ```
-node "<plugin-root>/scripts/backfill.mjs" --via login
+node "<plugin-root>/scripts/backfill.mjs" --via login --account <key>
 ```
 
 It is the one-time upload of this machine's past Codex sessions into Beezi and can take several
-minutes; it prints progress lines as it goes. Report its output verbatim — progress and final
+minutes; it prints progress lines as it goes. It covers the **last 30 days only** — older sessions
+are out of scope for this import and for the `sync` skill alike, and no later run reaches them. Report its output verbatim — progress and final
 summary, or the error line. It is safe on every login: already-uploaded sessions are skipped, and
 if it says nothing new to upload, tell the user their history is up to date. If some sessions could
 not be delivered, tell the user that running this login skill again later resumes the upload where
 it left off. Never echo any token.
 
-If it reports the one-time import **has already been used**, that is final — the import is once per
-account and tool and cannot be re-run. Do NOT retry, do NOT run the script again with different
-flags, and refuse politely if the user asks you to bypass it; relay the script's message (including
-the upgrade suggestion when it prints one) and stop.
+If it reports the one-time import **has already been used**, that is final for THAT account — the
+import is once per Beezi account and tool and cannot be re-run. Do NOT retry, do NOT run the script
+again with different flags, and refuse politely if the user asks you to bypass it; relay the
+script's message (including the upgrade suggestion when it prints one) and stop. A different Beezi
+account linked on this machine has its own untouched import, so this message is never a reason to
+skip step 4 for an account that has just been linked.
 
-Only when it reports the pull *finalized*, tell the user: the pull is one-time per account and
+Only when it reports the pull *finalized*, tell the user: the pull is one-time per Beezi account and
 tool — if they have Codex history on other machines, they should sign in to Beezi there BEFORE it
 finalizes; a finalized pull cannot be re-opened.
+
+### Step 5 — offer to make this the analytics default
+
+Only when step 1's output said the analytics skill still reads from a different account. Logging in
+never switches the default by itself, because a second workspace signing in must not silently take
+over the analytics the user was reading.
+
+Ask once — "Make `<name>` (`<workspace>`) the account the analytics skill reads from?" — using the
+name and workspace step 1 printed. On yes:
+
+```
+node "<plugin-root>/scripts/accounts.mjs" use <key>
+```
+
+Report its output in full — what analytics now read from, a note about starting a new Codex session
+if the workspaces are on different plans, and the reminder that every linked account still receives
+this machine's analytics. Relay whatever it prints rather than counting lines; the `accounts` skill
+is the authority on its output. On no, say nothing further; the `accounts` skill can change it
+later.
 
 ## Logging out
 

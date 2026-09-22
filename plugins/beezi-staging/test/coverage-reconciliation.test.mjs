@@ -5,6 +5,11 @@ import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
 import { ReplayDecision } from '../lib/session-coverage.mjs';
 import { TrackingMode } from '../lib/tracking.mjs';
 import { LOCK_KINDS } from '../lib/single-instance-lock.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One account per run: its session, its ledger, its coverage record.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 // G-3-3 under REVIEW.md §R2. Every case R2 names has a test here; the file is ordered by that
 // list. Nothing touches the real ~/.beezi-codex or ~/.codex and nothing reaches the network —
@@ -95,7 +100,7 @@ function fakeCheckpoint(plan) {
 
 function fakeFlush(statusFor = () => BackfillSessionStatus.ACCEPTED) {
   const calls = [];
-  const impl = async (groups, _token, _deps, options) => {
+  const impl = async (groups, _key, _session, _deps, options) => {
     calls.push({ groups, options });
     const bySession = new Map();
     let stored = 0;
@@ -118,7 +123,8 @@ function makeDeps(over = {}) {
   const flush = over.flush || fakeFlush();
   const deps = {
     now: () => 10 * 60 * 60 * 1000,
-    getAccessToken: async () => 'tok',
+    linkedSessions: async () => [SESSION],
+    getDefaultKey: async () => KEY,
     whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.LIVE, backfillCompleted: false }),
     recordWhoamiImpl: () => {},
     listRollouts: () => [rollout('s1')],
@@ -128,7 +134,7 @@ function makeDeps(over = {}) {
     markBackfillCompletedImpl: () => {},
     completeBackfillImpl: async () => ({ completed: true, code: null }),
     loadLedgerImpl: () => ledger,
-    saveLedgerImpl: (l) => saved.push(l),
+    saveLedgerImpl: (_key, l) => saved.push(l),
     runCheckpointImpl: checkpoint.impl,
     flushBackfillChunksImpl: flush.impl,
     computeSessionTimelineImpl: () => null,
@@ -144,6 +150,51 @@ function makeDeps(over = {}) {
 }
 
 const sync = (h, options = {}) => runAudit(h.deps, { mode: SYNC_MODE, ...options });
+
+// The 30-day window is shared policy, not a backfill-only rule: a session out of scope for the
+// one-time import must be out of scope here too, or the two commands disagree about the same file.
+test('the 30-day window applies to sync as well, and is never reconciled', async () => {
+  const NOW = 100 * 24 * 60 * 60 * 1000;
+  const asked = [];
+  const h = makeDeps({
+    deps: {
+      now: () => NOW,
+      listRollouts: () => [
+        rollout('ancient', { mtimeMs: NOW - 31 * 24 * 60 * 60 * 1000 }),
+        rollout('recent', { mtimeMs: NOW - 2 * 24 * 60 * 60 * 1000 }),
+      ],
+      fetchCoverageImpl: async (ids) => { asked.push(...ids); return new Map(); },
+    },
+  });
+
+  const result = await sync(h);
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 1);
+  assert.deepEqual(asked, ['recent'], 'the server is never asked about an out-of-window session');
+});
+
+// When the window empties the candidate list there is no coverage call at all, so `coverageKnown`
+// must stay null: sync.mjs prints a NETWORK failure on `false`, and "we never asked" is not that.
+test('a machine with only out-of-window history does not report a coverage failure', async () => {
+  const NOW = 100 * 24 * 60 * 60 * 1000;
+  let asked = 0;
+  const h = makeDeps({
+    deps: {
+      now: () => NOW,
+      listRollouts: () => [rollout('ancient', { mtimeMs: NOW - 60 * 24 * 60 * 60 * 1000 })],
+      fetchCoverageImpl: async () => { asked += 1; return new Map(); },
+    },
+  });
+
+  const result = await sync(h);
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 0);
+  assert.equal(asked, 0, 'no candidates means no coverage request');
+  assert.equal(result.coverageKnown, null, 'not false — sync would call that a network failure');
+  assert.equal(result.sessionsImported, 0);
+});
 
 // ─── R2 case list ───────────────────────────────────────────────────────────────────────────
 
@@ -388,7 +439,7 @@ test('R2/identity change — a coverage record bound to another machine is not c
   const h = makeDeps({
     checkpoint,
     deps: {
-      loadCoverageCheckpointsImpl: (binding) => ({ version: 1, ...binding, sessions: {}, updatedAt: null }),
+      loadCoverageCheckpointsImpl: (_key, binding) => ({ version: 1, ...binding, sessions: {}, updatedAt: null }),
       fetchCoverageImpl: async () => new Map(),
     },
   });

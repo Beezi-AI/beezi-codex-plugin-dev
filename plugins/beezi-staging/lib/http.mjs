@@ -28,7 +28,18 @@ async function bounded(fetchImpl, url, init, timeoutMs) {
   }
 }
 
-export async function postJson(url, token, body, deps = {}) {
+// A bare token used to be enough. It no longer is: the client id travels with the token, and a
+// caller that still passes a string would post with no X-Beezi-Client at all — a silent
+// misattribution, not an error. Throwing is how the sweep finds the sites no type checker will.
+export function sessionOf(session) {
+  if (typeof session !== 'object' || session === null || typeof session.token !== 'string') {
+    throw new TypeError('http: expected a session object { token, clientId }, not a bare token');
+  }
+  return session;
+}
+
+export async function postJson(url, session, body, deps = {}) {
+  const { token, clientId } = sessionOf(session);
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_TIMEOUT_MS);
   return bounded(fetchImpl, url, {
@@ -36,17 +47,18 @@ export async function postJson(url, token, body, deps = {}) {
     headers: {
       'Authorization': `Bearer ${token}`,
       'Content-Type': 'application/json',
-      ...machineHeaders(),
+      ...machineHeaders(clientId),
     },
     body: JSON.stringify(body),
   }, timeoutMs);
 }
 
 // Bounded GET with bearer auth. Returns the fetch Response; throws on network error or timeout.
-export async function getJson(url, token, deps = {}) {
+export async function getJson(url, session, deps = {}) {
+  const { token, clientId } = sessionOf(session);
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_READ_TIMEOUT_MS);
   return bounded(fetchImpl, url, {
-    headers: { 'Authorization': `Bearer ${token}`, ...machineHeaders() },
+    headers: { 'Authorization': `Bearer ${token}`, ...machineHeaders(clientId) },
   }, timeoutMs);
 }

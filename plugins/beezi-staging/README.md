@@ -3,7 +3,7 @@
 A Codex plugin that (1) drafts and creates tickets on your board (Jira / Azure DevOps) or in Beezi
 via the Beezi MCP server, and (2) hooks into Codex session lifecycle events (`SessionStart`,
 `PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`) to report per-branch token-usage analytics
-to your Beezi workspace.
+to every Beezi account linked on this machine.
 
 This is the Codex port of the Claude Code `beezi` plugin. The auth, MCP stdio bridge, and reporting
 engine are shared logic; the session-transcript parsing and subscription-plan capture are
@@ -34,6 +34,9 @@ about the link should go through `beezi_status`.
 Codex's own MCP OAuth is not used: it only covers streamable-HTTP servers, and it would put the
 token in Codex's store while the analytics hooks read `~/.beezi-codex/credentials.json` — so the machine
 would have to be linked twice.
+
+Signing in a second time adds a second account rather than replacing the first — see
+[Several Beezi accounts on one machine](#several-beezi-accounts-on-one-machine).
 
 ### Analytics needs the hooks installed and trusted
 
@@ -90,6 +93,47 @@ Leaving any entry untrusted fails silently — an untrusted hook simply does not
 reports it. Skipping `SubagentStart` / `SubagentStop`, for example, still bills subagent tokens (the
 parent's checkpoint does that) but loses every spawned agent's name and its span on the timeline.
 
+## Several Beezi accounts on one machine
+
+Any number of Beezi accounts can be linked at once, and **every linked account receives this
+machine's analytics.** Reporting fans out over every account that can currently produce a token —
+the same list session start, every checkpoint, the rollout watcher and the `track` skill each loop
+over (`linkedSessions` in `lib/accounts.mjs`). The **default** is the account the analytics tools
+read from: the MCP server resolves it per request, so a switch made in a shell reaches a session
+that is already running. Switching it therefore changes what you read rather than what is reported,
+and unlinks nothing.
+
+**To add one**, run the `login` skill again. The browser signs in as whichever Beezi account it is
+already signed in as, so to link a different one, sign out of Beezi in the browser first or use a
+private window. When accounts are already linked, the command-line sign-in prints that and lists
+them before it opens the browser. Logging in never switches the default away from what you read;
+the `accounts` skill is what changes it.
+
+**To switch the default**, the `accounts` skill. It lists every linked account, marks the default
+and any revoked row, and `use <n>` picks the account analytics read from.
+
+**To remove one**, the `logout` skill. It logs out one named account, or every account at once, and
+reports the outcome for each.
+
+**Each account has its own one-time history import.** The import is spent once per Beezi account and
+tool, so the `login` skill runs it for the account it has just linked, and the script refuses to run
+without being told which account it is for. An account linked later pulls its own history; an import
+already spent by one account says nothing about another's.
+
+**Two users of one Beezi workspace cannot both link the same machine — once your Beezi server names
+the workspace at sign-in.** A sign-in whose workspace is already linked as somebody else is then
+refused, with the reason: `Workspace <name> is already linked as <email>. Log that account out first
+to link <your email>.` Nothing is stored on that path — no credentials, no index row, no account
+directory. The reason is the fan-out above: both accounts would receive this machine's analytics,
+and one workspace would count the same sessions twice. A server that does not return the workspace
+on sign-in gives the check nothing to compare, so against one of those the second account links like
+any other.
+
+An account linked before this layout existed reads as `linked account (no name or email recorded)`
+in the `accounts` and `me` lists: no name, email or workspace was recorded for it when it was
+carried over, and those lists show what they have. The next session start that reaches Beezi as that
+account, and a sign-in as it, both record what the server answers with.
+
 ## Updating
 
 The plugin checks whether it is out of date, but never updates itself. At session start it compares
@@ -144,9 +188,10 @@ exist.
 
 | Skill | Covers |
 | --- | --- |
-| `login` | Link this machine, refresh the captured plan |
-| `logout` | Unlink this machine and drop its stored credentials |
-| `me` | Is this machine linked, as whom, and are the hooks installed |
+| `login` | Link a Beezi account to this machine, refresh the captured plan |
+| `accounts` | List the linked accounts and pick which one analytics are read from |
+| `logout` | Log one account, or every one, out and drop its stored credentials |
+| `me` | Which accounts are linked, as whom, and are the hooks installed |
 | `analytics-hooks` | Install, repair, remove, or check the analytics hooks (never asks you to run the command yourself) |
 | `track` | Checkpoint the current branch now, without hooks |
 | `analytics` | Your own spend and session summary, for 7 or 30 days |
@@ -157,8 +202,8 @@ Two flows are MCP tools rather than skills, because they have to run in the serv
 `beezi_login` and `beezi_status`. The skills prefer them and fall back to the scripts.
 
 Each skill runs a script under `scripts/`; those stay directly runnable from a terminal —
-`login.mjs`, `logout.mjs`, `me.mjs`, `hooks.mjs [install|uninstall|status]`, `track.mjs`,
-`billing-capture.mjs --from-codex`.
+`login.mjs`, `accounts.mjs [list|use <account>]`, `logout.mjs [--list|--account <a>|--all]`,
+`me.mjs`, `hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`.
 
 ## How analytics work
 
@@ -308,7 +353,7 @@ and the account id are ever captured — **no token ever leaves the machine**, a
    automatic overwrites. Reached only when neither tier above named a plan.
 
 The account id and email are persisted into `billing.json` alongside the plan, and read back from
-there first (`lib/account-identity.mjs`, and the account check-in). Without that the id would exist
+there first (`lib/chatgpt-identity.mjs`, and the account check-in). Without that the id would exist
 only for the one session that happened to run the probe. API-key billing carries no plan.
 
 Codex's own tier names are folded onto those labels (`CODEX_PLAN_ALIASES` in `lib/billing.mjs`),
@@ -316,6 +361,11 @@ because the wire vocabulary is not the pricing vocabulary. The load-bearing case
 Pro split: the $200 tier kept the name `pro` and became 20×, and the new $100 5× tier ships as
 `prolite`. Anything left unmapped normalizes to `unknown`, which never settles — so the
 "refresh your plan" nudge would fire on every session with no way for the user to end it.
+
+Both history paths — the login skill's one-time import and the repeatable `sync` — reach back
+**30 days** and no further. A rollout older than that is skipped with a visible count and is never
+picked up by a later run; the window is shared deliberately, so a session cannot be in scope for
+one command and out of scope for the other.
 
 New or unfinished historical backfills register and snapshot the current ChatGPT account before
 upload, then attach its `account_uuid` to every imported report, including subagent reports. This

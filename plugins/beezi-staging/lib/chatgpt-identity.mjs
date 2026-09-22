@@ -1,10 +1,10 @@
-import { readCodexAccount } from './codex-account.mjs';
+import { readChatgptAuth } from './chatgpt-auth.mjs';
 import { readBillingConfig } from './billing-config.mjs';
 import { orDefault } from './compat.mjs';
 
 // Only identity fields accepted by both session reports and quota snapshots. Unknown or
 // overlong identifiers are omitted, never truncated into a different account's identifier.
-export function accountIdentityFields(account) {
+export function chatgptIdentityFields(account) {
   const out = {};
   for (const [source, target, max] of [['accountId', 'account_uuid', 64], ['email', 'account_email', 320]]) {
     const value = account && account[source];
@@ -26,13 +26,13 @@ export function accountIdentityFields(account) {
 // auth.json remains the fallback, unchanged: it is the answer on a machine that has a sign-in on
 // disk but has never captured a plan. Both reads are small and synchronous — THIS RUNS ON THE
 // CHECKPOINT HOT PATH and must never spawn anything.
-export function readAccountIdentity(deps = {}) {
+export function readChatgptIdentity(deps = {}) {
   let fromConfig = {};
-  try { fromConfig = accountIdentityFields(orDefault(deps.readBillingConfig, readBillingConfig)()); }
+  try { fromConfig = chatgptIdentityFields(orDefault(deps.readBillingConfig, readBillingConfig)()); }
   catch { fromConfig = {}; }
   if (fromConfig.account_uuid) return fromConfig;
   let fromAuth = {};
-  try { fromAuth = accountIdentityFields((deps.readCodexAccount || readCodexAccount)()); }
+  try { fromAuth = chatgptIdentityFields((deps.readChatgptAuth || readChatgptAuth)()); }
   catch { fromAuth = {}; }
   // A config that knew only the address still contributes it; the uuid decides which wins because
   // it is the field the API keys the account row on.

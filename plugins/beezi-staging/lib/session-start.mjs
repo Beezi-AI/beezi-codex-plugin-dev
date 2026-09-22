@@ -2,7 +2,13 @@ import { fetchCompat } from './fetch-compat.mjs';
 import { checkForUpdate as _checkForUpdate, updateNotice } from './update-check.mjs';
 import fs from 'fs';
 import path from 'path';
-import { getAccessToken as _getAccessToken, getAuthentication as _getAuthentication } from './token.mjs';
+import { getAuthentication as _getAuthentication } from './token.mjs';
+import {
+  linkedSessions as _linkedSessions,
+  listAccounts as _listAccounts,
+  updateAccount as _updateAccount,
+  AccountStatus,
+} from './accounts.mjs';
 import { flushQueue, SESSION_LOCK_LEASE_MS } from './checkpoint.mjs';
 import { git as _git, resolveOriginRemote } from './git.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
@@ -21,7 +27,6 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { whoami } from './whoami.mjs';
 import { recordWhoami } from './tracking.mjs';
-import { getMachineClientId } from './machine-identity.mjs';
 import { BillingSource } from './billing.mjs';
 import {
   readBillingConfig as _readBillingConfig,
@@ -31,7 +36,7 @@ import {
   isStale as _isStale,
   shouldProbeAccount as _shouldProbeAccount,
 } from './billing-config.mjs';
-import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
+import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
 import { orDefault } from './compat.mjs';
 import { captureFromCodexAccount } from './billing-capture.mjs';
 import { readAccountViaAppServer as _readAccountViaAppServer } from './codex-app-server.mjs';
@@ -106,14 +111,16 @@ export function discoverRepos(cwd, gitImpl, map, deps = {}) {
   return { map, dirty };
 }
 
-async function announceRepo(cwd, token, fetchImpl, gitImpl) {
-  const remote = resolveOriginRemote(gitImpl, cwd);
+// The remote is resolved ONCE by the caller and handed in: it is a git shell-out and it is the
+// same answer for every linked account, so resolving it per account would multiply a subprocess
+// inside the hook budget by however many workspaces happen to be linked.
+async function announceRepo(remote, session, fetchImpl) {
   if (!remote) return null; // not a git repo — silent
   try {
     // postJson, not a bare fetch: this runs inside the SessionStart hook's 10s budget, and an
     // unbounded request against a stalled API would hold the whole turn open rather than
     // degrading to the silent "offline" path below.
-    const res = await postJson(`${apiBase()}${ENDPOINTS.reposStatus}`, token, { remote }, { fetchImpl });
+    const res = await postJson(`${apiBase()}${ENDPOINTS.reposStatus}`, session, { remote }, { fetchImpl });
     if (!res.ok) return null;
     const { connected, projectName } = await res.json();
     // Both branches are informational only. Nothing downstream gates on `connected`: the
@@ -130,15 +137,45 @@ async function announceRepo(cwd, token, fetchImpl, gitImpl) {
 // So this only decides what to *tell* the user; discarding credentials is left to the token
 // endpoint naming the grant revoked, or to the user signing in again.
 // Offline/unknown (null) still reads as fine, so a check we couldn't run stays silent.
-async function isTokenRejected(token, fetchImpl) {
-  const who = await whoami(token, { fetchImpl });
+async function isTokenRejected(key, session, fetchImpl, deps = {}) {
+  const who = await whoami(session, { fetchImpl });
   // Piggyback the tracking-policy refresh on the check we already make: the trackingMode /
-  // backfillCompleted cache (tracking.json) goes stale between logins otherwise, and the live
-  // gate plus the backfill fast-path both key off it. Best-effort — never blocks session start.
+  // backfillCompleted cache goes stale between logins otherwise, and the live gate plus the
+  // backfill fast-path both key off it. Best-effort — never blocks session start.
   if ((who || {}).valid === true) {
-    try { recordWhoami(who, getMachineClientId()); } catch { /* best-effort */ }
+    // The account's OWN client id, carried on the session this whoami was made with — never a
+    // process-global, which with several accounts linked would bind one tenant's policy under
+    // another's identity and make matchesIdentity discard the wrong cache.
+    try { recordWhoami(key, who, orDefault(session.clientId, null)); } catch { /* best-effort */ }
+    // And fill the index row's identity while a valid answer is in hand. A row whose email is null
+    // — migrated from a pre-0.13 install, or linked while the portal was unreachable — can never be
+    // matched by lib/accounts.mjs's findByEmail, so a re-login as its own user mints a SECOND
+    // linked row and the machine fans out two reports of every session into one workspace.
+    //
+    // AFTER recordWhoami, never inside it. recordWhoami takes `shared:tracking-<key>` and
+    // updateAccount takes `shared:accounts-index`; both are rank 3 in LOCK_ORDER and
+    // lib/single-instance-lock.mjs refuses a rank-3 lock while this process holds another rank-3
+    // lock under a different name. recordWhoami is synchronous and its lock is released by the time
+    // it returns, so this call is sequential rather than nested.
+    //
+    // Only when the row has nothing recorded and the portal named somebody: updateAccount treats
+    // null as "leave it alone", so an older portal's null tenant fields cannot blank a known one.
+    if (session.email == null && who.email != null) {
+      const updateAccount = orDefault(deps.updateAccount, _updateAccount);
+      try {
+        await updateAccount(key, {
+          email: who.email, name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
+        }, deps);
+      } catch { /* best-effort — a session must not fail because a row could not be labelled */ }
+    }
   }
   return (who || {}).valid === false;
+}
+
+// How a warning line names an account. Only reached when more than one is linked — with one,
+// naming it in every message would be noise about a fact the user already knows.
+function workspaceLabel(account) {
+  return orDefault(orDefault(account.tenantName, account.email), account.key);
 }
 
 // How long the SessionStart hook will wait on `codex app-server` before falling through to the
@@ -161,7 +198,6 @@ function readAuthFileMtimeMs() {
 
 // Returns an optional systemMessage string (or null). Never throws for expected failures.
 export async function runSessionStart(input, deps = {}) {
-  const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const gitImpl = orDefault(deps.gitImpl, _git);
   const resolveSource = orDefault(deps.resolveSource, _resolveSource);
@@ -169,7 +205,7 @@ export async function runSessionStart(input, deps = {}) {
   const writeBillingConfig = orDefault(deps.writeBillingConfig, _writeBillingConfig);
   const isStale = orDefault(deps.isStale, _isStale);
   const shouldProbeAccount = orDefault(deps.shouldProbeAccount, _shouldProbeAccount);
-  const readCodexAccount = orDefault(deps.readCodexAccount, _readCodexAccount);
+  const readChatgptAuth = orDefault(deps.readChatgptAuth, _readChatgptAuth);
   // Tier 1 of the plan/account ladder. Threaded like every other reader on this path: a bare call
   // would SPAWN A REAL `codex app-server` from the test suite, which tools/hermetic-env.mjs records
   // as an escape to the developer's own ~/.codex.
@@ -182,32 +218,82 @@ export async function runSessionStart(input, deps = {}) {
   const env = orDefault(deps.env, process.env);
   const checkForUpdate = orDefault(deps.checkForUpdate, _checkForUpdate);
 
-  const authenticate = deps.getAuthentication || (deps.getAccessToken
-    ? async (options) => ({ accessToken: await getAccessToken({}, options), state: 'unlinked' })
-    : async (options) => _getAuthentication({}, options));
-  const auth = await authenticate().catch(() => ({ state: 'unavailable' }));
-  let token = auth.accessToken;
-  if (!token && (auth.state === 'unavailable' || auth.state === 'refreshing')) {
-    return 'Beezi authentication is temporarily unavailable or refreshing. Your saved link is preserved; analytics will retry.';
-  }
-  if (!token)
-    return '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Ask Beezi to sign you in.';
+  const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
+  const listAccounts = orDefault(deps.listAccounts, _listAccounts);
+  const authenticate = orDefault(deps.getAuthentication, _getAuthentication);
 
-  if (await isTokenRejected(token, fetchImpl)) {
-    // The 401 is the server's verdict on the token; expires_at was only ours, and a server that
-    // omits expires_in leaves it a guess. Take the server's word and refresh once before
-    // declaring the link bad — otherwise a token that died earlier than we estimated is never
-    // renewed, and every session reports a rejection that a single refresh would have fixed.
-    const retry = await authenticate({ forceRefresh: true }).catch(() => ({ state: 'unavailable' }));
-    if (!retry.accessToken && (retry.state === 'unavailable' || retry.state === 'refreshing')) {
+  // Every account that can currently produce a token. linkedSessions DROPS one it cannot — that is
+  // what keeps a single failing account from costing the whole hook — so an account missing from
+  // this list still has to be explained, below, or a machine whose only account is mid-refresh
+  // would be told it is "not linked" and the user sent to sign in again for nothing.
+  let sessions;
+  try { sessions = orDefault(await listSessions(deps), []); } catch { sessions = []; }
+  let indexed;
+  try { indexed = orDefault(await listAccounts(deps), []); } catch { indexed = []; }
+  const linked = indexed.filter((account) => account.status !== AccountStatus.REVOKED);
+  const many = linked.length > 1;
+
+  // One authentication read per unresolved account, SERIALLY: getAuthentication takes
+  // `shared:token-refresh-<key>` when it renews, and two rank-3 locks under different names at
+  // once in one process is a 'lock-order' refusal rather than a wait.
+  const unresolved = [];
+  for (const account of linked) {
+    if (sessions.some((session) => session.key === account.key)) continue;
+    let state = 'unavailable';
+    try { state = orDefault((await authenticate(account.key, deps)).state, 'unavailable'); }
+    catch { state = 'unavailable'; }
+    unresolved.push({ account, state });
+  }
+  const isTemporary = (state) => state === 'unavailable' || state === 'refreshing';
+
+  if (sessions.length === 0) {
+    if (unresolved.some((one) => isTemporary(one.state))) {
       return 'Beezi authentication is temporarily unavailable or refreshing. Your saved link is preserved; analytics will retry.';
     }
-    const refreshed = retry.accessToken;
-    if (!refreshed || await isTokenRejected(refreshed, fetchImpl)) {
+    if (unresolved.some((one) => one.state === 'reauth_required')) {
       return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.';
     }
-    token = refreshed;
+    return '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Ask Beezi to sign you in.';
   }
+
+  // Lines about accounts that will not report this session. With one account linked these are the
+  // whole answer and the function has already returned above; past that point they ride alongside
+  // the accounts that DID resolve, because one broken workspace must not silence a working one.
+  const warnings = [];
+  for (const one of unresolved) {
+    if (!many) continue;
+    warnings.push(isTemporary(one.state)
+      ? `Beezi: ${workspaceLabel(one.account)} is temporarily unavailable or refreshing — its analytics will retry.`
+      : `⚠ Beezi: ${workspaceLabel(one.account)} is not reporting — its link was rejected. Ask Beezi to sign you in again.`);
+  }
+
+  // The token check, per account and serially for the same lock-order reason as above.
+  const active = [];
+  for (const session of sessions) {
+    let current = session;
+    if (await isTokenRejected(session.key, current, fetchImpl, deps)) {
+      // The 401 is the server's verdict on the token; expires_at was only ours, and a server that
+      // omits expires_in leaves it a guess. Take the server's word and refresh once before
+      // declaring the link bad — otherwise a token that died earlier than we estimated is never
+      // renewed, and every session reports a rejection that a single refresh would have fixed.
+      const retry = await authenticate(session.key, deps, { forceRefresh: true })
+        .catch(() => ({ state: 'unavailable' }));
+      if (!retry.accessToken && isTemporary(retry.state)) {
+        if (!many) return 'Beezi authentication is temporarily unavailable or refreshing. Your saved link is preserved; analytics will retry.';
+        warnings.push(`Beezi: ${workspaceLabel(session)} is temporarily unavailable or refreshing — its analytics will retry.`);
+        continue;
+      }
+      const refreshed = retry.accessToken;
+      if (!refreshed || await isTokenRejected(session.key, { ...current, token: refreshed }, fetchImpl, deps)) {
+        if (!many) return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.';
+        warnings.push(`⚠ Beezi: ${workspaceLabel(session)} is not reporting — its link was rejected. Ask Beezi to sign you in again.`);
+        continue;
+      }
+      current = { ...current, token: refreshed };
+    }
+    active.push(current);
+  }
+  if (active.length === 0) return warnings.length ? warnings.join('\n') : null;
 
   // Best-effort like every other write here: writeJsonSecure refuses to overwrite a file it could
   // not replace atomically, and losing this mapping costs one checkpoint's cwd hint — not the
@@ -218,16 +304,25 @@ export async function runSessionStart(input, deps = {}) {
       transcriptPath: orDefault(input.transcript_path, null),
     });
   } catch { /* best-effort */ }
-  // Independent network I/O on the per-session hot path — flush queued checkpoints
-  // and probe repo status concurrently rather than serially.
-  //
-  // flushQueue takes `shared:queue` itself, so this bare caller needs no lock of its own — and it
-  // must not take one: the rank-2 session lock above has already been released by the time this
-  // runs, but a rank-3 lock held HERE would be nested inside flushQueue's own and refused.
-  const [, systemMessage] = await Promise.all([
-    flushQueue(token, { fetchImpl }),
-    announceRepo(input.cwd, token, fetchImpl, gitImpl),
-  ]);
+
+  // The repo's origin: one git shell-out for the machine, then one probe per account, because the
+  // repo→project mapping is a fact about a TENANT and two workspaces answer it differently.
+  let remote = null;
+  try { remote = resolveOriginRemote(gitImpl, input.cwd); } catch { remote = null; }
+
+  // SERIAL over the accounts: flushQueue takes `shared:queue-<key>`, rank 3, so two drains at once
+  // in this one process would be refused as 'lock-order' — an account silently not uploading,
+  // which is the exact failure the fan-out exists to prevent. The repo probe carries no lock, so
+  // it rides along inside each account's turn.
+  const announcements = [];
+  for (const session of active) {
+    const [, line] = await Promise.all([
+      flushQueue(session.key, session, { fetchImpl }),
+      announceRepo(remote, session, fetchImpl),
+    ]);
+    if (line) announcements.push(many ? `${workspaceLabel(session)} — ${line}` : line);
+  }
+  const systemMessage = announcements.length ? announcements.join('\n') : null;
   try { pruneStale(); } catch { /* best-effort */ }
 
   // Pre-warm + self-heal the repo-map: discover this session's repo(s) and drop dead roots.
@@ -301,7 +396,7 @@ export async function runSessionStart(input, deps = {}) {
         existing: billingConfig,
         env: env,
         deps: {
-          readCodexAccount,
+          readChatgptAuth,
           resolveSource,
           readAccountViaAppServer,
           // Shorter than the module default: this sits inside the hook's 10s budget alongside a
@@ -344,7 +439,7 @@ export async function runSessionStart(input, deps = {}) {
   // its steady state — unchanged payload, checked in within the week — is two reads and NO network.
   //
   // Three things travel that are not optional:
-  //   fetchImpl / readCodexAccount — the seams this hook already threads. A bare call would run the
+  //   fetchImpl / readChatgptAuth — the seams this hook already threads. A bare call would run the
   //                                  real reader and the real fetch, reopening exactly the
   //                                  hermeticity class G-10-1 closed on this path.
   //   timeoutMs: 1500              — a refusal never seals the marker, so an unreachable API would
@@ -359,16 +454,25 @@ export async function runSessionStart(input, deps = {}) {
   // `force` is reserved for periodic/non-file captures. An auth-file revalidation already moves the
   // payload hash when account or plan changed; leaving force false keeps token-only refreshes
   // network-free while still propagating an account switch in this run.
-  try {
-    await syncAccount(token, { force: forceAccountSync }, {
-      fetchImpl,
-      readCodexAccount,
-      readBillingConfig: () => billingConfig,
-      timeoutMs: 1500,
-    });
-  } catch { /* best-effort */ }
+  //
+  // One check-in per account, serially. The payload is the same for all of them — it describes
+  // the ChatGPT sign-in and plan this MACHINE is on — but the marker that suppresses a redundant
+  // POST is per account, so a workspace linked yesterday still gets its first check-in even
+  // though another was told the same thing last week.
+  for (const session of active) {
+    try {
+      await syncAccount(session.key, session, { force: forceAccountSync }, {
+        fetchImpl,
+        readChatgptAuth,
+        readBillingConfig: () => billingConfig,
+        timeoutMs: 1500,
+      });
+    } catch { /* best-effort */ }
+  }
 
-  let message = systemMessage;
+  let message = warnings.length
+    ? (systemMessage ? `${warnings.join('\n')}\n${systemMessage}` : warnings.join('\n'))
+    : systemMessage;
   let nudge = null;
   if (billingSource === BillingSource.SUBSCRIPTION && isStale(billingConfig)) {
     // Reached only when the auto-capture above could not name a plan it trusts — so pointing the

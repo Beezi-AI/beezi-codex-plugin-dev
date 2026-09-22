@@ -17,7 +17,12 @@ import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 // Point BEEZI_CODEX_HOME at a temp dir and restore it afterward.
 const tmpHome = (t) => sandboxHome(t, 'creds-');
 
-const credsPath = (dir) => path.join(dir, 'credentials.json');
+// Every credential call is keyed from 0.13 on. One account key serves the whole file: these cases
+// are about the BACKENDS, not about keeping two accounts apart — test/account-credentials.test.mjs
+// owns that — so the store now lives under accounts/<key>/ rather than at the data root.
+const KEY = 'a1b2c3d4';
+const accountPath = (dir, name) => path.join(dir, 'accounts', KEY, name);
+const credsPath = (dir) => accountPath(dir, 'credentials.json');
 
 // Minimal valid credentials object; access_token varies per test for traceability.
 const creds = (accessToken) => ({
@@ -30,16 +35,16 @@ const creds = (accessToken) => ({
 });
 
 // Stored access_token, or null — the round-trip observable in these tests.
-const storedToken = async (deps) => (await getCredentials(deps))?.access_token ?? null;
+const storedToken = async (deps) => (await getCredentials(KEY, deps))?.access_token ?? null;
 
 test('an inaccessible Windows credential store is not reported as a revision mismatch', async (t) => {
   tmpHome(t);
   const run = winRun();
-  await setCredentials(creds('at'), { platform: 'win32', run });
-  assert.throws(() => readRawCredential({
+  await setCredentials(KEY, creds('at'), { platform: 'win32', run });
+  assert.throws(() => readRawCredential(KEY, {
     platform: 'win32', run: () => ({ ok: false, stdout: '' }),
   }), /Committed credentials could not be read; check access to the credential store/);
-  assert.equal(JSON.parse(readRawCredential({ platform: 'win32', run })).access_token, 'at');
+  assert.equal(JSON.parse(readRawCredential(KEY, { platform: 'win32', run })).access_token, 'at');
 });
 
 const nativeReadCases = [
@@ -55,8 +60,8 @@ for (const reader of [getCredentials, readRawCredential]) {
     test(`${reader.name}: bounded ${platform} ${probe ? 'probe' : 'read'} retries, recovery=${recover}`, async (t) => {
       const dir = tmpHome(t);
       const backing = makeRun();
-      await setCredentials(creds('at'), { platform, run: backing });
-      const authorityPath = path.join(dir, 'credential-control.json');
+      await setCredentials(KEY, creds('at'), { platform, run: backing });
+      const authorityPath = accountPath(dir, 'credential-control.json');
       const authority = fs.readFileSync(authorityPath, 'utf-8');
       let reads = 0;
       const waits = [];
@@ -71,10 +76,10 @@ for (const reader of [getCredentials, readRawCredential]) {
         },
       };
       if (recover) {
-        const result = await reader(deps);
+        const result = await reader(KEY, deps);
         assert.equal((typeof result === 'string' ? JSON.parse(result) : result).access_token, 'at');
       } else {
-        await assert.rejects(async () => reader(deps), { code: 'CREDENTIALS_UNAVAILABLE' });
+        await assert.rejects(async () => reader(KEY, deps), { code: 'CREDENTIALS_UNAVAILABLE' });
       }
       assert.equal(reads, 3);
       assert.deepEqual(waits, [100, 250]);
@@ -89,7 +94,7 @@ for (const { platform, makeRun, isRead } of nativeReadCases.filter(c => !c.probe
 test(`${platform} readable revision mismatches are not retried`, async (t) => {
   tmpHome(t);
   const backing = makeRun();
-  await setCredentials(creds('at'), { platform, run: backing });
+  await setCredentials(KEY, creds('at'), { platform, run: backing });
   let reads = 0;
   const deps = {
     platform, sleepImpl: () => assert.fail('must not wait for a revision mismatch'),
@@ -102,8 +107,8 @@ test(`${platform} readable revision mismatches are not retried`, async (t) => {
       return result;
     },
   };
-  assert.throws(() => readRawCredential(deps), /Credential revision mismatch/);
-  await assert.rejects(getCredentials(deps), { code: 'CREDENTIALS_UNAVAILABLE' });
+  assert.throws(() => readRawCredential(KEY, deps), /Credential revision mismatch/);
+  await assert.rejects(getCredentials(KEY, deps), { code: 'CREDENTIALS_UNAVAILABLE' });
   assert.equal(reads, 2);
 });
 }
@@ -111,12 +116,12 @@ test(`${platform} readable revision mismatches are not retried`, async (t) => {
 test('a readable credential with a different revision still blocks raw reads', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'unknown' };
-  await setCredentials(creds('at'), deps);
+  await setCredentials(KEY, creds('at'), deps);
   const stored = JSON.parse(fs.readFileSync(credsPath(dir), 'utf-8'));
   const credential = JSON.parse(stored.token);
   credential.beezi_revision = 'stale';
   fs.writeFileSync(credsPath(dir), JSON.stringify({ token: JSON.stringify(credential) }));
-  assert.throws(() => readRawCredential(deps), /Credential revision mismatch/);
+  assert.throws(() => readRawCredential(KEY, deps), /Credential revision mismatch/);
 });
 
 // ── fake OS tools (in-memory), injected via deps.run ──────────────────────────
@@ -178,24 +183,24 @@ function winRun({ credMan = true, dpapi = true } = {}) {
 test('round-trips a credentials object through the file store', async (t) => {
   tmpHome(t);
   const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };
-  await setCredentials(creds('at'), deps);
-  assert.deepEqual(await getCredentials(deps), creds('at'));
+  await setCredentials(KEY, creds('at'), deps);
+  assert.deepEqual(await getCredentials(KEY, deps), creds('at'));
 });
 
 test('legacy bare device token reads as null (not linked)', async (t) => {
   const dir = tmpHome(t);
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(path.dirname(credsPath(dir)), { recursive: true });
   fs.writeFileSync(credsPath(dir), JSON.stringify({ token: 'bzi_legacy' }));
   const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };
-  assert.equal(await getCredentials(deps), null);
+  assert.equal(await getCredentials(KEY, deps), null);
 });
 
 test('malformed stored JSON reads as null', async (t) => {
   const dir = tmpHome(t);
-  fs.mkdirSync(dir, { recursive: true });
+  fs.mkdirSync(path.dirname(credsPath(dir)), { recursive: true });
   fs.writeFileSync(credsPath(dir), JSON.stringify({ token: '{not json' }));
   const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };
-  assert.equal(await getCredentials(deps), null);
+  assert.equal(await getCredentials(KEY, deps), null);
 });
 
 // ── macOS ─────────────────────────────────────────────────────────────────────
@@ -203,10 +208,10 @@ test('malformed stored JSON reads as null', async (t) => {
 test('macOS — security keychain round-trip; nothing written to disk', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'darwin', run: macRun(new Map()) };
-  await setCredentials(creds('mac-tok'), deps);
+  await setCredentials(KEY, creds('mac-tok'), deps);
   assert.equal(fs.existsSync(credsPath(dir)), false, 'keychain used, no file');
   assert.equal(await storedToken(deps), 'mac-tok');
-  await deleteCredentials(deps);
+  await deleteCredentials(KEY, deps);
   assert.equal(await storedToken(deps), null);
 });
 
@@ -215,17 +220,17 @@ test('macOS — security keychain round-trip; nothing written to disk', async (t
 test('Linux — secret-tool round-trip when libsecret is installed', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'linux', run: secretToolRun(new Map(), true) };
-  await setCredentials(creds('lin-tok'), deps);
+  await setCredentials(KEY, creds('lin-tok'), deps);
   assert.equal(fs.existsSync(credsPath(dir)), false, 'keychain used, no file');
   assert.equal(await storedToken(deps), 'lin-tok');
-  await deleteCredentials(deps);
+  await deleteCredentials(KEY, deps);
   assert.equal(await storedToken(deps), null);
 });
 
 test('Linux — no secret-tool → falls back to the 0600 file', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'linux', run: secretToolRun(new Map(), false) };
-  await setCredentials(creds('lin-file'), deps);
+  await setCredentials(KEY, creds('lin-file'), deps);
   assert.equal(fs.existsSync(credsPath(dir)), true, 'file fallback written');
   const raw = JSON.parse(fs.readFileSync(credsPath(dir), 'utf-8')).token;
   assert.equal(JSON.parse(raw).access_token, 'lin-file');
@@ -237,18 +242,18 @@ test('Linux — no secret-tool → falls back to the 0600 file', async (t) => {
 test('Windows — Credential Manager round-trip (primary); nothing written to disk', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'win32', run: winRun() };
-  const where = await setCredentials(creds('win-cred'), deps);
+  const where = await setCredentials(KEY, creds('win-cred'), deps);
   assert.equal(where, 'the Windows Credential Manager');
   assert.equal(fs.existsSync(credsPath(dir)), false, 'Credential Manager used, no file');
   assert.equal(await storedToken(deps), 'win-cred');
-  await deleteCredentials(deps);
+  await deleteCredentials(KEY, deps);
   assert.equal(await storedToken(deps), null);
 });
 
 test('Windows — Credential Manager unavailable → DPAPI encrypts at rest (no plaintext in file)', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'win32', run: winRun({ credMan: false, dpapi: true }) };
-  await setCredentials(creds('win-tok'), deps);
+  await setCredentials(KEY, creds('win-tok'), deps);
   const raw = fs.readFileSync(credsPath(dir), 'utf-8');
   const obj = JSON.parse(raw);
   assert.ok(obj.enc, 'ciphertext stored under "enc"');
@@ -260,7 +265,7 @@ test('Windows — Credential Manager unavailable → DPAPI encrypts at rest (no 
 test('Windows — Credential Manager + DPAPI unavailable → plaintext 0600 file fallback', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'win32', run: winRun({ credMan: false, dpapi: false }) };
-  await setCredentials(creds('win-plain'), deps);
+  await setCredentials(KEY, creds('win-plain'), deps);
   const raw = JSON.parse(fs.readFileSync(credsPath(dir), 'utf-8')).token;
   assert.equal(JSON.parse(raw).access_token, 'win-plain');
   assert.equal(await storedToken(deps), 'win-plain');
@@ -270,7 +275,7 @@ test('Windows — legacy DPAPI-file credentials still read when Credential Manag
   tmpHome(t);
   // Simulate a user who linked before the Credential Manager backend existed: credentials live
   // in the DPAPI file only. A later session (credMan present but empty) must still find them.
-  await setCredentials(creds('legacy-dpapi'), { platform: 'win32', run: winRun({ credMan: false, dpapi: true }) });
+  await setCredentials(KEY, creds('legacy-dpapi'), { platform: 'win32', run: winRun({ credMan: false, dpapi: true }) });
   assert.equal(await storedToken({ platform: 'win32', run: winRun({ credMan: true, dpapi: true }) }), 'legacy-dpapi');
 });
 
@@ -279,14 +284,14 @@ test('Windows — legacy DPAPI-file credentials still read when Credential Manag
 test('unknown platform → file store round-trip', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) };
-  await setCredentials(creds('generic'), deps);
+  await setCredentials(KEY, creds('generic'), deps);
   assert.equal(fs.existsSync(credsPath(dir)), true);
   assert.equal(await storedToken(deps), 'generic');
 });
 
 test('keychain empty but file credentials exist → file fallback on read', async (t) => {
   tmpHome(t);
-  await setCredentials(creds('legacy-file'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) }); // file
+  await setCredentials(KEY, creds('legacy-file'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) }); // file
   const deps = { platform: 'darwin', run: macRun(new Map()) };                                                // empty keychain
   assert.equal(await storedToken(deps), 'legacy-file');
 });
@@ -294,26 +299,26 @@ test('keychain empty but file credentials exist → file fallback on read', asyn
 test('no credentials anywhere → null, never throws', async (t) => {
   tmpHome(t);
   const deps = { platform: 'darwin', run: macRun(new Map()) };
-  await assert.doesNotReject(() => getCredentials(deps));
-  assert.equal(await getCredentials(deps), null);
+  await assert.doesNotReject(() => getCredentials(KEY, deps));
+  assert.equal(await getCredentials(KEY, deps), null);
 });
 
 test('deleteCredentials clears both keychain and any file copy', async (t) => {
   const dir = tmpHome(t);
   // Seed a stale file copy AND a keychain copy.
-  await setCredentials(creds('file-one'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) });
+  await setCredentials(KEY, creds('file-one'), { platform: 'sunos', run: () => ({ ok: false, stdout: '' }) });
   const store = new Map();
   const deps = { platform: 'darwin', run: macRun(store) };
-  await setCredentials(creds('key-one'), deps);
-  await deleteCredentials(deps);
+  await setCredentials(KEY, creds('key-one'), deps);
+  await deleteCredentials(KEY, deps);
   assert.equal(store.has('k'), false, 'keychain cleared');
   assert.equal(fs.existsSync(credsPath(dir)), false, 'file cleared');
-  assert.equal(await getCredentials(deps), null);
+  assert.equal(await getCredentials(KEY, deps), null);
 });
 
 test('file store uses restricted 0600 permissions (posix only)', { skip: process.platform === 'win32' }, async (t) => {
   const dir = tmpHome(t);
-  await setCredentials(creds('x'), { platform: 'linux', run: secretToolRun(new Map(), false) });
+  await setCredentials(KEY, creds('x'), { platform: 'linux', run: secretToolRun(new Map(), false) });
   const mode = fs.statSync(credsPath(dir)).mode & 0o777;
   assert.equal(mode, 0o600);
 });
@@ -330,7 +335,7 @@ test('every backend keys off that one name', () => {
   const calls = [];
   const run = (file, args) => { calls.push([file, ...args].join(' ')); return { ok: false, stdout: '' }; };
   for (const platform of ['darwin', 'linux', 'win32']) {
-    getCredentials({ run, platform }).catch(() => {});
+    getCredentials(KEY, { run, platform }).catch(() => {});
   }
   const text = calls.join('\n');
   assert.ok(text.includes(SERVICE), 'the service name reaches the keyring commands');
@@ -346,18 +351,18 @@ test('every native backend passes the exact service name through, argv by argv',
   const run = (file, args, input) => { calls.push({ file, args, input }); return { ok: false, stdout: '' }; };
   tmpHome(t);
 
-  await getCredentials({ platform: 'darwin', run });
+  await getCredentials(KEY, { platform: 'darwin', run });
   const mac = calls.find((c) => c.file === 'security');
   assert.equal(mac.args[mac.args.indexOf('-s') + 1], SERVICE, 'macOS -s carries the service name');
 
   calls.length = 0;
-  await setCredentials(creds('mac'), { platform: 'darwin', run });
+  await setCredentials(KEY, creds('mac'), { platform: 'darwin', run });
   const macSet = calls.find((c) => c.args[0] === 'add-generic-password');
   assert.equal(macSet.args[macSet.args.indexOf('-s') + 1], SERVICE);
 
   tmpHome(t); // each platform starts with a legacy, uncommitted store
   calls.length = 0;
-  await getCredentials({ platform: 'linux', run: (f, a, i) => {
+  await getCredentials(KEY, { platform: 'linux', run: (f, a, i) => {
     calls.push({ file: f, args: a, input: i });
     return f === 'secret-tool' && a[0] === '--version' ? { ok: true, stdout: 'x' } : { ok: false, stdout: '' };
   } });
@@ -365,7 +370,7 @@ test('every native backend passes the exact service name through, argv by argv',
   assert.equal(lookup.args[lookup.args.indexOf('service') + 1], SERVICE, 'secret-tool service attr');
 
   calls.length = 0;
-  await setCredentials(creds('lin'), { platform: 'linux', run: (f, a, i) => {
+  await setCredentials(KEY, creds('lin'), { platform: 'linux', run: (f, a, i) => {
     calls.push({ file: f, args: a, input: i });
     return f === 'secret-tool' && a[0] === '--version' ? { ok: true, stdout: 'x' } : { ok: false, stdout: '' };
   } });
@@ -384,14 +389,16 @@ test('the Windows PowerShell templates carry the service name as literal script 
     return { ok: false, stdout: '', input };
   };
   tmpHome(t);
-  await getCredentials({ platform: 'win32', run });
-  await setCredentials(creds('w'), { platform: 'win32', run });
-  await deleteCredentials({ platform: 'win32', run });
+  await getCredentials(KEY, { platform: 'win32', run });
+  await setCredentials(KEY, creds('w'), { platform: 'win32', run });
+  await deleteCredentials(KEY, { platform: 'win32', run });
 
   const credMan = scripts.filter((s) => /Cred(Read|Write|Delete)/.test(s));
   assert.ok(credMan.length >= 3, 'all three Credential Manager scripts were exercised');
+  // The target is `<service>:<key>` since the store became keyed — a generic credential is
+  // identified by TargetName, so the account has to be in it and not only in the UserName.
   for (const script of credMan) {
-    assert.ok(script.includes(`'${SERVICE}'`), `a CredMan script lost the target name:
+    assert.ok(script.includes(`'${SERVICE}:${KEY}'`), `a CredMan script lost the target name:
 ${script}`);
   }
 });
@@ -399,30 +406,32 @@ ${script}`);
 test('the stored blob is stamped with its environment, and readers never see the stamp', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };
-  await setCredentials(creds('stamped'), deps);
+  await setCredentials(KEY, creds('stamped'), deps);
   const stored = JSON.parse(JSON.parse(fs.readFileSync(credsPath(dir), 'utf-8')).token);
   assert.equal(stored.beezi_env, BEEZI_ENV, 'the environment binding is persisted');
   // Stripped on read: every consumer (token.mjs, login.mjs, logout.mjs) sees the shape it always
   // saw, and the refresh path's `{ ...creds }` re-stamps through setCredentials.
-  assert.deepEqual(await getCredentials(deps), creds('stamped'));
+  assert.deepEqual(await getCredentials(KEY, deps), creds('stamped'));
 });
 
 test('credentials stamped for another environment read as absent, so no token is issued', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };
   // Exactly what a staging install writes into a BEEZI_CODEX_HOME root shared with production.
+  fs.mkdirSync(path.dirname(credsPath(dir)), { recursive: true });
   fs.writeFileSync(credsPath(dir), JSON.stringify({
     token: JSON.stringify({ ...creds('staging-token'), beezi_env: 'staging' }),
   }));
-  assert.equal(await getCredentials(deps), null, 'a crossed binding produced a usable token');
+  assert.equal(await getCredentials(KEY, deps), null, 'a crossed binding produced a usable token');
 });
 
 test('a pre-G-2-2 unstamped blob reads as production, so existing installs keep working', async (t) => {
   const dir = tmpHome(t);
   const deps = { platform: 'unknown', run: () => ({ ok: false, stdout: '' }) };
+  fs.mkdirSync(path.dirname(credsPath(dir)), { recursive: true });
   fs.writeFileSync(credsPath(dir), JSON.stringify({ token: JSON.stringify(creds('legacy')) }));
   assert.equal(BEEZI_ENV, '', 'this process is the production namespace');
-  assert.deepEqual(await getCredentials(deps), creds('legacy'));
+  assert.deepEqual(await getCredentials(KEY, deps), creds('legacy'));
 });
 
 test('the libsecret label follows the service argument, not the module constant', (t) => {
@@ -441,7 +450,7 @@ test('the libsecret label follows the service argument, not the module constant'
   };
 
   const preserved = preserveMigrationCredential(
-    JSON.stringify(creds('to-preserve')), destination, { platform: 'linux', run },
+    KEY, JSON.stringify(creds('to-preserve')), destination, { platform: 'linux', run },
   );
   assert.equal(preserved, true, 'the staging credential must round-trip through libsecret');
 
@@ -452,4 +461,24 @@ test('the libsecret label follows the service argument, not the module constant'
     store.args.includes(`--label=${service}`),
     `the label must name the entry that was written, got ${JSON.stringify(store.args)}`,
   );
+
+  // The authority record must land where the DESTINATION install's readControl(key) will look for
+  // it — under that root's accounts/<key>/, not at its root. Split the two and the preserved
+  // install falls through to the uncommitted read path, silently losing the revision check and the
+  // tombstone. Proved by pointing the data root at the destination and reading the preserved
+  // credential back through the committed path.
+  assert.ok(
+    fs.existsSync(path.join(destination, 'accounts', KEY, 'credential-control.json')),
+    `the authority is not beside the destination account: ${JSON.stringify(fs.readdirSync(destination))}`,
+  );
+  const previousHome = process.env.BEEZI_CODEX_HOME;
+  process.env.BEEZI_CODEX_HOME = destination;
+  try {
+    const raw = readRawCredential(KEY, { platform: 'linux', run });
+    assert.equal(JSON.parse(raw).access_token, 'to-preserve',
+      'the destination could not read its own committed credential');
+    assert.equal(JSON.parse(raw).beezi_env, 'staging');
+  } finally {
+    process.env.BEEZI_CODEX_HOME = previousHome;
+  }
 });

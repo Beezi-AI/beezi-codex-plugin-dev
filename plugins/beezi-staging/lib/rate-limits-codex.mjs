@@ -1,5 +1,5 @@
 import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { usageObservationsFile } from './paths.mjs';
+import { usageObservationsFile, usagePendingFile } from './paths.mjs';
 import { orDefault, parseTimestampMs } from './compat.mjs';
 import { canonicalPlan } from './billing.mjs';
 import { withLock, sharedLock } from './single-instance-lock.mjs';
@@ -283,28 +283,74 @@ export function readObservedPlan(deps = {}) {
   };
 }
 
-// Appends the observations worth posting to the pending queue. Pure file I/O and arithmetic — never
-// network, so it is safe to run inside the hook budget.
-export function recordRateLimitObservations(observations, deps = {}) {
-  const result = withLock(sharedLock('rate-limit-observations'), {},
+function queueBusy() {
+  const error = new Error('Rate-limit queue is busy; retry this checkpoint');
+  error.code = 'RATE_LIMIT_QUEUE_BUSY';
+  return error;
+}
+
+/**
+ * Queue the observations worth posting, once per linked account. Pure file I/O and arithmetic —
+ * never network, so it is safe to run inside the hook budget.
+ *
+ * THE READING IS MACHINE-LEVEL, THE QUEUE IS NOT. A rate-limit block describes the ChatGPT account
+ * Codex is signed into, not a Beezi tenant, so the debounce series and the observed plan stay in
+ * one file: deciding materiality per account would multiply the 5-point gate by however many
+ * workspaces happen to be linked and re-open the 15-minute floor for each of them. What is
+ * per-account is DELIVERY — every linked tenant is owed the same row, and each drains and clears
+ * its own copy.
+ *
+ * TWO LOCKS, TAKEN ONE AFTER THE OTHER AND NEVER NESTED. `shared:rate-limit-observations` covers
+ * the series; `shared:rate-limit-pending-<key>` covers one account's queue. Both are rank 3, so
+ * holding the first while reaching for the second would be refused as 'lock-order' — a permanent
+ * failure, not a busy lock. The series section therefore ENDS before the first append begins.
+ *
+ * Returns `{ recorded, reason?, skippedKeys }`. A refused SERIES lock throws, exactly as before:
+ * nothing was decided, so the checkpoint keeps its cursor and the whole window is retried. A
+ * refused per-account queue is reported in `skippedKeys` instead — the series has already advanced
+ * by then, and failing the entire checkpoint (its segments included) over one contended account's
+ * sample, which the next reading re-observes within the 15-minute floor, would cost far more than
+ * it saves.
+ */
+export function recordRateLimitObservations(observations, keys, deps = {}) {
+  const decided = withLock(sharedLock('rate-limit-observations'), {},
     () => recordObservationsLocked(observations, deps));
-  if (!result.ok) {
-    const error = new Error('Rate-limit queue is busy; retry this checkpoint');
-    error.code = 'RATE_LIMIT_QUEUE_BUSY';
-    throw error;
+  if (!decided.ok) throw queueBusy();
+  const outcome = decided.value;
+  const rows = outcome.rows;
+  const skippedKeys = [];
+  if (rows.length > 0) {
+    for (const key of Array.isArray(keys) ? keys : []) {
+      if (!appendPending(key, rows, deps)) skippedKeys.push(key);
+    }
   }
-  return result.value;
+  return { recorded: outcome.recorded, reason: outcome.reason, skippedKeys };
+}
+
+// One account's queue, under that account's own lock. Returns false when the lock was refused —
+// see the contract on recordRateLimitObservations.
+function appendPending(key, rows, deps) {
+  const run = withLock(sharedLock(`rate-limit-pending-${key}`), {}, () => {
+    const file = deps.pendingFile == null ? usagePendingFile(key) : deps.pendingFile;
+    let state = readJson(file);
+    if (state == null) state = {};
+    const pending = Array.isArray(state.pending) ? state.pending : [];
+    writeJsonSecure(file, { version: 1, pending: pending.concat(rows).slice(-MAX_PENDING) });
+  });
+  return run.ok;
 }
 
 function recordObservationsLocked(observations, deps) {
   if (!Array.isArray(observations) || observations.length === 0) {
-    return { recorded: 0, reason: 'no-observations' };
+    return { recorded: 0, reason: 'no-observations', rows: [] };
   }
   const file = deps.file == null ? usageObservationsFile() : deps.file;
   let state = readJson(file);
   if (state == null) state = {};
   const series = state.series == null ? {} : state.series;
-  const pending = Array.isArray(state.pending) ? state.pending : [];
+  // The rows this pass decided are worth sending. They are handed BACK rather than written here:
+  // every linked account gets the same list, each into its own queue and under its own lock.
+  const rows = [];
 
   // Rung 2 of the plan ladder, kept beside the debounce state because this file is root-level and
   // survives pruneStale's 14-day sweep (`pruneStale` in lib/prune.mjs) — the plan must outlive the
@@ -337,7 +383,7 @@ function recordObservationsLocked(observations, deps) {
       || isMaterial(o.sevenDay, s.lastSevenDay)
       || isMaterial(o.monthly, s.lastMonthly);
     if (!material && atMs - s.lastRecordedMs < RECORD_FLOOR_MS) continue;
-    pending.push(buildRow(o));
+    rows.push(buildRow(o));
     recorded += 1;
     // The baseline only ever moves FORWARD. Unlike the Claude plugin's wall-clock debounce, this
     // floor is measured against a record's own timestamp, and two writers can interleave — a second
@@ -357,17 +403,20 @@ function recordObservationsLocked(observations, deps) {
   // observed plan is worth having at all. A plan that merely repeats writes nothing.
   const planChanged = (storedPlan == null ? null : storedPlan.plan)
     !== (observedPlan == null ? null : observedPlan.plan);
-  if (recorded === 0 && !planChanged) return { recorded: 0, reason: 'immaterial' };
+  if (recorded === 0 && !planChanged) return { recorded: 0, reason: 'immaterial', rows: rows };
 
-  const next = { version: 1, series: series, pending: pending.slice(-MAX_PENDING) };
+  // `pending` is gone from this file — it lives per account now — but a machine that migrated from
+  // a pre-0.13 layout still has the emptied key here (lib/accounts.mjs splitUsageObservations), and
+  // rewriting the record without it would be the one write that could resurrect a stale queue.
+  const next = { version: 1, series: series, pending: [] };
   if (observedPlan != null) next.observedPlan = observedPlan;
   writeJsonSecure(file, next);
-  if (recorded === 0) return { recorded: 0, reason: 'plan-only' };
-  return { recorded: recorded };
+  if (recorded === 0) return { recorded: 0, reason: 'plan-only', rows: rows };
+  return { recorded: recorded, rows: rows };
 }
 
-export function readPendingRateLimits(deps = {}) {
-  const file = deps.file == null ? usageObservationsFile() : deps.file;
+export function readPendingRateLimits(key, deps = {}) {
+  const file = deps.pendingFile == null ? usagePendingFile(key) : deps.pendingFile;
   let state = readJson(file);
   if (state == null) state = {};
   return Array.isArray(state.pending) ? state.pending : [];
@@ -385,15 +434,15 @@ export function readPendingRateLimits(deps = {}) {
 // fetched_at is the identity: it is half the server's (tenant, user, account_uuid, fetched_at)
 // unique key, so two local rows sharing one can never both be stored — dropping both when one
 // posts loses nothing the server would have kept.
-export function clearPendingRateLimits(posted, deps = {}) {
-  return withLock(sharedLock('rate-limit-observations'), {},
-    () => clearPendingLocked(posted, deps));
+export function clearPendingRateLimits(key, posted, deps = {}) {
+  return withLock(sharedLock(`rate-limit-pending-${key}`), {},
+    () => clearPendingLocked(key, posted, deps));
 }
 
-function clearPendingLocked(posted, deps) {
+function clearPendingLocked(key, posted, deps) {
   const rows = Array.isArray(posted) ? posted : [];
   if (rows.length === 0) return;
-  const file = deps.file == null ? usageObservationsFile() : deps.file;
+  const file = deps.pendingFile == null ? usagePendingFile(key) : deps.pendingFile;
   let state = readJson(file);
   if (state == null) state = {};
   const pending = Array.isArray(state.pending) ? state.pending : [];

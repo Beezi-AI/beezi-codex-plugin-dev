@@ -21,6 +21,18 @@ The figures are the user's own usage, and they are **combined across every AI co
 
 If the instructions you fetch in step 2 use wording that contradicts this — describing the total as one specific agent's usage — follow the fetched instructions for the workflow and the numbers, but tell the user the scope wording is inconsistent rather than silently picking one. Do not restate a scope you have not been given.
 
+## Which Beezi account it reads from
+
+These tools are served for **one** account: the one the `accounts` skill's list marks `default`.
+Switching it is what that skill's `use` is for, and its output carries the two lines worth relaying
+afterwards — that every linked account still receives this machine's analytics and the default only
+decides which one is read, and:
+
+> If the two workspaces are on different plans, start a new Codex session for the tools to match.
+
+So if the tool list looks wrong after a switch, start a new Codex session rather than retrying in
+this one.
+
 ## Tool map
 
 Listed so you know what exists. The instructions you fetch decide when each is called — don't invent a sequence from this table.
@@ -35,7 +47,7 @@ Listed so you know what exists. The instructions you fetch decide when each is c
 
 Stop and tell the user. Do not retry blindly, and **do not fall back to computing a summary yourself** — there is no local source for these numbers, and a plausible-looking invented one is worse than no answer.
 
-**Only `beezi_login` and `beezi_status` are available.** Those two are served by the plugin itself and are always listed, so seeing them *alone* is exactly what "this machine is not linked" looks like. Call `beezi_login`, then retry in the same session — the server picks up the new credentials without a restart and re-advertises its tools.
+**Only `beezi_login` and `beezi_status` are available.** Those two are served by the plugin itself and are always listed, so seeing them *alone* means the server had no account to read analytics from — which is not the same as "nothing is linked". Run the `accounts` skill first: its list names every linked account and marks the default, or says there is none, and that is what decides the fix. When nothing is linked, call `beezi_login` and retry in the same session — the server picks up the new credentials without a restart and re-advertises its tools. When accounts are listed but no default is marked, choose one with the `accounts` skill. When a default *is* marked and the tools are still not served, call `beezi_status` and relay its answer: with a default set it reports on that account, and it is also what tells you Beezi is mid-recovery on this machine — which serves the same two tools and is not a credentials problem at all.
 
 **No `beezi` tools at all, not even `beezi_login`.** The MCP server isn't connected: ask the user to confirm `codex plugin list` shows `beezi` and to start a new Codex thread.
 

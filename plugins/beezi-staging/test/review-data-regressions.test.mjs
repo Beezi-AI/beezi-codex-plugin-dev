@@ -12,12 +12,20 @@ import { drainRateLimitSnapshots } from '../lib/usage-report-codex.mjs';
 import { runAudit, SYNC_MODE } from '../lib/session-audit.mjs';
 import { pruneStale } from '../lib/prune.mjs';
 import { acquireLock, sharedLock, forgetHeldLocks } from '../lib/single-instance-lock.mjs';
+import { linkAccount, accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account: these regressions are about the engine, not about which tenant is reported
+// to, so every one of them runs against a single account the way a real single-account install
+// does — which is also the case the keyed layout has to keep working unchanged.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'fake');
 
 function home(t) {
   const oldHome = process.env.BEEZI_CODEX_HOME;
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'review-data-'));
   process.env.BEEZI_CODEX_HOME = dir;
   t.after(() => { forgetHeldLocks(); process.env.BEEZI_CODEX_HOME = oldHome; fs.rmSync(dir, { recursive: true, force: true }); });
+  linkAccount(dir, KEY);
   return dir;
 }
 const id = '11111111-2222-3333-4444-555555555555';
@@ -26,7 +34,7 @@ const meta = cwd => ({ type: 'session_meta', timestamp: at(0), payload: { id, cw
 const token = n => ({ type: 'event_msg', timestamp: at(n), payload: { type: 'token_count', info: { total_token_usage: { input_tokens: n * 10, cached_input_tokens: 0, output_tokens: n, total_tokens: n * 11 } } } });
 const rows = cwd => [meta(cwd), { type: 'turn_context', timestamp: at(1), payload: { cwd, model: 'gpt-5.2-codex' } }, token(10), token(20), token(30), token(40), token(50)];
 const write = (file, records) => fs.writeFileSync(file, records.map(JSON.stringify).join('\n') + '\n');
-const cpDeps = (dir, file) => ({ getAccessToken: async () => 'fake', env: {}, readCodexAuthSignals: () => ({ authMode: null, hasStoredApiKey: false }), resolveTranscript: () => ({ sessionId: id, transcriptPath: file }), gitImpl: () => null, readAgents: () => ({}), findSubagentRollouts: () => [] });
+const cpDeps = (dir, file) => ({ linkedSessions: async () => [SESSION], env: {}, readCodexAuthSignals: () => ({ authMode: null, hasStoredApiKey: false }), resolveTranscript: () => ({ sessionId: id, transcriptPath: file }), gitImpl: () => null, readAgents: () => ({}), findSubagentRollouts: () => [] });
 const observation = n => ({ observedAt: at(n), limitId: 'codex', planType: 'plus', fiveHour: { pct: n * 10, resetsAt: 1800000000 }, sevenDay: null, monthly: null, raw: null });
 
 test('F1: existing unreadable metadata fails closed while ENOENT keeps defaults', t => {
@@ -62,7 +70,7 @@ test('F3: a retained observation with a pruned cursor consults coverage before r
   assert.equal(fs.existsSync(state), false);
   write(file, records);
   let coverageCalls = 0;
-  await watcher.runWatchPass({ getAccessToken: async () => 'fake', pruneStale: () => {}, listRolloutFiles: () => [file], yieldControl: async () => {},
+  await watcher.runWatchPass({ linkedSessions: async () => [SESSION], pruneStale: () => {}, listRolloutFiles: () => [file], yieldControl: async () => {},
     fetchCoverage: async () => { coverageCalls++; return new Map([[id, 5]]); }, isLiveTrackingAllowed: () => true, readTrackingState: () => null,
     runCheckpoint: (input, _deps, opts) => runCheckpoint(input, { ...deps, ..._deps }, { ...opts, drainRateLimits: false, skipFlush: true, sink: p => sent.push(p) }),
   }, { sessionsDir: dir, cooldownMs: 0 });
@@ -72,24 +80,29 @@ test('F3: a retained observation with a pruned cursor consults coverage before r
 });
 
 test('F4: a competing quota append defers, then survives retry after clear', t => {
-  const dir = home(t), file = path.join(dir, 'usage.json');
-  rates.recordRateLimitObservations([observation(1)], { file });
-  const acknowledged = rates.readPendingRateLimits({ file });
+  // Two files since the split: the debounce SERIES is machine-level, the pending QUEUE is the
+  // account's. The refusal the case is about is unchanged — a record that lands mid-clear is told
+  // the queue is busy rather than interleaving with it — it is now the series lock that says so,
+  // because a rank-3 lock may not be taken while the clear holds the rank-3 pending one.
+  const dir = home(t);
+  const io = { file: path.join(dir, 'usage.json'), pendingFile: path.join(dir, 'usage-pending.json') };
+  rates.recordRateLimitObservations([observation(1)], [KEY], io);
+  const acknowledged = rates.readPendingRateLimits(KEY, io);
   const read = fs.readFileSync;
   let armed = true, blocked = false;
   fs.readFileSync = function (p, ...args) {
     const snapshot = read.call(this, p, ...args);
-    if (p === file && armed) {
+    if (p === io.pendingFile && armed) {
       armed = false;
-      try { rates.recordRateLimitObservations([observation(2)], { file }); }
+      try { rates.recordRateLimitObservations([observation(2)], [KEY], io); }
       catch (e) { blocked = e.code === 'RATE_LIMIT_QUEUE_BUSY'; }
     }
     return snapshot;
   };
-  try { rates.clearPendingRateLimits(acknowledged, { file }); } finally { fs.readFileSync = read; }
+  try { rates.clearPendingRateLimits(KEY, acknowledged, io); } finally { fs.readFileSync = read; }
   assert.equal(blocked, true);
-  rates.recordRateLimitObservations([observation(2)], { file });
-  assert.deepEqual(rates.readPendingRateLimits({ file }).map(r => r.fetched_at), [at(2)]);
+  rates.recordRateLimitObservations([observation(2)], [KEY], io);
+  assert.deepEqual(rates.readPendingRateLimits(KEY, io).map(r => r.fetched_at), [at(2)]);
 });
 
 test('F4: a busy quota queue prevents checkpoint cursor advancement until retry', async t => {
@@ -109,14 +122,14 @@ test('F4: a busy quota queue prevents checkpoint cursor advancement until retry'
   held.handle.release();
   await runCheckpoint({ session_id: id, cwd: dir }, cpDeps(dir, file), options);
   assert.equal(sent.length, 1);
-  assert.equal(rates.readPendingRateLimits().length, 1);
+  assert.equal(rates.readPendingRateLimits(KEY).length, 1);
 });
 
 for (const drain of [{ lockSkipped: true }, { unreadable: 1 }]) {
   test(`F5: history sync defers on incomplete drain ${JSON.stringify(drain)}`, async t => {
     home(t);
     let asked = false;
-    const result = await runAudit({ getAccessToken: async () => 'fake',
+    const result = await runAudit({ linkedSessions: async () => [SESSION], getDefaultKey: async () => KEY,
       flushQueueImpl: async () => ({ flushed: 0, failed: 0, deferred: 0, ...drain }),
       readTrackingStateImpl: () => null,
       fetchCoverageImpl: async () => { asked = true; return new Map(); },
@@ -129,14 +142,14 @@ for (const drain of [{ lockSkipped: true }, { unreadable: 1 }]) {
 
 test('F6: old quota rows are not assigned the account signed in at drain time', async t => {
   home(t);
-  rates.recordRateLimitObservations([observation(1)]);
+  rates.recordRateLimitObservations([observation(1)], [KEY]);
   const posted = [];
-  await drainRateLimitSnapshots('fake', { env: {}, readCodexAccount: () => ({ accountId: 'account-B' }), readBillingConfig: () => null,
+  await drainRateLimitSnapshots(KEY, SESSION, { env: {}, readChatgptAuth: () => ({ accountId: 'account-B' }), readBillingConfig: () => null,
     fetchImpl: async (_url, opts) => { posted.push(JSON.parse(opts.body)); return { status: 200 }; },
   });
   assert.equal(posted.length, 1);
   assert.equal(posted[0].account_uuid, undefined);
-  assert.equal(rates.readPendingRateLimits().length, 0);
+  assert.equal(rates.readPendingRateLimits(KEY).length, 0);
 });
 
 test('F7: shortening a checkpointed rollout preserves its cursor and emits no overlap', async t => {

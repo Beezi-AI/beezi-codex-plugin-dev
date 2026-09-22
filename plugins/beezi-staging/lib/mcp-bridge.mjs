@@ -1,9 +1,16 @@
-import { getAccessToken as _getAccessToken } from './token.mjs';
+import { getAuthentication as _getAuthentication } from './token.mjs';
+import {
+  getAccount as _getAccount,
+  getDefaultKey as _getDefaultKey,
+  listAccounts as _listAccounts,
+} from './accounts.mjs';
 import { checkEnvironment } from './env-guard.mjs';
 import { machineHeaders } from './machine-identity.mjs';
 import { apiBase } from './config.mjs';
-import { performLogin as _performLogin } from './login.mjs';
-import { linkStatus as _linkStatus, describeLink, describeReporting } from './link-status.mjs';
+import { performLogin as _performLogin, refusedSameTenantMessage } from './login.mjs';
+import {
+  linkStatus as _linkStatus, describeLink, describeReporting, LinkState, NO_DEFAULT_ACCOUNT,
+} from './link-status.mjs';
 import { ensureHooks as _ensureHooks, TRUST_STEP } from './hooks-install.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import { orDefault } from './compat.mjs';
@@ -74,6 +81,19 @@ export const LOCAL_TOOLS = Object.freeze([LOGIN_TOOL, STATUS_TOOL]);
 const REJECTED_MESSAGE =
   "Beezi rejected this machine's credentials. Call the beezi_login tool to relink.";
 
+// The three states in which this bridge has no account to forward a request as. They are kept
+// apart because their remedies differ and because the first sentence is FALSE of the other two: a
+// machine with two accounts linked is not "not linked", and a sign-in links ANOTHER account rather
+// than picking among the ones already here.
+const NOT_LINKED_MESSAGE =
+  `This machine is not linked to Beezi. Call the ${LOGIN_TOOL.name} tool first, then retry.`;
+const NO_DEFAULT_MESSAGE =
+  'Beezi accounts are linked on this machine, but none is set as the one the analytics tools read '
+  + 'from. Run the accounts skill to choose one, then retry.';
+const DEFAULT_UNUSABLE_MESSAGE =
+  'Beezi could not use the saved credentials for the account the analytics tools read from. '
+  + `Run the accounts skill to choose another account, or call the ${LOGIN_TOOL.name} tool to sign in again.`;
+
 export function mcpUrl() {
   return process.env.BEEZI_MCP_URL || `${apiBase()}/mcp`;
 }
@@ -108,7 +128,10 @@ async function* sseEvents(body, onChunk) {
 
 export function createBridge(deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
-  const getToken = deps.getAccessToken || _getAccessToken;
+  const getDefaultKey = deps.getDefaultKey || _getDefaultKey;
+  const getAuthentication = deps.getAuthentication || _getAuthentication;
+  const listAccounts = deps.listAccounts || _listAccounts;
+  const getAccount = deps.getAccount || _getAccount;
   const url = deps.url || mcpUrl();
   const write = deps.write;
   const logError = deps.logError || ((msg) => process.stderr.write(`[beezi-mcp] ${msg}\n`));
@@ -117,8 +140,24 @@ export function createBridge(deps = {}) {
   const linkStatus = deps.linkStatus || _linkStatus;
 
   let sessionId = null;
+  // Which account the upstream session id above belongs to. Remembered rather than re-derived,
+  // because the id and the bearer are only valid together: the portal issued that session to THAT
+  // account's token, and what it answers to a mismatched pair is not established anywhere in this
+  // repo. A 404 would be recovered transparently; a 401 becomes REJECTED_MESSAGE, "call the
+  // beezi_login tool to relink" — the exact wrong diagnosis this task exists to remove.
+  //
+  // So `accountKey` gates BOTH ENDS, and it took a review to get the second one: `emit` may only
+  // publish a session id while the response's account is still current, and `post` may only send
+  // one while the request's account is. Gating the write alone left every request between the key
+  // check and the wire reading an ambient id that could already belong to somebody else — which
+  // test/account-bridge.test.mjs cases 8 and 9 caught sending, with the pairs printed.
+  let accountKey = null;
   let initializeMsg = null;
-  let reinit = null; // in-flight transparent re-initialize, shared by concurrent 404s
+  // { key, promise } — an in-flight transparent re-initialize, shared by concurrent 404s OF THE
+  // SAME ACCOUNT. Keyed, because two accounts' handshakes are different operations producing
+  // different upstream sessions: a waiter that inherited another account's would proceed on a
+  // session its own bearer was never issued.
+  let reinit = null;
   // Has an `initialize` reached the portal? False while unlinked (we answered it ourselves), so a
   // machine linked mid-session hands the portal its handshake before the first real request.
   let upstreamReady = false;
@@ -212,18 +251,36 @@ export function createBridge(deps = {}) {
     if (deadline) deadline.refresh();
   }
 
-  async function post(msg, token) {
+  // `session` is one account's { key, token, clientId } — the bearer and the client id inseparably,
+  // the same object every other posting site in this plugin takes. machineHeaders() used to be
+  // called with nothing here, so every forwarded request went out with no X-Beezi-Client at all.
+  async function post(msg, session) {
     const deadline = armDeadline();
     let res;
     try {
       res = await fetchImpl(url, {
         method: 'POST',
         headers: {
-          'Authorization': `Bearer ${token}`,
+          'Authorization': `Bearer ${session.token}`,
           'Content-Type': 'application/json',
           'Accept': 'application/json, text/event-stream',
-          ...(sessionId ? { [SESSION_HEADER]: sessionId } : {}),
-          ...machineHeaders(),
+          // THE READ SIDE OF THE PAIRING, and the half that was missing. `sessionId` is ambient by
+          // protocol, and every await between handleMessage's key check and this line — inside
+          // reinitialize, and either side of the 404 retry — is a window in which the default can
+          // move. Gating only the WRITE (emit) left those requests reading an id that by then
+          // belonged to another account: measured, not theorised — test/account-bridge.test.mjs
+          // cases 8 and 9 print the exact pairs this used to send.
+          //
+          // What this establishes is the whole of what it establishes: a stale request goes out
+          // WITHOUT a session id. How the portal answers a sessionless non-`initialize` POST is not
+          // established anywhere in this repo, and the recovery below keys on 404 alone — so do not
+          // read this as "it recovers". That request belongs to an account that is no longer the
+          // default; before this gate it went out carrying a mismatched pair instead, and what the
+          // portal made of THAT is no better established here. The gate's claim is only that it can
+          // no longer reach REJECTED_MESSAGE — "call the beezi_login tool to relink" — on a machine
+          // whose credentials are perfectly good.
+          ...((sessionId && isCurrent(session.key)) ? { [SESSION_HEADER]: sessionId } : {}),
+          ...machineHeaders(session.clientId),
         },
         body: JSON.stringify(msg),
         signal: deadline.signal,
@@ -246,10 +303,19 @@ export function createBridge(deps = {}) {
   // each lands as one line. `silent` drains instead — used for the transparent
   // re-initialize, whose response the client must not see twice. `transform`
   // rewrites each message on the way out.
-  async function emit(res, { silent = false, transform = (m) => m } = {}) {
+  // Upstream state — the session id and the handshake flag — belongs to ONE account, and only the
+  // account we are currently forwarding as may publish it. scripts/mcp.mjs starts each line's
+  // handling WITHOUT awaiting the previous, so a default switch can land between a request going
+  // out and its response coming back; without this check, that older response writes its session id
+  // over state `accountKey` already says belongs to another bearer, and the very next request pairs
+  // the two. Check-then-act is unavoidable here (there is one ambient sessionId, by protocol), so
+  // the act is gated on the check still holding.
+  const isCurrent = (key) => key === accountKey;
+
+  async function emit(res, { silent = false, transform = (m) => m, key = null } = {}) {
     try {
       const newSession = res.headers.get(SESSION_HEADER);
-      if (newSession) sessionId = newSession;
+      if (newSession && isCurrent(key)) sessionId = newSession;
       if (res.status === 202 || res.status === 204) return;
       if ((res.headers.get('content-type') || '').includes('text/event-stream')) {
         // Every chunk restarts the idle window, so a stream that keeps talking is never cut off
@@ -282,24 +348,31 @@ export function createBridge(deps = {}) {
   // The portal's MCP sessions are in-memory; an API restart between turns loses
   // them (HTTP 404). Rebuild one transparently — replay initialize (response
   // hidden) and the initialized notification — so the client never notices.
-  function reinitialize(token) {
-    if (!reinit) {
-      reinit = (async () => {
+  function reinitialize(session) {
+    if (!reinit || reinit.key !== session.key) {
+      // `sessionId = null` stays UNGUARDED: clearing is always safe (the worst it costs is one 404
+      // and the recovery that follows), while setting under the wrong account is the pairing this
+      // whole mechanism exists to prevent.
+      const promise = (async () => {
         sessionId = null;
-        const res = await post(initializeMsg, token);
+        const res = await post(initializeMsg, session);
         if (!res.ok) {
           // Discarded unread, so `emit` will never reach its release.
           releaseDeadline(res);
           throw new Error(`re-initialize failed (HTTP ${res.status})`);
         }
-        await emit(res, { silent: true });
-        await emit(await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, token));
-        upstreamReady = true;
-      })().finally(() => {
-        reinit = null;
+        await emit(res, { silent: true, key: session.key });
+        await emit(await post({ jsonrpc: '2.0', method: 'notifications/initialized' }, session), { key: session.key });
+        if (isCurrent(session.key)) upstreamReady = true;
+      })();
+      // Identity-checked, or a slow handshake for the account we have just left would clear the
+      // entry belonging to the one we are now on.
+      reinit = { key: session.key, promise };
+      promise.catch(() => {}).then(() => {
+        if (reinit && reinit.promise === promise) reinit = null;
       });
     }
-    return reinit;
+    return reinit.promise;
   }
 
   const toolText = (id, text, isError = false) => {
@@ -390,11 +463,22 @@ export function createBridge(deps = {}) {
       return;
     }
     const { result } = settled;
-    const account = result.account ? ` as ${result.account}` : '';
+    // A second user of a tenant this machine already reports into: nothing was stored, so there is
+    // no key to hand back and the tool list has not changed.
+    if (result.outcome === 'refused-same-tenant') {
+      toolText(id, refusedSameTenantMessage(result), true);
+      return;
+    }
+    // `account` is the index row lib/accounts.mjs keeps, not a display string.
+    const named = result.account && (result.account.name || result.account.email);
+    const account = named ? ` as ${named}` : '';
     const where = result.apiBase ? ` (API: ${result.apiBase})` : '';
-    const text = result.type === 'already-linked'
-      ? `This machine is already linked to Beezi${account}${where}.`
-      : `Signed in to Beezi${account}. This machine is now linked; the Beezi tools are available.`;
+    // The same last line scripts/login.mjs prints, for the same reason: the login skill threads
+    // the key into the check-in and the history pull, and this tool is the path it prefers.
+    const key = result.key ? `\naccount=${result.key}` : '';
+    const text = result.outcome === 'already-linked'
+      ? `This machine is already linked to Beezi${account}${where}.${key}`
+      : `Signed in to Beezi${account}. This machine is now linked; the Beezi tools are available.${key}`;
     toolText(id, text);
     writeMessage({ jsonrpc: '2.0', method: 'notifications/tools/list_changed' });
   }
@@ -448,18 +532,96 @@ export function createBridge(deps = {}) {
       // reading the repaired registry. On an UNLINKED machine nothing has been written, and nothing
       // should be: hooks are installed at login, for someone who has asked for analytics.
       const repair = healNote;
-      const status = await linkStatus();
-      const reporting = describeReporting(status);
-      toolText(id, [describeLink(status), reporting, repair].filter(Boolean).join('\n'));
+      // `deps`, not nothing. linkStatus takes a seam for every part of its answer, and handing it
+      // none meant this tool reported on a different account resolution than the one the bridge
+      // forwards with. In production `deps` carries no such seam, so nothing about a real machine
+      // changes; it is what lets the state below be driven against a real index.
+      const status = await linkStatus(deps);
+      // THE LIFT lib/me.mjs APPLIES, for the same reason. The local names differ: `anyLinked`
+      // there; here `healthy` is the accounts that can report and `lift` is the raise itself.
+      //
+      // A linkStatus answer's TOP-LEVEL fields describe the DEFAULT account. So a machine whose
+      // default has lost its credentials while a sibling is perfectly healthy answered "This
+      // machine is not linked to Beezi. Sign in to link it." and "Analytics are NOT being
+      // reported". Both false — the machine IS linked and the sibling IS reporting — and the remedy
+      // sent the user to link a third account they did not need. "Is this machine linked" and "is
+      // anything being reported" are true as soon as ONE account can report.
+      //
+      // Only ever a RAISE, never a lower: an answer that already says LINKED is left exactly as it
+      // is. That matters here because lib/link-status.mjs falls back to accounts[0] when the
+      // default names no row, so `status.state` can already be LINKED on a machine with no default
+      // at all — a separate, pre-existing case this must not reach into or restate.
+      const accounts = orDefault(status.accounts, []);
+      const healthy = accounts.filter((one) => one.state === LinkState.LINKED);
+      const lift = healthy.length > 0 && status.state !== LinkState.LINKED;
+      const lifted = lift ? { ...status, state: LinkState.LINKED } : status;
+      // Printed only when the lift applied, because only then is there a discrepancy to explain:
+      // the machine is fine and one account is not. Worded off `defaultKey` rather than assuming
+      // one exists — see the accounts[0] fallback above.
+      const note = !lift ? null
+        : `${healthy.length} of ${accounts.length} linked Beezi accounts can report. `
+          + (status.defaultKey === null
+            ? NO_DEFAULT_ACCOUNT
+            : 'The one the analytics tools read from cannot report just now — run the me skill for each '
+              + 'account’s own state, or the accounts skill to read from a different one.');
+      const reporting = describeReporting(lifted);
+      toolText(id, [describeLink(lifted), reporting, note, repair].filter(Boolean).join('\n'));
     } catch (error) {
       toolText(id, `Beezi status check failed: ${error && error.message ? error.message : String(error)}`, true);
     }
   }
 
+  // ── which account this bridge forwards as ──────────────────────────────────
+  //
+  // Resolved PER REQUEST, from the DEFAULT account, because the default is a file another process
+  // rewrites: `accounts use` is run in a shell while this server is already alive, and a value read
+  // once at spawn would keep serving the previous account's analytics for the rest of the session.
+  //
+  // Two index reads at most and one credential read — the same credential read this path has always
+  // made, now with a key. The index reads are a local JSON file; the row is only consulted when the
+  // credential blob carried no client id, which is a pre-0.13 migrated row.
+  //
+  // Answers { key, session } where `session` is null when nothing can be posted: `key` then says
+  // which of the three refusals applies. A THROW from the index (the one-time migration in
+  // progress, an unreadable accounts.json) is its own answer again — collapsing it into "not
+  // linked" would state something about this machine that nobody established.
+  async function resolveAccount() {
+    let key;
+    try {
+      key = await getDefaultKey(deps);
+    } catch (error) {
+      const detail = error && error.message ? error.message : String(error);
+      return { key: null, session: null, blocked: `Beezi could not read this machine's linked accounts: ${detail}` };
+    }
+    if (key == null) return { key: null, session: null, blocked: null };
+    let auth = null;
+    try { auth = await getAuthentication(key, deps); } catch (error) { auth = null; }
+    if (!auth || auth.state !== 'ready' || !auth.accessToken) return { key, session: null, blocked: null };
+    let clientId = auth.clientId;
+    // The stored row is the fallback, not the authority — lib/accounts.mjs's sessionFor states the
+    // rule: the credential blob is what the refresh actually rotated, so its client_id wins.
+    if (clientId == null) {
+      const row = await getAccount(key, deps).catch(() => null);
+      clientId = orDefault((row || {}).clientId, null);
+    }
+    return { key, session: { key, token: auth.accessToken, clientId }, blocked: null };
+  }
+
+  // Which of the three refusals a null session earns. The distinction is the whole point: two of
+  // the sentences are false of the state the third describes.
+  async function refusalFor(resolved) {
+    if (resolved.blocked) return resolved.blocked;
+    let accounts = [];
+    try { accounts = orDefault(await listAccounts(deps), []); } catch (error) { accounts = []; }
+    if (accounts.length === 0) return NOT_LINKED_MESSAGE;
+    if (resolved.key == null) return NO_DEFAULT_MESSAGE;
+    return DEFAULT_UNUSABLE_MESSAGE;
+  }
+
   // Unlinked: keep the server alive and useful. `initialize` succeeds locally, the tool list is
   // exactly LOCAL_TOOLS — signing in and status, both served here — so the model has an obvious way
-  // out, notifications are dropped, and any other tool call is refused with the same pointer.
-  async function handleUnlinked(msg, ids) {
+  // out, notifications are dropped, and any other tool call is refused with `message`.
+  async function handleUnlinked(msg, ids, message) {
     if (isInitialize(msg)) {
       writeMessage({
         jsonrpc: '2.0',
@@ -483,9 +645,7 @@ export function createBridge(deps = {}) {
       await runLocalTool(local, msg.id);
       return;
     }
-    ids.forEach((id) =>
-      errorResponse(id, `This machine is not linked to Beezi. Call the ${LOGIN_TOOL.name} tool first, then retry.`),
-    );
+    ids.forEach((id) => errorResponse(id, orDefault(message, NOT_LINKED_MESSAGE)));
   }
 
   async function serverErrorMessage(res) {
@@ -534,10 +694,20 @@ export function createBridge(deps = {}) {
       }
       return;
     }
-    const token = await getToken();
-    if (!token) {
-      await handleUnlinked(msg, ids);
+    const resolved = await resolveAccount();
+    const session = resolved.session;
+    if (!session) {
+      await handleUnlinked(msg, ids, await refusalFor(resolved));
       return;
+    }
+    // The default changed under us — `accounts use` ran in a shell while this server stayed alive.
+    // Whatever upstream session id we hold was issued to the PREVIOUS account's bearer, so it is
+    // dropped rather than paired with this one: the existing re-initialize path below then rebuilds
+    // a session under the new token, exactly as it does after an API restart.
+    if (session.key !== accountKey) {
+      accountKey = session.key;
+      sessionId = null;
+      upstreamReady = false;
     }
     // First message from a LINKED machine — the earliest point at which installing hooks on the
     // user's behalf is the obviously right thing to do. Its verdict is dropped here and kept for
@@ -553,20 +723,22 @@ export function createBridge(deps = {}) {
 
     try {
       if (!upstreamReady && initializeMsg && !isInitialize(msg)) {
-        await reinitialize(token);
+        await reinitialize(session);
       }
-      let res = await post(msg, token);
+      let res = await post(msg, session);
       if (res.status === 404 && initializeMsg && !isInitialize(msg)) {
         // Thrown away unread in favour of the retry below: release its timer here or it stays
         // armed for the full idle window with nobody left to clear it.
         releaseDeadline(res);
-        await reinitialize(token);
-        res = await post(msg, token);
+        await reinitialize(session);
+        res = await post(msg, session);
       }
       try {
         if (res.ok) {
-          if (isInitialize(msg)) upstreamReady = true;
-          await emit(res, isToolsList(msg) ? { transform: withLocalTools } : {});
+          if (isInitialize(msg) && isCurrent(session.key)) upstreamReady = true;
+          await emit(res, isToolsList(msg)
+            ? { key: session.key, transform: withLocalTools }
+            : { key: session.key });
           return;
         }
         if (res.status === 401 || res.status === 403) {
@@ -597,5 +769,10 @@ export function createBridge(deps = {}) {
     await handleMessage(msg);
   }
 
-  return { handleLine, handleMessage };
+  // The account this bridge last forwarded as, and the upstream session id it holds — the pair the
+  // switch above has to keep together. Exposed rather than kept in a parallel store, because the
+  // bridge already has to remember both to decide whether the id may travel with the next bearer.
+  const state = () => ({ accountKey, sessionId });
+
+  return { handleLine, handleMessage, state };
 }

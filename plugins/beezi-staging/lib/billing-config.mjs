@@ -4,7 +4,7 @@ import {
   BillingSource,
   detectBillingSource as detectBillingSourceFromEnv,
 } from './billing.mjs';
-import { readCodexAuthSignals } from './codex-account.mjs';
+import { readCodexAuthSignals } from './chatgpt-auth.mjs';
 import { orDefault, parseTimestampMs } from './compat.mjs';
 
 const STALE_MS = 7 * 24 * 60 * 60 * 1000; // refresh plan info at least weekly

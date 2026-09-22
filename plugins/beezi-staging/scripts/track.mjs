@@ -25,13 +25,23 @@ async function main() {
   const target = resolveTrackTarget(cwd);
   if (!target.ok) fail(target.message);
 
-  const { ok, message } = await trackSession({
+  const { ok, lines } = await trackSession({
     sessionId: target.sessionId,
     transcriptPath: target.transcriptPath,
     cwd,
   });
-  if (!ok) fail(message);
-  console.log(`✓ ${message}`);
+  // ONE MARKED LINE PER ACCOUNT. The checkpoint fans one delta out into every linked account, so a
+  // single run can save for one workspace and be rejected by another — a single marker over the
+  // whole block would label whichever account succeeded a failure, and vice versa.
+  for (const line of lines) {
+    if (line.ok) console.log(`✓ ${line.text}`);
+    else console.error(`✗ ${line.text}`);
+  }
+  // `exitCode`, not fail()'s process.exit(1). A mixed run has already written ✓ lines to stdout,
+  // and stdout on a pipe is asynchronous — exiting outright can truncate them, which would drop
+  // the account that succeeded from the record of a run that also failed. Same shape
+  // scripts/logout.mjs uses for its partial outcome.
+  if (!ok) process.exitCode = 1;
 }
 
 main().catch((error) => fail(friendlyMessage(error)));

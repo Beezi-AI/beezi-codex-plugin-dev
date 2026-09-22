@@ -38,7 +38,7 @@ function toEpochMs(iso) {
 // is why a caller may synthesize signals from a null account. `authMode` and `hasStoredApiKey` are
 // exposed on BOTH return shapes so the billing source detector can tell subscription from API-key
 // auth off this one read (`resolveSource` in billing-config.mjs).
-export function readCodexAccount(deps = {}) {
+export function readChatgptAuth(deps = {}) {
   const readFile = orDefault(deps.readFile, (p) => fs.readFileSync(p, 'utf-8'));
   const exists = orDefault(deps.exists, (p) => fs.existsSync(p));
   const authFile = orDefault(deps.authFile, codexAuthFile());

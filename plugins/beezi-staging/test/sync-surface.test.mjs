@@ -6,6 +6,8 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withoutGuard } from '../tools/hermetic-env.mjs';
+import { runAudit, SYNC_MODE } from '../lib/session-audit.mjs';
+import { makeHome, accountSession } from '../tools/account-fixtures.mjs';
 
 // G-9-3: the repeatable sync surface. Two halves — the script's flag policy, which is the
 // MECHANICAL enforcement of "sync is not a way around the one-time import", and the skill that
@@ -20,7 +22,7 @@ const skill = fs.readFileSync(skillFile, 'utf-8');
 // The flag refusals happen in parseSyncArgs, before runAudit and therefore before any token read,
 // filesystem scan or request. The child still gets a sandbox home so a regression that moved the
 // check later fails loudly here instead of reading the developer's machine.
-function runSync(t, args) {
+function runScript(t, script, args) {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-syncsurf-'));
   t.after(() => fs.rmSync(home, { recursive: true, force: true }));
   const env = { ...process.env };
@@ -29,11 +31,13 @@ function runSync(t, args) {
   env.USERPROFILE = home;
   env.BEEZI_CODEX_HOME = home;
   env.CODEX_HOME = path.join(home, '.codex');
-  const res = withoutGuard(() => spawnSync(process.execPath, [syncScript, ...args], {
+  const res = withoutGuard(() => spawnSync(process.execPath, [script, ...args], {
     cwd: pluginRoot, encoding: 'utf-8', timeout: 60_000, env,
   }));
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
 }
+
+const runSync = (t, args) => runScript(t, syncScript, args);
 
 test('sync — --since is refused with a reason, not silently honoured', (t) => {
   const res = runSync(t, ['--since', '2026-01-01']);
@@ -80,6 +84,67 @@ test('backfill — a busy run lock is never reported as "no past sessions found"
   assert.match(script, /already running on this machine/);
 });
 
+// The one-time import is spent per account and cannot be given back, so there is no default to
+// fall back to: a run with no --account would burn whichever account the fallback landed on.
+test('backfill — a run with no --account is refused before anything is uploaded', (t) => {
+  const res = runScript(t, path.join(pluginRoot, 'scripts', 'backfill.mjs'), []);
+  assert.notEqual(res.status, 0);
+  assert.match(res.stderr, /backfill needs --account/);
+  assert.equal(res.stdout, '', 'nothing is read or sent before the refusal');
+});
+
+// Two-sided: backfill now REQUIRES the flag, and the login skill is the caller that always passes
+// it. Either half alone passes happily while the login flow is broken at step 4.
+test('backfill — the login skill passes the --account the script requires', () => {
+  const skill = fs.readFileSync(path.join(pluginRoot, 'skills', 'login', 'SKILL.md'), 'utf-8');
+  assert.match(skill, /scripts\/backfill\.mjs" --via login --account <key>/);
+  assert.match(
+    fs.readFileSync(path.join(pluginRoot, 'scripts', 'backfill.mjs'), 'utf-8'),
+    /parseAccountFlag/,
+  );
+});
+
+// THE ASSERTION ABOVE IS NOT ENOUGH, and shipping it as if it were is how this broke: it greps for
+// the step-4 command string, while the `beezi_login`-tool outcome that told the model to run the
+// remaining steps without the flag sits ~118 lines ABOVE it. On the path a Codex model actually
+// takes, step 4 would have refused outright.
+//
+// WHAT THIS TEST IS, EXACTLY — because overclaiming is what produced that defect:
+//   · a real STRUCTURAL property: every line invoking the script carries the flag. Complete.
+//   · an ENUMERATED phrasing guard for prose that tells a path to skip it. Prose cannot be pinned
+//     completely; this covers without/skip/omit/drop/leave off/leave out/no within 20 characters of
+//     the flag. It is a family, not a proof.
+//   · the positive: the keyless branch names where a key comes from.
+//
+// TWO KNOWN IMPRECISIONS, both stated rather than engineered away:
+//   · The window was 40 and is now 20, which stops `Never drop a step; always run step 4 with
+//     \`--account <key>\`` — prose INSISTING on the flag — failing the test. Every ENUMERATED
+//     phrasing that should be caught still is; only the gap between verb and flag narrowed.
+//   · A verb sitting right next to the flag in insisting prose (`Never drop the \`--account\`
+//     flag.`) still matches. Separating that from a real instruction needs negative lookbehind for
+//     never/always/must/don't, which is more pattern than this is worth: the failure is loud, in
+//     the safe direction, and a one-word edit clears it.
+const SKIPS_ACCOUNT_FLAG = /(without|skip|omit|drop|leave off|leave out|no)\b[^.\n]{0,20}`?--account/i;
+
+test('backfill — every login-skill invocation carries --account, and no enumerated phrasing tells a path to skip it', () => {
+  const skill = fs.readFileSync(path.join(pluginRoot, 'skills', 'login', 'SKILL.md'), 'utf-8');
+
+  const invocations = skill.split('\n').filter((line) => line.includes('scripts/backfill.mjs'));
+  assert.ok(invocations.length > 0, 'the skill still runs the one-time import');
+  for (const line of invocations) {
+    assert.match(line, /--account/, `backfill is invoked without --account: ${line}`);
+  }
+
+  const skipped = skill.match(SKIPS_ACCOUNT_FLAG);
+  assert.equal(
+    skipped, null,
+    `the skill tells a path to run without --account, where the one-time import refuses: ${skipped && skipped[0]}`,
+  );
+
+  assert.match(skill, /get a key before continuing/);
+  assert.match(skill, /the `accounts` skill's list/);
+});
+
 // ── the skill ───────────────────────────────────────────────────────────────────────────────
 
 test('skill — declares the frontmatter the plugin loader reads', () => {
@@ -93,6 +158,62 @@ test('skill — runs exactly the one script, derived from its own location', () 
   assert.equal(commands.length, 1, 'the house pattern is exactly one command');
 });
 
+// REWRITTEN. This used to assert the skill said "takes no flags" and named --since and --force as
+// the two it refuses. The script now takes `--account`, so the old assertion pinned a sentence that
+// had become false: a skill saying the command takes none would have the model drop the one flag
+// the login flow and the user both need. The two refusals themselves are unchanged and still
+// pinned — above, against the script, and here against the skill.
+test('skill — states the flag policy in the same terms the script enforces', () => {
+  assert.match(skill, /--account <account>/);
+  assert.match(skill, /takes no other flags/i);
+  assert.match(skill, /--since/);
+  assert.match(skill, /--force/);
+  assert.doesNotMatch(skill, /takes no flags/i, 'it takes --account — saying otherwise hides it');
+});
+
+test('skill — documents the per-account fan-out the script prints headings for', () => {
+  const script = fs.readFileSync(syncScript, 'utf-8');
+  assert.ok(script.includes('── Account: '), 'scripts/sync.mjs should still print the heading');
+  assert.match(skill, /── Account: /, 'skills/sync/SKILL.md should explain the heading');
+  assert.match(skill, /every linked\s+account in turn/);
+});
+
+// ── a scoped run's 'no-token' is about the ACCOUNT, never the machine ────────────────────────
+//
+// REACHABILITY FIRST, because this branch had no behavioural test at all and the false sentence it
+// used to print survived a full green suite. auditSession returns null whenever the key names no
+// entry in linkedSessions() — an account that is in the index and cannot produce a token right now
+// — and runAudit reports that as 'no-token', the same code an unlinked machine gets.
+test('a run scoped to an account that cannot produce a token answers no-token', async (t) => {
+  makeHome(t);
+  const result = await runAudit(
+    { linkedSessions: async () => [accountSession('99887766', 'tok-b')] },
+    { mode: SYNC_MODE, key: 'a1b2c3d4' },
+  );
+  assert.equal(result.reason, 'no-token');
+  assert.equal(result.scanned, 0, 'nothing was read — the account was the whole problem');
+});
+
+test('sync and backfill word that as the account’s problem, from one definition', () => {
+  const sync = fs.readFileSync(syncScript, 'utf-8');
+  const backfill = fs.readFileSync(path.join(pluginRoot, 'scripts', 'backfill.mjs'), 'utf-8');
+  // One definition, two callers: a second spelling leaves the skill relaying a sentence one of
+  // them no longer prints — the same rule test/account-surfaces.test.mjs case 15 enforces.
+  assert.match(
+    fs.readFileSync(path.join(pluginRoot, 'lib', 'session-audit.mjs'), 'utf-8'),
+    /export const ACCOUNT_TOKEN_UNUSABLE/,
+  );
+  for (const [name, script] of [['sync', sync], ['backfill', backfill]]) {
+    assert.match(script, /ACCOUNT_TOKEN_UNUSABLE/, `scripts/${name}.mjs should import the one definition`);
+  }
+  // backfill REQUIRES --account, so every no-token it can reach is an account it already resolved.
+  assert.doesNotMatch(backfill, /this machine is not linked/, 'backfill can no longer reach that state');
+  // sync keeps it for the UNSCOPED run, which is the only one where it is still true.
+  assert.match(sync, /key === null\s*\n?\s*\? 'Beezi: this machine is not linked/);
+  assert.match(skill, /could not use the saved credentials for that account/);
+  assert.match(skill, /Do not report it as the machine being unlinked/);
+});
+
 test('skill — carries the hard boundary against the one-time import', () => {
   assert.match(skill, /NOT the one-time import/);
   assert.match(skill, /does not consume, reopen, re-run or stand in for/);
@@ -103,12 +224,6 @@ test('skill — carries the trust-gap framing and points at the cause, not just 
   assert.match(skill, /trusts them in `\/hooks`/);
   assert.match(skill, /Trust survives a plugin upgrade/);
   assert.match(skill, /analytics-hooks/);
-});
-
-test('skill — states the no-flags policy in the same terms the script enforces', () => {
-  assert.match(skill, /takes no flags/i);
-  assert.match(skill, /--since/);
-  assert.match(skill, /--force/);
 });
 
 test('skill — "everything is already uploaded" is documented as a success, not a retry', () => {

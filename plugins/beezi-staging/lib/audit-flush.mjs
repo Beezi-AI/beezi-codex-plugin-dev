@@ -152,9 +152,12 @@ async function readResponseBody(res) {
 // accepted unless it appears there.
 //
 // sessionGroups: [{ sessionId, reports: payload[] }] — order preserved.
+// `key` names the account this history is being uploaded to and is used for one thing: the 401
+// renewal below, which has to renew THAT account's token rather than "the" token. `session` is
+// { token, clientId } — the bearer and the machine row it belongs to, inseparable since 0.13.
 // Returns { chunks, stored, skipped, itemErrors, retryableFailures, permanentRejections,
 //           unattributed, bySession: Map, halt, lastError }.
-export async function flushBackfillChunks(sessionGroups, token, deps = {}, options = {}) {
+export async function flushBackfillChunks(sessionGroups, key, session, deps = {}, options = {}) {
   const postJsonImpl = deps.postJsonImpl || postJson;
   const getAccessToken = deps.getAccessToken || _getAccessToken;
   const fetchImpl = deps.fetchImpl || fetchCompat;
@@ -197,8 +200,12 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
   const renewToken = async () => {
     if (renewed) return null;
     renewed = true;
-    const next = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
-    if (next && next !== token) { token = next; return next; }
+    const next = await getAccessToken(key, {}, { forceRefresh: true }).catch(() => null);
+    if (next && next !== session.token) {
+      // Only the bearer moves; a refresh does not mint a new client id.
+      session = { ...session, token: next };
+      return session;
+    }
     return null;
   };
 
@@ -207,7 +214,7 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
   const post = async (chunk) =>
     postJsonImpl(
       url,
-      token,
+      session,
       chunk.timelines && chunk.timelines.length
         ? { sessions: chunk.reports, timelines: chunk.timelines }
         : { sessions: chunk.reports },
@@ -417,13 +424,16 @@ export async function flushBackfillChunks(sessionGroups, token, deps = {}, optio
 
 // Seal this user's pull for the calling tool. Idempotent server-side (snapshot_taken_at is
 // COALESCEd), so retrying a lost response is safe.
-export async function completeBackfill(token, deps = {}, options = {}) {
+// It takes no account key, unlike flushBackfillChunks: there is no renewal on this path — one
+// small POST, and a 401 here is reported rather than retried — so a key would be an unused
+// parameter, not a contract.
+export async function completeBackfill(session, deps = {}, options = {}) {
   const postJsonImpl = deps.postJsonImpl || postJson;
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const timeoutMs = orDefault(options.timeoutMs, DEFAULT_BACKFILL_TIMEOUT_MS);
   const url = `${apiBase()}${ENDPOINTS.sessionsBackfillComplete}`;
   try {
-    const res = await postJsonImpl(url, token, {}, { fetchImpl, timeoutMs });
+    const res = await postJsonImpl(url, session, {}, { fetchImpl, timeoutMs });
     if (res.status >= 200 && res.status < 300) return { completed: true, code: null };
     const { code, message } = await readResponseBody(res);
     return { completed: false, code, reason: orDefault(message, `HTTP ${res.status}`) };

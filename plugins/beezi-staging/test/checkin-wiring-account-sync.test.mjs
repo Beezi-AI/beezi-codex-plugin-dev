@@ -71,7 +71,24 @@ test('the capture script FORCES its check-in', () => {
   // Load-bearing here, unlike at session start: the plan can change while the accountUuid and the
   // email do not, so the payload can be byte-identical to the marker's and the resync interval
   // would swallow the one check-in this command exists to send.
-  assert.match(src, /await syncAccountIfNeeded\(await getAccessToken\(\), \{ force: true \}\);/);
+  // Keyed from 0.13 on: the plan is the machine's, but the row it updates belongs to one account.
+  assert.match(src, /await syncAccountIfNeeded\(key, await sessionFor\(key\), \{ force: true \}\);/);
+});
+
+test('the capture script’s session keeps the index row as the client-id fallback', () => {
+  const src = readSource('scripts', 'billing-capture.mjs');
+  // lib/accounts.mjs states the rule and lib/login.mjs follows it: the credential blob's client_id
+  // wins whenever it has one, and the stored row is the FALLBACK. A blob migrated from a pre-0.13
+  // install carries none, and without the fallback this check-in posts with no X-Beezi-Client —
+  // a silent misattribution to no machine row at all, which no response code reports.
+  //
+  // Structural, like the rest of this file: scripts/billing-capture.mjs is an executable, so
+  // importing it runs it and spawning it is a hermeticity violation.
+  assert.match(src, /await getAccount\(key\)/, 'the row is never read, so there is no fallback to apply');
+  assert.match(src, /if \(auth\.clientId != null\) return \{ token: auth\.accessToken, clientId: auth\.clientId \};/,
+    'the blob must still win whenever it names a client');
+  assert.match(src, /clientId: orDefault\(\(row \|\| \{\}\)\.clientId, null\)/,
+    'the row supplies the id only when the blob has none');
 });
 
 test('the capture script’s check-in is best-effort — it cannot fail a write that succeeded', () => {

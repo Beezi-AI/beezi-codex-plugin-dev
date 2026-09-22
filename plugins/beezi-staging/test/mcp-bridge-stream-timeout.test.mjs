@@ -19,6 +19,15 @@ import { createBridge } from '../lib/mcp-bridge.mjs';
 // local async generators that honour the abort signal the way fetch does.
 
 const URL_UNDER_TEST = 'https://api.test/api/mcp';
+
+// The bridge resolves the DEFAULT account per request — an index read plus a keyed credential
+// read. Both are injected here so this file stays a test of the deadline and nothing else; the
+// resolution itself runs against the real modules in test/account-bridge.test.mjs.
+const LINKED_ACCOUNT = {
+  getDefaultKey: async () => 'a1b2c3d4',
+  getAuthentication: async () => ({ state: 'ready', accessToken: 'tok', clientId: 'c-a1b2c3d4' }),
+  listAccounts: async () => [{ key: 'a1b2c3d4', clientId: 'c-a1b2c3d4', status: 'linked' }],
+};
 const CALL = { jsonrpc: '2.0', id: 1, method: 'tools/call', params: { name: 'get_my_usage_summary' } };
 
 // The idle window under test. Wide enough that Windows timer jitter cannot decide an outcome:
@@ -130,7 +139,7 @@ function streamBridge(options) {
   let signalSeen = null;
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
-    getAccessToken: async () => 'tok',
+    ...LINKED_ACCOUNT,
     fetchImpl: async (url, init) => {
       signalSeen = init.signal;
       return streamingResponse(init.signal, options);
@@ -261,7 +270,7 @@ test('a discarded response releases its deadline instead of leaving one armed', 
   const out = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
-    getAccessToken: async () => 'tok',
+    ...LINKED_ACCOUNT,
     // 401 is answered without the body ever being read, so nothing downstream would release it.
     fetchImpl: async () => ({
       ok: false,

@@ -4,8 +4,9 @@ import { postJson as _postJson } from './http.mjs';
 import fs from 'fs';
 import path from 'path';
 import { getAccessToken as _getAccessToken } from './token.mjs';
+import { linkedSessions as _linkedSessions, getDefaultKey as _getDefaultKey } from './accounts.mjs';
 import { runCheckpoint as _runCheckpoint, flushQueue as _flushQueue } from './checkpoint.mjs';
-import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
+import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
 import { buildAccountSyncPayload, accountSyncPath } from './account-sync.mjs';
 import { listAllRollouts as _listAllRollouts } from './transcript-index-codex.mjs';
@@ -46,7 +47,6 @@ import {
 import { computeSessionTimeline as _computeSessionTimeline } from './session-timeline-codex.mjs';
 import { postSessionError as _postSessionError } from './session-error-report.mjs';
 import { resolveTranscriptByCwd } from './transcript-codex.mjs';
-import { getMachineClientId } from './machine-identity.mjs';
 import { whoami as _whoami } from './whoami.mjs';
 import { credentialsFile, stateDir, beeziCodexHome } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
@@ -77,12 +77,36 @@ const AUDIT_TIMEOUT_MS = 60_000;
 // boundaries than the next live report — double-counted spend. Skip and let the user rerun.
 const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
 
+// How far back either history path will reach. A rollout older than this is never uploaded, in
+// EITHER mode — the one-time import and the repair pass share the window so a session cannot be
+// in scope for one command and out of scope for the other.
+//
+// This is deliberately NOT expressed as a default `--since`: `shouldFinalize` treats a non-null
+// `sinceMs` as a scoped run and refuses to seal, so defaulting it would leave every login's pull
+// permanently unfinalized. It is policy, applied in the candidate loop, and it stacks with an
+// explicit `--since` rather than replacing it (two independent skips give `max(sinceMs, cutoff)`).
+export const MAX_SESSION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+
 const SINCE_FORMAT = /^\d{4}-\d{2}-\d{2}$/;
 
 // The repeatable repair pass (G-3-3). Everything that differs from the one-time import hangs off
 // this one value: it never seals, it consults /sessions/coverage instead of local cursors, it
 // drains the durable queue first, and it flushes to the tracking-policy-aware sync route.
 export const SYNC_MODE = 'sync';
+
+/**
+ * What `reason: 'no-token'` means when the run was scoped to ONE account, and the one phrasing of
+ * it — scripts/sync.mjs and scripts/backfill.mjs both print it, and a second spelling would leave
+ * the sync skill relaying a sentence one of them no longer says.
+ *
+ * It is NOT "this machine is not linked", which is what both scripts used to print here. With a key
+ * in hand the caller has already resolved it against the index (resolveAccountRef, or sync's own
+ * filter over the linked rows), so the account EXISTS — auditSession returned null because
+ * linkedSessions() could not produce a token for it. On a machine with a second account linked and
+ * working, "not linked" is simply false, and it sends the user to link a machine that is linked.
+ */
+export const ACCOUNT_TOKEN_UNUSABLE =
+  'Beezi: could not use the saved credentials for that account. Sign in to Beezi again as it (the login skill).';
 
 // ONE run lock for BOTH modes, deliberately sharing a name: an import and a repair pass replaying
 // the same machine's rollouts at the same time would hand the server two differently-partitioned
@@ -150,15 +174,41 @@ function liveSession(deps) {
 // as the fallback for links made before the stamp existed — but it is only written by the
 // plaintext fallback store, so on a keyring machine (CredMan, Keychain, secret-tool) it does not
 // exist and this returns null; the per-session cursor check in runAudit covers that hole.
-function linkedAtMs(tracking, deps) {
-  const stamped = _linkedAtMs(tracking);
+function linkedAtMs(key, deps) {
+  const stamped = _linkedAtMs(key, deps);
   if (stamped != null) return stamped;
   const statImpl = orDefault(deps.statImpl, (p) => fs.statSync(p));
   try {
-    return orDefault(statImpl(credentialsFile()).mtimeMs, null);
+    return orDefault(statImpl(credentialsFile(key)).mtimeMs, null);
   } catch {
     return null;
   }
+}
+
+/**
+ * Which linked account this run uploads to.
+ *
+ * `options.key` names one explicitly — that is where the `--account` flag lands when Task 10 wires
+ * it up. With no key the DEFAULT account is used, falling back to the only linked one, so the
+ * existing scripts keep working unchanged on a single-account machine.
+ *
+ * One account per run, deliberately: the scan parses every rollout on the machine, and running it
+ * once per linked workspace would re-parse them all N times inside one command. A caller that
+ * wants every account uploads to each in turn.
+ */
+async function auditSession(deps, options) {
+  const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
+  let sessions;
+  try { sessions = await listSessions(deps); } catch { return null; }
+  if (!sessions || sessions.length === 0) return null;
+  if (options.key != null) {
+    return orDefault(sessions.find((s) => s.key === options.key), null);
+  }
+  const getDefaultKey = orDefault(deps.getDefaultKey, _getDefaultKey);
+  let def = null;
+  try { def = await getDefaultKey(deps); } catch { def = null; }
+  const chosen = def === null ? undefined : sessions.find((s) => s.key === def);
+  return orDefault(chosen, sessions[0]);
 }
 
 // A persisted state cursor > 0 is direct evidence the live hooks already reported this session.
@@ -217,6 +267,11 @@ export function shouldFinalize(result, options = {}) {
 // timeline route is unreachable for audit tenants); only rate-limit error reports remain a
 // live-only follow-up — and only for sessions the server judged accepted, so a failed session
 // stays fully retryable.
+//
+// ONE ACCOUNT per run, named by `options.key` and defaulting to the default account — see
+// auditSession. It travels in `options` beside `mode`, `force` and `since` rather than as a
+// positional argument because it is the same kind of thing they are: a caller-driven choice,
+// parsed off argv, not a seam.
 export async function runAudit(deps = {}, options = {}) {
   const acquire = orDefault(deps.acquireLockImpl, _acquireLock);
   let lock;
@@ -327,6 +382,8 @@ function emptyAuditResult(options = {}) {
     // Sessions whose history this run deliberately did not touch because it could not prove a
     // non-overlapping start line. Visible, retryable, and never silently downgraded to a scan
     // from zero.
+    // Rollouts older than MAX_SESSION_AGE_MS. Never uploaded, never retried by a re-run.
+    tooOld: 0,
     deferred: 0,
     deferredUnavailable: 0,
     deferredGap: 0,
@@ -360,29 +417,37 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const saveCoverage = orDefault(deps.saveCoverageCheckpointsImpl, _saveCoverageCheckpoints);
   const flushQueue = orDefault(deps.flushQueueImpl, _flushQueue);
   const postJson = orDefault(deps.postJsonImpl, _postJson);
-  const readCodexAccount = orDefault(deps.readCodexAccountImpl, _readCodexAccount);
+  const readChatgptAuth = orDefault(deps.readChatgptAuthImpl, _readChatgptAuth);
   const readBillingConfig = orDefault(deps.readBillingConfigImpl, _readBillingConfig);
 
   const syncMode = options.mode === SYNC_MODE;
   const result = emptyAuditResult(options);
 
-  let token = await getAccessToken().catch(() => null);
-  if (!token) {
+  let session = await auditSession(deps, options);
+  if (!session) {
     result.reason = 'no-token';
     return result;
   }
+  const key = session.key;
 
-  // getAccessToken primed the machine client id — the binding key for the machine-global
-  // ledger and tracking cache (a new login mints a new id, so a workspace switch invalidates
-  // both instead of sealing the new tenant's pull empty).
-  const identity = getMachineClientId();
-  const tracking = readTracking();
-  const trackingValid = matchesIdentity(tracking, identity);
+  // The binding key for the ledger and the tracking cache. It used to be a process-global primed
+  // by getAccessToken; that global is gone, because with several accounts linked it would bind one
+  // account's ledger under another's id. It is this account's own client id, carried on the
+  // session the token resolution produced.
+  //
+  // It can still be NULL — lib/accounts.mjs's sessionFor falls back to the stored row, and a row
+  // migrated from a pre-0.13 install whose credential blob carried no client_id has none. A null
+  // identity makes matchesIdentity fail open, which is the posture the whole tracking cache takes:
+  // the server's guard is the boundary, and a ledger read under an unknown identity re-offers
+  // every session rather than trusting one (lib/audit-ledger.mjs loadLedger).
+  const identity = orDefault(session.clientId, null);
+  const tracking = readTracking(key, deps);
+  const trackingValid = matchesIdentity(key, identity, deps);
 
   // The repair pass rides the tracking-policy-aware sync route and must NOT be a way around an
   // audit-only tenant's restrictions. Checked locally first so the run refuses cleanly instead of
   // taking one 403 per chunk; a server that refuses anyway still halts on FORBIDDEN below.
-  if (syncMode && trackingValid && !isLiveTrackingAllowed(tracking)) {
+  if (syncMode && trackingValid && !isLiveTrackingAllowed(key, deps)) {
     result.ok = true;
     result.reason = 'audit-only';
     result.upgradeAdvised = true;
@@ -404,7 +469,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         return { ...result, ok: true, reason: 'pending-transaction' };
       }
     } catch (error) { if (error.code !== 'ENOENT') return { ...result, ok: true, reason: 'pending-unreadable' }; }
-    const drained = await flushQueue(token, { fetchImpl });
+    const drained = await flushQueue(key, session, { fetchImpl });
     result.pendingDrained = orDefault(drained.flushed, 0);
     if (drained.trackingDisabled === true) {
       result.ok = true;
@@ -438,11 +503,11 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // a reinstall never had them), and without this check a re-run would re-parse every
   // transcript only to be 403'd on its first chunk. Offline/old servers answer null — proceed;
   // the chunk-level ALREADY_COMPLETED guard still stands behind us.
-  const who = await whoamiImpl(token, { fetchImpl }).catch(() => null);
+  const who = await whoamiImpl(session, { fetchImpl }).catch(() => null);
   if (who && who.valid) {
-    try { recordWhoamiImpl(who, identity); } catch { /* best-effort */ }
+    try { recordWhoamiImpl(key, who, identity); } catch { /* best-effort */ }
     if (!syncMode && who.backfillCompleted === true) {
-      try { markCompleted(); } catch { /* best-effort */ }
+      try { markCompleted(key); } catch { /* best-effort */ }
       result.ok = true;
       result.reason = 'already-completed';
       result.upgradeAdvised = who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE;
@@ -458,7 +523,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     }
   }
 
-  const ledger = loadLedger(identity);
+  const ledger = loadLedger(key, identity);
   if (!syncMode && !options.force && isComplete(ledger)) {
     result.ok = true;
     result.reason = 'already-completed';
@@ -473,8 +538,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // would double-count once its per-session cursor was pruned. Dark-mode tenants never tracked
   // live, so every transcript is fair game.
   const liveMode = trackingValid && (tracking || {}).trackingMode === TrackingMode.LIVE;
-  const linkCutoffMs = liveMode ? linkedAtMs(tracking, deps) : null;
+  const linkCutoffMs = liveMode ? linkedAtMs(key, deps) : null;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
+  const ageCutoffMs = now() - MAX_SESSION_AGE_MS;
 
   const candidates = [];
   for (const entry of all) {
@@ -498,6 +564,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       continue;
     }
     if (!syncMode && !options.force && isImported(ledger, entry.sessionId)) { result.alreadyImported += 1; continue; }
+    // The 30-day window (MAX_SESSION_AGE_MS). Counted, not silently dropped: `candidates === 0`
+    // otherwise prints "nothing new to upload" on a machine that plainly has older history.
+    if (entry.mtimeMs < ageCutoffMs) { result.tooOld += 1; continue; }
     if (options.sinceMs != null && entry.mtimeMs < options.sinceMs) continue;
     if (entry.size > MAX_TRANSCRIPT_BYTES) { result.oversize += 1; continue; }
     candidates.push(entry);
@@ -512,12 +581,12 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // what the server holds as a repair pass delivering one, and recording it during the import is
   // what gives the FIRST repair pass something to detect a gap against.
   const coverageBinding = currentBinding(identity);
-  const coverageRecord = loadCoverage(coverageBinding);
+  const coverageRecord = loadCoverage(key, coverageBinding);
   let coverageDirty = false;
   if (syncMode && candidates.length > 0) {
     const coverage = await fetchCoverage(
       candidates.map((entry) => entry.sessionId),
-      token,
+      session,
       { fetchImpl },
       { timeoutMs: AUDIT_TIMEOUT_MS },
     ).catch(() => null);
@@ -552,7 +621,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // but unlike the best-effort check-in the reply is verified: history is not uploaded against
   // an account the server did not link.
   let account = null;
-  try { account = readCodexAccount(); } catch { /* best-effort */ }
+  try { account = readChatgptAuth(); } catch { /* best-effort */ }
   let billingConfig = null;
   try { billingConfig = readBillingConfig(); } catch { /* best-effort */ }
   const registration = buildAccountSyncPayload({ config: billingConfig, account, now: now() });
@@ -560,21 +629,23 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const subscriptionIdentity = accountUuid ? { account_uuid: accountUuid } : {};
 
   if (accountUuid && !options.dryRun) {
-    const register = (bearer) => postJson(
+    const register = (as) => postJson(
       `${apiBase()}${accountSyncPath()}`,
-      bearer,
+      as,
       registration,
       { fetchImpl, timeoutMs: AUDIT_TIMEOUT_MS },
     );
 
     let response;
     try {
-      response = await register(token);
+      response = await register(session);
       if (response.status === 401) {
-        const renewed = await getAccessToken({}, { forceRefresh: true }).catch(() => null);
+        // Keyed: this account's token, never "the" token. Only the bearer moves on a refresh, so
+        // the client id rides through unchanged.
+        const renewed = await getAccessToken(key, {}, { forceRefresh: true }).catch(() => null);
         if (renewed) {
-          token = renewed;
-          response = await register(token);
+          session = { ...session, token: renewed };
+          response = await register(session);
         }
       }
       const reply = response.ok ? await response.json().catch(() => null) : null;
@@ -600,12 +671,12 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       result.lastError = `history run lock ${owned.reason} — the pull was not sealed`;
       return;
     }
-    const sealed = await completeBackfill(token, { fetchImpl }, { timeoutMs: AUDIT_TIMEOUT_MS });
+    const sealed = await completeBackfill(session, { fetchImpl }, { timeoutMs: AUDIT_TIMEOUT_MS });
     if (sealed.completed || sealed.code === 'BACKFILL_ALREADY_COMPLETED') {
       result.finalized = true;
       markComplete(ledger);
-      try { saveLedger(ledger); } catch { /* best-effort */ }
-      try { markCompleted(); } catch { /* best-effort */ }
+      try { saveLedger(key, ledger); } catch { /* best-effort */ }
+      try { markCompleted(key); } catch { /* best-effort */ }
     } else {
       result.lastError = orDefault(sealed.reason, result.lastError);
     }
@@ -621,7 +692,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
 
   // Rate-limit error follow-ups hit a tracking-gated route: a dark-mode tenant would take one
   // 403 per session. Timelines are exempt — they ride inside the backfill chunks themselves.
-  const followupsAllowed = !trackingValid || isLiveTrackingAllowed(tracking);
+  const followupsAllowed = !trackingValid || isLiveTrackingAllowed(key, deps);
   result.followupsAllowed = followupsAllowed;
 
   // Accumulated but not yet delivered. Bounded by the same caps the request planner uses, so
@@ -658,7 +729,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
 
     const flushed = await flushBackfillChunks(
       batch,
-      token,
+      key,
+      session,
       { fetchImpl },
       // The historical replay goes to the tracking-policy-aware sync route, never to the one-time
       // backfill route: /sessions/backfill is what the seal governs, and R2 forbids the repair
@@ -729,9 +801,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       }
     }
     // Written per dispatch, not once at the end, so Ctrl-C keeps the progress made so far.
-    try { saveLedger(ledger); } catch { /* best-effort */ }
+    try { saveLedger(key, ledger); } catch { /* best-effort */ }
     if (coverageDirty) {
-      saveCoverage(coverageRecord);
+      saveCoverage(key, coverageRecord);
       coverageDirty = false;
     }
 
@@ -742,8 +814,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       // somehow provoked this halt must leave the local caches exactly as it found them.
       if (!syncMode && flushed.halt === BackfillHalt.ALREADY_COMPLETED) {
         markComplete(ledger);
-        try { saveLedger(ledger); } catch { /* best-effort */ }
-        try { markCompleted(); } catch { /* best-effort */ }
+        try { saveLedger(key, ledger); } catch { /* best-effort */ }
+        try { markCompleted(key); } catch { /* best-effort */ }
       }
       return;
     }
@@ -754,7 +826,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         followups.delete(sessionId);
         if (!followup) return;
         for (const errorPayload of followup.sessionErrors) {
-          const { reported } = await postSessionError(errorPayload, token, { fetchImpl, timeoutMs: AUDIT_TIMEOUT_MS });
+          const { reported } = await postSessionError(errorPayload, session, { fetchImpl, timeoutMs: AUDIT_TIMEOUT_MS });
           if (reported) result.sessionErrors += 1;
         }
       });
@@ -812,7 +884,11 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
           transcript_path: entry.transcriptPath,
           cwd: orDefault(entry.cwd, null),
         },
-        { getAccessToken: async () => token, fetchImpl, recoveryPermit: lockHandle.token },
+        // gitImpl rides along so the audit's checkpoint resolves repo roots through whatever the
+        // caller handed in. Unforwarded it was the one reader the audit could not steer, and the
+        // suite's only protection against `git` running against the developer's own repository is
+        // that seam — tools/hermetic-env.mjs records the spawn but does not stop it.
+        { linkedSessions: async () => [session], fetchImpl, gitImpl: deps.gitImpl, recoveryPermit: lockHandle.token },
         {
           sink: (payload) => reports.push({ ...payload, ...subscriptionIdentity }),
           skipFlush: true,
@@ -917,10 +993,10 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // A run can hit unreadable transcripts and dispatch nothing at all, so this cannot ride on the
   // per-dispatch save — without it the retry marker is lost and the next run blocks again.
   if (unreadableDirty) {
-    try { saveLedger(ledger); } catch { /* best-effort */ }
+    try { saveLedger(key, ledger); } catch { /* best-effort */ }
   }
   if (coverageDirty) {
-    saveCoverage(coverageRecord);
+    saveCoverage(key, coverageRecord);
     coverageDirty = false;
   }
 

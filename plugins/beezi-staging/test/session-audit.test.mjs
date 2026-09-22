@@ -2,6 +2,13 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { parseArgs, runAudit, shouldFinalize } from '../lib/session-audit.mjs';
 import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The audit uploads ONE account's history per run — `options.key` names it, defaulting to the
+// default account — so every seam below is that account's: its session, its ledger, its coverage
+// record, its tracking cache.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 // ─── helpers ────────────────────────────────────────────────────────────────
 
@@ -45,7 +52,7 @@ const checkpointResult = (skipped = {}) => ({
 // A flush double that accepts everything it is handed and records the call.
 function fakeFlush(statusFor = () => BackfillSessionStatus.ACCEPTED) {
   const calls = [];
-  const impl = async (groups, _token, _deps, options) => {
+  const impl = async (groups, _key, _session, _deps, options) => {
     calls.push({ groups, options });
     const bySession = new Map();
     let stored = 0;
@@ -69,14 +76,15 @@ function makeDeps(overrides = {}) {
   const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
   const deps = {
     now: () => 10 * 60 * 60 * 1000, // fixed clock, far past every fixture mtime + the 30min window
-    getAccessToken: async () => 'tok',
+    linkedSessions: async () => [SESSION],
+    getDefaultKey: async () => KEY,
     whoamiImpl: async () => ({ valid: true, trackingMode: 'live', backfillCompleted: false }),
     recordWhoamiImpl: () => {},
     listRollouts: () => [rollout('s1')],
     // Stubbed: the real ones read this machine's ~/.beezi-codex and ~/.codex trees.
     resolveTranscriptByCwdImpl: () => null,
     readStateImpl: () => null,
-    readCodexAccountImpl: () => null,
+    readChatgptAuthImpl: () => null,
     readBillingConfigImpl: () => null,
     postJsonImpl: async () => ({ ok: true, status: 200, json: async () => ({ accountLinked: true }) }),
     readTrackingStateImpl: () => null,
@@ -101,7 +109,7 @@ function makeDeps(overrides = {}) {
       });
     },
     loadLedgerImpl: () => ledger,
-    saveLedgerImpl: (l) => saved.push(JSON.parse(JSON.stringify(l))),
+    saveLedgerImpl: (_key, l) => saved.push(JSON.parse(JSON.stringify(l))),
     computeSessionTimelineImpl: () => ({ periods: [{ state: 'working' }], plan_events: [], subagents: [] }),
     postSessionErrorImpl: async () => { events.push('error'); return { reported: true }; },
     ...overrides,
@@ -115,7 +123,7 @@ test('backfill stamps every historical report with one current subscription acco
   const registrations = [];
   const { deps } = makeDeps({
     listRollouts: () => [rollout('s1'), rollout('s2')],
-    readCodexAccountImpl: () => ({
+    readChatgptAuthImpl: () => ({
       authMode: 'chatgpt', accountId: `current-${++reads}`, subscriptionType: 'plus', expiresAt: 99_000_000,
     }),
     postJsonImpl: async (url, token, body) => {
@@ -144,10 +152,10 @@ test('account registration failure leaves history untouched and a later run retr
   const events = [];
   let registrationAttempts = 0;
   const make = () => makeDeps({
-    readCodexAccountImpl: () => ({
+    readChatgptAuthImpl: () => ({
       authMode: 'chatgpt', accountId: 'current-account', subscriptionType: 'plus', expiresAt: 1,
     }),
-    postJsonImpl: async (_url, _token, body) => {
+    postJsonImpl: async (_url, _session, body) => {
       events.push(['register', body]);
       registrationAttempts += 1;
       if (registrationAttempts === 1) {
@@ -189,20 +197,23 @@ test('account registration renews a rejected credential and uses the fresh token
   const calls = [];
   let tokenReads = 0;
   const { deps } = makeDeps({
-    getAccessToken: async (_deps, options = {}) => {
+    // The first bearer rides in on the session; only the RENEWAL is a token read now.
+    linkedSessions: async () => { calls.push(['token', false]); return [accountSession(KEY, 'stale-token')]; },
+    getDefaultKey: async () => KEY,
+    getAccessToken: async (_key, _deps, options = {}) => {
       tokenReads += 1;
       calls.push(['token', options.forceRefresh === true]);
       return options.forceRefresh ? 'fresh-token' : 'stale-token';
     },
-    readCodexAccountImpl: () => ({ authMode: 'chatgpt', accountId: 'current-account' }),
-    postJsonImpl: async (_url, token) => {
-      calls.push(['register', token]);
-      return token === 'stale-token'
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'current-account' }),
+    postJsonImpl: async (_url, session) => {
+      calls.push(['register', session.token]);
+      return session.token === 'stale-token'
         ? { ok: false, status: 401, json: async () => ({}) }
         : { ok: true, status: 200, json: async () => ({ accountLinked: true }) };
     },
-    flushBackfillChunksImpl: async (groups, token) => {
-      calls.push(['flush', token]);
+    flushBackfillChunksImpl: async (groups, _key, session) => {
+      calls.push(['flush', session.token]);
       return flushResult({
         stored: 1,
         bySession: new Map([[groups[0].sessionId, {
@@ -210,14 +221,14 @@ test('account registration renews a rejected credential and uses the fresh token
         }]]),
       });
     },
-    completeBackfillImpl: async (token) => {
-      calls.push(['complete', token]);
+    completeBackfillImpl: async (session) => {
+      calls.push(['complete', session.token]);
       return { completed: true, code: null };
     },
   });
   const result = await runAudit(deps);
   assert.equal(result.finalized, true);
-  assert.equal(tokenReads, 2);
+  assert.equal(tokenReads, 1, 'one forced renewal; the first bearer came with the session');
   assert.deepEqual(calls, [
     ['token', false],
     ['register', 'stale-token'],
@@ -232,7 +243,7 @@ test('dry-run annotates planned reports without registering the account', async 
   let registrations = 0;
   const flush = fakeFlush();
   const { deps } = makeDeps({
-    readCodexAccountImpl: () => ({ authMode: 'chatgpt', accountId: 'dry-account' }),
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'dry-account' }),
     postJsonImpl: async () => { registrations += 1; throw new Error('must not post'); },
     flushBackfillChunksImpl: flush.impl,
   });
@@ -246,7 +257,7 @@ test('backfill still uploads when subscription identity is unavailable', async (
   for (const read of [() => null, () => { throw new Error('unreadable'); },
     () => ({ authMode: 'chatgpt', accountId: null, email: null })]) {
     const flush = fakeFlush();
-    const { deps } = makeDeps({ readCodexAccountImpl: read, flushBackfillChunksImpl: flush.impl });
+    const { deps } = makeDeps({ readChatgptAuthImpl: read, flushBackfillChunksImpl: flush.impl });
     await runAudit(deps);
     assert.equal(flush.calls.length, 1);
     assert.equal(Object.hasOwn(flush.calls[0].groups[0].reports[0], 'account_uuid'), false);
@@ -283,7 +294,7 @@ test('4. rejects a well-formatted but impossible --since date', () => {
 // ─── candidate selection ────────────────────────────────────────────────────
 
 test('5. bails without a token and never scans', async () => {
-  const { deps } = makeDeps({ getAccessToken: async () => null, listRollouts: () => { throw new Error('scanned'); } });
+  const { deps } = makeDeps({ linkedSessions: async () => [], listRollouts: () => { throw new Error('scanned'); } });
 
   const result = await runAudit(deps, {});
 
@@ -538,6 +549,25 @@ test('12. --since drops rollouts older than the cutoff', async () => {
   assert.equal(result.candidates, 1);
 });
 
+// The 30-day window (MAX_SESSION_AGE_MS). Unlike --since it is policy, not a flag, so it counts
+// what it dropped and it must NOT turn the run into a scoped one that never seals.
+test('12b. drops rollouts older than the 30-day window and still finalizes', async () => {
+  const NOW = 100 * 24 * 60 * 60 * 1000;
+  const { deps } = makeDeps({
+    now: () => NOW,
+    listRollouts: () => [
+      rollout('ancient', NOW - 31 * 24 * 60 * 60 * 1000),
+      rollout('recent', NOW - 2 * 24 * 60 * 60 * 1000),
+    ],
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.tooOld, 1);
+  assert.equal(result.candidates, 1);
+  assert.equal(result.finalized, true, 'a capped run is not a scoped run');
+});
+
 test('13. skips a rollout too large to parse safely', async () => {
   const { deps } = makeDeps({
     listRollouts: () => [{ ...rollout('huge'), size: 128 * 1024 * 1024 }],
@@ -574,7 +604,7 @@ test('14. an unreadable transcript is skipped without ending the run', async () 
 test('15. a foreign-identity ledger is discarded, never trusted into a seal', async () => {
   let askedIdentity = 'unset';
   const { deps, events } = makeDeps({
-    loadLedgerImpl: (identity) => {
+    loadLedgerImpl: (_key, identity) => {
       askedIdentity = identity;
       // loadLedger's contract: a mismatched identity yields a FRESH ledger.
       return { version: 1, identity, sessions: {}, complete: false, updatedAt: null };
@@ -584,7 +614,8 @@ test('15. a foreign-identity ledger is discarded, never trusted into a seal', as
 
   const result = await runAudit(deps, {});
 
-  assert.notEqual(askedIdentity, 'unset');
+  assert.equal(askedIdentity, SESSION.clientId,
+    'the ledger binds to the account\'s OWN client id, carried on its session');
   assert.equal(result.candidates, 1);
   assert.ok(events.includes('flush'));
 });

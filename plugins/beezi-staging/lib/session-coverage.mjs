@@ -1,8 +1,7 @@
 import { fetchCompat } from './fetch-compat.mjs';
-import path from 'path';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
-import { beeziCodexHome, BEEZI_ENV } from './paths.mjs';
+import { coverageFile, BEEZI_ENV } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 
@@ -34,8 +33,9 @@ import { orDefault } from './compat.mjs';
 // answered and holds no prefix. Confusing the two turns one network blip into every linked machine
 // re-uploading its whole history at once.
 //
-// DURABLE STATE: `<beeziCodexHome()>/coverage.json`, at the data-root LEVEL — not under state/ or
-// queue/, the only two directories lib/prune.mjs sweeps. It is bound to `{identity, environment,
+// DURABLE STATE: `accounts/<key>/coverage.json` — PER ACCOUNT, because the prefix it records is
+// one server's idea of what this machine delivered to THAT tenant, and outside state/ and queue/,
+// the only two directories lib/prune.mjs sweeps. It is bound to `{identity, environment,
 // apiBase}` and a mismatch DISCARDS the record, which is safe only because this file is a cache of
 // a server-derived fact and never the only copy of an analytics payload; that is why the R6
 // quarantine rule does not apply to it.
@@ -82,7 +82,7 @@ function chunkIds(ids, size) {
  *          availability is a run-level fact, so a caller never has to reason about a half-known
  *          map.
  */
-export async function fetchCoverage(sessionIds, token, deps = {}, options = {}) {
+export async function fetchCoverage(sessionIds, session, deps = {}, options = {}) {
   const ids = Array.isArray(sessionIds)
     ? sessionIds.filter((id) => typeof id === 'string' && id.length > 0)
     : [];
@@ -97,7 +97,7 @@ export async function fetchCoverage(sessionIds, token, deps = {}, options = {}) 
   for (const batch of chunkIds([...new Set(ids)], MAX_COVERAGE_IDS)) {
     let res;
     try {
-      res = await postJsonImpl(url, token, { sessionIds: batch }, { fetchImpl, timeoutMs });
+      res = await postJsonImpl(url, session, { sessionIds: batch }, { fetchImpl, timeoutMs });
     } catch {
       return null;
     }
@@ -124,9 +124,8 @@ export async function fetchCoverage(sessionIds, token, deps = {}, options = {}) 
 
 // ── Durable coverage checkpoints ────────────────────────────────────────────────────────────
 
-export function coverageCheckpointFile() {
-  return path.join(beeziCodexHome(), 'coverage.json');
-}
+// Named by lib/paths.mjs like every other per-account file — see the DURABLE STATE note above.
+export { coverageFile };
 
 // Everything a stored answer is only meaningful under. `apiBase()` asserts the environment first,
 // so a variant whose env.json could not be read never reaches a checkpoint file at all.
@@ -165,11 +164,11 @@ function bindingMatches(record, binding) {
  * API base is DISCARDED rather than migrated: it describes another server's idea of what landed,
  * and acting on it is how a staging cursor ends up steering a production upload.
  */
-export function loadCoverageCheckpoints(binding, deps = {}) {
+export function loadCoverageCheckpoints(key, binding, deps = {}) {
   const read = orDefault(deps.readJsonImpl, readJson);
   let stored = null;
   try {
-    stored = read(coverageCheckpointFile(), null);
+    stored = read(coverageFile(key), null);
   } catch {
     stored = null;
   }
@@ -177,9 +176,9 @@ export function loadCoverageCheckpoints(binding, deps = {}) {
   return stored;
 }
 
-export function saveCoverageCheckpoints(record) {
+export function saveCoverageCheckpoints(key, record) {
   try {
-    writeJsonSecure(coverageCheckpointFile(), { ...record, updatedAt: new Date().toISOString() });
+    writeJsonSecure(coverageFile(key), { ...record, updatedAt: new Date().toISOString() });
     return true;
   } catch {
     return false;
