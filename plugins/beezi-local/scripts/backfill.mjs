@@ -1,14 +1,21 @@
-import { parseArgs, runAudit } from '../lib/session-audit.mjs';
+import { parseArgs, runAudit, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
-import { friendlyMessage } from '../lib/friendly-error.mjs';
+import { friendlyMessage, UserError } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
 import { fail, plural } from '../lib/cli.mjs';
+import { parseAccountFlag } from '../lib/accounts.mjs';
 
 // The login flow's final step: uploads this machine's past Codex sessions into Beezi. There is
 // no standalone skill for it — the login skill runs it after the link and plan capture, and
 // running the login skill again resumes an interrupted upload. Flags (--dry-run / --since /
 // --force) remain for manual `node scripts/backfill.mjs` runs only.
+//
+// `--account` is REQUIRED, and it is the one flag with no default. The one-time import is per
+// account, and the account it belongs to is the one that has just been linked — which is not
+// necessarily the default (a second workspace signing in does not take the default over). Falling
+// back to the default would spend one account's single import on another's behalf, and there is no
+// way to give it back. The login skill passes the key it just linked.
 
 // The 30-day window is a hard floor, not a resume point: a re-run will not pick these up later,
 // so the upload has to say so once rather than leave the user waiting for a run that never comes.
@@ -19,7 +26,15 @@ const OLD_SESSIONS_NOTE =
 
 async function main() {
   if (!cliMayProceed()) { process.exitCode = 1; return; }
-  const options = parseArgs(process.argv.slice(2));
+  const flagged = await parseAccountFlag(process.argv.slice(2));
+  if (flagged.account === null) {
+    throw new UserError(
+      'Beezi: backfill needs --account <account>. The one-time import is per account, and it is '
+      + 'the login skill that runs this with the account it has just linked.',
+    );
+  }
+  const options = parseArgs(flagged.rest);
+  options.key = flagged.account;
   const viaLogin = options.via === 'login';
 
   const result = await runAudit(
@@ -34,8 +49,12 @@ async function main() {
     options,
   );
 
+  // Unconditional now, because --account is required: every state that reaches this branch is an
+  // account resolveAccountRef already found in the index and whose token could not be produced.
+  // "This machine is not linked" was false of all of them — including the login flow's own step 4,
+  // which runs seconds after a sign-in.
   if (result.reason === 'no-token') {
-    fail('Beezi: this machine is not linked. Sign in to Beezi first (the login skill).');
+    fail(ACCOUNT_TOKEN_UNUSABLE);
   }
   if (result.reason === 'account-registration-failed') {
     fail(

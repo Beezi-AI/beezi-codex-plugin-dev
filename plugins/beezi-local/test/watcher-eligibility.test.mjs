@@ -4,6 +4,13 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runWatchPass, loadObservations, observationFor } from '../lib/rollout-watcher.mjs';
 import { makeMachine as sandboxMachine, uuid } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The pass resolves every linked account and hands the whole list to runCheckpoint, which fans the
+// one delta out into each of their queues. `linkedSessions` is therefore the seam that says
+// whether this machine is linked at all.
+const SESSION = accountSession(TEST_KEY, 'token');
+
 
 // R2's eligibility matrix, driven through the watcher rather than through the coverage core.
 //
@@ -45,7 +52,7 @@ function passDeps(overrides) {
   const calls = { checkpoints: [], audits: [], coverageAsks: [] };
   const deps = {
     now: () => NOW,
-    getAccessToken: async () => 'token',
+    linkedSessions: async () => [SESSION],
     runCheckpoint: async (input, _d, options) => {
       calls.checkpoints.push({ id: input.session_id, options });
       return { outcome: 'committed', enqueued: 1, skipped: {} };
@@ -233,8 +240,10 @@ test('10. an unestablished QUIET session goes down the sync route, not a direct 
   const out = await runWatchPass(deps, opts(m));
 
   assert.equal(calls.checkpoints.length, 0, 'no direct replay of history');
-  assert.deepEqual(calls.audits, [{ mode: 'sync' }], 'exactly one sync-mode audit');
-  assert.ok(out.history, 'the audit result is surfaced');
+  // One repair pass PER ACCOUNT, each naming the account it uploads to: the audit uploads to the
+  // account it was given, so a second linked workspace would never have its history repaired.
+  assert.deepEqual(calls.audits, [{ mode: 'sync', key: SESSION.key }], 'exactly one sync-mode audit, for the one linked account');
+  assert.equal(out.history.length, 1, 'one audit result per linked account is surfaced');
 });
 
 test('11. an unestablished ACTIVE session is the one the sync route refuses, so coverage handles it', async (t) => {
@@ -284,7 +293,7 @@ test('13. an audit-only tenant gets no live capture from the watcher', async (t)
   assert.equal(calls.checkpoints.length, 0, 'no live checkpoint on a dark tenant');
   // The history route still runs — runAudit refuses an audit-only tenant itself, in the one place
   // that also knows the server's verdict. The watcher does not reimplement that check.
-  assert.deepEqual(calls.audits, [{ mode: 'sync' }]);
+  assert.deepEqual(calls.audits, [{ mode: 'sync', key: SESSION.key }]);
 });
 
 test('14. a missing tracking cache fails OPEN, matching lib/tracking.mjs\'s documented posture', async (t) => {

@@ -10,13 +10,17 @@ import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './diagnostics
 // diagnostic. What travels is the HTTP status and the error's class/errno, never the payload: the
 // payload carries `lastAssistantMessage`, which is model output, and none of it may reach a
 // diagnostic. See lib/diagnostics.mjs — consent-gated, default off.
-export async function postSessionError(payload, token, deps = {}) {
+export async function postSessionError(payload, session, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const recordIssueImpl = deps.recordIssue || recordIssue;
   if (!payload || !payload.sessionId || !payload.error) return { reported: false, reason: 'missing-fields' };
-  if (!token) return { reported: false, reason: 'no-token' };
+  // `session` is { token, clientId }, never a bare token: the client id names the machine row this
+  // report belongs to, and with several accounts linked one account's id on another's bearer is a
+  // silent misattribution. postJson would throw; answering 'no-token' for an absent one keeps the
+  // fire-and-forget contract.
+  if (!session || !session.token) return { reported: false, reason: 'no-token' };
   try {
-    const res = await postJson(`${apiBase()}${ENDPOINTS.sessionErrors}`, token, payload, { fetchImpl });
+    const res = await postJson(`${apiBase()}${ENDPOINTS.sessionErrors}`, session, payload, { fetchImpl });
     const reported = res.status >= 200 && res.status < 300;
     if (!reported) {
       recordIssueImpl({

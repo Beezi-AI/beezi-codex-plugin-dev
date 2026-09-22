@@ -46,7 +46,7 @@ export function isSubscriptionBillingEvidence(apiErrorEvents = []) {
 // The ChatGPT plan tiers the Beezi API prices under vendor `openai`. ONE list, imported by every
 // normalizer that needs it.
 //
-// This was previously duplicated here and in codex-account.mjs, and `go` was missing from both: a
+// This was previously duplicated here and in chatgpt-auth.mjs, and `go` was missing from both: a
 // ChatGPT Go machine normalized to 'unknown', so nothing was ever captured, the config never stopped
 // being stale, and the "refresh your plan" nudge fired on every single session with no way for the
 // user to end it. Two copies is how that happens — keep it at one.

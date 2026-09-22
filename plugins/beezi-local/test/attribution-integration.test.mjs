@@ -9,6 +9,13 @@ import { resolveRepoRoot } from '../lib/repo-timeline.mjs';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir } from '../lib/paths.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One linked account, injected: from 0.13 on runCheckpoint resolves every account that can produce
+// a token and fans the one delta out into each of their queues.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
+
 
 // G-6-1 — the attribution ratchet. `branch` is a BILLING DIMENSION: it rides on every
 // /sessions/report payload built by `enqueueSegments` in lib/checkpoint.mjs, and decides which
@@ -427,8 +434,8 @@ test('A13 — a resumed window never bills a line at or before its cursor', (t) 
 
 const tmpHome = (t) => sandboxHome(t, 'beezi-attr-cp-');
 
-const queued = () => fs.readdirSync(queueDir())
-  .map((f) => JSON.parse(fs.readFileSync(path.join(queueDir(), f), 'utf-8')))
+const queued = () => fs.readdirSync(queueDir(KEY))
+  .map((f) => JSON.parse(fs.readFileSync(path.join(queueDir(KEY), f), 'utf-8')))
   .sort((a, b) => a.from_line - b.from_line);
 
 // A git stub that dispatches on args[0]/args[1], because branchOf and resolveRemote call it four
@@ -488,7 +495,7 @@ function assertGitFullyStubbed(gitImpl) {
 // rollout — the sibling suite's stubTranscript writes '\n', an empty rollout that yields zero
 // segments and a confusingly green result.
 const depsReal = (rollout, gitImpl, over = {}) => ({
-  getAccessToken: async () => 'tok',
+  linkedSessions: async () => [SESSION],
   fetchImpl: async () => { throw new Error('offline'); }, // keep payloads on disk
   resolveTranscript: () => ({ transcriptPath: rollout, sessionId: 's1' }),
   gitImpl,

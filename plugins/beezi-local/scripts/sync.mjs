@@ -1,9 +1,12 @@
-import { runAudit, SYNC_MODE } from '../lib/session-audit.mjs';
+import { runAudit, SYNC_MODE, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
 import { fail, plural } from '../lib/cli.mjs';
+import {
+  AccountStatus, describeAccount, listAccounts, parseAccountFlag,
+} from '../lib/accounts.mjs';
 
 // The repeatable history repair pass (G-3-3 engine, G-9-3 surface).
 //
@@ -14,7 +17,8 @@ import { fail, plural } from '../lib/cli.mjs';
 // It reaches back 30 days and no further: MAX_SESSION_AGE_MS in lib/session-audit.mjs is shared
 // policy, so a session out of scope for the one-time import is out of scope here too.
 //
-// It takes NO FLAGS, and both refusals below are mechanical enforcement of that:
+// It takes ONE FLAG — `--account`, which scopes the run to a single linked account — and the two
+// refusals below are the mechanical enforcement of the flags it still does not take:
 //
 //   --since filters on the transcript's modification time, which says when a session last RAN, not
 //   what Beezi is missing. It would silently exclude exactly the old half-uploaded session this
@@ -23,6 +27,10 @@ import { fail, plural } from '../lib/cli.mjs';
 //   --force exists on the import to skip the LOCAL seal caches. There is no seal on this path to
 //   force past, so accepting the flag would only advertise a bypass that does not exist — and
 //   invite the model to reach for it the moment the one-time import refuses.
+//
+// With no --account the run repeats for EVERY linked account in turn. That is not wasteful
+// duplication: /sessions/coverage answers for the account whose bearer asked, so a run for one
+// account establishes nothing about what another is missing.
 
 function parseSyncArgs(argv) {
   for (const flag of argv) {
@@ -42,24 +50,40 @@ function parseSyncArgs(argv) {
   return { mode: SYNC_MODE };
 }
 
-async function main() {
-  if (!cliMayProceed()) { process.exitCode = 1; return; }
-  const options = parseSyncArgs(process.argv.slice(2));
+// A refusal, worded identically either way — but the fan-out must not let one account's refusal
+// cancel the accounts after it, and fail() exits the process. So when more than one account is
+// being run, the ✗ line is printed, the exit code is set, and the loop carries on. With one
+// account the output is byte-identical to what a single-account install has always printed.
+function refuse(message, many) {
+  if (!many) fail(message); // never returns
+  console.error(`✗ ${message}`);
+  process.exitCode = 1;
+}
 
+async function runOne(key, many, options) {
   const result = await runAudit(
     {
       onProgress: ({ processed, total }) => {
         console.log(`Beezi: ${processed}/${total} sessions read…`);
       },
     },
-    options,
+    { ...options, key },
   );
 
+  // 'no-token' says two different things depending on whether this run was scoped. Unscoped it is
+  // the machine: nothing here can report. SCOPED it is the account, which the caller has already
+  // resolved against the index — so "this machine is not linked" would be false, and on a fan-out
+  // it would print under the heading of one account while another was mid-upload.
   if (result.reason === 'no-token') {
-    fail('Beezi: this machine is not linked. Sign in to Beezi first (the login skill).');
+    return refuse(
+      key === null
+        ? 'Beezi: this machine is not linked. Sign in to Beezi first (the login skill).'
+        : ACCOUNT_TOKEN_UNUSABLE,
+      many,
+    );
   }
   if (result.reason === 'lock-order' || result.reason === 'lock-failed') {
-    fail(`Beezi: could not start the history sync (${orDefault(result.lastError, 'lock error')}).`);
+    return refuse(`Beezi: could not start the history sync (${orDefault(result.lastError, 'lock error')}).`, many);
   }
   if (result.reason === 'run-in-progress') {
     console.log('✓ Beezi: a history upload is already running on this machine — letting it finish.');
@@ -90,18 +114,20 @@ async function main() {
     return;
   }
   if (result.halt === BackfillHalt.NOT_ALLOWED || result.halt === BackfillHalt.ALREADY_COMPLETED) {
-    fail('Beezi: this workspace does not accept history uploads on demand.');
+    return refuse('Beezi: this workspace does not accept history uploads on demand.', many);
   }
   if (result.halt === BackfillHalt.UNSUPPORTED_SERVER) {
-    fail(
+    return refuse(
       'Beezi: your workspace’s Beezi server does not support history sync yet — it needs updating. '
       + 'No history was lost; run this again after the portal update.',
+      many,
     );
   }
   if (result.halt === BackfillHalt.FORBIDDEN) {
-    fail(
+    return refuse(
       `Beezi: the server refused the upload (${orDefault(result.lastError, 'forbidden')}). `
       + 'Check your seat with your workspace admin, then sign in to Beezi again.',
+      many,
     );
   }
 
@@ -186,6 +212,38 @@ async function main() {
     console.log(`  ${plural(result.unreadable, 'session')} could not be read — not uploaded.`);
   }
   console.log('  Plan and billing details reflect your current setup, not the plan you were on at the time.');
+}
+
+async function main() {
+  if (!cliMayProceed()) { process.exitCode = 1; return; }
+  const argv = process.argv.slice(2);
+  // The two flag refusals stay FIRST and unconditional. They are the mechanical half of "sync is
+  // not a way around the one-time import", and a refused run must still be refused before anything
+  // is read — including the accounts index.
+  const options = parseSyncArgs(argv);
+  const { account } = await parseAccountFlag(argv);
+
+  if (account !== null) {
+    await runOne(account, false, options);
+    return;
+  }
+
+  const linked = (await listAccounts()).filter((a) => a.status === AccountStatus.LINKED);
+  // Nothing linked, or one account: one run, and no heading. `null` lets lib/session-audit.mjs
+  // pick the default exactly as it always has — including answering 'no-token' on a machine that
+  // has never signed in, which is the message that path must still produce.
+  if (linked.length < 2) {
+    await runOne(linked.length === 1 ? linked[0].key : null, false, options);
+    return;
+  }
+  for (let i = 0; i < linked.length; i += 1) {
+    if (i > 0) console.log('');
+    // Same shape the accounts skill's list prints, key included: describeAccount answers
+    // "linked account (no name or email recorded)" for a pre-0.13 migrated row, and two of those
+    // would be indistinguishable headings without it.
+    console.log(`── Account: ${describeAccount(linked[i])} [${linked[i].key}] ──`);
+    await runOne(linked[i].key, true, options);
+  }
 }
 
 main().catch((error) => fail(friendlyMessage(error)));

@@ -19,6 +19,7 @@ import {
   stateDir,
   repoMapFile,
   credentialsFile,
+  legacyCredentialsFile,
   billingConfigFile,
   hookLauncherDir,
   codexHome,
@@ -55,12 +56,18 @@ function envJsonFixture(t, body) {
   return file;
 }
 
+// The per-account stores need a key, so the sweep supplies one — skipping them would quietly
+// shrink the surface these two regression locks cover, and an account directory that escaped the
+// data root would be exactly as damaging as a root-level file that did.
+const PROBE_KEY = '0123abcd';
+
 const everyStore = () => [
   beeziCodexHome(),
-  queueDir(),
+  queueDir(PROBE_KEY),
   stateDir(),
   repoMapFile(),
-  credentialsFile(),
+  credentialsFile(PROBE_KEY),
+  legacyCredentialsFile(),
   billingConfigFile(),
   hookLauncherDir(),
 ];

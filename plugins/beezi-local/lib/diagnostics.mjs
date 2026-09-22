@@ -36,7 +36,7 @@ import { beeziCodexHome } from './paths.mjs';
 import { orDefault, removeFileSync } from './compat.mjs';
 import { readJson, readJsonSalvaged, writeJsonSecure, safeFileName } from './fs-store.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
-import { postJson, POST_TIMEOUT_MS } from './http.mjs';
+import { postJson, sessionOf, POST_TIMEOUT_MS } from './http.mjs';
 import { fetchCompat } from './fetch-compat.mjs';
 import { codeOf } from './friendly-error.mjs';
 
@@ -423,16 +423,40 @@ export function isPostableEvent(event) {
 // `deps.timeoutMs` exists because this plugin's checkpoint runs against a real hook budget, unlike
 // Claude's: an unbounded 3s POST would eat 40% of the budget before a single analytics segment is
 // sent. The caller shrinks it to whatever the budget has left.
-export async function flushDiagnostics(token, deps = {}) {
+/**
+ * Which account a diagnostics batch is sent as, when one has to be chosen.
+ *
+ * The event store and the consent record are MACHINE-level — a crash is a fact about this install,
+ * not about a tenant — so the batch travels once, under one bearer, rather than once per linked
+ * account. The default account when it is still reporting, otherwise the first one that is: a
+ * tenant whose tracking has gone dark answers 403, which this flush keeps rather than deletes, so
+ * choosing one would hold every event on disk for nothing.
+ *
+ * Pure, and `isLive` is handed in rather than imported, so the choice is assertable without a
+ * tracking file on disk. Returns null when no linked account is reporting.
+ */
+export function diagnosticsSession(sessions, defaultKey, isLive) {
+  const live = (sessions || []).filter((session) => isLive(session.key));
+  if (live.length === 0) return null;
+  const preferred = live.find((session) => session.key === defaultKey);
+  return preferred === undefined ? live[0] : preferred;
+}
+
+export async function flushDiagnostics(session, deps = {}) {
   const result = { sent: 0, deleted: 0, expired: 0, failed: 0, skipped: null };
   const postJsonImpl = orDefault(deps.postJsonImpl, postJson);
   const fetchImpl = orDefault(deps.fetchImpl, fetchCompat);
   const now = orDefault(deps.now, Date.now);
 
-  if (!token) {
+  if (!session) {
     result.skipped = 'no-token';
     return result;
   }
+  // Validated HERE, before anything is read off disk. postJson would raise the same TypeError one
+  // batch later, but by then the events have been read and a caller that swallows the throw would
+  // have lost nothing visible — the bare-token call site would stay invisible, which is the whole
+  // point of the guard. Same posture as lib/whoami.mjs.
+  sessionOf(session);
   // Redundant against the record-time gate by design. It is the direct assertion that nothing
   // leaves this machine without consent, rather than a property inherited from another function.
   if (!isTelemetryGranted()) {
@@ -485,7 +509,7 @@ export async function flushDiagnostics(token, deps = {}) {
   try {
     res = await postJsonImpl(
       `${apiBase()}${endpointPath}`,
-      token,
+      session,
       { events: batch },
       { fetchImpl, timeoutMs: orDefault(deps.timeoutMs, POST_TIMEOUT_MS) },
     );

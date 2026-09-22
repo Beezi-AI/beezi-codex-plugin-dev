@@ -5,6 +5,11 @@ import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
 import { ReplayDecision } from '../lib/session-coverage.mjs';
 import { TrackingMode } from '../lib/tracking.mjs';
 import { LOCK_KINDS } from '../lib/single-instance-lock.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// One account per run: its session, its ledger, its coverage record.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 // G-3-3 under REVIEW.md §R2. Every case R2 names has a test here; the file is ordered by that
 // list. Nothing touches the real ~/.beezi-codex or ~/.codex and nothing reaches the network —
@@ -95,7 +100,7 @@ function fakeCheckpoint(plan) {
 
 function fakeFlush(statusFor = () => BackfillSessionStatus.ACCEPTED) {
   const calls = [];
-  const impl = async (groups, _token, _deps, options) => {
+  const impl = async (groups, _key, _session, _deps, options) => {
     calls.push({ groups, options });
     const bySession = new Map();
     let stored = 0;
@@ -118,7 +123,8 @@ function makeDeps(over = {}) {
   const flush = over.flush || fakeFlush();
   const deps = {
     now: () => 10 * 60 * 60 * 1000,
-    getAccessToken: async () => 'tok',
+    linkedSessions: async () => [SESSION],
+    getDefaultKey: async () => KEY,
     whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.LIVE, backfillCompleted: false }),
     recordWhoamiImpl: () => {},
     listRollouts: () => [rollout('s1')],
@@ -128,7 +134,7 @@ function makeDeps(over = {}) {
     markBackfillCompletedImpl: () => {},
     completeBackfillImpl: async () => ({ completed: true, code: null }),
     loadLedgerImpl: () => ledger,
-    saveLedgerImpl: (l) => saved.push(l),
+    saveLedgerImpl: (_key, l) => saved.push(l),
     runCheckpointImpl: checkpoint.impl,
     flushBackfillChunksImpl: flush.impl,
     computeSessionTimelineImpl: () => null,
@@ -433,7 +439,7 @@ test('R2/identity change — a coverage record bound to another machine is not c
   const h = makeDeps({
     checkpoint,
     deps: {
-      loadCoverageCheckpointsImpl: (binding) => ({ version: 1, ...binding, sessions: {}, updatedAt: null }),
+      loadCoverageCheckpointsImpl: (_key, binding) => ({ version: 1, ...binding, sessions: {}, updatedAt: null }),
       fetchCoverageImpl: async () => new Map(),
     },
   });

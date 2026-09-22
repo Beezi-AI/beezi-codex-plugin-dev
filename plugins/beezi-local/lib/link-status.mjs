@@ -1,8 +1,10 @@
 import { apiBase } from './config.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { getAuthentication as _getAuthentication } from './token.mjs';
+import { listAccounts as _listAccounts, getDefaultKey as _getDefaultKey } from './accounts.mjs';
 import { whoami as _whoami } from './whoami.mjs';
 import { hooksStatus as _hooksStatus, statusCommand } from './hooks-install.mjs';
+import { orDefault } from './compat.mjs';
 
 // One answer to "is this machine linked, and is it reporting?".
 //
@@ -21,36 +23,78 @@ export const LinkState = Object.freeze({
   UNREACHABLE: 'unreachable',
 });
 
-// { state, account, apiBase, hooks } — `hooks` is the analytics-reporting half of the answer,
-// because "linked" alone never explains why no analytics are arriving.
-export async function linkStatus(deps = {}) {
+// One account's verdict, in the same vocabulary the whole machine used to be described in.
+//
+// `key`, `email`, `name` and `tenantName` come off the index row; `state`, `authState`, `account`
+// and `who` are what this function establishes. The whoami runs against the account's OWN session
+// — bearer and client id together — because a client id borrowed from another account names the
+// wrong machine row on a linked-machines page.
+async function accountStatus(row, base, deps) {
   const getAccessToken = deps.getAccessToken || _getAccessToken;
   const whoami = deps.whoami || _whoami;
-  const base = deps.apiBase || apiBase();
+  const identity = { key: row.key, email: orDefault(row.email, null),
+    name: orDefault(row.name, null), tenantName: orDefault(row.tenantName, null),
+    // The INDEX row's own status rides along because the token layer cannot reproduce it:
+    // markAccountRevoked deletes the credentials and THEN marks the row, so on the next read a
+    // revoked grant and an account that never had credentials both answer 'unlinked'. Without
+    // this field `me` would have to call them the same thing.
+    status: orDefault(row.status, null) };
 
   const auth = deps.getAccessToken && !deps.getAuthentication
-    ? { accessToken: await getAccessToken().catch(() => null), state: 'unlinked' }
-    : await (deps.getAuthentication || _getAuthentication)().catch(() => ({ state: 'unavailable' }));
+    ? { accessToken: await getAccessToken(row.key, deps).catch(() => null), state: 'unlinked' }
+    : await (deps.getAuthentication || _getAuthentication)(row.key, deps)
+      .catch(() => ({ state: 'unavailable' }));
   const token = auth.accessToken;
   if (!token) {
     const state = auth.state === 'unlinked' ? LinkState.NOT_LINKED
       : auth.state === 'reauth_required' ? LinkState.REVOKED : LinkState.UNREACHABLE;
-    return { state, authState: auth.state, account: null, apiBase: base, hooks: hooks(deps) };
+    return { ...identity, state, authState: auth.state, account: null };
   }
 
-  const who = await whoami(token, { base });
-  if (who === null) return { state: LinkState.UNREACHABLE, account: null, apiBase: base, hooks: hooks(deps) };
-  if (!who.valid) return { state: LinkState.REVOKED, account: null, apiBase: base, hooks: hooks(deps) };
-
+  const who = await whoami({ token, clientId: orDefault(row.clientId, null) }, { base });
+  if (who === null) return { ...identity, state: LinkState.UNREACHABLE, account: null };
+  if (!who.valid) return { ...identity, state: LinkState.REVOKED, account: null };
   return {
+    ...identity,
     state: LinkState.LINKED,
     account: who.name || who.email || null,
-    apiBase: base,
-    hooks: hooks(deps),
     // The full whoami verdict rides along so the already-linked login path can refresh the
     // tracking cache (trackingMode / backfillCompleted) without a second round trip.
     who,
   };
+}
+
+// { state, account, apiBase, hooks, accounts, defaultKey } — `hooks` is the analytics-reporting
+// half of the answer, because "linked" alone never explains why no analytics are arriving.
+//
+// `accounts` is every linked account's verdict in the same vocabulary; the TOP-LEVEL fields
+// describe the DEFAULT one, so every existing reader of `state`/`account` keeps getting the answer
+// it has always got on a single-account machine. There is no aggregate state, deliberately: "this
+// machine is linked" stopped being one fact the moment two workspaces could be linked at once, and
+// collapsing three accounts into one verdict would hide the revoked one.
+export async function linkStatus(deps = {}) {
+  const base = deps.apiBase || apiBase();
+  const listAccounts = deps.listAccounts || _listAccounts;
+  const getDefaultKey = deps.getDefaultKey || _getDefaultKey;
+
+  let rows = [];
+  try { rows = orDefault(await listAccounts(deps), []); } catch { rows = []; }
+  let defaultKey = null;
+  try { defaultKey = orDefault(await getDefaultKey(deps), null); } catch { defaultKey = null; }
+
+  // SERIAL: getAuthentication takes `shared:token-refresh-<key>` when it renews, rank 3, and two
+  // rank-3 locks under different names at once in one process is refused as 'lock-order'. This is
+  // a foreground command, so there is nothing to gain by racing them anyway.
+  const accounts = [];
+  for (const row of rows) accounts.push(await accountStatus(row, base, deps));
+
+  const preferred = accounts.find((one) => one.key === defaultKey);
+  const primary = preferred === undefined ? orDefault(accounts[0], null) : preferred;
+  if (primary === null) {
+    return { state: LinkState.NOT_LINKED, authState: null, account: null,
+      apiBase: base, hooks: hooks(deps), accounts, defaultKey };
+  }
+  return { ...primary, apiBase: base, hooks: hooks(deps), accounts, defaultKey };
 }
 
 // Never let a hook-registry read break a link check — the two are independent failures.
@@ -93,6 +137,23 @@ function describeBrokenHooks(status) {
     + ` ${statusCommand()} lists the paths.`;
 }
 
+/**
+ * True when the index holds rows and not one of them can report.
+ *
+ * The top-level `state` is the DEFAULT account's verdict and says nothing about the others, so on a
+ * machine with rows it can read NOT_LINKED while the machine is plainly linked. Both sentences
+ * below then said "this machine is not linked" — which lib/mcp-bridge.mjs contradicted in the same
+ * breath (refusalFor answers DEFAULT_UNUSABLE_MESSAGE for exactly this machine) and which lib/me.mjs
+ * printed directly under its own "N accounts linked" header.
+ *
+ * LINKED is the only state that means "a token was produced and the portal accepted it", so its
+ * absence across every row is what "none can report" rests on.
+ */
+function noAccountCanReport(status) {
+  const accounts = orDefault(status.accounts, []);
+  return accounts.length > 0 && !accounts.some((one) => one.state === LinkState.LINKED);
+}
+
 // The single phrasing of each outcome, so the MCP tool, the CLI script and the session banner
 // cannot drift apart — and so none of them names a slash command Codex does not have.
 export function describeLink(status) {
@@ -105,9 +166,21 @@ export function describeLink(status) {
       if (status.authState) return 'Beezi authentication is temporarily unavailable or refreshing. Retry shortly; your saved link has been preserved.';
       return `Could not reach Beezi at ${status.apiBase} to check the link. Check the connection, or BEEZI_API_URL if that address is wrong.`;
     default:
+      if (noAccountCanReport(status)) {
+        return `No Beezi account linked on this machine can report just now (API: ${status.apiBase}). Sign in again to re-arm one.`;
+      }
       return 'This machine is not linked to Beezi. Sign in to link it.';
   }
 }
+
+// "Accounts are linked but none of them is the default", in one phrasing for the same reason as
+// the switch above: lib/me.mjs prints it as its own line and the bridge's beezi_status appends it
+// to a lead-in, and the two had drifted into two sentences for one outcome.
+//
+// lib/accounts-cli.mjs keeps its own wording deliberately: that output IS the accounts skill, so a
+// remedy naming the accounts skill would send the reader where they already are.
+export const NO_DEFAULT_ACCOUNT =
+  'No default is set — run the accounts skill to choose which account analytics read from.';
 
 // Analytics need both halves: a link and trusted hooks. Returns null when there is nothing to say.
 //
@@ -122,7 +195,9 @@ export function describeReporting(status) {
   };
 
   if (status.state === LinkState.NOT_LINKED) {
-    return withBroken('Analytics are NOT being reported — this machine is not linked.');
+    return withBroken(noAccountCanReport(status)
+      ? 'Analytics are NOT being reported — no Beezi account linked on this machine can report just now.'
+      : 'Analytics are NOT being reported — this machine is not linked.');
   }
   if (status.state === LinkState.REVOKED) {
     return withBroken('Analytics are NOT being reported — this machine’s link was revoked.');

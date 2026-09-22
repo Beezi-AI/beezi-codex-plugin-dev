@@ -1,11 +1,10 @@
 import crypto from 'crypto';
-import path from 'path';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { fetchCompat } from './fetch-compat.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
-import { beeziCodexHome } from './paths.mjs';
-import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
+import { accountSyncStateFile } from './paths.mjs';
+import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
 import { boundedLabel, orDefault, parseTimestampMs } from './compat.mjs';
 
@@ -34,16 +33,16 @@ export function accountSyncPath() {
   return ENDPOINTS.accountSync;
 }
 
-// Hash + timestamp of the last check-in the SERVER confirmed. Root-level, NOT under state/:
-// pruneStale() sweeps state/ and queue/ at 14 days, and losing this marker means a redundant POST
-// every fortnight — the same reasoning lib/paths.mjs states for auditLedgerFile() and
-// usageObservationsFile().
+// Hash + timestamp of the last check-in the SERVER confirmed. PER ACCOUNT, and outside state/ and
+// queue/ — pruneStale() sweeps those at 14 days, and losing this marker means a redundant POST
+// every fortnight. One marker per account rather than one per machine because the payload it
+// hashes is what THAT tenant was last told; sharing it would let a check-in to one workspace
+// suppress the first-ever check-in to another.
 //
-// It joins onto beeziCodexHome() exactly as every accessor in lib/paths.mjs does, so the
-// environment suffix and the BEEZI_CODEX_HOME override both apply to it unchanged.
-export function accountSyncStateFile() {
-  return path.join(beeziCodexHome(), 'account-sync.json');
-}
+// Named by lib/paths.mjs like every other per-account file, so the environment suffix and the
+// BEEZI_CODEX_HOME override both apply to it unchanged. Re-exported here because the check-in is
+// the only thing that reads or writes it.
+export { accountSyncStateFile };
 
 // The bounds of CliAgentAccountSyncRequestDto ITSELF (@MaxLength 64 / 320 / 50 on accountUuid /
 // email / subscriptionType). Deliberately restated here rather than imported from
@@ -112,7 +111,7 @@ function resolveSubscriptionType(config, account, nowMs) {
 export function buildAccountSyncPayload({ config = null, account = null, now = Date.now() } = {}) {
   const nowMs = now;
   const payload = {};
-  // billing.json first, ~/.codex/auth.json second — the same precedence lib/account-identity.mjs
+  // billing.json first, ~/.codex/auth.json second — the same precedence lib/chatgpt-identity.mjs
   // states, and for the same reason: the config is the only place a `codex app-server` identity is
   // written down, and on a keychain-only machine auth.json names no account at all.
   const field = (source, key, max) => boundedLabel(
@@ -155,11 +154,11 @@ export function payloadHash(payload) {
   return crypto.createHash('sha256').update(canonicalJson(payload)).digest('hex');
 }
 
-function readAccountSyncState(deps = {}) {
+function readAccountSyncState(key, deps = {}) {
   const read = orDefault(deps.readJsonImpl, readJson);
   let raw = null;
   try {
-    raw = read(accountSyncStateFile(), null);
+    raw = read(accountSyncStateFile(key), null);
   } catch {
     return null;
   }
@@ -167,10 +166,10 @@ function readAccountSyncState(deps = {}) {
   return raw;
 }
 
-function writeAccountSyncState(state, deps = {}) {
+function writeAccountSyncState(key, state, deps = {}) {
   const write = orDefault(deps.writeJsonImpl, writeJsonSecure);
   try {
-    write(accountSyncStateFile(), { version: STATE_VERSION, ...state });
+    write(accountSyncStateFile(key), { version: STATE_VERSION, ...state });
   } catch { /* best-effort — a marker we could not write costs one redundant POST */ }
 }
 
@@ -193,21 +192,23 @@ function dueForResync(state, nowMs) {
 // PREVIOUS identity would otherwise suppress the one check-in that is guaranteed to be news.
 //
 // Return: { synced, reason?, status? }.
-//   no-token      — no usable access token. This is also what a credential store bound to another
-//                   environment looks like: lib/credentials.mjs reads a mismatched binding as NO
-//                   credentials, so getAccessToken() answers null and nothing uploads. Quiet by
-//                   design — that machine is not ours to talk about.
+//   no-token      — the caller had no session for this account. This is also what a credential
+//                   store bound to another environment looks like: lib/credentials.mjs reads a
+//                   mismatched binding as NO credentials, so linkedSessions() drops that account
+//                   entirely. Quiet by design — that machine is not ours to talk about.
 //   nothing-known — the payload named nothing; no request was made.
 //   unchanged     — same payload, inside RESYNC_MS; no request was made.
 //   rejected      — the server refused. THE MARKER IS LEFT UNTOUCHED, so the next trigger retries.
 //                   Sealing it on a 404 from an older API would freeze the account row for a week
 //                   while looking like a success.
 //   network       — offline, DNS failure, or the bounded request timed out. Marker untouched.
-export async function syncAccountIfNeeded(token, options = {}, deps = {}) {
-  if (!token) return { synced: false, reason: 'no-token' };
+export async function syncAccountIfNeeded(key, session, options = {}, deps = {}) {
+  if (!session || !session.token) return { synced: false, reason: 'no-token' };
 
   const fetchImpl = orDefault(deps.fetchImpl, fetchCompat);
-  const readAccount = orDefault(deps.readCodexAccount, _readCodexAccount);
+  // `readChatgptAuth`, not `readAccount`: from 0.13 on "account" means a linked BEEZI account, and
+  // the value this reads is the ChatGPT sign-in Codex holds (Task 1's rename).
+  const readChatgptAuth = orDefault(deps.readChatgptAuth, _readChatgptAuth);
   const readConfig = orDefault(deps.readBillingConfig, _readBillingConfig);
   const now = orDefault(deps.now, new Date());
   const force = options.force === true;
@@ -218,14 +219,14 @@ export async function syncAccountIfNeeded(token, options = {}, deps = {}) {
   try {
     let config = null;
     try { config = readConfig(); } catch { config = null; }
-    let account = null;
-    try { account = readAccount(); } catch { account = null; }
+    let chatgptAccount = null;
+    try { chatgptAccount = readChatgptAuth(); } catch { chatgptAccount = null; }
 
-    const payload = buildAccountSyncPayload({ config, account, now: now.getTime() });
+    const payload = buildAccountSyncPayload({ config, account: chatgptAccount, now: now.getTime() });
     if (isEmptyPayload(payload)) return { synced: false, reason: 'nothing-known' };
 
     const hash = payloadHash(payload);
-    const state = readAccountSyncState(deps);
+    const state = readAccountSyncState(key, deps);
     const unchanged = state !== null && state.lastSyncedHash === hash;
     if (!force && unchanged && !dueForResync(state, now.getTime())) {
       return { synced: false, reason: 'unchanged' };
@@ -237,10 +238,10 @@ export async function syncAccountIfNeeded(token, options = {}, deps = {}) {
     const postDeps = { fetchImpl };
     if (deps.timeoutMs !== null && deps.timeoutMs !== undefined) postDeps.timeoutMs = deps.timeoutMs;
 
-    const res = await postJson(`${apiBase()}${accountSyncPath()}`, token, payload, postDeps);
+    const res = await postJson(`${apiBase()}${accountSyncPath()}`, session, payload, postDeps);
     const status = res === null || res === undefined ? null : res.status;
     if (typeof status === 'number' && status >= 200 && status < 300) {
-      writeAccountSyncState({ lastSyncedHash: hash, lastSyncedAt: now.toISOString() }, deps);
+      writeAccountSyncState(key, { lastSyncedHash: hash, lastSyncedAt: now.toISOString() }, deps);
       return { synced: true, status };
     }
     return { synced: false, status, reason: 'rejected' };

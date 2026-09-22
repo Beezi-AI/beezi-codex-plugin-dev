@@ -16,15 +16,15 @@ const LEDGER_LOCK_LEASE_MS = 5_000;
 //
 // This has to be durable in a way ~/.beezi-codex/state/<id>.json is not: pruneStale() deletes
 // anything in state/ and queue/ older than 14 days, so a marker there expires and every old
-// session looks importable again on the next run. auditLedgerFile() sits at the beeziCodexHome()
-// root, outside the dirs pruneStale walks.
+// session looks importable again on the next run. auditLedgerFile(key) sits in the account
+// directory, outside the dirs pruneStale walks.
 //
-// The ledger is machine-global but the server's pull record is per (tenant, user, tool), so it
-// binds to the login that wrote it: a ledger recorded under another identity is discarded, or a
-// logout→login into a different workspace would replay it, find zero candidates, and seal the
-// new tenant's pull EMPTY (there is no reopen).
-export function loadLedger(identity = null) {
-  const raw = readJson(auditLedgerFile(), null);
+// The ledger belongs to ONE ACCOUNT, and the server's pull record is per (tenant, user, tool), so
+// it binds to the login that wrote it as well: a ledger recorded under another identity is
+// discarded, or a logout→login into a different workspace would replay it, find zero candidates,
+// and seal the new tenant's pull EMPTY (there is no reopen).
+export function loadLedger(key, identity = null) {
+  const raw = readJson(auditLedgerFile(key), null);
   // A ledger from a future/foreign shape is discarded rather than merged: re-sending is
   // idempotent server-side, whereas trusting an unknown shape is not.
   if (!raw || raw.version !== LEDGER_VERSION || typeof raw.sessions !== 'object' || raw.sessions === null) {
@@ -121,8 +121,8 @@ export function wasUnreadable(ledger, sessionId) {
 
 // The on-disk record, or null when there is nothing mergeable there. Same shape gate as
 // loadLedger, minus the identity substitution — a merge must see the identity exactly as written.
-function readLedgerRaw() {
-  const raw = readJson(auditLedgerFile(), null);
+function readLedgerRaw(key) {
+  const raw = readJson(auditLedgerFile(key), null);
   if (!raw || raw.version !== LEDGER_VERSION) return null;
   if (typeof raw.sessions !== 'object' || raw.sessions === null) return null;
   return raw;
@@ -174,7 +174,11 @@ function mergeLedger(ledger, disk) {
 // 0600 — the ledger records which projects the user worked on, by session id only, but the file
 // lives alongside credentials.json and follows the same rule.
 //
-// ONE rank-3 `shared:audit-ledger` lock around a re-read, a merge and the write (G-8-3 / R3) —
+// ONE rank-3 `shared:audit-ledger-<key>` lock around a re-read, a merge and the write (G-8-3 / R3)
+// — the name carries the key, so two accounts' ledgers never serialise against each other across
+// processes. Within one process they must still be saved SERIALLY: two rank-3 locks under
+// different names at once is refused as 'lock-order'. Every fan-out caller loops accounts in turn.
+//
 // the last-writer-wins hazard G-8-3 opens with. writeJsonSecure already makes each write atomic,
 // so the file is never TORN; what it is not is safe against two backfill runs that each loaded the
 // ledger minutes ago and now save their own in-memory copy over the top. Run A's markImported
@@ -190,11 +194,11 @@ function mergeLedger(ledger, disk) {
 //
 // The merged result is written back into `ledger`, so the caller's in-memory copy stops being the
 // stale one and its later `isImported` checks see the other run's rows too.
-export function saveLedger(ledger) {
+export function saveLedger(key, ledger) {
   const run = withLock(
-    sharedLock('audit-ledger'),
+    sharedLock(`audit-ledger-${key}`),
     { leaseMs: LEDGER_LOCK_LEASE_MS },
-    () => writeJsonSecure(auditLedgerFile(), mergeLedger(ledger, readLedgerRaw())),
+    () => writeJsonSecure(auditLedgerFile(key), mergeLedger(ledger, readLedgerRaw(key))),
   );
   // 'held'/'contended' is another run mid-save; this one's rows are still in memory and its next
   // save (there is always one — the caller saves per chunk and again at finalize) carries them.

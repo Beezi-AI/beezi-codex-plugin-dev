@@ -5,19 +5,27 @@ import os from 'node:os';
 import path from 'node:path';
 import { postSessionError } from '../lib/session-error-report.mjs';
 import { recordingFetch } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// A bare token is refused by lib/http.mjs: the client id names the machine row this report belongs
+// to, and with several accounts linked one account's id on another's bearer is a misattribution.
+const MINE = accountSession(TEST_KEY, 'my-token');
+const SESSION = accountSession(TEST_KEY, 'tok');
 
 test('POSTs the payload to /sessions/errors with bearer auth', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const res = await postSessionError(
     { sessionId: 's1', error: 'rate_limit', errorDetails: null,
       lastAssistantMessage: 'resets 4:30pm (Europe/Kiev)', occurredAt: '2026-07-08T10:00:00.000Z' },
-    'my-token',
+    MINE,
     { fetchImpl },
   );
   assert.equal(res.reported, true);
   assert.equal(fetchImpl.calls.length, 1);
   assert.match(fetchImpl.calls[0].url, /\/sessions\/errors$/);
   assert.equal(fetchImpl.calls[0].opts.headers.Authorization, 'Bearer my-token');
+  assert.equal(fetchImpl.calls[0].opts.headers['X-Beezi-Client'], MINE.clientId,
+    'the report names the machine row of the account it was sent as');
   assert.deepEqual(JSON.parse(fetchImpl.calls[0].opts.body), {
     sessionId: 's1', error: 'rate_limit', errorDetails: null,
     lastAssistantMessage: 'resets 4:30pm (Europe/Kiev)', occurredAt: '2026-07-08T10:00:00.000Z',
@@ -37,7 +45,7 @@ test('a non-2xx records one diagnostic carrying only the status — never the pa
   const fetchImpl = async () => ({ status: 422 });
   const res = await postSessionError(
     { sessionId: 's1', error: 'rate_limit', lastAssistantMessage: 'you are over your ACME Corp quota' },
-    'tok',
+    SESSION,
     { fetchImpl, recordIssue: (issue) => { issues.push(issue); return true; } },
   );
 
@@ -52,7 +60,7 @@ test('a non-2xx records one diagnostic carrying only the status — never the pa
 test('a transport failure records the error object, and a 2xx records nothing', async () => {
   const issues = [];
   const boom = async () => { throw new TypeError('fetch failed', { cause: { code: 'ECONNRESET' } }); };
-  const failed = await postSessionError({ sessionId: 's1', error: 'rate_limit' }, 'tok', {
+  const failed = await postSessionError({ sessionId: 's1', error: 'rate_limit' }, SESSION, {
     fetchImpl: boom,
     recordIssue: (issue) => { issues.push(issue); return true; },
   });
@@ -61,7 +69,7 @@ test('a transport failure records the error object, and a 2xx records nothing', 
   assert.equal(issues[0].error.name, 'TypeError');
 
   const quiet = [];
-  await postSessionError({ sessionId: 's1', error: 'rate_limit' }, 'tok', {
+  await postSessionError({ sessionId: 's1', error: 'rate_limit' }, SESSION, {
     fetchImpl: async () => ({ status: 201 }),
     recordIssue: (issue) => { quiet.push(issue); return true; },
   });
@@ -78,7 +86,7 @@ test('the real recordIssue writes nothing on a machine that never consented', as
     fs.rmSync(dir, { recursive: true, force: true });
   });
 
-  const res = await postSessionError({ sessionId: 's1', error: 'rate_limit' }, 'tok', {
+  const res = await postSessionError({ sessionId: 's1', error: 'rate_limit' }, SESSION, {
     fetchImpl: async () => ({ status: 500 }),
   });
 

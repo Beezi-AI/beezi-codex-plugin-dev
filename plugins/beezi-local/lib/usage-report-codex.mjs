@@ -2,8 +2,8 @@ import { fetchCompat } from './fetch-compat.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { orDefault } from './compat.mjs';
-import { readCodexAccount as _readCodexAccount } from './codex-account.mjs';
-import { accountIdentityFields } from './account-identity.mjs';
+import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
+import { chatgptIdentityFields } from './chatgpt-identity.mjs';
 import { readBillingConfig as _readBillingConfig, resolveBilling as _resolveBilling } from './billing-config.mjs';
 import {
   readPendingRateLimits as _readPendingRateLimits,
@@ -55,18 +55,20 @@ function signalsFromAccount(account) {
 //   1. billing.json's SELF-REPORTED plan — a tier the user typed always wins.
 //   2. the `plan_type` on the most recent rate-limit observation (rate-limits-codex.mjs).
 //   3. billing.json's captured (non-self-reported) plan.
-//   4. readCodexAccount().plan, the live id_token decode.
+//   4. readChatgptAuth().plan, the live id_token decode.
 // Rungs 3 and 4 are unchanged; rung 2 was added because `plan_type` was on disk and unread.
 export function usageIdentityFields(deps = {}) {
-  const readAccount = deps.readCodexAccount || _readCodexAccount;
+  // `readChatgptAuth` / `chatgptAccount`, not `readAccount` / `account`: from 0.13 on "account"
+  // means a linked BEEZI account, and what these read is the ChatGPT sign-in Codex holds.
+  const readChatgptAuth = deps.readChatgptAuth || _readChatgptAuth;
   const readBilling = deps.readBillingConfig || _readBillingConfig;
 
-  let account = null;
-  try { account = readAccount(); } catch (e) { account = null; }
+  let chatgptAccount = null;
+  try { chatgptAccount = readChatgptAuth(); } catch (e) { chatgptAccount = null; }
   let billing = null;
   try { billing = readBilling(); } catch (e) { billing = null; }
 
-  const out = accountIdentityFields(account);
+  const out = chatgptIdentityFields(chatgptAccount);
 
   // The plugin's own resolution ladder decides whether a plan is even meaningful — under API-key
   // billing it returns no subscription fields at all, and stating one would be a false claim.
@@ -75,7 +77,7 @@ export function usageIdentityFields(deps = {}) {
   let fields = {};
   try {
     fields = resolveBilling(billing, env, {
-      readCodexAuthSignals: function () { return signalsFromAccount(account); },
+      readCodexAuthSignals: function () { return signalsFromAccount(chatgptAccount); },
       ...billingDepsFrom(deps),
     });
   } catch (e) { fields = {}; }
@@ -119,12 +121,12 @@ export function usageIdentityFields(deps = {}) {
   // and so does the observed plan above.
   const stated = fields.subscription_plan;
   if ((stated == null || stated === 'unknown') && fields.billing_source === 'subscription') {
-    const livePlan = account == null ? null : account.plan;
+    const livePlan = chatgptAccount == null ? null : chatgptAccount.plan;
     if (livePlan != null && livePlan !== 'unknown') {
       fields = {
         ...fields,
         subscription_plan: livePlan,
-        subscription_type: orDefault(fields.subscription_type, account.subscriptionType),
+        subscription_type: orDefault(fields.subscription_type, chatgptAccount.subscriptionType),
       };
     }
   }
@@ -140,21 +142,26 @@ export function usageIdentityFields(deps = {}) {
   return out;
 }
 
-// Ships the rate-limit rows the rollout scan queued. Each row carries the timestamp of the reading
-// it describes, so the server's (tenant, user, account_uuid, fetched_at) unique key collapses a
+// Ships ONE ACCOUNT's queued rate-limit rows. Each row carries the timestamp of the reading it
+// describes, so the server's (tenant, user, account_uuid, fetched_at) unique key collapses a
 // replay for free — which is what makes re-scanning an old rollout safe.
 //
-// Rows are cleared only up to the last CONFIRMED store. A non-2xx stops the loop with the rest
-// still queued: the API rejects an entire payload on one bad field, and clearing past a failure
-// would silently drop every row behind it.
-export async function drainRateLimitSnapshots(token, deps = {}) {
+// Rows are cleared only up to the last CONFIRMED store. A non-2xx stops THAT ACCOUNT's loop with
+// the rest still queued: the API rejects an entire payload on one bad field, and clearing past a
+// failure would silently drop every row behind it. One tenant refusing a row says nothing about
+// another, so each account drains and clears its own queue.
+//
+// `deps.deadline` is now SHARED across the accounts rather than granted to each: the caller passes
+// the same epoch to every drain, so N linked accounts split one hook budget instead of
+// multiplying it. Whatever the deadline cuts off stays on disk for the next turn end.
+export async function drainRateLimitSnapshots(key, session, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const now = orDefault(deps.now, Date.now);
   const readPending = deps.readPendingRateLimits || _readPendingRateLimits;
   const clearPending = deps.clearPendingRateLimits || _clearPendingRateLimits;
-  if (!token) return { posted: 0, reason: 'no-token' };
+  if (!session || !session.token) return { posted: 0, reason: 'no-token' };
 
-  const pending = readPending();
+  const pending = readPending(key, deps);
   if (!pending.length) return { posted: 0, reason: 'empty' };
 
   const url = `${apiBase()}${ENDPOINTS.usageSnapshot}`;
@@ -186,7 +193,7 @@ export async function drainRateLimitSnapshots(token, deps = {}) {
     let res = null;
     try {
       // The row last, so a stored observation can never be overwritten by an identity field.
-      res = await postJson(url, token, { ...identity, ...pending[i] }, postOpts);
+      res = await postJson(url, session, { ...identity, ...pending[i] }, postOpts);
     } catch (e) {
       stopped = 'network';
       break;
@@ -199,7 +206,7 @@ export async function drainRateLimitSnapshots(token, deps = {}) {
   }
   // The rows themselves, not a count: the queue is re-read inside clearPending and its indices may
   // have shifted under us. See the note there.
-  if (posted > 0) clearPending(pending.slice(0, posted));
+  if (posted > 0) clearPending(key, pending.slice(0, posted), deps);
   // Rows still on disk when the drain stopped, WHATEVER stopped it. `pending.length - posted` is
   // exact on every path because a non-success breaks immediately, so `posted` is always the index
   // the loop stopped at. It used to be counted only on the deadline path, which reported `deferred:

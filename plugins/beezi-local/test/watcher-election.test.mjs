@@ -10,6 +10,13 @@ import {
 } from '../lib/single-instance-lock.mjs';
 import { createBridge } from '../lib/mcp-bridge.mjs';
 import { makeMachine as sandboxMachine, uuid } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The pass resolves every linked account and hands the whole list to runCheckpoint, which fans the
+// one delta out into each of their queues. `linkedSessions` is therefore the seam that says
+// whether this machine is linked at all.
+const SESSION = accountSession(TEST_KEY, 'token');
+
 
 // R3's half of G-1-1: the election lock, and the two things it is NOT.
 //
@@ -42,7 +49,7 @@ function makeWatcher(machine, overrides, options) {
       setTimeoutImpl: (fn, ms) => { const h = { fn, ms }; armed.push(h); return h; },
       clearTimeoutImpl: (h) => { cleared.push(h); },
       now: () => 1_000_000,
-      getAccessToken: async () => { calls.tokens += 1; return 'token'; },
+      linkedSessions: async () => { calls.tokens += 1; return [SESSION]; },
       listRolloutFiles: (root) => { calls.scans += 1; return []; },
       runCheckpoint: async () => { calls.checkpoints += 1; return { outcome: 'committed', enqueued: 0, skipped: {} }; },
       runAudit: async () => ({ ok: true }),
@@ -263,7 +270,13 @@ test('10. the JSON-RPC channel is answered WHILE a large scan is in flight', asy
   const written = [];
   const bridge = createBridge({
     url: 'https://api.test/api/mcp',
-    getAccessToken: async () => null,              // unlinked: answered locally, no network
+    // Unlinked: answered locally, no network — and no filesystem either, which matters here
+    // because what is being timed is how fast the JSON-RPC channel answers during a scan. The
+    // filesystem work was never the token stub (that was honoured); it was the UN-INJECTED
+    // `checkEnvironment`, which reads the environment binding on every message.
+    checkEnvironment: () => ({ status: 'ok' }),
+    getDefaultKey: async () => null,
+    listAccounts: async () => [],
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => written.push(JSON.parse(line)),
     logError: () => {},

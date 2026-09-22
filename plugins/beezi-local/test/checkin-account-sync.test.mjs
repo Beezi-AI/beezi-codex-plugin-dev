@@ -13,10 +13,17 @@ import {
 import { apiBase } from '../lib/config.mjs';
 import { beeziCodexHome, queueDir, stateDir } from '../lib/paths.mjs';
 import { recordingFetch, hangingFetch as hangingResponder } from '../tools/suite-fixtures.mjs';
+import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+
+// The check-in is per account: the PAYLOAD describes the ChatGPT sign-in this machine is on, which
+// is the same for every linked workspace, but the marker that suppresses a redundant POST is that
+// account's — so a workspace linked yesterday still gets its first check-in.
+const KEY = TEST_KEY;
+const SESSION = accountSession(KEY, 'tok');
 
 // The vendor-generic account check-in (G-2-1).
 //
-// EVERY test here injects readCodexAccount AND readBillingConfig, including the ones that return
+// EVERY test here injects readChatgptAuth AND readBillingConfig, including the ones that return
 // before either could be reached. Those two readers are the modules that reach for real machine
 // state (~/.codex/auth.json and ~/.beezi-codex/billing.json); an escaped read does not fail an
 // assertion, it only moves the runner's PROCESS EXIT STATUS, so the discipline has to be
@@ -60,7 +67,7 @@ function deps(overrides) {
   const o = overrides || {};
   return {
     fetchImpl: o.fetchImpl || recordingFetch(async () => ({ status: 200 })),
-    readCodexAccount: o.readCodexAccount || (() => ACCOUNT),
+    readChatgptAuth: o.readChatgptAuth || (() => ACCOUNT),
     readBillingConfig: o.readBillingConfig || (() => CONFIG),
     readJsonImpl: o.readJsonImpl || (() => null),
     writeJsonImpl: o.writeJsonImpl || spyWrite(),
@@ -182,7 +189,7 @@ test('payloadHash — stable under key reordering, so a reordered build is not n
 
 test('route — posts to /me/cli-agent/account, the vendor-generic route (NOT a /me/codex/* one)', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const res = await syncAccountIfNeeded('tok', {}, deps({ fetchImpl }));
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({ fetchImpl }));
   assert.equal(res.synced, true);
   assert.equal(fetchImpl.calls.length, 1);
   assert.equal(fetchImpl.calls[0].url, `${apiBase()}/me/cli-agent/account`);
@@ -192,7 +199,7 @@ test('route — posts to /me/cli-agent/account, the vendor-generic route (NOT a 
 
 test('route — the request carries the bearer token and the codex agent header', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  await syncAccountIfNeeded('my-token', {}, deps({ fetchImpl }));
+  await syncAccountIfNeeded(KEY, accountSession(KEY, 'my-token'), {}, deps({ fetchImpl }));
   const { headers } = fetchImpl.calls[0].opts;
   assert.equal(headers.Authorization, 'Bearer my-token');
   // The discriminator: there is no vendor field in the body, the server reads it off this header.
@@ -202,7 +209,7 @@ test('route — the request carries the bearer token and the codex agent header'
 
 test('route — the body carries ONLY whitelisted keys, and no credential, token or path', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  await syncAccountIfNeeded('super-secret-token', { force: true, via: 'session-start' }, deps({ fetchImpl }));
+  await syncAccountIfNeeded(KEY, accountSession(KEY, 'super-secret-token'), { force: true, via: 'session-start' }, deps({ fetchImpl }));
   const body = JSON.parse(fetchImpl.calls[0].opts.body);
   const allowed = ['accountUuid', 'email', 'subscriptionType', 'rateLimitTier', 'keys'];
   for (const key of Object.keys(body)) {
@@ -221,7 +228,7 @@ test('gate — an unchanged payload inside RESYNC_MS sends NOTHING', async () =>
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const now = new Date('2026-09-10T12:00:00.000Z');
   const hash = payloadHash(buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT }));
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     fetchImpl,
     now,
     readJsonImpl: () => ({
@@ -238,7 +245,7 @@ test('gate — past RESYNC_MS the same payload is re-sent, which is what moves l
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const now = new Date('2026-09-10T12:00:00.000Z');
   const hash = payloadHash(buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT }));
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     fetchImpl,
     now,
     readJsonImpl: () => ({
@@ -254,10 +261,10 @@ test('gate — past RESYNC_MS the same payload is re-sent, which is what moves l
 test('gate — a CHANGED payload posts even inside RESYNC_MS (an account switch must propagate)', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const now = new Date('2026-09-10T12:00:00.000Z');
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     fetchImpl,
     now,
-    readCodexAccount: () => ({ ...ACCOUNT, accountId: 'acct-OTHER', email: 'other@acme.com' }),
+    readChatgptAuth: () => ({ ...ACCOUNT, accountId: 'acct-OTHER', email: 'other@acme.com' }),
     readJsonImpl: () => ({
       version: 1,
       lastSyncedHash: payloadHash(buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT })),
@@ -272,7 +279,7 @@ test('gate — force bypasses it: a fresh login must not be suppressed by the PR
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const now = new Date('2026-09-10T12:00:00.000Z');
   const hash = payloadHash(buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT }));
-  const res = await syncAccountIfNeeded('tok', { force: true }, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, { force: true }, deps({
     fetchImpl,
     now,
     readJsonImpl: () => ({ version: 1, lastSyncedHash: hash, lastSyncedAt: now.toISOString() }),
@@ -285,7 +292,7 @@ test('gate — a marker from an older STATE_VERSION is ignored rather than trust
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const now = new Date('2026-09-10T12:00:00.000Z');
   const hash = payloadHash(buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT }));
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     fetchImpl,
     now,
     readJsonImpl: () => ({ version: 99, lastSyncedHash: hash, lastSyncedAt: now.toISOString() }),
@@ -297,7 +304,7 @@ test('gate — a marker stamped in the FUTURE is a clock change, not a fresh syn
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const now = new Date('2026-09-10T12:00:00.000Z');
   const hash = payloadHash(buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT }));
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     fetchImpl,
     now,
     readJsonImpl: () => ({
@@ -314,7 +321,7 @@ test('gate — a marker stamped in the FUTURE is a clock change, not a fresh syn
 test('marker — sealed only inside the 2xx branch, with the hash and an ISO stamp', async () => {
   const writeJsonImpl = spyWrite();
   const now = new Date('2026-09-10T12:00:00.000Z');
-  const res = await syncAccountIfNeeded('tok', {}, deps({ writeJsonImpl, now }));
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({ writeJsonImpl, now }));
   assert.equal(res.synced, true);
   assert.equal(writeJsonImpl.calls.length, 1);
   assert.deepEqual(writeJsonImpl.calls[0].obj, {
@@ -322,12 +329,12 @@ test('marker — sealed only inside the 2xx branch, with the hash and an ISO sta
     lastSyncedHash: payloadHash(buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT })),
     lastSyncedAt: now.toISOString(),
   });
-  assert.equal(writeJsonImpl.calls[0].file, accountSyncStateFile());
+  assert.equal(writeJsonImpl.calls[0].file, accountSyncStateFile(KEY));
 });
 
 test('marker — a 404 from an older API does NOT seal it, so the next trigger retries', async () => {
   const writeJsonImpl = spyWrite();
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     writeJsonImpl,
     fetchImpl: recordingFetch(async () => ({ status: 404 })),
   }));
@@ -337,7 +344,7 @@ test('marker — a 404 from an older API does NOT seal it, so the next trigger r
 
 test('marker — a 400 (an unknown key reaching the whitelist) does NOT seal it either', async () => {
   const writeJsonImpl = spyWrite();
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     writeJsonImpl,
     fetchImpl: recordingFetch(async () => ({ status: 400 })),
   }));
@@ -348,7 +355,7 @@ test('marker — a 400 (an unknown key reaching the whitelist) does NOT seal it 
 
 test('marker — a 401 does not seal it (the token, not the payload, is the problem)', async () => {
   const writeJsonImpl = spyWrite();
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     writeJsonImpl,
     fetchImpl: recordingFetch(async () => ({ status: 401 })),
   }));
@@ -356,13 +363,17 @@ test('marker — a 401 does not seal it (the token, not the payload, is the prob
   assert.equal(writeJsonImpl.calls.length, 0);
 });
 
-test('marker — lives at the data root, NOT under state/ or queue/ that pruneStale() sweeps', () => {
-  const file = accountSyncStateFile();
-  assert.equal(path.dirname(file), beeziCodexHome());
+// REWRITTEN for the keyed layout. The marker moved from the data root into the account directory,
+// and the property it pins is unchanged: it is outside state/ and outside every account's queue/,
+// the only two trees pruneStale() sweeps, so losing it would cost a redundant POST a fortnight.
+// The new half is that two accounts cannot share one marker.
+test('marker — lives in the account directory, NOT under state/ or queue/ that pruneStale() sweeps', () => {
+  const file = accountSyncStateFile(KEY);
+  assert.equal(path.dirname(file), path.join(beeziCodexHome(), 'accounts', KEY));
   assert.equal(path.basename(file), 'account-sync.json');
-  assert.equal(path.dirname(file), path.dirname(stateDir()));
   assert.notEqual(path.dirname(file), stateDir());
-  assert.notEqual(path.dirname(file), queueDir());
+  assert.notEqual(path.dirname(file), queueDir(KEY));
+  assert.notEqual(accountSyncStateFile(KEY), accountSyncStateFile('99887766'));
 });
 
 // ── the quiet states ──────────────────────────────────────────────────────────────────────────
@@ -375,7 +386,7 @@ test('unlinked — no token means no request, and no complaint', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
   const writeJsonImpl = spyWrite();
   for (const token of [null, undefined, '']) {
-    const res = await syncAccountIfNeeded(token, { force: true }, deps({ fetchImpl, writeJsonImpl }));
+    const res = await syncAccountIfNeeded(KEY, token === null || token === undefined || token === '' ? token : accountSession(KEY, token), { force: true }, deps({ fetchImpl, writeJsonImpl }));
     assert.deepEqual(res, { synced: false, reason: 'no-token' });
   }
   assert.equal(fetchImpl.calls.length, 0);
@@ -384,9 +395,9 @@ test('unlinked — no token means no request, and no complaint', async () => {
 
 test('nothing known — a machine with no Codex sign-in and no billing config sends nothing', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const res = await syncAccountIfNeeded('tok', { force: true }, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, { force: true }, deps({
     fetchImpl,
-    readCodexAccount: () => null,
+    readChatgptAuth: () => null,
     readBillingConfig: () => null,
   }));
   assert.deepEqual(res, { synced: false, reason: 'nothing-known' });
@@ -395,7 +406,7 @@ test('nothing known — a machine with no Codex sign-in and no billing config se
 
 test('offline — a throwing fetch is a quiet skip, and the marker is untouched', async () => {
   const writeJsonImpl = spyWrite();
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     writeJsonImpl,
     fetchImpl: recordingFetch(async () => { throw Object.assign(new Error('getaddrinfo ENOTFOUND'), { code: 'ENOTFOUND' }); }),
   }));
@@ -407,7 +418,7 @@ test('slow server — the request is bounded, so a hook is never blocked on it',
   const fetchImpl = hangingFetch();
   const writeJsonImpl = spyWrite();
   const started = Date.now();
-  const res = await syncAccountIfNeeded('tok', {}, deps({ fetchImpl, writeJsonImpl, timeoutMs: 30 }));
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({ fetchImpl, writeJsonImpl, timeoutMs: 30 }));
   assert.deepEqual(res, { synced: false, reason: 'network' });
   assert.ok(Date.now() - started < 5000, 'the call did not settle promptly — it is unbounded');
   assert.equal(fetchImpl.calls.length, 1);
@@ -417,9 +428,9 @@ test('slow server — the request is bounded, so a hook is never blocked on it',
 
 test('never throws — a reader that blows up degrades to "nothing known" rather than failing a hook', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const res = await syncAccountIfNeeded('tok', { force: true }, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, { force: true }, deps({
     fetchImpl,
-    readCodexAccount: () => { throw new Error('EACCES'); },
+    readChatgptAuth: () => { throw new Error('EACCES'); },
     readBillingConfig: () => { throw new Error('EACCES'); },
   }));
   assert.deepEqual(res, { synced: false, reason: 'nothing-known' });
@@ -427,7 +438,7 @@ test('never throws — a reader that blows up degrades to "nothing known" rather
 });
 
 test('never throws — a marker that cannot be written costs one redundant POST, not an exception', async () => {
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     writeJsonImpl: () => { throw new Error('held open by another process'); },
   }));
   assert.equal(res.synced, true);
@@ -435,7 +446,7 @@ test('never throws — a marker that cannot be written costs one redundant POST,
 
 test('never throws — an unreadable marker is treated as absent', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     fetchImpl,
     readJsonImpl: () => { throw new Error('EACCES'); },
   }));
@@ -444,7 +455,7 @@ test('never throws — an unreadable marker is treated as absent', async () => {
 
 test('a fetch answering with no status is a refusal, not a success', async () => {
   const writeJsonImpl = spyWrite();
-  const res = await syncAccountIfNeeded('tok', {}, deps({
+  const res = await syncAccountIfNeeded(KEY, SESSION, {}, deps({
     writeJsonImpl,
     fetchImpl: recordingFetch(async () => undefined),
   }));
@@ -456,7 +467,7 @@ test('a fetch answering with no status is a refusal, not a success', async () =>
 // billing.json is the only place a `codex app-server` identity is ever written down. On a machine
 // whose credentials live in the OS keychain, auth.json names no account at all, and the probe that
 // does runs at most weekly — so reading auth.json first would report no account id on every session
-// except the one that happened to probe. Same precedence as lib/account-identity.mjs.
+// except the one that happened to probe. Same precedence as lib/chatgpt-identity.mjs.
 
 test('the check-in prefers the account id recorded in billing.json', () => {
   const payload = buildAccountSyncPayload({

@@ -201,16 +201,32 @@ function envSuffix() {
   return ENVIRONMENT.suffix;
 }
 
+// The shape of a Beezi account key: 8 lowercase hex characters, nothing else.
+const ACCOUNT_KEY_RE = /^[0-9a-f]{8}$/;
+
+// The key names keyring entries and is interpolated into the PowerShell templates in
+// lib/credentials.mjs, so its shape is a security invariant. Validated on every use rather than
+// once at mint time: a key can arrive from accounts.json, which a user can edit.
+function assertAccountKey(key) {
+  if (typeof key !== 'string' || !ACCOUNT_KEY_RE.test(key)) {
+    throw new Error(
+      `invalid Beezi account key '${describeName(key)}' — expected 8 lowercase hex characters`,
+    );
+  }
+  return key;
+}
+
 /**
  * The environment reader, grouped rather than exported as loose functions.
  *
  * That grouping is load-bearing, not cosmetic. test/hermetic.test.mjs's L2 sweep takes EVERY
- * function this module exports, calls it with no arguments and asserts the result is a path inside
- * the test sandbox — which is the direct evidence that a run never writes to the real ~/.codex or
- * ~/.beezi-codex. A reader is not a root: `envSuffix()` returns '' and `readEnvJson()` returns an
- * object, so exporting either as a bare function would make that sweep fail on a value it was
- * never meant to inspect. Every FUNCTION exported from lib/paths.mjs is a path accessor; anything
- * else lives in here.
+ * function this module exports, calls it (with a probe account key where one is required) and
+ * asserts the result is a path inside the test sandbox — which is the direct evidence that a run
+ * never writes to the real ~/.codex or ~/.beezi-codex. A reader is not a root: `envSuffix()`
+ * returns '', `readEnvJson()` returns an object and `assertAccountKey()` returns a key, so
+ * exporting any of them as a bare function would make that sweep fail on a value it was never
+ * meant to inspect. Every FUNCTION exported from lib/paths.mjs is a path accessor; anything else
+ * lives in here.
  */
 export const environment = Object.freeze({
   KNOWN_ENVIRONMENTS,
@@ -219,6 +235,7 @@ export const environment = Object.freeze({
   environmentError,
   assertEnvironment,
   envSuffix,
+  assertAccountKey,
 });
 
 // This plugin's own data root — deliberately NOT `~/.beezi`, and deliberately not overridable via
@@ -238,10 +255,6 @@ export function beeziCodexHome() {
   return process.env.BEEZI_CODEX_HOME || path.join(os.homedir(), `.beezi-codex${suffix}`);
 }
 
-export function queueDir() {
-  return path.join(beeziCodexHome(), 'queue');
-}
-
 export function stateDir() {
   return path.join(beeziCodexHome(), 'state');
 }
@@ -251,19 +264,15 @@ export function repoMapFile() {
   return path.join(beeziCodexHome(), 'repo-map.json');
 }
 
-export function credentialsFile() {
+// The PRE-0.13 credential file, at the machine root. It is not an account's file and never gains
+// a key: lib/credentials.mjs resolves the legacy subject here so the one-time migration can still
+// find what a single-account install left behind, and nothing else may write it.
+export function legacyCredentialsFile() {
   return path.join(beeziCodexHome(), 'credentials.json');
 }
 
 export function billingConfigFile() {
   return path.join(beeziCodexHome(), 'billing.json');
-}
-
-// Durable record of which past sessions the one-time history import has delivered. Lives at
-// the data root, NOT under state/ or queue/: pruneStale() sweeps those at 14 days, and an
-// expired ledger would make every old session look importable again.
-export function auditLedgerFile() {
-  return path.join(beeziCodexHome(), 'audit-ledger.json');
 }
 
 // Rate-limit observations pulled off the rollout, plus the per-limit_id debounce baseline that
@@ -272,12 +281,6 @@ export function auditLedgerFile() {
 // every series.
 export function usageObservationsFile() {
   return path.join(beeziCodexHome(), 'usage-observations.json');
-}
-
-// Cached tenant tracking policy (trackingMode / backfillCompleted / linkedAt). Root-level for
-// the same prune-survival reason as the audit ledger.
-export function trackingStateFile() {
-  return path.join(beeziCodexHome(), 'tracking.json');
 }
 
 // Which environment this data root belongs to, written once and then enforced on every run
@@ -337,4 +340,60 @@ export function codexHooksFile() {
 // `command` field never depends on how Codex splits arguments or resolves `node` on PATH.
 export function hookLauncherDir() {
   return path.join(beeziCodexHome(), 'hooks');
+}
+
+// ── the per-account layout ────────────────────────────────────────────────────────────────────
+//
+// Every identity-bound file lives under `accounts/<key>/`; only the index and its migration
+// journal stay at the machine root, because they are what names the keys in the first place.
+
+export function accountsIndexFile() {
+  return path.join(beeziCodexHome(), 'accounts.json');
+}
+
+export function accountsMigrationJournalFile() {
+  return path.join(beeziCodexHome(), 'accounts.migration.json');
+}
+
+export function accountsDir() {
+  return path.join(beeziCodexHome(), 'accounts');
+}
+
+export function accountDir(key) {
+  return path.join(accountsDir(), assertAccountKey(key));
+}
+
+export function credentialsFile(key) {
+  return path.join(accountDir(key), 'credentials.json');
+}
+
+// Cached tenant tracking policy (trackingMode / backfillCompleted / linkedAt), per account. It
+// sits in the account directory rather than under state/ or queue/ for the same prune-survival
+// reason it used to sit at the root: pruneStale() sweeps those two at 14 days, and an expiring
+// gate would silently re-enable a dark-mode tenant.
+export function trackingStateFile(key) {
+  return path.join(accountDir(key), 'tracking.json');
+}
+
+// Durable record of which past sessions the one-time history import has delivered TO THIS ACCOUNT.
+// Outside state/ and queue/ for the prune reason above: an expired ledger would make every old
+// session look importable again.
+export function auditLedgerFile(key) {
+  return path.join(accountDir(key), 'audit-ledger.json');
+}
+
+export function accountSyncStateFile(key) {
+  return path.join(accountDir(key), 'account-sync.json');
+}
+
+export function coverageFile(key) {
+  return path.join(accountDir(key), 'coverage.json');
+}
+
+export function usagePendingFile(key) {
+  return path.join(accountDir(key), 'usage-pending.json');
+}
+
+export function queueDir(key) {
+  return path.join(accountDir(key), 'queue');
 }

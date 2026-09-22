@@ -1,6 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { queueDir, stateDir } from './paths.mjs';
+import { listAccountsSync } from './accounts.mjs';
 import { locksDir, MAX_HOLDER_LEASE_MS, acquireLock, runLock } from './single-instance-lock.mjs';
 import { removeDirSync } from './compat.mjs';
 
@@ -19,7 +20,12 @@ export function pruneStale(now = Date.now(), maxAgeMs = FOURTEEN_DAYS_MS) {
 function pruneLocked(now, maxAgeMs) {
   let locks = null;
   try { locks = locksDir(); } catch { locks = null; } // an unresolvable environment names no root
-  const dirs = [stateDir(), queueDir()];
+  // state/ is machine-level; every linked account has a queue of its own, and all of them expire
+  // on the same 14-day rule. listAccountsSync, not listAccounts: a prune must never be the thing
+  // that runs the one-time migration, and it must stay synchronous for its hook-path callers.
+  const dirs = [stateDir()];
+  try { for (const account of listAccountsSync()) dirs.push(queueDir(account.key)); }
+  catch { /* an unreadable index sweeps no queue, which deletes nothing */ }
   if (locks !== null) dirs.push(locks);
 
   for (const dir of dirs) {

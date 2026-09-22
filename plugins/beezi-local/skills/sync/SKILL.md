@@ -43,10 +43,20 @@ This file is at `<plugin-root>/skills/sync/SKILL.md`, so the script is at
 node "<plugin-root>/scripts/sync.mjs"
 ```
 
-**It takes no flags.** Not `--since`, not `--force` — the script rejects both with an explanation,
-and neither exists to be worked around. `--since` filters on when a session last ran, which would
-skip exactly the old half-uploaded sessions this command is for; `--force` has no seal to force
-past on this path. If the user pushes for a flag, say the command takes none.
+**Run it with no flags unless the user names an account.** With none, it runs for every linked
+account in turn; with more than one linked it prints a `── Account: … ──` heading before each, and
+everything between one heading and the next is that account's outcome. Beezi is asked separately,
+per account, how far it already has each session, so one account's run says nothing about what
+another is missing.
+
+To scope the run to a single account, add `--account <account>` — a key, an email address, or a
+position from the `accounts` skill's list. A value matching no linked account is refused and the
+run does not start.
+
+**It takes no other flags.** Not `--since`, not `--force` — the script rejects both with an
+explanation, and neither exists to be worked around. `--since` filters on when a session last ran,
+which would skip exactly the old half-uploaded sessions this command is for; `--force` has no seal
+to force past on this path. If the user pushes for either, say the command takes neither.
 
 The scan reads every rollout under `~/.codex/sessions/`, so it can take a few minutes on a machine
 with a lot of history and it prints progress as it goes. Let it finish. Report the output verbatim.
@@ -54,6 +64,14 @@ Never echo a token.
 
 ## What the output means
 
+- **`── Account: <who> [<key>] ──`** — a heading, printed only when more than one account is linked.
+  The lines below it are that account's run, and the outcomes in this list are per account: one
+  account can report "everything is already uploaded" while the next uploads sessions. Report each
+  account's outcome under its own heading.
+- **could not use the saved credentials for that account** — that account is linked on this machine
+  but no working sign-in could be produced for it, so nothing was uploaded **for it**. Any other
+  account in the same run is unaffected — read the headings. Point at the `login` skill, signing in
+  as that account. Do not report it as the machine being unlinked; it is not.
 - **everything is already uploaded** — a **success**, not a failure. Beezi has everything this
   machine can offer right now. Say so and stop; do not re-run hoping for a different answer.
 - **uploaded `<n>` sessions** — the repair worked. The counts are sessions and reports, not tokens.
