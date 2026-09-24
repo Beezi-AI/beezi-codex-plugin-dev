@@ -10,11 +10,12 @@ import { commandsFromProgram, toolNamesFromProgram } from './exec-program.mjs';
 //   - function_call        { name, arguments, call_id }   + function_call_output       { call_id, output }
 //   - custom_tool_call      { name, input, call_id }        + custom_tool_call_output    { call_id, output }
 //
-// MCP server tools are surfaced as bare function calls (e.g. `notion_search`, or plainly `js`)
-// with NO server prefix in the call record. The server name lives in a separate completion record,
+// MCP server tools can be bare function calls (e.g. `notion_search`, or plainly `js`).
+// For those, the server name lives in a separate completion record,
 // and Codex has shipped two era-exclusive spellings of it — `event_msg/mcp_tool_call_end` on
 // ≤0.146 and `event_msg/item_completed` + `item.type === 'McpToolCall'` on 0.153+. Both name the
-// server and both key on the call id, so a call IS an MCP call exactly when one of them exists.
+// server and both key on the call id. Explicit mcp__ names and the plugin's own
+// legacy local tools can also identify the server without that event.
 // `by_skill` stays empty — Codex skills are prompt-injected, not tools.
 //
 // On unified exec (Codex ≥ ~0.145) the name in the record is NOT the tool that did the work:
@@ -28,7 +29,16 @@ const INTERNET_TOOLS = new Set(['web_search', 'web_fetch', 'browser', 'open_page
 // Interactive / planning builtins that aren't real work against the repo. `tool_search_call` is
 // Codex's own tool-discovery search, not a search of the user's code — it does not belong in
 // the `search` bucket.
-const OTHER_BUILTINS = new Set(['update_plan', 'request_user_input', 'wait', 'view_plan', 'tool_search_call']);
+const OTHER_BUILTINS = new Set([
+  'update_plan', 'request_user_input', 'request_user_input_async', 'wait', 'view_plan',
+  'tool_search_call', 'create_goal', 'get_goal', 'update_goal',
+  'spawn_agent', 'send_message', 'wait_agent', 'list_agents', 'followup_task',
+  'interrupt_agent', 'close_agent', 'resume_agent', 'sleep',
+]);
+
+// These are the plugin's own legacy local tool names. Do not infer a server
+// from arbitrary underscored names: Codex builtins use that spelling too.
+const LEGACY_MCP_SERVERS = new Map([['beezi_login', 'beezi'], ['beezi_status', 'beezi']]);
 
 const CATEGORIES = ['file', 'search', 'internet', 'mcp', 'shell', 'skill', 'other'];
 
@@ -167,10 +177,47 @@ function categoryOf(name, { isMcp = false, args = null } = {}) {
   if (FILE_TOOLS.has(name)) return 'file';
   if (INTERNET_TOOLS.has(name)) return 'internet';
   if (OTHER_BUILTINS.has(name)) return 'other';
-  // An unrecognized name with no mcp_tool_call_end behind it. Older rollouts predate that event,
-  // so a name shaped like an MCP tool (`<server>_<verb>`) still reads as MCP; anything else is a
-  // Codex builtin we don't know yet, and calling that MCP would invent a server.
-  return /^[a-z0-9]+_[a-z0-9_]+$/i.test(name) ? 'mcp' : 'other';
+  // These builtins can also appear as direct calls, outside an exec program.
+  if (EXEC_TOOL_CATEGORY.has(name)) return EXEC_TOOL_CATEGORY.get(name);
+  return name.indexOf('mcp__') === 0 ? 'mcp' : 'other';
+}
+
+function serverFromName(name) {
+  if (typeof name !== 'string') return null;
+  return name.indexOf('mcp__') === 0 ? mcpServerOf(name) : (LEGACY_MCP_SERVERS.get(name) || null);
+}
+
+// Shared across repo segments, but only metadata is shared: calls, bytes and
+// durations still belong to their original segment and are never replayed.
+export function operationContext(records) {
+  const servers = new Map();
+  for (const record of records) {
+    const inv = mcpInvocation(record);
+    if (inv && String(inv.callId).indexOf('exec-') !== 0) servers.set(inv.callId, inv.server);
+  }
+  return servers;
+}
+
+// A bare direct call may only name its MCP server in a later completion event.
+// Keep the cursor before such a call until that evidence or a turn boundary
+// arrives. The transcript is the pending state; no second durable cursor exists.
+export function operationWindowEnd(records, fromLine, servers) {
+  let lastBoundary = -1;
+  for (let i = 0; i < records.length; i++) {
+    const r = records[i];
+    const p = (r && r.payload) || {};
+    if ((r && r.type === 'event_msg' && ['task_complete', 'turn_aborted', 'task_started'].indexOf(p.type) !== -1)
+      || (r && r.type === 'response_item' && p.type === 'message' && p.role === 'assistant' && p.phase === 'final')) lastBoundary = i;
+  }
+  for (let i = fromLine; i < records.length; i++) {
+    const call = toolCall(records[i]);
+    if (!call || !call.callId || call.program !== null || i < lastBoundary) continue;
+    const name = call.name;
+    if (servers.has(call.callId) || serverFromName(name) !== null
+      || categoryOf(name) !== 'other' || OTHER_BUILTINS.has(name) || EXEC_TOOL_CATEGORY.has(name)) continue;
+    return i;
+  }
+  return records.length;
 }
 
 function outputBytes(output) {
@@ -255,13 +302,13 @@ function toolOutput(record) {
   return null;
 }
 
-export function computeOperations(lines) {
+export function computeOperations(lines, context = null) {
   // First pass: output bytes by call_id (a call's result lands in a later record within the
   // segment), and the MCP server behind each call from its completion record.
   const bytesById = new Map();
   // callId -> server name. Values stay plain strings: the second pass hands this straight to the
   // `by_server` key, and an object here would key the whole map under '[object Object]'.
-  const serverByCallId = new Map();
+  const serverByCallId = context || new Map();
   // server -> { ms, calls }. Banked by the server the completion record names, NOT by a call-id
   // join, because an MCP call made inside an exec program reports under an `exec-<uuid>` id that
   // matches no call record (1 of 12 measured). Joining would drop the latency for exactly the
@@ -296,7 +343,8 @@ export function computeOperations(lines) {
   for (const record of lines) {
     const call = toolCall(record);
     if (!call) continue;
-    const named = orDefault(serverByCallId.get(call.callId), null);
+    const prefixed = serverFromName(call.name);
+    const named = orDefault(serverByCallId.get(call.callId), prefixed);
     // An mcp_tool_call_end still wins: it is the server's own record, not an inference from a
     // name. Otherwise, an exec call is categorized by the program it ran.
     const viaExec = named === null && call.program !== null ? execCategory(call.program) : null;
@@ -310,8 +358,8 @@ export function computeOperations(lines) {
     cat.est_tokens += est;
 
     if (category === 'mcp') {
-      // 'unknown' only when the call had neither a completion record to name its server nor an
-      // `mcp__<server>__<tool>` name inside its exec program.
+      // Malformed explicit MCP names can still lack a server. Unidentified bare
+      // tools are other, not evidence of an unnamed MCP server.
       const serverName = orDefault(server, 'unknown');
       if (cat.by_server[serverName] === undefined || cat.by_server[serverName] === null) {
         cat.by_server[serverName] = { count: 0, est_tokens: 0 };
