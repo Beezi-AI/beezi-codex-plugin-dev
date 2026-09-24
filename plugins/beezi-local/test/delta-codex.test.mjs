@@ -1016,3 +1016,76 @@ test('F8 — sum of deltas across successive checkpoints still reproduces the cu
   assert.deepEqual(partition, acc);
   assert.deepEqual(Object.keys(effortAcc).sort(), ['high', 'low', 'medium']);
 });
+
+test('MCP attribution survives every checkpoint boundary without duplicating tokens or calls', () => {
+  const records = [
+    meta('/repoA'), turn('/repoA', 'gpt-6-astra', '2026-01-01T00:00:01.000Z'),
+    tokens('2026-01-01T00:00:02.000Z', 100, 0, 10),
+    { type: 'response_item', payload: { type: 'function_call', name: 'js', call_id: 'm1', arguments: '{}' } },
+    { type: 'response_item', payload: { type: 'function_call_output', call_id: 'm1', output: 'done' } },
+    { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'McpToolCall', id: 'm1', server: 'cua_repl', tool: 'js' } } },
+    tokens('2026-01-01T00:00:04.000Z', 150, 0, 20),
+  ];
+  for (let split = 1; split < records.length; split++) {
+    const file = writeRollout(records.slice(0, split));
+    const first = computeDelta(file, 0, identityResolvers);
+    fs.appendFileSync(file, jsonl(records.slice(split)) + '\n');
+    const second = computeDelta(file, first.nextCursor, identityResolvers);
+    const stats = [...first.segments, ...second.segments].map(s => s.stats);
+    assert.equal(stats.reduce((n, s) => n + (s.operations.mcp.by_server.cua_repl?.count || 0), 0), 1, `split ${split}`);
+    assert.equal(stats.reduce((n, s) => n + (s.operations.mcp.by_server.unknown?.count || 0), 0), 0);
+    assert.equal(stats.reduce((n, s) => n + s.token_total, 0), 170);
+    assert.equal(second.nextCursor, records.length);
+    assert.equal(computeDelta(file, second.nextCursor, identityResolvers).segments.length, 0);
+  }
+});
+
+test('server metadata across repo segments names the original call without recounting it', () => {
+  const file = writeRollout([
+    meta('/repoA'),
+    { type: 'response_item', payload: { type: 'function_call', name: 'notion_search', call_id: 'm1', arguments: '{}' } },
+    turn('/repoB', 'gpt-6-astra', '2026-01-01T00:00:02.000Z'),
+    { type: 'event_msg', payload: { type: 'mcp_tool_call_end', call_id: 'm1', invocation: { server: 'notion', tool: 'search' } } },
+  ]);
+  const { segments } = computeDelta(file, 0, identityResolvers);
+  assert.equal(segments[0].stats.operations.mcp.by_server.notion.count, 1);
+  assert.equal(segments[1].stats.operations.mcp.count, 0);
+});
+
+test('an unidentified pending call waits for metadata but a terminal turn releases the cursor', () => {
+  for (const terminal of ['task_complete', 'turn_aborted']) {
+    const file = writeRollout([
+      meta('/repoA'),
+      { type: 'response_item', payload: { type: 'function_call', name: 'new_tool', call_id: 'm1', arguments: '{}' } },
+    ]);
+    const first = computeDelta(file, 0, identityResolvers);
+    assert.equal(first.nextCursor, 1);
+    fs.appendFileSync(file, jsonl([{ type: 'event_msg', payload: { type: terminal } }]) + '\n');
+    const second = computeDelta(file, first.nextCursor, identityResolvers);
+    assert.equal(second.nextCursor, 3);
+    assert.equal(second.segments[0].stats.operations.other.count, 1);
+    assert.equal(second.segments[0].stats.operations.mcp.count, 0);
+  }
+});
+
+test('known agent builtins do not hold a checkpoint waiting for MCP metadata', () => {
+  const file = writeRollout([meta('/repoA'), ...['send_message', 'wait_agent', 'spawn_agent', 'list_agents', 'followup_task'].map((name, i) => ({
+    type: 'response_item', payload: { type: 'function_call', name, call_id: String(i), arguments: '{}' },
+  }))]);
+  const out = computeDelta(file, 0, identityResolvers);
+  assert.equal(out.nextCursor, 6);
+  assert.equal(out.segments[0].stats.operations.other.count, 5);
+});
+
+test('MCP discovery without a server argument waits for the server completion', () => {
+  const file = writeRollout([meta('/repoA'), {
+    type: 'response_item', payload: { type: 'function_call', name: 'list_mcp_resources', call_id: 'r1', arguments: '{}' },
+  }]);
+  const first = computeDelta(file, 0, identityResolvers);
+  assert.equal(first.nextCursor, 1);
+  fs.appendFileSync(file, jsonl([{
+    type: 'event_msg', payload: { type: 'item_completed', item: { type: 'McpToolCall', id: 'r1', server: 'codex', tool: 'list_mcp_resources' } },
+  }]) + '\n');
+  const second = computeDelta(file, first.nextCursor, identityResolvers);
+  assert.equal(second.segments[0].stats.operations.mcp.by_server.codex.count, 1);
+});

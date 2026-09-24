@@ -2,7 +2,7 @@ import fs from 'fs';
 import { IDLE_GAP_SEC } from './timing.mjs';
 import { orDefault } from './compat.mjs';
 import { computeCodeChanges } from './code-changes-codex.mjs';
-import { computeOperations, parseArgs } from './operations-codex.mjs';
+import { computeOperations, parseArgs, operationContext, operationWindowEnd } from './operations-codex.mjs';
 import { buildActiveIntervals, totalMs } from './active-time.mjs';
 import { rateLimitObservationFromRecord } from './rate-limits-codex.mjs';
 
@@ -273,6 +273,11 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
 
   // How far the cursor may advance. Everything except a torn trailing record is passed over.
   const completeLines = completeLineCount(raw, endsWithNewline);
+  const records = raw.slice(0, completeLines).map(line => {
+    try { return JSON.parse(line); } catch { return null; }
+  });
+  const operationServers = operationContext(records);
+  const windowEnd = operationWindowEnd(records, fromLine, operationServers);
 
   const segments = [];
   const apiErrorEvents = [];
@@ -313,7 +318,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
       // The caller needs the intervals, not just their total, so a subagent's time and its parent's
       // can be unioned instead of summed (they describe the same stretch of clock).
       const activeIntervals = buildActiveIntervals(run.timestamps, IDLE_GAP_SEC * 1000);
-      const stats = summarize(run.models, run.timestamps, run.lines, activeIntervals);
+      const stats = summarize(run.models, run.timestamps, run.lines, activeIntervals, operationServers);
       // Context occupancy: absent rather than 0 when the window saw no reading. 0 is a claim that
       // the context was empty and the server stores it as one, so a token-free window must ship no
       // key at all — mirroring delta.mjs in the beezi-claude-plugins repo.
@@ -339,10 +344,9 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     }
   };
 
-  for (let i = 0; i < raw.length; i++) {
-    if (!raw[i].trim()) continue;
-    let rec;
-    try { rec = JSON.parse(raw[i]); } catch { continue; }
+  for (let i = 0; i < windowEnd; i++) {
+    const rec = records[i];
+    if (!rec) continue;
     const lineNo = i + 1;
 
     // Update the active root/model from this record BEFORE attributing it, so a turn's work
@@ -446,7 +450,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   }
   closeRun();
   return {
-    nextCursor: Math.max(fromLine, completeLines),
+    nextCursor: Math.max(fromLine, windowEnd),
     segments,
     apiErrorEvents: dedupeErrors(apiErrorEvents),
     rateLimitObservations,
@@ -459,7 +463,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   };
 }
 
-function summarize(models, timestamps, lines, activeIntervals) {
+function summarize(models, timestamps, lines, activeIntervals, operationServers) {
   timestamps.sort((a, z) => a - z);
   // Identical to the gap sum this replaced: buildActiveIntervals emits exactly the pairs that loop
   // summed (0 < gap < idle) and coalesces consecutive ones, so totalMs is the same integer. A lone
@@ -476,7 +480,7 @@ function summarize(models, timestamps, lines, activeIntervals) {
     ...totals,
     duration_sec: Math.round(activeMs / 1000),
     code_changes: computeCodeChanges(lines),
-    operations: computeOperations(lines),
+    operations: computeOperations(lines, operationServers),
     started_at: timestamps.length ? new Date(timestamps[0]).toISOString() : null,
     ended_at: timestamps.length ? new Date(timestamps[timestamps.length - 1]).toISOString() : null,
   };
