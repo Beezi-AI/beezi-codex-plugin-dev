@@ -3,7 +3,7 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { orDefault } from './compat.mjs';
 import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
-import { chatgptIdentityFields } from './chatgpt-identity.mjs';
+import { readChatgptIdentity } from './chatgpt-identity.mjs';
 import { readBillingConfig as _readBillingConfig, resolveBilling as _resolveBilling } from './billing-config.mjs';
 import {
   readPendingRateLimits as _readPendingRateLimits,
@@ -68,7 +68,10 @@ export function usageIdentityFields(deps = {}) {
   let billing = null;
   try { billing = readBilling(); } catch (e) { billing = null; }
 
-  const out = chatgptIdentityFields(chatgptAccount);
+  const out = readChatgptIdentity({
+    readBillingConfig: () => billing,
+    readChatgptAuth: () => chatgptAccount,
+  });
 
   // The plugin's own resolution ladder decides whether a plan is even meaningful — under API-key
   // billing it returns no subscription fields at all, and stating one would be a false claim.
@@ -114,13 +117,13 @@ export function usageIdentityFields(deps = {}) {
 
   // billing.json is the reconciled record, but it goes stale: a login that could not resolve the
   // tier writes plan 'unknown' and never revisits it, so a machine on Plus reports nothing forever.
-  // The live id_token is the fallback, and it is safe here in a way it is not on the Claude side:
-  // there, the cached uuid and the plan can describe DIFFERENT accounts, so a mismatch guard is
-  // needed. Codex reads the account id and the plan out of the same id_token, so they cannot
-  // disagree. Only consulted when the record states nothing usable — a real plan on disk still wins,
+  // The live id_token is the fallback, but the cached uuid and live plan can describe different
+  // accounts. Only use that plan when
+  // the live account does not contradict the resolved identity. A real plan on disk still wins,
   // and so does the observed plan above.
   const stated = fields.subscription_plan;
-  if ((stated == null || stated === 'unknown') && fields.billing_source === 'subscription') {
+  const sameAccount = !out.account_uuid || !(chatgptAccount || {}).accountId || out.account_uuid === chatgptAccount.accountId;
+  if ((stated == null || stated === 'unknown') && fields.billing_source === 'subscription' && sameAccount) {
     const livePlan = chatgptAccount == null ? null : chatgptAccount.plan;
     if (livePlan != null && livePlan !== 'unknown') {
       fields = {
@@ -173,8 +176,8 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
   // Deferring is free: unposted rows stay on disk and the next turn end retries them.
   const deadline = orDefault(deps.deadline, null);
   const capMs = orDefault(deps.timeoutMs, null);
-  // Historical rollout readings have no provable owner unless captured on the row. Never
-  // relabel them with the account signed in at drain time, including queues from older builds.
+  // Enrich unidentified readings using the billing-first identity, including existing queues.
+  // Keep a captured identity together so a later sign-in cannot supply another account's email.
   const { account_uuid, account_email, ...identity } = (deps.usageIdentityFields || usageIdentityFields)(deps);
 
   let posted = 0;
@@ -193,7 +196,10 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
     let res = null;
     try {
       // The row last, so a stored observation can never be overwritten by an identity field.
-      res = await postJson(url, session, { ...identity, ...pending[i] }, postOpts);
+      const row = pending[i];
+      const rowIdentity = row.account_uuid != null || row.account_email != null
+        ? {} : { account_uuid, account_email };
+      res = await postJson(url, session, { ...identity, ...rowIdentity, ...row }, postOpts);
     } catch (e) {
       stopped = 'network';
       break;
