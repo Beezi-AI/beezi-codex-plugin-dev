@@ -225,7 +225,12 @@ Codex writes one rollout transcript per session at
   5-point change, a window rollover, crossing 100%, or a 15-minute floor), queued to
   `~/.beezi-codex/usage-observations.json`, and drained to `/me/codex/usage` at turn end. Each row
   is stamped with the *record's* timestamp rather than wall-clock now, so re-scanning a rollout
-  reproduces it exactly and the server's `(account, fetched_at)` key collapses the replay.
+  reproduces it exactly and the server's `(account, fetched_at)` key collapses the replay for
+  the same account. Uploads include `account_uuid` and `account_email` from the local Beezi
+  `billing.json` (`accountId` and `email`), falling back to Codex auth identity when needed.
+  This also enriches queued readings without identifiers; any identity already on a row is
+  preserved. For unidentified historical readings, these identifiers describe the account
+  configured at upload time.
 - **Repo / branch attribution**: cwd is tracked per turn (`session_meta.cwd` seeds it,
   `turn_context.cwd` updates it, a shell tool's `arguments.workdir` refines it); the branch is
   resolved from the per-repo reflog timeline at each line's timestamp. Work with no resolvable
