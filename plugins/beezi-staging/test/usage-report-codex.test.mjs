@@ -167,6 +167,28 @@ const account = (over = {}) => ({
 });
 const subscriptionBilling = { source: 'subscription', subscriptionType: 'plus', plan: 'plus', rateLimitTier: null };
 
+for (const live of [null, account()]) {
+  test(`billing identity reaches quota uploads with ${live ? 'conflicting' : 'missing'} auth identity`, async () => {
+    const h = harness([ROW(1)], [200]);
+    const result = await drainRateLimitSnapshots(KEY, SESSION, {
+      ...h.deps,
+      usageIdentityFields,
+      readChatgptAuth: () => live,
+      readBillingConfig: () => ({
+        ...subscriptionBilling, authType: 'chatgpt',
+        accountId: ' billing-account ', email: ' billing@example.com ',
+      }),
+      readObservedPlan: () => null,
+      env: {},
+    });
+    assert.equal(result.posted, 1);
+    assert.equal(h.calls[0].body.account_uuid, 'billing-account');
+    assert.equal(h.calls[0].body.account_email, 'billing@example.com');
+    assert.equal(h.calls[0].body.subscription_plan, 'plus');
+    assert.equal(h.calls[0].body.five_hour_pct, 1);
+  });
+}
+
 // L1 + L3. usageIdentityFields calls resolveBilling(billing, env) with no deps
 // (usage-report-codex.mjs:49), so step 4 of the ladder opens the real ~/.codex/auth.json, and its
 // `deps.env == null ? process.env` default (:45) lets a host OPENAI_API_KEY win at step 1. The
@@ -227,14 +249,16 @@ test('an unreadable auth.json degrades to no identity rather than throwing', () 
   assert.deepEqual(f, {});
 });
 
-test('the drain preserves captured identity and leaves historical ownership unknown', async () => {
+test('the drain preserves captured identity and enriches unidentified rows', async () => {
   const h = harness([{ ...ROW(1), account_uuid: 'captured-account' }, ROW(2)], [200, 200]);
   await drainRateLimitSnapshots(KEY, SESSION, {
     ...h.deps,
-    usageIdentityFields: () => ({ account_uuid: 'acct-1', five_hour_pct: 999 }),
+    usageIdentityFields: () => ({ account_uuid: 'acct-1', account_email: 'current@example.com', five_hour_pct: 999 }),
   });
   assert.equal(h.calls[0].body.account_uuid, 'captured-account');
-  assert.equal(h.calls[1].body.account_uuid, undefined);
+  assert.equal(h.calls[0].body.account_email, undefined, 'do not mix accounts');
+  assert.equal(h.calls[1].body.account_uuid, 'acct-1');
+  assert.equal(h.calls[1].body.account_email, 'current@example.com');
   assert.equal(h.calls[0].body.five_hour_pct, 1, 'the observation must not be overwritten');
 });
 
@@ -258,6 +282,19 @@ test('a stale unknown plan on disk falls back to the live id_token', (t) => {
   });
   assert.equal(f.subscription_plan, 'plus');
   assert.equal(f.subscription_type, 'plus');
+});
+
+test('a different live account cannot supply the billing account plan', () => {
+  const fields = usageIdentityFields({
+    readChatgptAuth: () => account(),
+    readBillingConfig: () => ({
+      source: 'subscription', authType: 'chatgpt', plan: 'unknown', accountId: 'billing-account',
+    }),
+    readObservedPlan: () => null,
+    env: {},
+  });
+  assert.equal(fields.account_uuid, 'billing-account');
+  assert.equal(fields.subscription_plan, undefined);
 });
 
 test('a real plan on disk still wins over the live read', (t) => {

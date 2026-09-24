@@ -140,15 +140,18 @@ for (const drain of [{ lockSkipped: true }, { unreadable: 1 }]) {
   });
 }
 
-test('F6: old quota rows are not assigned the account signed in at drain time', async t => {
+test('F6: queued quota rows receive billing.json identifiers on upload', async t => {
   home(t);
+  fs.mkdirSync(path.dirname(paths.billingConfigFile()), { recursive: true });
+  fs.writeFileSync(paths.billingConfigFile(), JSON.stringify({ accountId: 'billing-account', email: 'billing@example.com' }));
   rates.recordRateLimitObservations([observation(1)], [KEY]);
   const posted = [];
-  await drainRateLimitSnapshots(KEY, SESSION, { env: {}, readChatgptAuth: () => ({ accountId: 'account-B' }), readBillingConfig: () => null,
+  await drainRateLimitSnapshots(KEY, SESSION, { env: {}, readChatgptAuth: () => ({ accountId: 'account-B' }),
     fetchImpl: async (_url, opts) => { posted.push(JSON.parse(opts.body)); return { status: 200 }; },
   });
   assert.equal(posted.length, 1);
-  assert.equal(posted[0].account_uuid, undefined);
+  assert.equal(posted[0].account_uuid, 'billing-account');
+  assert.equal(posted[0].account_email, 'billing@example.com');
   assert.equal(rates.readPendingRateLimits(KEY).length, 0);
 });
 
