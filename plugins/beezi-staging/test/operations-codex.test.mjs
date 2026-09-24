@@ -7,13 +7,13 @@ const fnOut = (callId, output) => ({ type: 'response_item', payload: { type: 'fu
 const custom = (name, callId) => ({ type: 'response_item', payload: { type: 'custom_tool_call', name, call_id: callId, input: 'x' } });
 const customOut = (callId, output) => ({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: callId, output } });
 
-test('categorizes shell, file, and unknown-as-mcp tools with est_tokens from output bytes', () => {
+test('categorizes shell, file, and unidentified tools without inventing MCP usage', () => {
   const lines = [
     fn('shell_command', 's1'),
     fnOut('s1', 'x'.repeat(40)), // 40 bytes → est 10
     custom('apply_patch', 'p1'),
     customOut('p1', 'y'.repeat(8)), // 8 bytes → est 2
-    fn('notion_search', 'n1'), // unknown name → mcp
+    fn('notion_search', 'n1'), // no server evidence
     fnOut('n1', 'z'.repeat(20)), // 20 bytes → est 5
   ];
   const ops = computeOperations(lines);
@@ -21,10 +21,10 @@ test('categorizes shell, file, and unknown-as-mcp tools with est_tokens from out
   assert.equal(ops.shell.est_tokens, 10);
   assert.equal(ops.file.count, 1);
   assert.equal(ops.file.est_tokens, 2);
-  assert.equal(ops.mcp.count, 1);
-  assert.equal(ops.mcp.est_tokens, 5);
-  assert.equal(ops.mcp.by_server.unknown.count, 1);
-  assert.equal(ops.plugins.unknown.count, 1);
+  assert.equal(ops.other.count, 1);
+  assert.equal(ops.other.est_tokens, 5);
+  assert.equal(ops.mcp.count, 0);
+  assert.deepEqual(ops.plugins, {});
 });
 
 test('planning/interactive builtins fall into other, not mcp', () => {
@@ -33,9 +33,10 @@ test('planning/interactive builtins fall into other, not mcp', () => {
   assert.equal(ops.mcp.count, 0);
 });
 
-test('list_mcp_resources is an mcp builtin', () => {
+test('server-agnostic MCP discovery does not invent a server', () => {
   const ops = computeOperations([fn('list_mcp_resources', 'm1')]);
-  assert.equal(ops.mcp.count, 1);
+  assert.equal(ops.mcp.count, 0);
+  assert.equal(ops.other.count, 1);
 });
 
 // --- MCP server attribution ------------------------------------------------------------------
@@ -74,6 +75,61 @@ test('two servers in one segment stay separate', () => {
   assert.equal(ops.mcp.by_server.beezi.count, 1);
 });
 
+test('direct prefixed MCP calls retain their server without a completion event', () => {
+  const ops = computeOperations([
+    fn('mcp__beezi__beezi_status', 'b1'), fnOut('b1', 'x'.repeat(20)),
+    custom('mcp__plugin_beezi_staging__list_projects', 'b2'),
+  ]);
+  assert.deepEqual(ops.mcp.by_server.beezi, { count: 1, est_tokens: 5 });
+  assert.deepEqual(ops.plugins.plugin_beezi_staging, { count: 1, est_tokens: 0 });
+  assert.equal(ops.mcp.by_server.unknown, undefined);
+});
+
+test('completion metadata takes precedence over a direct MCP prefix', () => {
+  const ops = computeOperations([
+    fn('mcp__alias__search', 'n1'), mcpEnd('n1', 'notion', 'search'),
+  ]);
+  assert.equal(ops.mcp.by_server.notion.count, 1);
+  assert.equal(ops.mcp.by_server.alias, undefined);
+});
+
+test('known direct builtins do not produce unknown MCP usage', () => {
+  const ops = computeOperations([
+    fn('write_stdin', 's1'), fn('web__run', 'w1'),
+    fn('request_permissions', 'p1'), fn('request_user_input_async', 'p2'),
+    fn('create_goal', 'g1'), fn('get_goal', 'g2'), fn('update_goal', 'g3'),
+  ]);
+  assert.equal(ops.shell.count, 1);
+  assert.equal(ops.internet.count, 1);
+  assert.equal(ops.other.count, 5);
+  assert.equal(ops.mcp.count, 0);
+  assert.deepEqual(ops.plugins, {});
+});
+
+test('agent lifecycle calls from local sessions never count as MCP', () => {
+  const names = ['send_message', 'wait_agent', 'spawn_agent', 'list_agents', 'followup_task',
+    'interrupt_agent', 'close_agent', 'resume_agent', 'new_builtin'];
+  const ops = computeOperations(names.map((name, i) => fn(name, String(i))));
+  assert.equal(ops.other.count, 9);
+  assert.equal(ops.mcp.count, 0);
+  assert.deepEqual(ops.plugins, {});
+});
+
+test('legacy Beezi local tools have an explicit mapping, not a prefix guess', () => {
+  const ops = computeOperations([
+    fn('beezi_login', 'l1'), fn('beezi_status', 's1'), fn('beezi_unrecognized', 'x1'),
+  ]);
+  assert.equal(ops.mcp.by_server.beezi.count, 2);
+  assert.equal(ops.other.count, 1);
+  assert.equal(ops.mcp.by_server.unknown, undefined);
+});
+
+test('completion metadata overrides the legacy Beezi mapping', () => {
+  const ops = computeOperations([fn('beezi_login', 'l1'), mcpEnd('l1', 'staging', 'beezi_login')]);
+  assert.equal(ops.mcp.by_server.staging.count, 1);
+  assert.equal(ops.mcp.by_server.beezi, undefined);
+});
+
 test('an unrecognized bare word is not invented into an MCP server', () => {
   // Without an mcp_tool_call_end and without an MCP-shaped name, a new Codex builtin is `other` —
   // guessing 'mcp' would report a server that does not exist.
@@ -82,10 +138,10 @@ test('an unrecognized bare word is not invented into an MCP server', () => {
   assert.equal(ops.other.count, 1);
 });
 
-test('an MCP-shaped name still reads as MCP on rollouts predating mcp_tool_call_end', () => {
+test('an underscore is not sufficient evidence of an MCP server', () => {
   const ops = computeOperations([fn('notion_search', 'n1')]);
-  assert.equal(ops.mcp.count, 1);
-  assert.equal(ops.mcp.by_server.unknown.count, 1);
+  assert.equal(ops.other.count, 1);
+  assert.equal(ops.mcp.count, 0);
 });
 
 // --- the search bucket -----------------------------------------------------------------------
@@ -436,7 +492,7 @@ test('latency never lands on the unknown bucket', () => {
   // Every record carrying a duration also names its server, so an unattributed call cannot pick
   // one up. Pinning it: an unnamed MCP call and a timed one from another server coexist cleanly.
   const ops = computeOperations([
-    fn('notion_search', 'n1'),
+    fn('mcp____search', 'n1'),
     fn('beezi_status', 'b1'), mcpEndTimed('b1', 'beezi', 'beezi_status', { secs: 0, nanos: 5000000 }),
   ]);
   assert.equal(ops.mcp.by_server.unknown.count, 1);
