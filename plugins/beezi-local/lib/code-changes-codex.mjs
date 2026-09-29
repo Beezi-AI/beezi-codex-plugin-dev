@@ -167,6 +167,35 @@ function legacyApplyPatch(record) {
   return { callId: orDefault(p.call_id, null), input: p.input };
 }
 
+// Paths a single record wrote, for the timeline's plan-document detection. Reuses changeEvent and
+// legacyApplyPatch so "what counts as a landed edit" (failed patches excluded, move_path preferred)
+// cannot drift from computeCodeChanges. The legacy envelope contributes Add/Update headers only:
+// it is the proposal, not the result, and a delete is never a plan being written.
+export function editedPathsOf(record) {
+  const out = [];
+  const ev = changeEvent(record);
+  if (ev) {
+    const changes = ev.changes;
+    if (changes && typeof changes === 'object') {
+      for (const rawPath of Object.keys(changes)) {
+        const change = changes[rawPath];
+        if (!change || typeof change !== 'object') continue;
+        const moved = change.move_path;
+        out.push(typeof moved === 'string' && moved !== '' ? moved : rawPath);
+      }
+    }
+    return out;
+  }
+  const call = legacyApplyPatch(record);
+  if (call) {
+    for (const rawLine of call.input.split('\n')) {
+      const header = FILE_HEADER_RE.exec(rawLine.replace(/\r$/, ''));
+      if (header && header[1] !== 'Delete') out.push(header[2].trim());
+    }
+  }
+  return out;
+}
+
 export function computeCodeChanges(lines) {
   const files = new Map();    // normalized key -> first-seen spelling
   const counts = { added: 0, removed: 0 };

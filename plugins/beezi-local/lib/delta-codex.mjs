@@ -186,11 +186,48 @@ function apiErrorFromRecord(rec) {
   if (isTransientApiError({ info, code, status })) return null;
   return {
     error: classifyError({ info, code, status, text }),
+    info,
     // The Codex-side code is the most durable identifier; the prose is what a human reads.
     details: orDefault(code, orDefault(info, null)),
     text: text ? text.slice(0, 1000) : null,
     occurredAt: orDefault(rec.timestamp, null),
   };
+}
+
+// Codex says "try again at 6:25 PM" in prose, which the portal cannot turn into a reset time. The
+// exact instant is on the last account-level token_count before the error, as unix SECONDS.
+//
+// Scans the WHOLE-file records backward from the error rather than carrying state through the
+// window loop: a checkpoint window can begin between the token_count and the error, and the
+// pre-window records are exactly where the reading lives. Bounded so a huge rollout stays cheap.
+const RESETS_AT_SCAN_LIMIT = 2000;
+
+export function resetsAtBefore(records, index, occurredAtIso) {
+  const occurredMs = new Date(occurredAtIso).getTime();
+  if (!Number.isFinite(occurredMs)) return null;
+  const stop = Math.max(0, index - RESETS_AT_SCAN_LIMIT);
+  for (let i = index - 1; i >= stop; i--) {
+    const rec = records[i];
+    const p = rec && rec.type === 'event_msg' ? rec.payload : null;
+    if (!p || p.type !== 'token_count' || !p.rate_limits || typeof p.rate_limits !== 'object') continue;
+    const limits = p.rate_limits;
+    // Other limit families (e.g. `premium`) usually carry null windows and are not the quota that
+    // just ran out.
+    if (limits.limit_id !== undefined && limits.limit_id !== null && limits.limit_id !== 'codex') continue;
+    let best = null;
+    for (const w of [limits.primary, limits.secondary]) {
+      if (!w || typeof w !== 'object' || !Number.isFinite(w.resets_at)) continue;
+      const used = Number.isFinite(w.used_percent) ? w.used_percent : -Infinity;
+      // The exhausted window often reads 99, so highest used wins; a tie takes the later reset.
+      if (!best || used > best.used || (used === best.used && w.resets_at > best.resetsAt)) {
+        best = { used, resetsAt: w.resets_at };
+      }
+    }
+    if (!best) continue;
+    const resetMs = best.resetsAt * 1000;
+    return resetMs > occurredMs ? new Date(resetMs).toISOString() : null;
+  }
+  return null;
 }
 
 // Second source: Codex stamps `rate_limits.rate_limit_reached_type` on token_count when a window
@@ -376,7 +413,12 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     }
 
     const apiError = orDefault(apiErrorFromRecord(rec), rateLimitFromRecord(rec));
-    if (apiError) apiErrorEvents.push(apiError);
+    if (apiError) {
+      if (apiError.info === 'usage_limit_exceeded') {
+        apiError.resetsAt = resetsAtBefore(records, i, apiError.occurredAt);
+      }
+      apiErrorEvents.push(apiError);
+    }
 
     // Account-scoped, so it is collected as a flat time series rather than attributed to the
     // (repoRoot, branch) segment the surrounding loop is building.

@@ -15,6 +15,10 @@ function writeRollout(records) {
 const at = (s) => `2026-01-01T00:${String(s).padStart(2, '0')}:00.000Z`;
 const userMsg = (s) => ({ timestamp: at(s), type: 'event_msg', payload: { type: 'user_message', message: 'go' } });
 const work = (s) => ({ timestamp: at(s), type: 'event_msg', payload: { type: 'agent_message' } });
+// update_plan only counts inside plan mode (in default mode it is a todo list), so fixtures that
+// assert on it open with a plan-mode task_started.
+const planMode = (s) => ({ timestamp: at(s), type: 'event_msg',
+  payload: { type: 'task_started', collaboration_mode_kind: 'plan' } });
 const updatePlan = (s, plan) => ({ timestamp: at(s), type: 'response_item', payload: { type: 'function_call', name: 'update_plan', arguments: JSON.stringify({ plan }) } });
 
 test('classifies the gap before a user prompt as waiting_user and work runs as working', () => {
@@ -38,6 +42,7 @@ test('long gaps become idle periods', () => {
 
 test('update_plan calls emit plan_start and (when all completed) plan_ready', () => {
   const tl = computeSessionTimeline(writeRollout([
+    planMode(0),
     updatePlan(0, [{ step: 'a', status: 'in_progress' }]),
     work(1),
     updatePlan(2, [{ step: 'a', status: 'completed' }]),
@@ -81,6 +86,7 @@ test('a Plan item and update_plan describing one completion collapse to a single
   // The 0.137.0 shape: one local rollout carries both surfaces. Appending them the way the Claude
   // engine appends its two sources would double-report the same moment.
   const tl = computeSessionTimeline(writeRollout([
+    planMode(5),
     planItem(5),
     updatePlan(5, [{ step: 'a', status: 'completed' }]),
     work(6),
@@ -96,6 +102,7 @@ test('two genuinely separate plan cycles are not collapsed into one', () => {
   // Measured on the co-occurrence rollout: its Plan items and its completing update_plan calls are
   // minutes apart, so all of them are real.
   const tl = computeSessionTimeline(writeRollout([
+    planMode(1),
     planItem(1),
     updatePlan(9, [{ step: 'a', status: 'completed' }]),
   ]));
@@ -109,6 +116,7 @@ test('two genuinely separate plan cycles are not collapsed into one', () => {
 test('tools.update_plan inside an exec program starts a plan but can never complete one', () => {
   // The step list is not recoverable from the program text, so ready is not inferable.
   const tl = computeSessionTimeline(writeRollout([
+    planMode(0),
     work(0),
     execCall(2, 'const r = await tools.update_plan({plan:[{step:"a",status:"in_progress"}]}); text(r);'),
     work(4),
@@ -125,8 +133,120 @@ test('an exec program that never calls update_plan emits nothing', () => {
 });
 
 test('every plan_events row carries exactly the two keys the server accepts', () => {
-  const tl = computeSessionTimeline(writeRollout([planItem(1), updatePlan(9, [{ step: 'a', status: 'completed' }])]));
+  const tl = computeSessionTimeline(writeRollout([planMode(1), planItem(1), updatePlan(9, [{ step: 'a', status: 'completed' }])]));
   for (const row of tl.plan_events) assert.deepEqual(Object.keys(row).sort(), ['at', 'type']);
+});
+
+test('update_plan outside plan mode is a todo list, not a plan', () => {
+  const defaultMode = { timestamp: at(0), type: 'event_msg', payload: { type: 'task_started', collaboration_mode_kind: 'default' } };
+  const tl = computeSessionTimeline(writeRollout([
+    defaultMode,
+    updatePlan(1, [{ step: 'a', status: 'in_progress' }]),
+    updatePlan(2, [{ step: 'a', status: 'completed' }]),
+    execCall(3, 'const r = await tools.update_plan({plan:[]}); text(r);'),
+    work(4),
+  ]));
+  assert.deepEqual(tl.plan_events, []);
+});
+
+// ─── planning skills ────────────────────────────────────────────────────────
+
+const injection = (s, name) => ({ timestamp: at(s), type: 'response_item', payload: { type: 'message', role: 'user',
+  content: [{ type: 'input_text', text: `<skill>\n<name>${name}</name>\n<path>C:\\x\\skills\\y\\SKILL.md</path>\n---\n` }] } });
+const fileChange = (s, file) => ({ timestamp: at(s), type: 'event_msg', payload: { type: 'item_completed',
+  item: { type: 'FileChange', id: `fc-${s}`, status: 'completed', changes: { [file]: { type: 'add', content: 'x\n' } } } } });
+const skillReadExec = (s, skill) => execCall(s, `const r = await tools.exec_command({cmd: "Get-Content -Raw 'C:\\\\Users\\\\u\\\\.codex\\\\plugins\\\\cache\\\\m\\\\superpowers\\\\6.3.0\\\\skills\\\\${skill}\\\\SKILL.md'"}); text(r);`);
+const rowsOk = (tl) => { for (const row of tl.plan_events) assert.deepEqual(Object.keys(row).sort(), ['at', 'type']); };
+
+test('a planning skill injection opens a cycle; the plan doc write makes it ready; code edit closes it', () => {
+  const tl = computeSessionTimeline(writeRollout([
+    work(0),
+    injection(1, 'superpowers:writing-plans'),
+    work(2),
+    fileChange(3, 'C:\\repo\\docs\\superpowers\\plans\\2026-09-29-x.md'),
+    work(4),
+    fileChange(5, 'C:\\repo\\src\\app.js'),
+    work(6),
+  ]));
+  assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: at(1) }, { type: 'plan_ready', at: at(3) }]);
+  rowsOk(tl);
+  const planning = tl.periods.filter((p) => p.state === 'planning');
+  assert.equal(planning.length, 1);
+  // A period is classified by the record that ENDS it (same as plan mode), so the gap leading up
+  // to the skill record is the first planning span.
+  assert.equal(planning[0].started_at, at(0));
+  assert.equal(planning[0].ended_at, at(3));
+});
+
+test('a SKILL.md read of brainstorming via exec opens a cycle', () => {
+  const tl = computeSessionTimeline(writeRollout([
+    work(0),
+    skillReadExec(1, 'brainstorming'),
+    fileChange(2, 'C:\\repo\\docs\\design.md'),
+    work(3),
+  ]));
+  assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: at(1) }, { type: 'plan_ready', at: at(2) }]);
+  rowsOk(tl);
+});
+
+test('listing or searching skill folders emits nothing', () => {
+  const dir = 'C:\\\\Users\\\\u\\\\.codex\\\\plugins\\\\cache\\\\m\\\\superpowers\\\\6.3.0\\\\skills';
+  const tl = computeSessionTimeline(writeRollout([
+    work(0),
+    execCall(1, `const r = await tools.exec_command({cmd: "Get-ChildItem -Recurse '${dir}' -Filter SKILL.md"}); text(r);`),
+    execCall(2, `const r = await tools.exec_command({cmd: "rg -n brainstorming '${dir}'"}); text(r);`),
+    fileChange(3, 'C:\\repo\\docs\\plan.md'),
+    work(4),
+  ]));
+  assert.deepEqual(tl.plan_events, []);
+});
+
+test('a planning skill read chained to other work still opens a cycle (the real automatic shape)', () => {
+  // Measured: `rg --files docs/gap-analysis; Get-Content …/subagents/SKILL.md; Get-Content
+  // …/writing-plans/SKILL.md` — one command, discovery plus several skill reads.
+  const tl = computeSessionTimeline(writeRollout([
+    work(0),
+    execCall(1, 'const r = await tools.exec_command({cmd: "rg --files docs/gap-analysis; Get-Content C:/Users/u/.agents/skills/subagents/SKILL.md; Get-Content C:/Users/u/.codex/plugins/cache/m/superpowers/6.3.0/skills/writing-plans/SKILL.md"}); text(r);'),
+    fileChange(2, 'C:\\repo\\docs\\superpowers\\plans\\2026-09-29-x.md'),
+    work(3),
+  ]));
+  assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: at(1) }, { type: 'plan_ready', at: at(2) }]);
+  rowsOk(tl);
+});
+
+test('executing-plans closes an open cycle and never opens one', () => {
+  const tl = computeSessionTimeline(writeRollout([
+    work(0),
+    injection(1, 'superpowers:executing-plans'),
+    fileChange(2, 'C:\\repo\\docs\\plan.md'),
+    injection(3, 'superpowers:writing-plans'),
+    fileChange(4, 'C:\\repo\\docs\\plan.md'),
+    injection(5, 'superpowers:executing-plans'),
+    fileChange(6, 'C:\\repo\\docs\\plan.md'),
+    work(7),
+  ]));
+  assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: at(3) }, { type: 'plan_ready', at: at(4) }]);
+});
+
+test('a planning skill inside built-in plan mode adds no second cycle', () => {
+  const tl = computeSessionTimeline(writeRollout([
+    planMode(0),
+    injection(1, 'superpowers:writing-plans'),
+    fileChange(2, 'C:\\repo\\docs\\plan.md'),
+    work(3),
+  ]));
+  assert.deepEqual(tl.plan_events, []);
+});
+
+test('a lone planning-skill start with no plan doc paints no planning period', () => {
+  const tl = computeSessionTimeline(writeRollout([
+    work(0),
+    injection(1, 'superpowers:brainstorming'),
+    work(2),
+    work(3),
+  ]));
+  assert.deepEqual(tl.plan_events, [{ type: 'plan_start', at: at(1) }]);
+  assert.deepEqual(tl.periods.filter((p) => p.state === 'planning'), []);
 });
 
 // ─── G-3-4: the break state and interrupt handling ──────────────────────────

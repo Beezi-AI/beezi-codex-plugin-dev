@@ -79,7 +79,9 @@ export function upsertRoot(map, root, origin, nowIso = new Date().toISOString())
 // (e.g. dubious-ownership) but the root was mapped earlier.
 export function knownOrigin(root, map) {
   const nr = normPath(root);
-  return nr && map && map.roots && map.roots[nr] ? orDefault(map.roots[nr].origin, null) : null;
+  // Re-sanitize: cached values may predate the current sanitizer (query strings, local paths).
+  const origin = nr && map && map.roots && map.roots[nr] ? orDefault(map.roots[nr].origin, null) : null;
+  return origin === null ? null : sanitizeRemote(origin);
 }
 
 // Drop roots whose .git no longer exists. Mutates `map`; returns the count removed.
