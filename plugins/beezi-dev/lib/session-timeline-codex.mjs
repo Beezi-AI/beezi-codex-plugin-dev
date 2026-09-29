@@ -1,5 +1,6 @@
 import { fetchCompat } from './fetch-compat.mjs';
 import fs from 'fs';
+import path from 'path';
 import { timelineWaits, isBackgroundNotification, isTimelineUserPrompt } from './timeline-waits-codex.mjs';
 import { toolNamesFromProgram } from './exec-program.mjs';
 import { parseArgs } from './operations-codex.mjs';
@@ -7,6 +8,8 @@ import { IDLE_GAP_SEC } from './timing.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { orDefault, parseTimestampMs } from './compat.mjs';
+import { skillInjectionOf, skillReadsOfCall } from './skills-codex.mjs';
+import { editedPathsOf } from './code-changes-codex.mjs';
 
 // Whole-session activity timeline, derived from a Codex rollout. Same output contract as the Claude
 // engine ({ periods, plan_events, subagents, started_at, ended_at, generated_at }), so the server
@@ -106,7 +109,14 @@ function collaborationModeOf(rec) {
   return null;
 }
 
-function buildPeriods(records) {
+function buildPeriods(records, skillIntervals) {
+  // A skill-plan window (buildSkillPlanCycles) charts as planning too, at the same rank as plan mode.
+  const inSkillPlan = (ms) => {
+    for (const iv of skillIntervals || []) {
+      if (ms >= iv.startMs && ms <= iv.endMs) return true;
+    }
+    return false;
+  };
   const waits = timelineWaits(records);
   const anchors = [];
   // 'default' rather than null: a session whose build predates collaboration_mode must read as
@@ -157,7 +167,7 @@ function buildPeriods(records) {
     // Planning last, below idle and waiting_user deliberately: a five-minute silence inside plan
     // mode is still idle, and a plan sitting unapproved is the human's time, not more planning.
     // Same rank as `session-timeline.mjs` in the beezi-claude-plugins repo gives it.
-    else if (isPlanMode(cur.mode)) state = STATE.PLANNING;
+    else if (isPlanMode(cur.mode) || inSkillPlan(cur.ts)) state = STATE.PLANNING;
     else state = STATE.WORKING;
 
     const last = merged[merged.length - 1];
@@ -195,7 +205,11 @@ function execCallsUpdatePlan(source) {
 // `payload.started_at_ms` is present on 1 of 15 Plan items, so the record's own `timestamp` is the
 // only usable anchor — which is also the house rule: a row carries the record's own timestamp so a
 // re-scan reproduces the same key and the server's idempotent upsert collapses the replay.
-function planMarkersOf(rec) {
+//
+// `update_plan` (either surface) only counts inside plan mode: in default mode it is a todo list,
+// not a plan — 17 of the 20 local rollouts calling it never entered plan mode, and the portal marks
+// a session `planned` on any plan event. `Plan` items are finished documents and stay unconditional.
+function planMarkersOf(rec, mode) {
   const p = (rec || {}).payload;
   if (!p) return null;
   if (rec.type === 'event_msg' && p.type === 'item_completed') {
@@ -204,6 +218,7 @@ function planMarkersOf(rec) {
     return { start: true, ready: true };
   }
   if (rec.type !== 'response_item') return null;
+  if (!isPlanMode(mode)) return null;
   if (p.type === 'function_call' && p.name === 'update_plan') {
     const args = parseArgs(p.arguments);
     const plan = args && Array.isArray(args.plan) ? args.plan : [];
@@ -228,29 +243,163 @@ function planMarkersOf(rec) {
 // one moment; it does not and should not merge a session's separate plan cycles.
 function buildPlanEvents(records) {
   const events = [];
-  const seenReady = new Set();
-  let started = false;
+  let mode = 'default';
   for (const rec of records) {
-    const marker = planMarkersOf(rec);
+    // Mode is read before the marker so an update_plan is judged by the mode in force for it.
+    const m = collaborationModeOf(rec);
+    if (m !== null) mode = m;
+    const marker = planMarkersOf(rec, mode);
     if (!marker) continue;
     const ms = tsOf(rec);
     if (ms == null) continue;
     const at = new Date(ms).toISOString();
-    // Only the earliest start, as before: a session opens its plan once.
-    if (marker.start && !started) {
-      events.push({ type: 'plan_start', at: at });
+    if (marker.start) events.push({ type: 'plan_start', at: at });
+    if (marker.ready) events.push({ type: 'plan_ready', at: at });
+  }
+  return events;
+}
+
+// Built-in and skill events merged into one list: sorted, only the earliest start kept (a session
+// opens its plan once), and plan_ready deduped per second so two sources reporting one completion
+// produce one row while separate plan cycles cannot suppress each other. Rows are rebuilt as
+// exactly {type, at}, the two keys the server accepts.
+function mergePlanEvents(events) {
+  const sorted = events.slice().sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
+  const out = [];
+  const seenReady = new Set();
+  let started = false;
+  for (const e of sorted) {
+    if (e.type === 'plan_start') {
+      if (started) continue;
       started = true;
+    } else {
+      const key = e.at.slice(0, 19);
+      if (seenReady.has(key)) continue;
+      seenReady.add(key);
     }
-    // Keyed per second, so two sources reporting one completion produce one row while two genuinely
-    // separate plan cycles cannot suppress each other.
-    const readyKey = at.slice(0, 19);
-    if (marker.ready && !seenReady.has(readyKey)) {
-      seenReady.add(readyKey);
-      events.push({ type: 'plan_ready', at: at });
+    out.push({ type: e.type, at: e.at });
+  }
+  return out;
+}
+
+// Skill-based planning, ported from buildSkillPlanCycles in the Claude engine
+// (beezi-claude-plugins/plugins/beezi/lib/session-timeline.mjs); names are kept identical so the two
+// can be diffed. Planning done through a skill (writing-plans, brainstorming) never enters plan
+// mode, so it charted as plain `working` and the session read "Plan Mode skipped".
+//   plan_start - a planning skill used: a `$name` injection or a SKILL.md read, even one chained to
+//     other work (that is how an automatic run looks). Detection is skills-codex.mjs only: the
+//     portal marks a session `planned` on any plan event, so listing skill folders must not qualify.
+//   plan_ready - the LAST plan-document write before the cycle closes.
+// A cycle closes on a non-plan edit after a plan write, another planning skill, an execution skill,
+// built-in plan mode starting (it owns its window), or end of transcript. A lone start gets no
+// interval: an unclosed brainstorm must not paint the rest of the session as planning.
+const PLAN_SKILL_HINTS = ['plan', 'spec', 'brainstorm'];
+const PLAN_SKILL_EXCLUSIONS = ['execut', 'implement'];
+const PLAN_DOC_HINTS = ['design', 'spec', 'plan'];
+const PLAN_DIR_NAMES = { plan: true, plans: true, spec: true, specs: true, design: true, designs: true };
+const PLAN_DOC_EXT = '.md';
+
+// Forward slashes so a Windows path parses with path.posix; bare path.basename on a POSIX runtime
+// would return the whole 'C:\...\plans\foo.md' string and turn basename matching into directory matching.
+function normPath(p) {
+  return typeof p === 'string' ? p.replace(/\\/g, '/') : p;
+}
+
+// Segment after the last ':', tokenized on non-alphanumerics and matched by token PREFIX:
+// 'plans' matches 'plan', 'inspect' does not match 'spec'.
+function leafTokens(skillId) {
+  if (typeof skillId !== 'string' || skillId === '') return [];
+  const i = skillId.lastIndexOf(':');
+  const leaf = i === -1 ? skillId : skillId.slice(i + 1);
+  return leaf.toLowerCase().split(/[^a-z0-9]+/).filter((t) => t !== '');
+}
+
+function anyTokenStartsWith(tokens, hints) {
+  for (const t of tokens) {
+    for (const h of hints) {
+      if (t.indexOf(h) === 0) return true;
     }
   }
-  events.sort((a, b) => Date.parse(a.at) - Date.parse(b.at));
-  return events;
+  return false;
+}
+
+function isPlanningSkill(skillId) {
+  const tokens = leafTokens(skillId);
+  if (tokens.length === 0) return false;
+  if (anyTokenStartsWith(tokens, PLAN_SKILL_EXCLUSIONS)) return false;
+  return anyTokenStartsWith(tokens, PLAN_SKILL_HINTS);
+}
+
+function isExcludedPlanSkill(skillId) {
+  return anyTokenStartsWith(leafTokens(skillId), PLAN_SKILL_EXCLUSIONS);
+}
+
+// '.md' with a keyword in the BASENAME, or directly inside a folder named exactly plan(s)/spec(s)/
+// design(s). Exact folder names only: execution dirs hold progress artifacts, and a substring match
+// would keep the cycle open forever.
+function isPlanDocPath(filePath) {
+  if (typeof filePath !== 'string' || filePath === '') return false;
+  const p = normPath(filePath);
+  const base = path.posix.basename(p).toLowerCase();
+  if (path.posix.extname(base) !== PLAN_DOC_EXT) return false;
+  for (const h of PLAN_DOC_HINTS) {
+    if (base.indexOf(h) !== -1) return true;
+  }
+  const parent = path.posix.basename(path.posix.dirname(p)).toLowerCase();
+  return PLAN_DIR_NAMES[parent] === true;
+}
+
+// Every skill this record used. A read chained to other work still counts: that is how an automatic
+// Codex skill run looks (discovery plus several SKILL.md reads in one command).
+function skillsUsedBy(rec) {
+  const injected = skillInjectionOf(rec);
+  if (injected) return [injected.name];
+  const reads = skillReadsOfCall(rec && rec.payload);
+  return reads === null ? [] : reads.names;
+}
+
+function buildSkillPlanCycles(records) {
+  const events = [];
+  const intervals = [];
+  let mode = 'default';
+  let cycle = null; // { startMs, lastPlanMs }
+
+  const close = () => {
+    if (cycle === null) return;
+    if (cycle.lastPlanMs !== null) {
+      events.push({ type: 'plan_ready', at: new Date(cycle.lastPlanMs).toISOString() });
+      intervals.push({ startMs: cycle.startMs, endMs: cycle.lastPlanMs });
+    }
+    cycle = null;
+  };
+
+  for (const rec of records) {
+    const m = collaborationModeOf(rec);
+    if (m !== null) {
+      const wasPlan = isPlanMode(mode);
+      mode = m;
+      if (isPlanMode(mode) && !wasPlan) close(); // built-in plan mode owns its window
+    }
+    const ms = tsOf(rec);
+    if (ms == null) continue;
+
+    const skills = skillsUsedBy(rec);
+    if (!isPlanMode(mode) && skills.some(isPlanningSkill)) {
+      close(); // a new planning skill ends the previous cycle
+      events.push({ type: 'plan_start', at: new Date(ms).toISOString() });
+      cycle = { startMs: ms, lastPlanMs: null };
+      continue;
+    }
+    if (cycle === null) continue;
+    if (skills.some(isExcludedPlanSkill)) { close(); continue; }
+
+    for (const filePath of editedPathsOf(rec)) {
+      if (isPlanDocPath(filePath)) cycle.lastPlanMs = ms;
+      else if (cycle.lastPlanMs !== null) { close(); break; }
+    }
+  }
+  close(); // end of transcript
+  return { events, intervals };
 }
 
 const MAX_SUBAGENTS = 1000;
@@ -291,8 +440,9 @@ export function computeSessionTimeline(transcriptPath, sessionId = null, deps = 
   let records;
   try { records = parseTranscript(transcriptPath); } catch { return null; }
 
-  const periods = buildPeriods(records);
-  const plan_events = buildPlanEvents(records);
+  const skillPlan = buildSkillPlanCycles(records);
+  const periods = buildPeriods(records, skillPlan.intervals);
+  const plan_events = mergePlanEvents(buildPlanEvents(records).concat(skillPlan.events));
 
   let minTs = Infinity;
   let maxTs = -Infinity;

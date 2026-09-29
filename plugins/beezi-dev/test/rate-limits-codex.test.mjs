@@ -141,6 +141,13 @@ test('isMaterial fires on a window rollover, a 5-point move, and crossing 100', 
   assert.equal(isMaterial({ pct: 100, resetsAt: 1 }, { pct: 98, resetsAt: 1 }), true, 'hit the ceiling');
 });
 
+test('isMaterial treats 99 as exhausted: crossing it either way is material', () => {
+  assert.equal(isMaterial({ pct: 99, resetsAt: 1 }, { pct: 97, resetsAt: 1 }), true, '97 -> 99 is exhaustion');
+  assert.equal(isMaterial({ pct: 97, resetsAt: 1 }, { pct: 99, resetsAt: 1 }), true, '99 -> 97 is recovery');
+  assert.equal(isMaterial({ pct: 100, resetsAt: 1 }, { pct: 99, resetsAt: 1 }), false, 'already exhausted');
+  assert.equal(isMaterial({ pct: 98.9, resetsAt: 1 }, { pct: 97, resetsAt: 1 }), false, 'below the line');
+});
+
 const obs = (pct, at, limitId = 'codex') => ({
   observedAt: at,
   fiveHour: { pct, resetsAt: 1788987264, windowMinutes: 300 },

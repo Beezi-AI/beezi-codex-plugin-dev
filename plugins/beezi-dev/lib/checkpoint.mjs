@@ -770,6 +770,7 @@ async function runLockedCheckpoint(lock, ctx) {
         errorDetails: orDefault(event.details, null),
         lastAssistantMessage: orDefault(event.text, null),
         occurredAt: orDefault(event.occurredAt, new Date().toISOString()),
+        ...(event.resetsAt ? { resetsAt: event.resetsAt } : {}),
       });
     }
   }
@@ -790,6 +791,7 @@ async function runLockedCheckpoint(lock, ctx) {
         errorDetails: orDefault(event.details, null),
         lastAssistantMessage: orDefault(event.text, null),
         occurredAt: orDefault(event.occurredAt, new Date().toISOString()),
+        ...(event.resetsAt ? { resetsAt: event.resetsAt } : {}),
       };
       // Every linked workspace is owed the failure, and the parked set is machine-level, so an
       // event is only retired once EVERY account took it. A retry can therefore re-post to an

@@ -222,7 +222,8 @@ Codex writes one rollout transcript per session at
   `secondary` slot they arrive in: across 10 338 local observations, 2 775 carried the *weekly*
   window in the `primary` slot and 315 carried a 30-day window there, so reading the slot as the
   role mislabels 30% of readings. Observations are debounced to the moves worth keeping (a
-  5-point change, a window rollover, crossing 100%, or a 15-minute floor), queued to
+  5-point change, a window rollover, crossing the 99% exhaustion line in either direction — Codex
+  reports an exhausted window as 99 as often as 100 — or a 15-minute floor), queued to
   `~/.beezi-codex/usage-observations.json`, and drained to `/me/codex/usage` at turn end. Each row
   is stamped with the *record's* timestamp rather than wall-clock now, so re-scanning a rollout
   reproduces it exactly and the server's `(account, fetched_at)` key collapses the replay for
@@ -236,7 +237,9 @@ Codex writes one rollout transcript per session at
   resolved from the per-repo reflog timeline at each line's timestamp. Work with no resolvable
   `origin` — a directory that isn't a repo, or a repo without a remote — is still reported, under a
   synthetic `local:<folder>` remote. Only the folder name travels, never the path around it, and the
-  `local:` prefix keeps it from ever canonicalizing onto a real remote server-side.
+  `local:` prefix keeps it from ever canonicalizing onto a real remote server-side. An `origin` that
+  is itself a local path (`C:/…`, `/…`, `file:`, a UNC share) is reported the same way. Real remotes
+  lose any userinfo, query string and fragment, so a token in any of them never leaves the machine.
 - **Project instructions** are observed independently for every segment's repository root. Codex
   selects a non-empty root `AGENTS.override.md` first, then `AGENTS.md`; an empty file remains a real
   zero-line result when there is no non-empty candidate. Reports carry
@@ -251,12 +254,27 @@ Codex writes one rollout transcript per session at
   (`payload.invocation.server`) and joins back by `call_id` — so `by_server` carries real names, and
   falls back to `unknown` only for rollouts predating that event. Repo searches run through the
   shell (`rg`, `grep`, `find`, `Select-String`, …) are bucketed as `search` rather than `shell`.
+  Codex has no Skill tool, so `skill.by_skill` has two sources: a `$name` injection (a user message
+  starting `<skill><name>X</name>`, estimated at its body bytes / 4) and a shell call that reads
+  `SKILL.md` files with a plain read command. A call that only reads skills moves its tokens from
+  `shell` to `skill`, split across the skills it read; one chained to other work (the usual shape of
+  an automatic run: `rg --files …; Get-Content …/SKILL.md; …`) records each skill use at 0 tokens
+  and keeps its category. Listing or searching skill folders is not a use. A skill under a
+  plugin's versioned cache directory is named `<plugin>:<skill>`, as Codex names it.
+- **Planning** is Codex plan mode (`collaboration_mode` / `collaboration_mode_kind` = `plan`, and
+  `Plan` items) **or** a planning skill (name matching plan/spec/brainstorm, not execute/implement):
+  the skill use opens a cycle, the last plan-document `.md` write makes it `plan_ready`, and the
+  first other edit closes it — the same rule the Claude plugin uses. `update_plan` counts only inside
+  plan mode; in default mode it is a todo list.
 - **API errors** come from `event_msg/{type: "error"}`, whose `message` is either prose or a
   stringified upstream JSON body; both are parsed. Transient failures Codex retries itself
   (`server_overloaded`, 5xx) are dropped, and `turn_aborted{reason: "interrupted"}` is a user
   pressing Esc, not a failure. Reports that miss the hook budget are parked in session state and
   drained next checkpoint — the cursor advances either way, so an unreported error is otherwise
-  unrecoverable.
+  unrecoverable. A `usage_limit_exceeded` error also carries `resetsAt`, taken from the last
+  codex-bucket `token_count` before it (`resets_at`, unix seconds, of its most-used window), because
+  the prose ("try again at 6:25 PM") names no zone. A portal that predates the field answers 400;
+  the report is then re-sent once without it.
 - **Code changes** are parsed from `apply_patch` tool inputs.
 - **Session title** is read from `~/.codex/session_index.jsonl` (`thread_name`), falling back to the
   first genuine user prompt in the rollout. That index is originator-gated — Codex Desktop and the

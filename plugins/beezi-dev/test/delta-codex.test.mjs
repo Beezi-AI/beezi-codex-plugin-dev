@@ -200,9 +200,11 @@ test('a task_complete usage-limit error from Codex 0.154 is reported as a rate l
   const { apiErrorEvents } = computeDelta(file, 0, identityResolvers);
   assert.deepEqual(apiErrorEvents, [{
     error: 'rate_limit',
+    info: 'usage_limit_exceeded',
     details: 'usage_limit_exceeded',
     text: "You've hit your usage limit. Upgrade to Plus to continue using Codex.",
     occurredAt: '2026-08-06T20:04:35.739Z',
+    resetsAt: null,
   }], 'duplicate terminal records in the same minute collapse to one portal event');
 });
 
@@ -1088,4 +1090,80 @@ test('MCP discovery without a server argument waits for the server completion', 
   }]) + '\n');
   const second = computeDelta(file, first.nextCursor, identityResolvers);
   assert.equal(second.segments[0].stats.operations.mcp.by_server.codex.count, 1);
+});
+
+// --- resetsAt on usage-limit errors ---------------------------------------------------------
+
+const limitsRec = (ts, limits) => ({
+  timestamp: ts, type: 'event_msg', payload: { type: 'token_count', rate_limits: limits },
+});
+const win = (used, resetsAtSec) => ({ used_percent: used, window_minutes: 300, resets_at: resetsAtSec });
+const limitError = (ts) => ({
+  timestamp: ts,
+  type: 'event_msg',
+  payload: {
+    type: 'task_complete',
+    error: { message: "You've hit your usage limit. try again at 6:25 PM.", codex_error_info: 'usage_limit_exceeded' },
+  },
+});
+const ERR_TS = '2026-01-01T00:00:10.000Z';
+const ERR_SEC = Date.parse(ERR_TS) / 1000;
+const R = ERR_SEC + 3600;
+const iso = (sec) => new Date(sec * 1000).toISOString();
+const eventsOf = (file, from = 0) => computeDelta(file, from, identityResolvers).apiErrorEvents;
+
+test('resetsAt comes from the codex block, skipping a later premium block with null windows', () => {
+  const file = withPrelude(
+    limitsRec('2026-01-01T00:00:05.000Z', { limit_id: 'codex', primary: win(100, R), secondary: win(42, R + 99999) }),
+    limitsRec('2026-01-01T00:00:06.000Z', { limit_id: 'premium', primary: null, secondary: null }),
+    limitError(ERR_TS),
+  );
+  assert.equal(eventsOf(file)[0].resetsAt, iso(R));
+});
+
+test('resetsAt picks the highest used_percent window (99 beats 42)', () => {
+  const file = withPrelude(
+    limitsRec('2026-01-01T00:00:05.000Z', { limit_id: 'codex', primary: win(99, R), secondary: win(42, R + 99999) }),
+    limitError(ERR_TS),
+  );
+  assert.equal(eventsOf(file)[0].resetsAt, iso(R));
+});
+
+test('resetsAt breaks a used_percent tie with the later reset', () => {
+  const file = withPrelude(
+    limitsRec('2026-01-01T00:00:05.000Z', { limit_id: 'codex', primary: win(100, R), secondary: win(100, R + 5000) }),
+    limitError(ERR_TS),
+  );
+  assert.equal(eventsOf(file)[0].resetsAt, iso(R + 5000));
+});
+
+test('resetsAt is found when the window starts after the token_count', () => {
+  const file = withPrelude(
+    limitsRec('2026-01-01T00:00:05.000Z', { limit_id: 'codex', primary: win(100, R), secondary: null }),
+    limitError(ERR_TS),
+  );
+  // meta + turn + token_count = 3 lines before the window; the error is line 4.
+  assert.equal(eventsOf(file, 3)[0].resetsAt, iso(R));
+});
+
+test('resetsAt is null without a preceding token_count', () => {
+  assert.equal(eventsOf(withPrelude(limitError(ERR_TS)))[0].resetsAt, null);
+});
+
+test('resetsAt is null when the reset is not after the error', () => {
+  const file = withPrelude(
+    limitsRec('2026-01-01T00:00:05.000Z', { limit_id: 'codex', primary: win(100, ERR_SEC), secondary: null }),
+    limitError(ERR_TS),
+  );
+  assert.equal(eventsOf(file)[0].resetsAt, null);
+});
+
+test('a non-limit error carries no resetsAt', () => {
+  const file = withPrelude(
+    limitsRec('2026-01-01T00:00:05.000Z', { limit_id: 'codex', primary: win(100, R), secondary: null }),
+    errorRec(ERR_TS, JSON.stringify({ status: 401, error: { type: 'authentication_error', message: 'nope' } })),
+  );
+  const [event] = eventsOf(file);
+  assert.equal(event.error, 'authentication_failed');
+  assert.equal('resetsAt' in event, false);
 });
