@@ -93,3 +93,26 @@ test('the real recordIssue writes nothing on a machine that never consented', as
   assert.equal(res.reported, false);
   assert.equal(fs.existsSync(path.join(dir, 'diagnostics')), false);
 });
+
+test('a 400 on a payload with resetsAt is retried once without it', async () => {
+  const fetchImpl = recordingFetch(async (url, opts) => ({ status: JSON.parse(opts.body).resetsAt ? 400 : 200 }));
+  const res = await postSessionError(
+    { sessionId: 's1', error: 'rate_limit', occurredAt: '2026-07-08T10:00:00.000Z', resetsAt: '2026-07-08T11:00:00.000Z' },
+    SESSION,
+    { fetchImpl, recordIssue: () => true },
+  );
+  assert.equal(res.reported, true);
+  assert.equal(fetchImpl.calls.length, 2);
+  assert.equal('resetsAt' in JSON.parse(fetchImpl.calls[1].opts.body), false);
+});
+
+test('a 400 on a payload without resetsAt is not retried', async () => {
+  const fetchImpl = recordingFetch(async () => ({ status: 400 }));
+  const res = await postSessionError(
+    { sessionId: 's1', error: 'rate_limit', occurredAt: '2026-07-08T10:00:00.000Z' },
+    SESSION,
+    { fetchImpl, recordIssue: () => true },
+  );
+  assert.equal(res.reported, false);
+  assert.equal(fetchImpl.calls.length, 1);
+});

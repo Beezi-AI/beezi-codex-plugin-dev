@@ -20,7 +20,15 @@ export async function postSessionError(payload, session, deps = {}) {
   // fire-and-forget contract.
   if (!session || !session.token) return { reported: false, reason: 'no-token' };
   try {
-    const res = await postJson(`${apiBase()}${ENDPOINTS.sessionErrors}`, session, payload, { fetchImpl });
+    const url = `${apiBase()}${ENDPOINTS.sessionErrors}`;
+    let res = await postJson(url, session, payload, { fetchImpl });
+    // Portals deploy independently of the plugin, and one that predates `resetsAt` rejects the
+    // unknown key (forbidNonWhitelisted) with a 400. Without this retry the event would park in
+    // pendingErrors and be re-sent, and rejected, on every checkpoint.
+    if (res.status === 400 && payload.resetsAt) {
+      const { resetsAt, ...withoutResetsAt } = payload;
+      res = await postJson(url, session, withoutResetsAt, { fetchImpl });
+    }
     const reported = res.status >= 200 && res.status < 300;
     if (!reported) {
       recordIssueImpl({

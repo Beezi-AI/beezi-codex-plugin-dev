@@ -499,3 +499,97 @@ test('latency never lands on the unknown bucket', () => {
   assert.equal(ops.mcp.by_server.unknown.duration_ms, undefined);
   assert.equal(ops.mcp.by_server.beezi.duration_ms, 5);
 });
+
+// --- skills ----------------------------------------------------------------------------------
+
+const userMsg = (text) => ({ type: 'response_item', payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] } });
+
+test('a $skill injection counts as one skill use with its body size', () => {
+  const text = '<skill>\n<name>beezi-staging:me</name>\n' + 'x'.repeat(400);
+  const ops = computeOperations([userMsg(text)]);
+  assert.equal(ops.skill.count, 1);
+  assert.equal(ops.skill.by_skill['beezi-staging:me'].count, 1);
+  assert.equal(ops.skill.by_skill['beezi-staging:me'].est_tokens, Math.round(Buffer.byteLength(text) / 4));
+  assert.equal(ops.plugins['beezi-staging'].count, 1);
+  assert.deepEqual(Object.keys(ops.skill.by_skill['beezi-staging:me']).sort(), ['count', 'est_tokens']);
+});
+
+test('a SKILL.md read through exec moves from shell to skill', () => {
+  const p = 'C:\\Users\\u\\.codex\\plugins\\cache\\mk\\superpowers\\6.3.0\\skills\\brainstorming\\SKILL.md';
+  const ops = computeOperations([
+    exec('e1', `const r = await tools.exec_command({cmd:"Get-Content -Raw '${p.replace(/\\/g, '\\\\')}'"}); text(r.output);`),
+    customOut('e1', 'y'.repeat(800)),
+  ]);
+  assert.equal(ops.shell.count, 0);
+  assert.equal(ops.shell.est_tokens, 0);
+  assert.equal(ops.skill.count, 1);
+  assert.equal(ops.skill.est_tokens, 200);
+  assert.deepEqual(ops.skill.by_skill['superpowers:brainstorming'], { count: 1, est_tokens: 200 });
+  assert.equal(ops.plugins.superpowers.count, 1);
+});
+
+test('a SKILL.md read through a legacy shell call moves out of shell', () => {
+  const ops = computeOperations([
+    shell('s1', 'cat /home/u/.codex/skills/foo/SKILL.md'),
+    fnOut('s1', 'y'.repeat(40)),
+  ]);
+  assert.equal(ops.shell.count, 0);
+  assert.deepEqual(ops.skill.by_skill.foo, { count: 1, est_tokens: 10 });
+});
+
+test('a bare user skill lands under plugins.builtin', () => {
+  const ops = computeOperations([shell('s1', 'cat /home/u/.codex/skills/foo/SKILL.md'), fnOut('s1', 'y'.repeat(8))]);
+  assert.deepEqual(ops.plugins.builtin, { count: 1, est_tokens: 2 });
+});
+
+test('listing skill folders stays shell/search, not skill', () => {
+  const ops = computeOperations([shell('s1', 'Get-ChildItem C:/x/skills -Recurse -Filter SKILL.md'), fnOut('s1', 'y'.repeat(8))]);
+  assert.equal(ops.skill.count, 0);
+  assert.deepEqual(ops.skill.by_skill, {});
+  assert.equal(ops.shell.count + ops.search.count, 1);
+});
+
+test('the $mention text alone is not counted', () => {
+  const ops = computeOperations([userMsg('$beezi-staging:me')]);
+  assert.equal(ops.skill.count, 0);
+  assert.deepEqual(ops.skill.by_skill, {});
+});
+
+test('a SKILL.md read whose call is named by an MCP server stays MCP', () => {
+  const ops = computeOperations([
+    shell('s1', 'cat /home/u/.codex/skills/foo/SKILL.md'),
+    mcpEnd('s1', 'notion', 'x'),
+  ]);
+  assert.equal(ops.skill.count, 0);
+  assert.equal(ops.mcp.count, 1);
+});
+
+test('a call reading only skills splits its tokens across every skill it read', () => {
+  const ops = computeOperations([
+    shell('s1', 'cat /h/.codex/skills/a/SKILL.md /h/.codex/skills/b/SKILL.md; cat /h/.codex/skills/c/SKILL.md'),
+    fnOut('s1', 'y'.repeat(40)), // est 10 -> 4 + 3 + 3
+  ]);
+  assert.equal(ops.shell.count, 0);
+  assert.equal(ops.skill.count, 1);
+  assert.equal(ops.skill.est_tokens, 10);
+  assert.deepEqual(ops.skill.by_skill, {
+    a: { count: 1, est_tokens: 4 }, b: { count: 1, est_tokens: 3 }, c: { count: 1, est_tokens: 3 },
+  });
+  const sum = Object.values(ops.skill.by_skill).reduce((s, v) => s + v.est_tokens, 0);
+  assert.equal(sum, ops.skill.est_tokens);
+});
+
+test('skill reads chained to other work record each use at 0 tokens and keep their category', () => {
+  // The measured shape of an automatic writing-plans run. Its leading `rg` makes it a search.
+  const ops = computeOperations([
+    shell('s1', 'rg --files docs; Get-Content /h/.agents/skills/subagents/SKILL.md; Get-Content /h/.codex/plugins/cache/m/superpowers/6.3.0/skills/writing-plans/SKILL.md'),
+    fnOut('s1', 'y'.repeat(40)),
+  ]);
+  assert.equal(ops.search.count, 1);
+  assert.equal(ops.search.est_tokens, 10);
+  assert.equal(ops.skill.count, 0);
+  assert.equal(ops.skill.est_tokens, 0);
+  assert.deepEqual(ops.skill.by_skill, {
+    subagents: { count: 1, est_tokens: 0 }, 'superpowers:writing-plans': { count: 1, est_tokens: 0 },
+  });
+});

@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { computeCodeChanges } from '../lib/code-changes-codex.mjs';
+import { computeCodeChanges, editedPathsOf } from '../lib/code-changes-codex.mjs';
 
 const applyPatch = (input) => ({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'c1', input } });
 
@@ -267,4 +267,22 @@ test('a change map that is missing, empty or malformed is inert', () => {
   assert.equal(cc.files_changed, 2, 'the two well-formed keys are still touched');
   assert.equal(cc.lines_added, 0);
   assert.equal(cc.lines_removed, 0);
+});
+
+test('editedPathsOf — FileChange prefers move_path; a failed patch_apply_end yields nothing', () => {
+  const fc = { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'FileChange', id: 'a', status: 'completed',
+    changes: { 'C:\\r\\old.md': { type: 'update', unified_diff: '@@\n+x', move_path: 'C:\\r\\new.md' }, 'C:\\r\\b.js': { type: 'add', content: 'x' } } } } };
+  assert.deepEqual(editedPathsOf(fc), ['C:\\r\\new.md', 'C:\\r\\b.js']);
+  const failed = { type: 'event_msg', payload: { type: 'patch_apply_end', success: false, changes: { 'C:\\r\\x.md': { type: 'add', content: 'x' } } } };
+  assert.deepEqual(editedPathsOf(failed), []);
+  const ok = { type: 'event_msg', payload: { type: 'patch_apply_end', success: true, changes: { '/r/x.md': { type: 'add', content: 'x' } } } };
+  assert.deepEqual(editedPathsOf(ok), ['/r/x.md']);
+});
+
+test('editedPathsOf — a legacy envelope yields its Add and Update headers', () => {
+  const input = '*** Begin Patch\n*** Add File: docs/plan.md\n+x\n*** Update File: src/a.js\n@@\n-a\n+b\n*** Delete File: old.md\n*** End Patch';
+  assert.deepEqual(editedPathsOf({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'apply_patch', input } }),
+    ['docs/plan.md', 'src/a.js']);
+  assert.deepEqual(editedPathsOf({ type: 'event_msg', payload: { type: 'agent_message' } }), []);
+  assert.deepEqual(editedPathsOf(null), []);
 });

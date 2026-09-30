@@ -38,6 +38,10 @@ const MONTHLY_MINUTES = 43200;
 // replayed after the fact, so this floor is elapsed BETWEEN THE READINGS. Same spacing in the
 // series; a backfill just produces it all at once.
 const MATERIAL_DELTA_PCT = 5;
+// Codex reports an exhausted window as 99.0 about as often as 100.0 (measured on real rollouts), so
+// the exhaustion line is 99. Crossing it DOWN is material too: that reading is what shows a limit
+// recovered before its reset time.
+const EXHAUSTED_PCT = 99;
 const RECORD_FLOOR_MS = 15 * 60 * 1000;
 const MAX_PENDING = 40;
 
@@ -110,8 +114,9 @@ export function isMaterial(next, last) {
   if (!last) return true;
   if (next.resetsAt !== last.resetsAt) return true;
   if (next.pct === null) return false;
-  if (next.pct >= 100 && (last.pct == null ? 0 : last.pct) < 100) return true;
-  return Math.abs(next.pct - (last.pct == null ? 0 : last.pct)) >= MATERIAL_DELTA_PCT;
+  const lastPct = last.pct == null ? 0 : last.pct;
+  if ((next.pct >= EXHAUSTED_PCT) !== (lastPct >= EXHAUSTED_PCT)) return true;
+  return Math.abs(next.pct - lastPct) >= MATERIAL_DELTA_PCT;
 }
 
 // The sub-fields the five whitelisted columns cannot express, for the `raw` jsonb passthrough

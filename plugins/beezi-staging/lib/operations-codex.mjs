@@ -1,5 +1,6 @@
 import { orDefault } from './compat.mjs';
 import { commandsFromProgram, toolNamesFromProgram } from './exec-program.mjs';
+import { skillInjectionOf, skillReadsOfCall } from './skills-codex.mjs';
 
 // Bucket each Codex tool call in a segment into one of seven operation categories and estimate
 // the token cost of its result. Like the Claude engine, exact tool counts are cheap but a tool's
@@ -16,7 +17,11 @@ import { commandsFromProgram, toolNamesFromProgram } from './exec-program.mjs';
 // ≤0.146 and `event_msg/item_completed` + `item.type === 'McpToolCall'` on 0.153+. Both name the
 // server and both key on the call id. Explicit mcp__ names and the plugin's own
 // legacy local tools can also identify the server without that event.
-// `by_skill` stays empty — Codex skills are prompt-injected, not tools.
+// `by_skill` has two sources, since Codex has no Skill tool: a `$name` injection (a user message
+// starting `<skill><name>X</name>`, est = its bytes / 4; not a tool call, so it adds to `skill`
+// without leaving any other bucket) and a shell/exec call that reads SKILL.md files (a call doing
+// nothing else MOVES its tokens from shell/file/search to `skill`, never counted twice; one chained
+// to other work records the use at 0 tokens and keeps its category).
 //
 // On unified exec (Codex ≥ ~0.145) the name in the record is NOT the tool that did the work:
 // every action is a `custom_tool_call` named `exec` whose `input` is a JS program. The whole
@@ -340,7 +345,30 @@ export function computeOperations(lines, context = null) {
   totals.skill.by_skill = {};
   const plugins = {};
 
+  // Mirrors the Claude engine's skillPlugin: `plugin:skill` -> plugin, a bare name is builtin.
+  const tallySkill = (name, est) => {
+    const skill = totals.skill;
+    if (skill.by_skill[name] === undefined || skill.by_skill[name] === null) {
+      skill.by_skill[name] = { count: 0, est_tokens: 0 };
+    }
+    skill.by_skill[name].count += 1;
+    skill.by_skill[name].est_tokens += est;
+    const colon = name.indexOf(':');
+    const plugin = colon > 0 ? name.slice(0, colon) : 'builtin';
+    if (plugins[plugin] === undefined || plugins[plugin] === null) plugins[plugin] = { count: 0, est_tokens: 0 };
+    plugins[plugin].count += 1;
+    plugins[plugin].est_tokens += est;
+  };
+
   for (const record of lines) {
+    const injected = skillInjectionOf(record);
+    if (injected !== null) {
+      const injectedEst = Math.round(injected.bytes / 4);
+      totals.skill.count += 1;
+      totals.skill.est_tokens += injectedEst;
+      tallySkill(injected.name, injectedEst);
+      continue;
+    }
     const call = toolCall(record);
     if (!call) continue;
     const prefixed = serverFromName(call.name);
@@ -348,15 +376,27 @@ export function computeOperations(lines, context = null) {
     // An mcp_tool_call_end still wins: it is the server's own record, not an inference from a
     // name. Otherwise, an exec call is categorized by the program it ran.
     const viaExec = named === null && call.program !== null ? execCategory(call.program) : null;
-    const category = viaExec === null
-      ? categoryOf(call.name, { isMcp: named !== null, args: call.args })
-      : viaExec.category;
     const server = viaExec !== null && viaExec.server !== null ? viaExec.server : named;
+    // SKILL.md reads are skill uses — unless an MCP server was named for the call. A call that ONLY
+    // reads skills is skill work: it moves out of shell/file/search and its tokens are split across
+    // the skills it read. A call that also does other work keeps its category and tokens (its output
+    // cannot be apportioned), but each skill still records the use, at 0 tokens.
+    const reads = server === null ? skillReadsOfCall(record.payload) : null;
+    let category;
+    if (reads !== null && reads.pure) category = 'skill';
+    else if (viaExec === null) category = categoryOf(call.name, { isMcp: named !== null, args: call.args });
+    else category = viaExec.category;
     const est = Math.round((bytesById.get(call.callId) || 0) / 4);
     const cat = totals[category];
     cat.count += 1;
     cat.est_tokens += est;
 
+    if (reads !== null) {
+      const n = reads.names.length;
+      const share = category === 'skill' ? Math.floor(est / n) : 0;
+      const remainder = category === 'skill' ? est - share * n : 0;
+      reads.names.forEach((name, i) => tallySkill(name, share + (i === 0 ? remainder : 0)));
+    }
     if (category === 'mcp') {
       // Malformed explicit MCP names can still lack a server. Unidentified bare
       // tools are other, not evidence of an unnamed MCP server.
