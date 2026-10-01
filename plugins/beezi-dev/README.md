@@ -453,12 +453,15 @@ earlier lines were already delivered to a staging tenant, and the queue holds se
 under a staging sign-in. Uploading either under a production account bills one tenant for
 another's work.
 
-Your previous sign-in moves with the data and is cleared from the production namespace, so
-`beezi:login` is the first step after the upgrade.
+Your previous sign-in is cleared from the production namespace, so `beezi:login` is the first step
+after the upgrade. A staging sign-in moves with the data; any other sign-in is not carried over.
 
-Three cases stop and ask rather than guessing — a data root that was already pointed at production
-by hand, one whose API cannot be established from its stored credentials, and a machine that
-already runs the staging variant. In all three nothing is uploaded until it is resolved:
+None of this needs you. A data root that was already pointed at production by hand is kept in place
+and adopted. When the API an old root was linked to cannot be established from its stored
+credentials, the data is still moved aside, never uploaded. When the machine already runs the
+staging variant, `~/.beezi-codex-staging` is left alone and the old data goes to an archive beside
+it, `~/.beezi-codex-legacy-<timestamp>-<id>`, which no build reads. The tools below are manual
+overrides:
 
 ```bash
 node scripts/migrate-env.mjs              # what this root is bound to, and any migration
