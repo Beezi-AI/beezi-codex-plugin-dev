@@ -390,6 +390,18 @@ Both history paths — the login skill's one-time import and the repeatable `syn
 picked up by a later run; the window is shared deliberately, so a session cannot be in scope for
 one command and out of scope for the other.
 
+Every `sync` also fills in missing subagent activity. Coverage counts parent lines only, so the
+decision is per agent, from the ledger's own record of the highest line it delivered for each one:
+an agent whose rollout has grown past that record is sent again WHOLE, from its fork boundary. The
+server retires every stored row strictly inside a wider window of the same session and agent, so a
+whole re-send supersedes the narrower windows live capture left rather than adding to them (checked
+on 24 real subagent rollouts cut at every `token_count` line and at arbitrary lines, the places a
+parent checkpoint can advance a child's cursor: 1656 live windows, all nested, equal token totals). Agents live
+capture still owns — a durable child cursor, or a rollout still being written — are left to it, and
+sessions that started before 2026-09-11 keep their subagents back, because live rows from before
+agent ids were canonicalized may carry a different `agent_id`. Before 0.16.0 a sync sent no
+subagents at all, so the first sync after upgrading uploads the ones it left behind.
+
 New or unfinished historical backfills register and snapshot the current ChatGPT account before
 upload, then attach its `account_uuid` to every imported report, including subagent reports. This
 attributes history to the account active during the import; it does not reconstruct the plan or
