@@ -171,7 +171,7 @@ test('2. switching the default drops the upstream session id instead of pairing 
 // Reachable by logging out the default while two accounts are left (test/account-surfaces.test.mjs
 // case 19). "Not linked" would be false about this machine — two accounts are — and it would send
 // the model to a sign-in that does not set a default.
-test('3. accounts linked with no default is refused by naming the accounts skill, not the sign-in tool', async (t) => {
+test('3. accounts linked with no default is refused by naming the settings skill, not the sign-in tool', async (t) => {
   const { deps } = await two(t);
   writeIndex({ version: 1, default: null, accounts: await listAccounts() });
   const { bridge, calls, out } = bridgeFor(deps);
@@ -180,7 +180,7 @@ test('3. accounts linked with no default is refused by naming the accounts skill
 
   assert.equal(calls.length, 0, 'nothing is posted without an account to post as');
   assert.match(out[0].error.message, /none is set as the one the analytics tools read from/);
-  assert.match(out[0].error.message, /accounts skill/);
+  assert.match(out[0].error.message, /settings skill \(Account → Default account\)/);
   // A sign-in links ANOTHER account (or re-arms one of these); it is not how you choose among the
   // accounts already here, which is the whole of what is wrong in this state.
   assert.ok(!out[0].error.message.includes(LOGIN_TOOL.name), 'signing in does not pick among linked accounts');
@@ -369,7 +369,7 @@ test('10. a dead default with a healthy sibling is not reported as an unlinked m
   assert.match(text, /This machine is linked to Beezi/);
   assert.match(text, /1 of 2 linked Beezi accounts can report/);
   assert.match(text, /cannot report just now/);
-  assert.match(text, /accounts skill/, 'the remedy is choosing another account, not linking a third');
+  assert.match(text, /settings skill \(Account → Default account\)/, 'the remedy is choosing another account, not linking a third');
 });
 
 // The lift must not invent a link. With nothing in the index there is no account to raise from.

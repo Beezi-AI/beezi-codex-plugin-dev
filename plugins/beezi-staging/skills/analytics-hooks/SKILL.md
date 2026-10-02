@@ -32,7 +32,7 @@ away rather than reporting the problem back and waiting for permission.
 Entries do not carry a plugin version: they run a launcher at a fixed path
 (`~/.beezi-codex[-<env>]/hooks/beezi-hook.mjs`) which picks up the newest installed version itself,
 so an upgrade needs no repair and no re-trust. `install` still refreshes that launcher's copy, and
-the MCP server, `login` and `me` all do so on their own.
+the MCP server, the `login` skill and the `settings` skill's screen all do so on their own.
 
 **The one step that is still theirs.** When an install or repair actually wrote something, say this
 once:
@@ -46,7 +46,8 @@ carry an older version's script paths has them rewritten to the launcher form th
 version installs, and that rewrite does need trust granted once more. When `install` reports nothing
 changed, existing trust is intact: do not send
 them to `/hooks` for no reason, mention it only if analytics still are not arriving. Being linked is
-the other half — see the `me` and `login` skills.
+the other half — the `beezi_status` tool (or the `settings` skill) says whether it is, and the
+`login` skill links it.
 
 There is one entry per lifecycle event: `SessionStart`, `PostToolUse`, `Stop`, `SubagentStart`,
 `SubagentStop`. `install` and `status` both print the list back, so check `/hooks` against what the

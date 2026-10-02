@@ -51,7 +51,14 @@ async function accountStatus(row, base, deps) {
     return { ...identity, state, authState: auth.state, account: null };
   }
 
-  const who = await whoami({ token, clientId: orDefault(row.clientId, null) }, { base });
+  const who = await whoami({
+    token,
+    clientId: orDefault(row.clientId, null),
+    tenantId: null,
+    tenants: Array.isArray(row.tenants) ? row.tenants : null,
+    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+  }, { base });
   if (who === null) return { ...identity, state: LinkState.UNREACHABLE, account: null };
   if (!who.valid) return { ...identity, state: LinkState.REVOKED, account: null };
   return {
@@ -177,10 +184,10 @@ export function describeLink(status) {
 // the switch above: lib/me.mjs prints it as its own line and the bridge's beezi_status appends it
 // to a lead-in, and the two had drifted into two sentences for one outcome.
 //
-// lib/accounts-cli.mjs keeps its own wording deliberately: that output IS the accounts skill, so a
-// remedy naming the accounts skill would send the reader where they already are.
+// lib/accounts-cli.mjs keeps its own wording deliberately: that output IS the settings skill (Account → Default account), so a
+// remedy naming the settings skill (Account → Default account) would send the reader where they already are.
 export const NO_DEFAULT_ACCOUNT =
-  'No default is set — run the accounts skill to choose which account analytics read from.';
+  'No default is set — run the settings skill (Account → Default account) to choose which account analytics read from.';
 
 // Analytics need both halves: a link and trusted hooks. Returns null when there is nothing to say.
 //

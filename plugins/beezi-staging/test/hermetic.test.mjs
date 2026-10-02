@@ -172,13 +172,14 @@ test('L2 — every root lib/paths.mjs resolves is inside the sandbox', () => {
   // while there were 29). A new accessor has to be added here deliberately, which is the point:
   // this sweep is the evidence that no root escapes the sandbox, and an accessor nobody added to
   // the count is an accessor nobody proved anything about.
-  assert.equal(roots.length, 26, `the path surface changed — add the new accessor's reasoning here`);
+  assert.equal(roots.length, 29, `the path surface changed — add the new accessor's reasoning here`);
   // The two roots a run must never touch, named rather than the whole home: on Windows the temp
   // directory sits under %USERPROFILE%, so "not under the home" would also forbid the sandbox.
   const forbidden = [path.join(REAL_HOME, '.codex'), path.join(REAL_HOME, '.beezi-codex')];
   // Keyed accessors REFUSE a missing key, so the sweep supplies one rather than skipping them:
   // an account directory that escaped the sandbox would be exactly as damaging as a root that
   // did, and skipping them would quietly shrink the surface this test proves.
+  // New paths: session workspace, per-account auth state, and telemetry send state.
   const PROBE_KEY = '0123abcd';
   for (const [name, fn] of roots) {
     const resolved = fn.length > 0 ? fn(PROBE_KEY) : fn();
