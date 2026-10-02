@@ -25,7 +25,10 @@ import {
 // retry after a crash reuses it instead of stranding the keyed entry the first attempt wrote.
 
 const INDEX_VERSION = 1;
-const FIELDS = ['email', 'name', 'tenantId', 'tenantName', 'clientId', 'linkedAt', 'status'];
+const FIELDS = [
+  'email', 'name', 'tenantId', 'tenantName', 'tenants', 'newFolders', 'workspaceRules',
+  'clientId', 'linkedAt', 'status',
+];
 
 export const AccountStatus = Object.freeze({ LINKED: 'linked', REVOKED: 'revoked' });
 
@@ -141,6 +144,9 @@ export async function migrateSingleAccount(deps = {}) {
     name: null,
     tenantId: null,
     tenantName: null,
+    tenants: null,
+    newFolders: null,
+    workspaceRules: [],
     clientId: legacy.client_id == null ? null : legacy.client_id,
     linkedAt: tracking && typeof tracking.linkedAt === 'string' ? tracking.linkedAt : null,
     status: AccountStatus.LINKED,
@@ -272,12 +278,6 @@ export async function findByEmail(email, deps = {}) {
   return (await listAccounts(deps)).find((a) => a.email != null && a.email.toLowerCase() === wanted) || null;
 }
 
-export async function findByTenant(tenantId, deps = {}) {
-  if (!tenantId) return null;
-  return (await listAccounts(deps))
-    .find((a) => a.tenantId === tenantId && a.status === AccountStatus.LINKED) || null;
-}
-
 export async function getDefaultKey(deps = {}) {
   return (await readIndex(deps)).default;
 }
@@ -302,6 +302,9 @@ export async function addAccount(row, deps = {}) {
       name: row.name == null ? null : row.name,
       tenantId: row.tenantId == null ? null : row.tenantId,
       tenantName: row.tenantName == null ? null : row.tenantName,
+      tenants: Array.isArray(row.tenants) ? row.tenants : null,
+      newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+      workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
       clientId: row.clientId == null ? null : row.clientId,
       linkedAt: row.linkedAt == null ? new Date().toISOString() : row.linkedAt,
       status: row.status == null ? AccountStatus.LINKED : row.status,
@@ -328,6 +331,84 @@ export async function updateAccount(key, patch, deps = {}) {
   });
 }
 
+// Where repos and folders with no rule send: ask, send (to tenantIds) or none; returns the stored value.
+export async function setNewFolders(key, { mode, tenantIds = [] } = {}, deps = {}) {
+  if (mode !== 'ask' && mode !== 'send' && mode !== 'none') {
+    throw new UserError(`Unknown New folders setting "${mode}". Use ask, send or none.`);
+  }
+  const ids = Array.isArray(tenantIds) ? tenantIds.filter((id) => typeof id === 'string' && id !== '') : [];
+  if (mode === 'send' && ids.length === 0) throw new UserError('Sending needs at least one workspace.');
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) throw new UserError('No such linked account.');
+    found.newFolders = { mode, tenantIds: mode === 'send' ? ids : [] };
+    writeIndex(index);
+    return found.newFolders;
+  });
+}
+
+// Loaded on use, outside the synchronous lock section, as linkedSessions loads token.mjs: keeps its
+// graph (workspace, audit-ledger → audit-flush → token) out of this module's static imports.
+function loadWorkspaceRules() {
+  return import('./workspace-rules.mjs');
+}
+
+// Adds a routing rule, or replaces the tenantIds of the one with the same kind and match in place; returns its 1-based number.
+export async function setWorkspaceRule(key, { kind, match, label = null, tenantIds } = {}, deps = {}) {
+  if (kind !== 'repo' && kind !== 'folder' && kind !== 'outside') {
+    throw new UserError(`Unknown rule kind "${kind}". Use repo, folder or outside.`);
+  }
+  const { rulesOf, outsideKey } = await loadWorkspaceRules();
+  // One outside rule per account, whatever match the caller passed.
+  if (kind === 'outside') ({ match, label } = outsideKey());
+  if (typeof match !== 'string' || match === '') throw new UserError('A rule needs a repository or folder to match.');
+  if (!Array.isArray(tenantIds) || tenantIds.some((id) => typeof id !== 'string' || id === '')) {
+    throw new UserError('A rule needs a list of workspace ids (none sends nowhere).');
+  }
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) throw new UserError('No such linked account.');
+    const stored = Array.isArray(found.workspaceRules) ? found.workspaceRules.slice() : [];
+    const existing = rulesOf({ workspaceRules: stored }).find((r) => r.kind === kind && r.match === match);
+    const rule = {
+      kind,
+      match,
+      label: typeof label === 'string' && label !== '' ? label : match,
+      tenantIds: tenantIds.slice(),
+      createdAt: existing != null && existing.createdAt != null ? existing.createdAt : new Date().toISOString(),
+    };
+    let n;
+    if (existing != null) {
+      stored[existing.index - 1] = rule;
+      n = existing.index;
+    } else {
+      stored.push(rule);
+      n = stored.length;
+    }
+    found.workspaceRules = stored;
+    writeIndex(index);
+    return { index: n, rule };
+  });
+}
+
+// Removes rule number n (1-based, as rulesOf numbers it); returns the removed rule.
+export async function removeWorkspaceRule(key, n, deps = {}) {
+  const { rulesOf } = await loadWorkspaceRules();
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) throw new UserError('No such linked account.');
+    const position = Number(n);
+    const rule = Number.isInteger(position) ? rulesOf(found).find((r) => r.index === position) : null;
+    if (rule == null) throw new UserError(`There is no rule ${n}. Ask the settings skill to list the rules.`);
+    found.workspaceRules.splice(position - 1, 1);
+    writeIndex(index);
+    return rule;
+  });
+}
+
 export async function removeAccount(key, deps = {}) {
   return mutate(deps, () => {
     const index = readIndexForMutation();
@@ -346,6 +427,12 @@ function sessionFor(a, auth) {
     email: a.email,
     name: a.name,
     tenantName: a.tenantName,
+    tenants: Array.isArray(a.tenants) ? a.tenants : null,
+    newFolders: a.newFolders != null && typeof a.newFolders === 'object' ? a.newFolders : null,
+    workspaceRules: Array.isArray(a.workspaceRules) ? a.workspaceRules : [],
+    // Always null on the base session: only a per-workspace clone sets it, and the row's own
+    // web-side tenantId never becomes X-Beezi-Tenant.
+    tenantId: null,
     token: auth.accessToken,
     // The stored row is the fallback, not the authority: the credential blob is what the refresh
     // actually rotated, so its client_id wins whenever it has one.
@@ -354,9 +441,10 @@ function sessionFor(a, auth) {
 }
 
 /**
- * The object every fan-out site loops over: one { key, email, name, tenantName, token, clientId }
- * per account that can currently produce a token. An account that cannot is DROPPED, never thrown
- * — a transient failure must cost one account, not the whole hook.
+ * The object every fan-out site loops over: one { key, email, name, tenantName, tenants,
+ * newFolders, workspaceRules, tenantId: null, token, clientId } per account that can currently
+ * produce a token. An account that cannot is DROPPED, never thrown — a transient failure must cost
+ * one account, not the whole hook.
  *
  * TWO PASSES, AND THE SECOND ONE IS NOT AN OPTIMISATION. getAuthentication takes
  * sharedLock('token-refresh-<key>') whenever a token needs renewing. That is rank 3 in LOCK_ORDER,
@@ -418,7 +506,7 @@ export async function resolveAccountRef(ref, deps = {}) {
     const found = accounts[Number(value) - 1];
     if (found) return found.key;
   }
-  throw new UserError(`No linked account matches "${value}". Run the accounts skill to list them.`);
+  throw new UserError(`No linked account matches "${value}". Run the settings skill (Account → Default account) to list them.`);
 }
 
 export async function parseAccountFlag(argv, deps = {}) {
@@ -427,7 +515,7 @@ export async function parseAccountFlag(argv, deps = {}) {
   for (let i = 0; i < argv.length; i += 1) {
     if (argv[i] === '--account') {
       ref = argv[++i];
-      if (ref == null) throw new UserError('--account needs a value: a key, an email, or a position from the accounts skill.');
+      if (ref == null) throw new UserError('--account needs a value: a key, an email, or a position from the settings skill (Account → Default account).');
       continue;
     }
     rest.push(argv[i]);

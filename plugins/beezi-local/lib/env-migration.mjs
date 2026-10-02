@@ -87,6 +87,7 @@ const DATA_ENTRIES = Object.freeze([
   'credentials.json', 'billing.json', 'repo-map.json', 'audit-ledger.json',
   'usage-observations.json', 'tracking.json', 'account-sync.json', 'telemetry.json',
   'watcher.json', 'coverage.json', 'accounts.json', 'accounts.migration.json',
+  'telemetry-send.json', 'installation.json',
 ]);
 
 function originOf(value) {
@@ -995,7 +996,7 @@ function migrationNotice(destination, credential) {
     lines.push('', 'Your previous sign-in was not carried over. Run /beezi:login to link this machine');
     lines.push('to production.');
   } else if (credential.cleared) {
-    lines.push('', 'Your previous sign-in could not be moved and was cleared. Run /beezi:login to');
+    lines.push('', 'Your previous sign-in could not be moved and was cleared. Run the login skill to');
     lines.push('link this machine to production.');
   }
   lines.push('', 'To roll back: node scripts/migrate-env.mjs --rollback');

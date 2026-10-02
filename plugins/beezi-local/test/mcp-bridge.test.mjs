@@ -25,6 +25,9 @@ const CLIENT_ID = 'c-a1b2c3d4';
 function accountDeps(readToken) {
   return {
     getDefaultKey: async () => (readToken() === null ? null : ACCOUNT_KEY),
+    getAccount: async (key) => (readToken() === null || key !== ACCOUNT_KEY
+      ? null
+      : { key: ACCOUNT_KEY, clientId: CLIENT_ID, status: 'linked', tenants: null }),
     getAuthentication: async () => ({ state: 'ready', accessToken: readToken(), clientId: CLIENT_ID }),
     listAccounts: async () => (readToken() === null
       ? []

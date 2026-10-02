@@ -1,3 +1,4 @@
+import { recordCoverageAttempts } from './session-coverage.mjs';
 import { fetchCompat } from './fetch-compat.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
@@ -154,7 +155,9 @@ async function readResponseBody(res) {
 // sessionGroups: [{ sessionId, reports: payload[] }] — order preserved.
 // `key` names the account this history is being uploaded to and is used for one thing: the 401
 // renewal below, which has to renew THAT account's token rather than "the" token. `session` is
-// { token, clientId } — the bearer and the machine row it belongs to, inseparable since 0.13.
+// { token, clientId } — the bearer and the machine row it belongs to, inseparable since 0.13 — and,
+// on a multi-workspace account, the caller's per-workspace clone: its `tenantId` becomes
+// X-Beezi-Tenant on every chunk (lib/http.mjs authHeaders) and survives the renewal's spread.
 // Returns { chunks, stored, skipped, itemErrors, retryableFailures, permanentRejections,
 //           unattributed, bySession: Map, halt, lastError }.
 export async function flushBackfillChunks(sessionGroups, key, session, deps = {}, options = {}) {
@@ -211,8 +214,11 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
 
   // `timelines` is omitted when empty so a chunk without them stays byte-identical to the
   // pre-timeline wire shape.
-  const post = async (chunk) =>
-    postJsonImpl(
+  const post = async (chunk) => {
+    if (!recordCoverageAttempts(key, session, chunk.reports)) {
+      throw new Error('Could not save workspace replay evidence; upload deferred.');
+    }
+    return postJsonImpl(
       url,
       session,
       chunk.timelines && chunk.timelines.length
@@ -220,6 +226,7 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
         : { sessions: chunk.reports },
       { fetchImpl, timeoutMs },
     );
+  };
 
   const setSession = (sessionId, status, reason) => {
     const existing = result.bySession.get(sessionId);
@@ -426,7 +433,7 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
 // COALESCEd), so retrying a lost response is safe.
 // It takes no account key, unlike flushBackfillChunks: there is no renewal on this path — one
 // small POST, and a 401 here is reported rather than retried — so a key would be an unused
-// parameter, not a contract.
+// parameter, not a contract. A per-workspace clone seals that workspace's pull only.
 export async function completeBackfill(session, deps = {}, options = {}) {
   const postJsonImpl = deps.postJsonImpl || postJson;
   const fetchImpl = deps.fetchImpl || fetchCompat;
