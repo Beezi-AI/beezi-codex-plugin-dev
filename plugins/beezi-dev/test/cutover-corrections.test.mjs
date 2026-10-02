@@ -15,7 +15,7 @@ import { accountSession, linkAccount, TEST_KEY } from '../tools/account-fixtures
 const SESSIONS = [accountSession(TEST_KEY, 'token')];
 
 function sandbox(t) {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), 'cutover-corrections-'));
+  const base = fs.realpathSync(fs.mkdtempSync(path.join(os.tmpdir(), 'cutover-corrections-')));
   const source = path.join(base, 'production'), destination = path.join(base, 'staging');
   fs.mkdirSync(source);
   const previous = process.env.BEEZI_CODEX_HOME;

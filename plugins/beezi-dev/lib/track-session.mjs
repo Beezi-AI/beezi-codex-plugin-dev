@@ -6,9 +6,11 @@ import {
   isUsableSessionId,
   resolveTranscriptByCwd as _resolveTranscriptByCwd,
 } from './transcript-codex.mjs';
+import { isMultiTenant, resolveTargets } from './workspace.mjs';
+import { createRouteContext, routeForDir, routeKeyForDir } from './workspace-rules.mjs';
 import { orDefault } from './compat.mjs';
 
-// What /beezi:track will report on, or a refusal — `{ ok: true, sessionId, transcriptPath }` or
+// What the track skill will report on, or a refusal — `{ ok: true, sessionId, transcriptPath }` or
 // `{ ok: false, message }`.
 //
 // This is where the strict id validation lives, and it is deliberately NOT in the resolver.
@@ -41,8 +43,26 @@ export function resolveTrackTarget(cwd, deps = {}) {
   return { ok: true, sessionId: transcript.sessionId, transcriptPath: transcript.transcriptPath };
 }
 
+// This folder's route key when a multi-workspace account holds its analytics for an answer: no rule
+// here and New folders on Ask me (the `rules` here: line with rule=none), else null.
+function heldHere(who, cwd, ctx) {
+  if (who == null || !isMultiTenant(who)) return null;
+  const key = routeKeyForDir(cwd, ctx());
+  if (key == null) return null;
+  const route = routeForDir(who, cwd, ctx());
+  return resolveTargets(who, { route: { [who.key]: route } }).pendingAsk ? key : null;
+}
+
+// A multi-workspace row's tenantName is the web-side workspace, so accounts are named by email.
+function accountName(who) {
+  if (isMultiTenant(who)) return orDefault(who.email, who.key);
+  return orDefault(orDefault(who.tenantName, who.email), who.key);
+}
+
 // The manual track flow for one session: checkpoint, flush, word the outcome.
-// Returns { ok, message, lines } (unprefixed); expected failures never throw.
+// Returns { ok, message, lines, pending } (unprefixed); expected failures never throw. `pending`
+// holds the skill's `pending=yes account=<key> kind=<…> match=<…>` lines, one per account whose
+// analytics for this folder wait for a workspace choice; they are never part of `message`.
 //
 // `lines` is the SAME text as `message`, split per account and each carrying its own verdict. The
 // two are not redundant: with several accounts linked, "analytics saved" and "the server rejected
@@ -124,13 +144,26 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
   const drains = orDefault(flushes, []);
   const many = drains.length > 1;
   const byKey = new Map(sessions.map((session) => [session.key, session]));
+  let routeCtx = null;
+  const ctx = () => {
+    if (routeCtx == null) routeCtx = createRouteContext();
+    return routeCtx;
+  };
   const lines = [];
+  const pending = [];
   let ok = true;
   for (const drain of drains) {
     const who = byKey.get(drain.key);
-    const name = who ? orDefault(orDefault(who.tenantName, who.email), who.key) : drain.key;
+    const name = who ? accountName(who) : drain.key;
     const saved = orDefault(drain.flushed, 0);
+    // Held for a workspace answer nothing has asked yet (no SessionStart ran): not "saved".
+    let here = null;
+    if (enqueued > 0 || orDefault(drain.workspacePending, 0) > 0) {
+      try { here = heldHere(who, cwd, ctx); } catch { here = null; }
+    }
+    if (here != null) pending.push(`pending=yes account=${who.key} kind=${here.kind} match=${here.match}`);
     let lineOk = true;
+    let held = false;
     let text;
     if (drain.failed) {
       lineOk = false;
@@ -138,23 +171,31 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
     } else if (drain.rejected) {
       lineOk = false;
       text = `Beezi: ${orDefault(drain.lastError, 'the server rejected this report')}.`;
+    } else if (here != null) {
+      // Both results when some segments went out (a subfolder's own rule, say) and the rest wait.
+      held = true;
+      text = saved > 0
+        ? `Beezi: analytics saved for ${label} (${saved} segment${saved === 1 ? '' : 's'}); the rest are held, not sent: no workspace is chosen for this folder yet.`
+        : `Beezi: analytics for ${label} are held, not sent: no workspace is chosen for this folder yet.`;
     } else if (enqueued === 0 && saved === 0) {
       text = `Beezi: nothing new to save for ${label} — already up to date.`;
     } else {
       text = `Beezi: analytics saved for ${label} (${saved} segment${saved === 1 ? '' : 's'}).`;
     }
     if (!lineOk) ok = false;
-    lines.push({ ok: lineOk, text: many ? `${name} — ${text}` : text });
+    const line = { ok: lineOk, text: many ? `${name} — ${text}` : text };
+    if (held) line.held = true;
+    lines.push(line);
   }
   if (lines.length === 0) {
     const nothing = `Beezi: nothing new to save for ${label} — already up to date.`;
-    return { ok: true, message: nothing, lines: [{ ok: true, text: nothing }] };
+    return { ok: true, message: nothing, lines: [{ ok: true, text: nothing }], pending };
   }
-  return { ok, message: lines.map((line) => line.text).join('\n'), lines };
+  return { ok, message: lines.map((line) => line.text).join('\n'), lines, pending };
 }
 
 // An outcome that belongs to no account: the session could not be identified, nothing is linked, or
 // the checkpoint never committed. One line, and it is not a success.
 function refusal(message) {
-  return { ok: false, message, lines: [{ ok: false, text: message }] };
+  return { ok: false, message, lines: [{ ok: false, text: message }], pending: [] };
 }

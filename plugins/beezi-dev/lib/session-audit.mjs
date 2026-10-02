@@ -17,6 +17,8 @@ import {
   saveCoverageCheckpoints as _saveCoverageCheckpoints,
   recordCoverageCheckpoint,
   checkpointLineFor,
+  attemptedLineFor,
+  attemptEvidence,
   currentBinding,
   decideReplay,
   syncEndpoint,
@@ -55,10 +57,13 @@ import { resolveTranscriptByCwd } from './transcript-codex.mjs';
 import { whoami as _whoami } from './whoami.mjs';
 import { credentialsFile, stateDir, beeziCodexHome } from './paths.mjs';
 import { readJson } from './fs-store.mjs';
+import { isMultiTenant, tenantsOf } from './workspace.mjs';
+import { createRouteContext, planSessionRoutes, waitingRoutes, rulesOf } from './workspace-rules.mjs';
 import {
   readTrackingState,
   matchesIdentity,
   isLiveTrackingAllowed,
+  isTenantDark,
   markBackfillCompleted,
   recordWhoami,
   linkedAtMs as _linkedAtMs,
@@ -284,6 +289,15 @@ function liveCursorOf(sessionId, deps) {
   return Number.isInteger((state || {}).cursor) && state.cursor > 0 ? state.cursor : 0;
 }
 
+// Ruling 16/20: with an attempted line, a segment another workspace (or none) took at or before it;
+// with the evidence missing, such a segment followed by one routed here. `elsewhere` holds from-lines.
+function splitHistory(attemptedLine, elsewhere, reports) {
+  if (attemptedLine !== null) return elsewhere.some((from) => from <= attemptedLine);
+  if (elsewhere.length === 0) return false;
+  const firstAway = Math.min.apply(null, elsewhere);
+  return reports.some((p) => p && p.is_subagent !== true && Number.isInteger(p.from_line) && p.from_line > firstAway);
+}
+
 // Run `worker` over `items` with at most `limit` in flight.
 async function mapLimited(items, limit, worker) {
   const queue = [...items];
@@ -323,7 +337,36 @@ export function shouldFinalize(result, options = {}) {
   // `empty` and `noRemote` never block: the first has nothing to upload, and the second can never
   // succeed (a rollout with no recorded cwd will have none on the next run either).
   if (result.retriableUnreadable > 0) return false;
+  // Repos still waiting for a rule may yet be routed here, so the one-time pull stays open for them.
+  if (result.routeDeferred > 0) return false;
+  // A workspace this run routed no session to has nothing from this machine to seal over; sealing
+  // it would close the pull on another machine that holds its history.
+  if (result.nothingRouted === true) return false;
   return true;
+}
+
+// Routes every past session of a multi-workspace account (its rule, else New folders) and lists, in row order, the workspaces any route or any rule reaches.
+// A rule's workspace is run even when no session route reaches it: a segment in its repo or folder routes there (runAudit keeps such sessions in).
+// markWaiting sets `waiting` on the routes waitingRoutes finds (New folders: Ask me only), the only ones that hold a seal.
+// `row` should be a linkedSessions() session: waitingRoutes binds the ledgers it reads to row.clientId.
+export function planWorkspaceRuns(row, { markWaiting = false } = {}) {
+  const entries = _listAllRollouts();
+  const ctx = createRouteContext();
+  const routes = planSessionRoutes(row, entries, ctx);
+  if (markWaiting) {
+    for (const sessionId of waitingRoutes(row, entries, ctx, { routes }).keys()) routes.get(sessionId).waiting = true;
+  }
+  const counts = { rule: 0, 'new-folders': 0, none: 0, pending: 0 };
+  const reached = new Set();
+  for (const route of routes.values()) {
+    if (counts[route.source] != null) counts[route.source] += 1;
+    for (const id of route.tenantIds) reached.add(id);
+  }
+  for (const rule of rulesOf(row)) for (const id of rule.tenantIds) reached.add(id);
+  // A workspace no route or rule reaches is never run; one only a rule reaches seals only once a
+  // run routes it a session (runAudit's nothingRouted).
+  const tenantIds = (tenantsOf(row) || []).map((t) => t.id).filter((id) => reached.has(id));
+  return { scanned: entries.length, routes, counts, tenantIds };
 }
 
 // Backfill every past Codex session on this machine into Beezi via the chunked backfill route,
@@ -336,6 +379,10 @@ export function shouldFinalize(result, options = {}) {
 // auditSession. It travels in `options` beside `mode`, `force` and `since` rather than as a
 // positional argument because it is the same kind of thing they are: a caller-driven choice,
 // parsed off argv, not a seam.
+//
+// A multi-workspace account runs once per workspace: `options.tenantId` names it (without one the
+// run returns `workspace-required`), and `options.sessionRoutes` (planWorkspaceRuns().routes, or
+// null for an unrouted --tenant override) keeps only the sessions routed to it.
 export async function runAudit(deps = {}, options = {}) {
   const acquire = orDefault(deps.acquireLockImpl, _acquireLock);
   let lock;
@@ -451,10 +498,18 @@ function emptyAuditResult(options = {}) {
     deferred: 0,
     deferredUnavailable: 0,
     deferredGap: 0,
+    // Multi-workspace sync only: sessions whose lines for this workspace are split between
+    // workspaces (Ruling 16). A later run does not repair them.
+    deferredSplit: 0,
     deferredOverlap: 0,
     // Sessions replayed from above line 0, whose subagent segments were therefore NOT swept.
     // See the child repair policy in lib/session-coverage.mjs.
     childrenDeferred: 0,
+    // Multi-workspace runs only: sessions whose route leaves this workspace out, and those of them still waiting for a rule.
+    routedElsewhere: 0,
+    routeDeferred: 0,
+    // Multi-workspace runs only: no session was routed to this workspace, so its pull stays open.
+    nothingRouted: false,
     lastError: null,
   };
 }
@@ -496,6 +551,19 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   }
   const key = session.key;
 
+  // A multi-workspace account never sends headerless: the caller names the workspace. Cloned HERE,
+  // before anything reassigns `session`, so every request below (whoami, drain, coverage,
+  // registration, chunks, error follow-ups, seal) carries X-Beezi-Tenant. A single-workspace
+  // account keeps its session untouched and headerless; its tenantId stays null for the ledger and
+  // coverage files too.
+  const multi = isMultiTenant(session);
+  const tenantId = multi && options.tenantId != null ? options.tenantId : null;
+  if (multi && tenantId == null) {
+    result.reason = 'workspace-required';
+    return result;
+  }
+  if (multi) session = { ...session, tenantId };
+
   // The binding key for the ledger and the tracking cache. It used to be a process-global primed
   // by getAccessToken; that global is gone, because with several accounts linked it would bind one
   // account's ledger under another's id. It is this account's own client id, carried on the
@@ -513,7 +581,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // The repair pass rides the tracking-policy-aware sync route and must NOT be a way around an
   // audit-only tenant's restrictions. Checked locally first so the run refuses cleanly instead of
   // taking one 403 per chunk; a server that refuses anyway still halts on FORBIDDEN below.
-  if (syncMode && trackingValid && !isLiveTrackingAllowed(key, deps)) {
+  // The account-wide mode describes the web workspace, so a multi-workspace run asks about its own.
+  if (syncMode && trackingValid && (multi ? isTenantDark(tracking, tenantId) : !isLiveTrackingAllowed(key, deps))) {
     result.ok = true;
     result.reason = 'audit-only';
     result.upgradeAdvised = true;
@@ -558,7 +627,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // All three seal short-circuits are !syncMode-guarded. The one-time import being finished is
   // exactly the state a user runs the repair pass in, and R2 forbids the replay from either
   // honouring or reopening that seal.
-  if (!syncMode && !options.force && trackingValid && (tracking || {}).backfillCompleted === true) {
+  //
+  // The sealed flag is per account, so it cannot vouch for one of several workspaces.
+  if (!syncMode && !options.force && !multi && trackingValid && (tracking || {}).backfillCompleted === true) {
     result.ok = true;
     result.reason = 'already-completed';
     result.upgradeAdvised = tracking.trackingMode != null && tracking.trackingMode !== TrackingMode.LIVE;
@@ -571,9 +642,15 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // the chunk-level ALREADY_COMPLETED guard still stands behind us.
   const who = await whoamiImpl(session, { fetchImpl }).catch(() => null);
   if (who && who.valid) {
-    try { recordWhoamiImpl(key, who, identity); } catch { /* best-effort */ }
+    // One workspace's answer must not overwrite a multi-workspace account's cache, which the
+    // headerless whoami at session start owns.
+    if (!multi) {
+      try { recordWhoamiImpl(key, who, identity); } catch { /* best-effort */ }
+    }
     if (!syncMode && who.backfillCompleted === true) {
-      try { markCompleted(key); } catch { /* best-effort */ }
+      if (!multi) {
+        try { markCompleted(key); } catch { /* best-effort */ }
+      }
       result.ok = true;
       result.reason = 'already-completed';
       result.upgradeAdvised = who.trackingMode != null && who.trackingMode !== TrackingMode.LIVE;
@@ -589,10 +666,19 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     }
   }
 
-  const ledger = loadLedger(key, identity);
+  // Each workspace of a multi-workspace account keeps its own ledger, so one import never blocks the rest.
+  const ledger = loadLedger(key, identity, tenantId);
   if (!syncMode && !options.force && isComplete(ledger)) {
     result.ok = true;
     result.reason = 'already-completed';
+    return result;
+  }
+
+  // Only this workspace's own whoami says which sessions live tracking already sent it. Without
+  // that answer the one-time import would re-send them, so it stops for this workspace instead.
+  if (multi && !syncMode && !(who && who.valid === true)) {
+    result.reason = 'whoami-failed';
+    result.lastError = who ? 'sign-in refused' : 'no answer';
     return result;
   }
 
@@ -603,16 +689,46 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // Live-tracking tenants: everything since the machine link was tracked live; re-sending it
   // would double-count once its per-session cursor was pruned. Dark-mode tenants never tracked
   // live, so every transcript is fair game.
-  const liveMode = trackingValid && (tracking || {}).trackingMode === TrackingMode.LIVE;
+  // The account-wide cache describes the web workspace; a multi-workspace run uses this workspace's own whoami.
+  const liveMode = multi
+    ? who != null && who.valid === true && who.trackingMode === TrackingMode.LIVE
+    : trackingValid && (tracking || {}).trackingMode === TrackingMode.LIVE;
   const linkCutoffMs = liveMode ? linkedAtMs(key, deps) : null;
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
   const ageCutoffMs = now() - MAX_SESSION_AGE_MS;
+  const sessionRoutes = orDefault(options.sessionRoutes, null);
+  // A rule that sends to this workspace can route single segments of any session here, so the
+  // import and sync inspect rule-reachable sessions too. Reconciliation below visibly defers
+  // sparse history whenever the server prefix cannot establish a safe replay boundary.
+  const ruleReachesHere = multi && rulesOf(session).some((rule) => rule.tenantIds.indexOf(tenantId) !== -1);
+  // Sessions kept only for that reason: one that yields nothing here was routed elsewhere, not empty.
+  const viaRuleOnly = new Set();
+  // Sessions this run routes here: by their own route, or by a rule that yields reports here.
+  let routedHere = 0;
 
   const candidates = [];
   for (const entry of all) {
     if (live && (entry.sessionId === live.sessionId || entry.transcriptPath === live.transcriptPath)) {
       result.live += 1;
       continue;
+    }
+    // Filtered before the ledger, so a later rule can still send it here.
+    if (sessionRoutes != null) {
+      const route = sessionRoutes.get(entry.sessionId);
+      if (route == null || route.tenantIds.indexOf(tenantId) === -1) {
+        // Holds the seal only for a waiting session this run would take if a rule sent it here:
+        // not one live tracking owns, and not one past the 30-day window.
+        if (route != null && route.waiting === true
+          && !(!syncMode && linkCutoffMs != null && entry.mtimeMs >= linkCutoffMs)
+          && entry.mtimeMs >= ageCutoffMs) {
+          result.routeDeferred += 1;
+        }
+        if (!ruleReachesHere) {
+          result.routedElsewhere += 1;
+          continue;
+        }
+        viaRuleOnly.add(entry.sessionId);
+      } else routedHere += 1;
     }
     // Kept in BOTH modes: a rollout still being written is an open session in another window, and
     // R2 requires reconciliation to coordinate with live writers rather than race them.
@@ -643,11 +759,18 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // non-overlapping start line can be PROVEN. Sessions where it cannot are dropped from the run
   // with a visible, retryable status — never replayed from zero on a guess.
   const startCursors = new Map();
+  // Multi-workspace sync decides after the parse (Ruling 16): `splitChecks` holds the attempted line
+  // no other workspace's segment may precede for a contiguous resume (null: the evidence is missing,
+  // Ruling 20), and `gapDeferred` the sessions the single-workspace decision defers, parsed only to
+  // see whether they owe this workspace anything.
+  const splitChecks = new Map();
+  const gapDeferred = new Set();
   // Loaded in BOTH modes. The one-time import delivering a session is exactly as much proof of
   // what the server holds as a repair pass delivering one, and recording it during the import is
   // what gives the FIRST repair pass something to detect a gap against.
   const coverageBinding = currentBinding(identity);
-  const coverageRecord = loadCoverage(key, coverageBinding);
+  // Per workspace on a multi-workspace account: each one answers /sessions/coverage for itself.
+  const coverageRecord = loadCoverage(key, coverageBinding, {}, tenantId);
   let coverageDirty = false;
   if (syncMode && candidates.length > 0) {
     const coverage = await fetchCoverage(
@@ -659,12 +782,27 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     result.coverageKnown = coverage !== null;
     const eligible = [];
     for (const entry of candidates) {
+      const attemptedLine = multi
+        ? attemptEvidence(coverageRecord, entry.sessionId, entry.transcriptPath)
+        : attemptedLineFor(coverageRecord, entry.sessionId);
+      // Decided as single-workspace Codex decides it. On an account in several workspaces that is
+      // the verdict for contiguous history; a split is ruled out after the parse.
       const verdict = decideReplay(entry.sessionId, {
         coverage,
+        attemptedLine,
+        contiguous: multi,
         checkpointLine: checkpointLineFor(coverageRecord, entry.sessionId),
         localCursor: liveCursorOf(entry.sessionId, deps),
         ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
       });
+      if (multi && verdict.reason !== DeferReason.UNAVAILABLE) {
+        // Parsed from the prefix either way: only that parse shows whether any of it routes here.
+        startCursors.set(entry.sessionId, verdict.stored);
+        if (attemptedLine === null || attemptedLine > verdict.stored) splitChecks.set(entry.sessionId, attemptedLine);
+        if (verdict.decision === ReplayDecision.DEFER) gapDeferred.add(entry.sessionId);
+        eligible.push(entry);
+        continue;
+      }
       if (verdict.decision === ReplayDecision.DEFER) {
         result.deferred += 1;
         if (verdict.reason === DeferReason.UNAVAILABLE) result.deferredUnavailable += 1;
@@ -727,6 +865,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   }
 
   const finalize = async () => {
+    result.nothingRouted = multi && sessionRoutes != null && routedHere === 0;
     if (!shouldFinalize(result, options)) return;
     // Ownership is re-checked immediately before the ONE irreversible act in this file. A run that
     // lost its lock has been overlapped by another run whose progress this one cannot see, and
@@ -740,8 +879,11 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     if (sealed.completed || sealed.code === 'BACKFILL_ALREADY_COMPLETED') {
       result.finalized = true;
       markComplete(ledger);
-      try { saveLedger(key, ledger); } catch { /* best-effort */ }
-      try { markCompleted(key); } catch { /* best-effort */ }
+      try { saveLedger(key, ledger, tenantId); } catch { /* best-effort */ }
+      // The account-wide flag cannot speak for one of several workspaces; their ledgers do.
+      if (!multi) {
+        try { markCompleted(key); } catch { /* best-effort */ }
+      }
     } else {
       result.lastError = orDefault(sealed.reason, result.lastError);
     }
@@ -757,7 +899,11 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
 
   // Rate-limit error follow-ups hit a tracking-gated route: a dark-mode tenant would take one
   // 403 per session. Timelines are exempt — they ride inside the backfill chunks themselves.
-  const followupsAllowed = !trackingValid || isLiveTrackingAllowed(key, deps);
+  // A multi-workspace run asks this workspace: its own whoami's mode (fail-open), and its dark mark.
+  const followupsAllowed = multi
+    ? !isTenantDark(tracking, tenantId) && !(who && who.valid === true
+      && (who.trackingMode === TrackingMode.BACKFILL_ONLY || who.trackingMode === TrackingMode.DISABLED))
+    : !trackingValid || isLiveTrackingAllowed(key, deps);
   result.followupsAllowed = followupsAllowed;
 
   // Accumulated but not yet delivered. Bounded by the same caps the request planner uses, so
@@ -823,7 +969,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       if (status === BackfillSessionStatus.ACCEPTED || status === BackfillSessionStatus.PARTIAL) {
         result.sessionsImported += 1;
         landed.push(group.sessionId);
-        // The durable coverage checkpoint, and the ONLY thing that writes one: a parent line the
+        // The delivered checkpoint (separate from pre-POST attempt evidence): a parent line the
         // server has now accepted from this machine. Written for both modes — it is the evidence
         // that later tells a mid-session coverage gap apart from a session that never landed, and
         // it is what makes ledger membership unnecessary as a coverage claim. It lives outside
@@ -876,9 +1022,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       }
     }
     // Written per dispatch, not once at the end, so Ctrl-C keeps the progress made so far.
-    try { saveLedger(key, ledger); } catch { /* best-effort */ }
+    try { saveLedger(key, ledger, tenantId); } catch { /* best-effort */ }
     if (coverageDirty) {
-      saveCoverage(key, coverageRecord);
+      saveCoverage(key, coverageRecord, tenantId);
       coverageDirty = false;
     }
 
@@ -889,8 +1035,10 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       // somehow provoked this halt must leave the local caches exactly as it found them.
       if (!syncMode && flushed.halt === BackfillHalt.ALREADY_COMPLETED) {
         markComplete(ledger);
-        try { saveLedger(key, ledger); } catch { /* best-effort */ }
-        try { markCompleted(key); } catch { /* best-effort */ }
+        try { saveLedger(key, ledger, tenantId); } catch { /* best-effort */ }
+        if (!multi) {
+          try { markCompleted(key); } catch { /* best-effort */ }
+        }
       }
       return;
     }
@@ -960,6 +1108,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // Backfill has no coverage answer and never had one: persistState:false already starts it at
     // line 0, which is the whole-history read the one-time import is for.
     const startCursor = syncMode ? orDefault(startCursors.get(entry.sessionId), 0) : 0;
+    // Parent lines the current rules send to another workspace (or none), for the split check.
+    const splitAt = splitChecks.get(entry.sessionId);
+    const elsewhere = [];
     try {
       // transcript_path is passed through so runCheckpoint's resolver takes it as-is instead of
       // walking the whole rollout tree per session; cwd rode in on the discovery head-read.
@@ -973,12 +1124,22 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         // caller handed in. Unforwarded it was the one reader the audit could not steer, and the
         // suite's only protection against `git` running against the developer's own repository is
         // that seam — tools/hermetic-env.mjs records the spawn but does not stop it.
+        //
+        // `session` is this run's clone. On a multi-workspace account its tenantId is the preset
+        // workspace: the checkpoint routes each segment by its own directory's rule and hands the
+        // sink only what routes here — or, under `unrouted` (a --tenant override), every segment.
         {
           linkedSessions: async () => [session], fetchImpl, gitImpl: deps.gitImpl, recoveryPermit: lockHandle.token,
           findSubagentRollouts: findSubagents,
         },
         {
           sink: (payload) => reports.push({ ...payload, ...subscriptionIdentity }),
+          ...(splitAt === undefined ? {} : {
+            elsewhere: (payload) => {
+              if (payload && payload.is_subagent !== true && Number.isInteger(payload.from_line)) elsewhere.push(payload.from_line);
+            },
+          }),
+          unrouted: sessionRoutes == null,
           skipFlush: true,
           collectSessionErrors: true,
           persistState: false,
@@ -1010,24 +1171,54 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       agents = orDefault((checkpoint || {}).agents, {});
       if (syncMode) result.childrenDeferred += orDefault((checkpoint || {}).childrenSkipped, 0);
     } catch {
+      processed += 1;
+      // A session parsed only to classify its deferral stays deferred when the parse fails.
+      if (gapDeferred.has(entry.sessionId)) {
+        result.deferred += 1;
+        result.deferredGap += 1;
+        continue;
+      }
       // One unreadable transcript must not end the run — but it is no longer silent.
       result.unreadable += 1;
       noteUnreadable(entry.sessionId);
-      processed += 1;
       continue;
     }
     processed += 1;
     if (syncMode) fillSubagents(reports, entry, startCursor, ledger, result, rolloutStartedAtImpl);
     if (reports.length === 0) {
+      if (gapDeferred.has(entry.sessionId)
+        && ((skipped && skipped.deltaFailed) || orDefault((skipped || {}).emitFailed, 0) > 0)) {
+        result.deferred += 1;
+        result.deferredGap += 1;
+        continue;
+      }
       // Classify rather than drop on the floor. `empty` is the only benign outcome, so it is the
       // fallback ONLY once every reason worth reporting has been ruled out — telling a user that
       // a session we failed to upload "held no usage data" is the silent loss this exists to end.
+      // A deferred multi-workspace session with nothing here owes this workspace nothing more.
       if (skipped && skipped.deltaFailed) {
         result.unreadable += 1;
         noteUnreadable(entry.sessionId);
       } else if (orDefault((skipped || {}).emitFailed, 0) > 0) result.emitFailed += 1;
+      else if (viaRuleOnly.has(entry.sessionId)) result.routedElsewhere += 1;
       else if (orDefault((skipped || {}).noRemote, 0) > 0) result.noRemote += 1;
       else result.empty += 1;
+      continue;
+    }
+    if (viaRuleOnly.has(entry.sessionId)) routedHere += 1;
+
+    // Ruling 16: a segment another workspace (or none) took before this workspace's last attempted
+    // line splits its history, and resuming from the prefix would re-send what it may already
+    // hold past that gap. Contiguous history resumes like a single-workspace account's. Without
+    // attempt evidence, any such segment followed by one routed here counts as split (Ruling 20).
+    if (splitAt !== undefined && splitHistory(splitAt, elsewhere, reports)) {
+      result.deferred += 1;
+      result.deferredSplit += 1;
+      continue;
+    }
+    if (gapDeferred.has(entry.sessionId)) {
+      result.deferred += 1;
+      result.deferredGap += 1;
       continue;
     }
 
@@ -1056,6 +1247,10 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       if (Number.isInteger(payload.to_line) && payload.to_line > parentMaxLine) parentMaxLine = payload.to_line;
     }
 
+    // Session-level data goes only where the live path sends it: the session's own route. One kept
+    // only because a rule sends some of its segments here gets those reports and nothing else.
+    const sessionLevel = !viaRuleOnly.has(entry.sessionId);
+
     // Timeline travels with the session's own chunk. Best-effort: a timeline that fails to
     // compute never blocks the usage upload. The agent map is handed over rather than re-read —
     // the checkpoint's sweep entries are ones the (possibly pruned) sidecars would not show.
@@ -1064,7 +1259,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // the server REPLACES a session's timeline, and its subagent spans come only from hook sidecars,
     // which are pruned at 14 days — re-deriving it here could wipe spans the server already has.
     let timeline = null;
-    if (parentReports.length > 0) {
+    if (sessionLevel && parentReports.length > 0) {
       try {
         const computed = computeSessionTimeline(entry.transcriptPath, entry.sessionId, {
           readAgents: () => agents,
@@ -1079,7 +1274,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       } catch { /* best-effort */ }
     }
 
-    followups.set(entry.sessionId, { sessionErrors });
+    followups.set(entry.sessionId, { sessionErrors: sessionLevel ? sessionErrors : [] });
     pending.push({ sessionId: entry.sessionId, reports, timeline, parentMaxLine });
     pendingBytes += Buffer.byteLength(JSON.stringify({ reports, timeline }), 'utf-8');
     pendingItems += reports.length;
@@ -1091,10 +1286,10 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // A run can hit unreadable transcripts and dispatch nothing at all, so this cannot ride on the
   // per-dispatch save — without it the retry marker is lost and the next run blocks again.
   if (unreadableDirty) {
-    try { saveLedger(key, ledger); } catch { /* best-effort */ }
+    try { saveLedger(key, ledger, tenantId); } catch { /* best-effort */ }
   }
   if (coverageDirty) {
-    saveCoverage(key, coverageRecord);
+    saveCoverage(key, coverageRecord, tenantId);
     coverageDirty = false;
   }
 

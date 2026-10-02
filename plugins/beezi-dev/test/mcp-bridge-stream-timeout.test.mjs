@@ -25,6 +25,9 @@ const URL_UNDER_TEST = 'https://api.test/api/mcp';
 // resolution itself runs against the real modules in test/account-bridge.test.mjs.
 const LINKED_ACCOUNT = {
   getDefaultKey: async () => 'a1b2c3d4',
+  getAccount: async (key) => (key === 'a1b2c3d4'
+    ? { key, clientId: 'c-a1b2c3d4', status: 'linked', tenants: null }
+    : null),
   getAuthentication: async () => ({ state: 'ready', accessToken: 'tok', clientId: 'c-a1b2c3d4' }),
   listAccounts: async () => [{ key: 'a1b2c3d4', clientId: 'c-a1b2c3d4', status: 'linked' }],
 };
