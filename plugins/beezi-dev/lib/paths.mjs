@@ -368,10 +368,23 @@ export function codexHooksFile() {
   return path.join(codexHome(), 'hooks.json');
 }
 
+// Codex's global instructions file — the USER'S, read into every session's context. Beezi only
+// ever adds or removes its own marked block there (lib/agents-notice.mjs): it is the one channel
+// measured to reach the model, where MCP `initialize.instructions` do not.
+export function codexAgentsFile() {
+  return path.join(codexHome(), 'AGENTS.md');
+}
+
 // Where the installer writes its launcher scripts. Each is a single-token executable so the
 // `command` field never depends on how Codex splits arguments or resolves `node` on PATH.
 export function hookLauncherDir() {
   return path.join(beeziCodexHome(), 'hooks');
+}
+
+// The last measured answer to "does Codex trust our hooks" (lib/hook-trust.mjs). Machine-level:
+// the hooks belong to the machine, not to an account. Root-level for the pruneStale() reason above.
+export function hookTrustFile() {
+  return path.join(beeziCodexHome(), 'hook-trust.json');
 }
 
 // ── the per-account layout ────────────────────────────────────────────────────────────────────

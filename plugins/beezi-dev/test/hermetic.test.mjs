@@ -172,7 +172,11 @@ test('L2 — every root lib/paths.mjs resolves is inside the sandbox', () => {
   // while there were 29). A new accessor has to be added here deliberately, which is the point:
   // this sweep is the evidence that no root escapes the sandbox, and an accessor nobody added to
   // the count is an accessor nobody proved anything about.
-  assert.equal(roots.length, 29, `the path surface changed — add the new accessor's reasoning here`);
+  // 30: hookTrustFile() (lib/hook-trust.mjs's cached verdict) joins beeziCodexHome(), so the
+  // sweep below proves it lands in the sandbox the same way the other root-level files do.
+  // 31: codexAgentsFile() (~/.codex/AGENTS.md, lib/agents-notice.mjs) joins codexHome(), so a run
+  // can never write the reminder block into the developer's real global instructions file.
+  assert.equal(roots.length, 31, `the path surface changed — add the new accessor's reasoning here`);
   // The two roots a run must never touch, named rather than the whole home: on Windows the temp
   // directory sits under %USERPROFILE%, so "not under the home" would also forbid the sandbox.
   const forbidden = [path.join(REAL_HOME, '.codex'), path.join(REAL_HOME, '.beezi-codex')];
