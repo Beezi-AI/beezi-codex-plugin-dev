@@ -6,6 +6,7 @@
 // The raw text stays reachable behind BEEZI_DEBUG for troubleshooting.
 
 import { orDefault } from './compat.mjs';
+import { inCodexSandbox, SANDBOXED_CREDENTIAL_STORE_MESSAGE } from './codex-sandbox.mjs';
 
 export class UserError extends Error {
   constructor(message) {
@@ -56,6 +57,8 @@ function isBadJson(error) {
 
 export function friendlyMessage(error, { env = process.env } = {}) {
   if (error && error.userFacing) return error.message;
+
+  if (error && error.storeUnreadable && inCodexSandbox(env)) return SANDBOXED_CREDENTIAL_STORE_MESSAGE;
 
   if (isTimeout(error)) {
     return 'The login server took too long to respond. Check BEEZI_API_URL, then try again.';
