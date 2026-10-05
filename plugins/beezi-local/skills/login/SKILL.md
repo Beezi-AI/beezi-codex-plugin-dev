@@ -134,9 +134,10 @@ repo or folder, when a session starts there"), "Send to…" ("Pick the workspace
 
 Write the command's first line verbatim. A skipped question runs nothing (the next login asks again).
 
-This step's `new-folders ask|send|none` and `rule add` commands write Beezi's settings under the
-user's home, outside the workspace: if the sandbox refuses one, run it again with escalated
-permissions so the user can approve it.
+This step's `new-folders ask|send|none` and `rule add` commands read Beezi's sign-in from the system
+credential store and write Beezi's settings under the user's home, outside the workspace, so the
+sandbox cannot run them: run each with escalated permissions from the start so the user can approve
+it.
 
 **Then this session's own folder.** A session that started before this account was linked was never
 asked where its analytics go, and under Ask me they would wait. Only when the setting is now Ask me —
@@ -325,9 +326,10 @@ the last choice was picked (it wins over the others). Never rebuild the command 
 yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
 sent this time, and the next login or the `sync` skill asks again.
 
-Write each command's first line verbatim. The rule commands write Beezi's settings under the user's
-home, outside the workspace: if the sandbox refuses one, run it again with escalated permissions so
-the user can approve it.
+Write each command's first line verbatim. The rule commands read Beezi's sign-in from the system
+credential store and write Beezi's settings under the user's home, outside the workspace, so the
+sandbox cannot run them: run each with escalated permissions from the start so the user can approve
+it.
 
 #### Step 4b — the one-time upload
 

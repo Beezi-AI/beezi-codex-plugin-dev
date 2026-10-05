@@ -597,6 +597,14 @@ Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
   under `codex exec`. "One-time" is what the design guarantees rather than an observation: an
   upgrade changes only the launcher file the entries point at, so the entry bytes Codex hashes are
   unchanged and there is nothing for it to distrust.
+- **A sandboxed skill command cannot reach the macOS keychain.** Read from Codex's source, not
+  measured: the Seatbelt base profile has no `com.apple.SecurityServer` lookup — only the
+  network-enabled profile adds it — so a `node scripts/<x>.mjs` the model runs under the sandbox
+  reads the keychain as empty, while hooks and the MCP server, which Codex spawns unsandboxed, read
+  it fine. Sandbox and network settings can differ per project, which is the likely reason one
+  folder works and another does not.
+  The guard recognises it (Codex sets `CODEX_SANDBOX` on a sandboxed command), still refuses, and
+  tells the model to run the command again with escalated permissions.
 - **`SessionEnd` is not registered.** It is out of scope for this release, and the reason is
   `Stop`: that hook already runs the same checkpoint, timeline included, at every turn end, so a
   `SessionEnd` entry would cost you one more hook to review and trust for work already done.

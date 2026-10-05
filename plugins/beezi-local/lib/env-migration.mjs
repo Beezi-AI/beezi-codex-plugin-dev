@@ -17,6 +17,7 @@ import {
   readRawCredential, deleteRawCredential, serviceFor, preserveMigrationCredential,
   tombstoneMigrationCredential, subjectCredentialsPath, subjectAuthorityPath, LEGACY_SUBJECT,
 } from './credentials.mjs';
+import { inCodexSandbox, SANDBOXED_CREDENTIAL_STORE_MESSAGE } from './codex-sandbox.mjs';
 
 // ── The production cutover guard (G-1-2, R1) ────────────────────────────────────────────────
 // R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
@@ -592,6 +593,11 @@ function clearStaleSignIns(deps) {
 export function ensureEnvironmentMigrated(deps = {}) {
   try { return ensureEnvironmentMigratedImpl(deps); }
   catch (error) {
+    // Still blocked — only the wording changes, and only for an OS store that answered with nothing
+    // inside Codex's sandbox. Escalated, the same command reads it.
+    if (error && error.storeUnreadable && inCodexSandbox(orDefault(deps.processEnv, process.env))) {
+      return { status: 'blocked', reason: 'credential-store-sandboxed', message: SANDBOXED_CREDENTIAL_STORE_MESSAGE };
+    }
     return { status: 'blocked', reason: 'inspection-or-migration-failed', message: `Beezi: environment verification failed (${error.message}). No uploads are permitted.` };
   }
 }

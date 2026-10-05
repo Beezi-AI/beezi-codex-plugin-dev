@@ -17,9 +17,10 @@ summarized, paraphrased or reformatted (a markdown table stays a table). Machine
 lines, and every line of an output you are told not to show) are never shown. A command that fails
 prints a line starting `✗`: show that line verbatim and stop.
 
-The commands that change a setting write Beezi's settings under the user's home, outside the
-workspace: if the sandbox refuses one, run it again with escalated permissions so the user can
-approve it.
+The commands that change a setting read Beezi's sign-in from the system credential store and write
+Beezi's settings under the user's home, outside the workspace, so the sandbox cannot run them: run
+each with escalated permissions from the start so the user can approve it. Any other command here
+that prints a `✗` line naming the sandbox: run it again with escalated permissions.
 
 ## Asking
 

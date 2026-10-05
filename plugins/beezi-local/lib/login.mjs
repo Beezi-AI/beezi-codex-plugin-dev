@@ -37,13 +37,13 @@ const LAUNCH_TIMEOUT_MS = 5000;
 // waiting for. Not detached-and-forgotten either: under a sandboxed shell (Codex sandboxes what it
 // runs) or on a machine with no http association, a launcher that fails silently leaves the user
 // staring at a spinner with nothing to go on. Resolves { ok } | { ok: false, detail }.
-function launch(file, args, env) {
+function launch(file, args, env, spawn) {
   return new Promise((resolve) => {
     let child;
     try {
       // stderr piped, not ignored: ShellExecute failures ("No application is associated with the
       // specified file for this operation") are reported by the launcher, not by the spawn.
-      child = childProcess.spawn(file, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env });
+      child = spawn(file, args, { stdio: ['ignore', 'ignore', 'pipe'], windowsHide: true, env });
     } catch (error) {
       resolve({ ok: false, detail: orDefault((error || {}).message, String(error)) });
       return;
@@ -74,11 +74,14 @@ function launch(file, args, env) {
 
 // Ask the OS to open `url` in the user's browser. Resolves { ok } | { ok: false, detail } — never
 // rejects, and never throws: the caller has the URL and can always fall back to showing it.
-export async function openBrowser(url) {
+// `deps.spawn` is the test seam: a launcher that cannot start is still a real spawn otherwise, and
+// the hermetic suite counts every real spawn as an escape.
+export async function openBrowser(url, deps = {}) {
   // The URL comes from the server response — never pass it through a shell. Require a
   // plain http(s) URL and hand it to the launcher as a single argv element (no shell,
   // no interpolation), so it cannot smuggle command-line metacharacters.
   if (!/^https?:\/\//i.test(url)) return { ok: false, detail: 'refusing to open a non-http(s) URL' };
+  const spawn = deps.spawn || ((file, args, options) => childProcess.spawn(file, args, options));
   try {
     if (process.platform === 'win32') {
       const sysRoot = process.env.SystemRoot || 'C:\\Windows';
@@ -92,10 +95,11 @@ export async function openBrowser(url) {
         powershell,
         ['-NoProfile', '-NonInteractive', '-Command', 'Start-Process $env:BEEZI_LOGIN_URL'],
         { ...process.env, BEEZI_LOGIN_URL: url },
+        spawn,
       );
     }
-    if (process.platform === 'darwin') return await launch('/usr/bin/open', [url], process.env);
-    return await launch('xdg-open', [url], process.env);
+    if (process.platform === 'darwin') return await launch('/usr/bin/open', [url], process.env, spawn);
+    return await launch('xdg-open', [url], process.env, spawn);
   } catch (error) {
     return { ok: false, detail: orDefault((error || {}).message, String(error)) };
   }
