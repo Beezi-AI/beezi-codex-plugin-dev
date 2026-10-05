@@ -1,9 +1,10 @@
 import { getDefaultKey, listAccounts } from './accounts.mjs';
 import { accountHealth, healHooks } from './me.mjs';
-import { currentSessionWorkspace, describeTenant, isMultiTenant, newFoldersOf, tenantById, tenantsOf } from './workspace.mjs';
+import { currentSessionWorkspace, describeTenant, isMultiTenant, isSingleTenant, newFoldersOf, tenantById, tenantsOf } from './workspace.mjs';
 import { createRouteContext, routeForDir, routeKeyForDir, rulesOf, rulesTableLines, shortLabel } from './workspace-rules.mjs';
 import { readBillingConfig, resolveSource } from './billing-config.mjs';
 import { BillingSource } from './billing.mjs';
+import { isLiveTrackingAllowed } from './tracking.mjs';
 import { crashMode } from './diagnostics.mjs';
 import { UserError, friendlyMessage } from './friendly-error.mjs';
 
@@ -45,6 +46,18 @@ function thisFolder(row, dir, ctx) {
   if (newFolders.mode === 'none') return `${place} → not uploaded (new folders: don't send)`;
   // Not "asks at the next session start": with the hooks untrusted no session start runs.
   return `${place} → no rule yet (choose in the settings skill)`;
+}
+
+// This folder's status for a one-workspace account: not tracked (with its rule) or tracked.
+// Skipped entirely when live tracking is off (audit mode or disabled): "→ tracked" would be wrong there.
+function thisFolderSingle(row, dir, ctx) {
+  if (!isLiveTrackingAllowed(row.key)) return null;
+  const key = routeKeyForDir(dir, ctx);
+  if (key == null) return null;
+  const place = shortLabel(key);
+  const route = routeForDir(row, dir, ctx);
+  if (route != null && route.tenantIds.length === 0) return `${place} → not tracked (R${route.index})`;
+  return `${place} → tracked`;
 }
 
 function rulesCount(n) {
@@ -99,24 +112,40 @@ export async function screenLines(deps = {}) {
     out.push(`Beezi · ${row.email || row.name || 'linked account'}${several && row.key === def ? ' (default)' : ''}`);
     const h = health[row.key];
     if (h != null && !h.ok && h.lines.length > 0) out.push(signInField(h.lines));
-    if (!isMultiTenant(row)) return;
-    const here = thisFolder(row, dir, ctx);
+    if (isMultiTenant(row)) {
+      const here = thisFolder(row, dir, ctx);
+      if (here != null) out.push(field('This folder', here));
+      out.push(field('Rules', rulesCount(rulesOf(row).length)));
+      out.push(field('New folders', newFoldersLabel(row)));
+      return;
+    }
+    if (!isSingleTenant(row)) return;
+    const here = thisFolderSingle(row, dir, ctx);
     if (here != null) out.push(field('This folder', here));
-    out.push(field('Rules', rulesCount(rulesOf(row).length)));
-    out.push(field('New folders', newFoldersLabel(row)));
+    const ruleCount = rulesOf(row).length;
+    if (ruleCount > 0) out.push(field('Rules', rulesCount(ruleCount)));
   });
   if (several) out.push('', 'This machine');
   return healed ? out.concat(machine, [healed]) : out.concat(machine);
+}
+
+// Known workspace count; 0 when unknown.
+function workspaceCount(row) {
+  const tenants = tenantsOf(row);
+  return tenants == null ? 0 : tenants.length;
 }
 
 // For the skill's routing only; never shown.
 export async function keysLines(deps = {}) {
   const accounts = await listAccounts(deps);
   const def = await getDefaultKey(deps);
-  const menu = (accounts.some((a) => isMultiTenant(a)) ? ['Rules', 'New folders'] : []).concat(['Account', 'Crash reports']);
+  const menu = [];
+  if (accounts.some((a) => workspaceCount(a) >= 1)) menu.push('Rules');
+  if (accounts.some((a) => isMultiTenant(a))) menu.push('New folders');
+  menu.push('Account', 'Crash reports');
   const out = [`menu=${menu.join('|')}`];
   for (const a of accounts) {
-    out.push(`account=${a.key} default=${a.key === def ? 'yes' : 'no'} multi=${isMultiTenant(a) ? 'yes' : 'no'} status=${a.status || 'linked'} email=${a.email || 'unknown'}`);
+    out.push(`account=${a.key} default=${a.key === def ? 'yes' : 'no'} multi=${isMultiTenant(a) ? 'yes' : 'no'} workspaces=${workspaceCount(a)} status=${a.status || 'linked'} email=${a.email || 'unknown'}`);
   }
   out.push(`crash=${crashMode()}`);
   return out;

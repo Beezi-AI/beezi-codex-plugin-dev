@@ -22,6 +22,11 @@ export function isMultiTenant(row) {
   return tenants != null && tenants.length > 1;
 }
 
+export function isSingleTenant(row) {
+  const tenants = tenantsOf(row);
+  return tenants != null && tenants.length === 1;
+}
+
 export function tenantById(row, id) {
   const tenants = tenantsOf(row);
   if (tenants == null || id == null) return null;
@@ -214,7 +219,21 @@ export function newFoldersOf(row) {
 // Where an account's analytics go this session: its bound rule, else New folders; one or unknown workspaces → [null] (no header).
 export function resolveTargets(row, state) {
   const tenants = tenantsOf(row);
-  if (tenants == null || tenants.length < 2) {
+  if (tenants == null || tenants.length === 0) {
+    return { tenants, multi: false, targets: [null], pendingAsk: false, askTenants: [], rule: null, source: 'single' };
+  }
+  if (tenants.length === 1) {
+    const bound = normalizeRoute(objectOr(objectOr(state).route)[row.key]);
+    // M1: a bound [] route stays honored only while the same [] rule is still stored (workspace.mjs
+    // cannot import workspace-rules.mjs, so this compares against the raw stored entries directly).
+    const stillStored = bound != null && Array.isArray(row.workspaceRules) && row.workspaceRules.some(
+      (raw) => raw != null && typeof raw === 'object' && raw.kind === bound.kind && raw.match === bound.match
+        && Array.isArray(raw.tenantIds) && raw.tenantIds.length === 0,
+    );
+    if (stillStored && bound.tenantIds.length === 0) {
+      const rule = { kind: bound.kind, match: bound.match, label: bound.label };
+      return { tenants, multi: false, targets: [], pendingAsk: false, askTenants: [], rule, source: 'rule' };
+    }
     return { tenants, multi: false, targets: [null], pendingAsk: false, askTenants: [], rule: null, source: 'single' };
   }
   const members = tenants.map((t) => t.id);

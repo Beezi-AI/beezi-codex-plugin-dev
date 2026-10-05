@@ -13,6 +13,7 @@ import { linkedSessions as _linkedSessions } from './accounts.mjs';
 import { pruneStale as _pruneStale } from './prune.mjs';
 import { readTrackingState, isLiveTrackingAllowed, isTenantDark } from './tracking.mjs';
 import { isMultiTenant, tenantsOf } from './workspace.mjs';
+import { usesRules } from './workspace-rules.mjs';
 import { loadLedger as _loadLedger, ledgerDelivered } from './audit-ledger.mjs';
 import {
   fetchCoverage as _fetchCoverage,
@@ -795,12 +796,13 @@ export async function runWatchPass(deps = {}, options = {}) {
               : loadCoverage(session.key, currentBinding(identity), {}, tenantId);
             // A workspace sent lines past its prefix may hold split history, and missing evidence
             // proves nothing (Ruling 20); with no parse here, either defers to the quiet-session sync.
-            const multi = isMultiTenant(account);
+            // A one-workspace account with rules records no attempts (no tenant key), so it always defers.
+            const multi = usesRules(account);
             const verdict = decideReplay(entry.sessionId, {
               multi,
-              attemptedLine: multi
+              attemptedLine: isMultiTenant(account)
                 ? attemptEvidence(coverageRecord, entry.sessionId, entry.transcriptPath)
-                : attemptedLineFor(coverageRecord, entry.sessionId),
+                : (multi ? null : attemptedLineFor(coverageRecord, entry.sessionId)),
               coverage, checkpointLine: checkpointLineFor(coverageRecord, entry.sessionId),
               localCursor: 0, ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
             });
@@ -843,7 +845,15 @@ export async function runWatchPass(deps = {}, options = {}) {
     try {
       for (const session of sessions) {
         if (!isMultiTenant(session)) {
-          histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key }));
+          if (usesRules(session)) {
+            const plan = planWorkspaceRuns(session);
+            const excludedSessionIds = new Set(
+              [...plan.routes].filter(([, route]) => route.source === 'rule' && route.tenantIds.length === 0).map(([sessionId]) => sessionId),
+            );
+            histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key, excludedSessionIds }));
+          } else {
+            histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key }));
+          }
           continue;
         }
         const workspaces = planWorkspaceRuns(session);

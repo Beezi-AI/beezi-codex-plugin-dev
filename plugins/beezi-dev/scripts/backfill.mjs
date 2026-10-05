@@ -6,6 +6,8 @@ import { cliMayProceed } from '../lib/env-guard.mjs';
 import { fail, plural } from '../lib/cli.mjs';
 import { parseAccountFlag, linkedSessions, getAccount, describeAccount } from '../lib/accounts.mjs';
 import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf } from '../lib/workspace.mjs';
+import { usesRules } from '../lib/workspace-rules.mjs';
+import { readTrackingState, matchesIdentity } from '../lib/tracking.mjs';
 
 // The login flow's final step: uploads this machine's past Codex sessions into Beezi. There is
 // no standalone skill for it — the login skill runs it after the link and plan capture, and
@@ -57,6 +59,12 @@ async function backfillOne(options) {
     },
     options,
   );
+
+  // The real count, after the live-session skip the audit already applies — not the pre-run plan,
+  // which also counts the live session and sessions still being written.
+  if (options.excludedLabel != null && result.excluded > 0) {
+    console.log(`Beezi (${options.excludedLabel}): ${plural(result.excluded, 'past session')} in repos or folders you don't track ${result.excluded === 1 ? 'is' : 'are'} skipped.`);
+  }
 
   // Unconditional now, because --account is required: every state that reaches this branch is an
   // account resolveAccountRef already found in the index and whose token could not be produced.
@@ -319,6 +327,24 @@ async function main() {
   }
   // One or unknown workspaces, or no usable login (runAudit then says so): one headerless run.
   if (session == null || !isMultiTenant(session)) {
+    const planningRow = session == null ? indexRow : session;
+    // Already sealed: every re-run (every login) would otherwise re-plan and re-read up to 64KB of
+    // every transcript just to report "already uploaded" right after.
+    const tracking = readTrackingState(key);
+    // Matches runAudit's own seal test (lib/session-audit.mjs): --force and a stale identity must
+    // reopen planning here too, or a manual --force / a relink can skip past the rule-exclusion
+    // scan and let this shortcut re-upload sessions the real audit would still refuse (M-2).
+    const trackingValid = matchesIdentity(key, orDefault(planningRow.clientId, null));
+    const sealed = !options.force && usesRules(planningRow) && trackingValid
+      && tracking != null && tracking.backfillCompleted === true;
+    if (usesRules(planningRow) && !sealed) {
+      const plan = planWorkspaceRuns(planningRow);
+      const excludedSessionIds = new Set(
+        [...plan.routes].filter(([, route]) => route.source === 'rule' && route.tenantIds.length === 0).map(([sessionId]) => sessionId),
+      );
+      options.excludedSessionIds = excludedSessionIds;
+      options.excludedLabel = describeAccount(indexRow);
+    }
     if (await backfillOne(options) !== 0) process.exitCode = 1;
     return;
   }
