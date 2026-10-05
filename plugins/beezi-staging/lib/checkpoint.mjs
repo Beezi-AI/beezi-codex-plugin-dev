@@ -37,7 +37,7 @@ import {
   enqueue as enqueueCopy, enqueueHeld, unwrapQueueFile, releaseHeldFile, isQueueFile, isAskFile,
 } from './workspace-queue.mjs';
 import {
-  bindSessionRoutes, createRouteContext, routeForDir, routeForSegment, routePastSession, rulesOf,
+  bindSessionRoutes, createRouteContext, routeForDir, routeForSegment, routePastSession, rulesOf, usesRules,
 } from './workspace-rules.mjs';
 import { acquireLock, withLockAsync, sessionLock, sharedLock } from './single-instance-lock.mjs';
 import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES, diagnosticsSession, isCorrelationGranted } from './diagnostics.mjs';
@@ -122,9 +122,16 @@ function planRecipients(recipients, { workspaceState, cwd, skipGate, unrouted, r
     const r = resolveTargets(session, workspaceState);
     const targets = (preset == null ? r.targets : [preset]).filter((t) => live(t));
     const hold = preset == null && r.pendingAsk ? r.askTenants.filter((t) => !isTenantDark(tracking, t)) : [];
-    const routed = multi && unrouted !== true;
-    if (targets.length === 0 && hold.length === 0 && !(routed && rulesOf(session).length > 0)) {
-      if (preset == null && r.multi && r.targets.length === 0 && !r.pendingAsk) policyGated = true;
+    // `unrouted` only means something for a preset workspace, and only multi-workspace runs have
+    // one: a one-workspace history run (sync, backfill, the watcher's repair pass) never passes
+    // sessionRoutes, so it must still route per segment (I-1) rather than fall back to the
+    // session-level plan.
+    const routed = usesRules(session) && (!multi || unrouted !== true);
+    // The keep-plan exception must not un-gate an account that cannot currently send live: a
+    // one-workspace row in backfill_only/disabled mode with a rule would otherwise keep a plan
+    // whose every segment live(null) filters out, skipping the dark gate below (I-2).
+    if (targets.length === 0 && hold.length === 0 && !(routed && rulesOf(session).length > 0 && (multi || live(null)))) {
+      if (preset == null && (r.source === 'rule' || r.source === 'none') && r.targets.length === 0 && !r.pendingAsk) policyGated = true;
       else darkGated = true;
       continue;
     }
@@ -168,13 +175,17 @@ function segmentPlan(plan, dir, routeCtx) {
 // A copy per target workspace, plus one held copy while an Ask is unanswered. `dir` is the
 // segment's directory (null = the session's own route).
 function emitToPlans(plans, routeCtx) {
-  return (payload, dir) => {
+  const emit = (payload, dir) => {
     for (const plan of plans) {
       const { targets, hold } = segmentPlan(plan, dir, routeCtx);
-      for (const tenantId of targets) enqueueCopy(plan.session.key, payload, tenantId, { multi: plan.multi });
+      for (const tenantId of targets) { enqueueCopy(plan.session.key, payload, tenantId, { multi: plan.multi }); emit.copies += 1; }
       if (hold.length > 0) enqueueHeld(plan.session.key, payload, hold, { version: 1, dir });
     }
   };
+  // Copies actually written to a queue, for `track` (M-1): `enqueued` counts built payloads, not
+  // routed ones, and a payload every plan excludes (a Don't-track rule) must not read as "saved".
+  emit.copies = 0;
+  return emit;
 }
 
 // A row merge is skipped when a caller hands in its own sessions (the backfill does), unless it
@@ -623,12 +634,12 @@ async function runLockedCheckpoint(lock, ctx) {
   // here, so a rule, a held file's release and the MCP server can find it. Never for the history
   // import: binding hundreds of past sessions would make one of them the newest session workspace.
   const anyPreset = recipients.some((s) => typeof s.tenantId === 'string' && s.tenantId !== '');
-  if (workspaceState == null && !anyPreset && cwd && recipients.some(isMultiTenant)) {
+  if (workspaceState == null && !anyPreset && cwd && recipients.some(usesRules)) {
     // The routes the bind writes, kept in memory so a refused write still routes this run's
     // segments and its session-level sends (errors, timeline, rate limits) alike.
     const route = {};
     for (const row of recipients) {
-      const rule = isMultiTenant(row) ? routeForDir(row, cwd, routeCtx) : null;
+      const rule = usesRules(row) ? routeForDir(row, cwd, routeCtx) : null;
       if (rule != null) route[row.key] = rule;
     }
     let bound = null;
@@ -666,10 +677,19 @@ async function runLockedCheckpoint(lock, ctx) {
   // It is handed only what routes to one of its recipients; `options.elsewhere` gets each payload
   // the current rules send to none of its presets (even on an unrouted run), which is how sync
   // tells a workspace's split history from a contiguous one (Ruling 16).
+  // Without a preset (a one-workspace history run) `presetRouted` is trivially true — there is no
+  // preset workspace to answer for — so `elsewhere` has to ask the real question instead: did any
+  // plan send this payload ANYWHERE (I-3). With a preset (multi-workspace), presetRouted's own
+  // per-directory rule-vs-route answer stands unchanged.
+  const noPreset = plans.every((plan) => plan.preset == null);
   const emit = options.sink
     ? (payload, dir) => {
-      if (plans.some((plan) => segmentPlan(plan, dir, routeCtx).targets.length > 0)) options.sink(payload);
-      if (options.elsewhere && !plans.some((plan) => presetRouted(plan, dir, routeCtx))) options.elsewhere(payload);
+      const sentSomewhere = plans.some((plan) => segmentPlan(plan, dir, routeCtx).targets.length > 0);
+      if (sentSomewhere) options.sink(payload);
+      if (options.elsewhere) {
+        const excludedHere = noPreset ? !sentSomewhere : !plans.some((plan) => presetRouted(plan, dir, routeCtx));
+        if (excludedHere) options.elsewhere(payload);
+      }
     }
     : emitToPlans(plans, routeCtx);
 
@@ -679,7 +699,7 @@ async function runLockedCheckpoint(lock, ctx) {
       if (pendingTransaction) {
         const boundaries = commitTransaction(pendingTransaction, lock, emit, deps, true);
         return { ...emptyResult(), outcome: 'committed', reason: 'resumed', committedBoundaries: boundaries,
-          enqueued: pendingTransaction.payloads.length };
+          enqueued: pendingTransaction.payloads.length, routedCopies: options.sink ? null : emit.copies };
       }
     } catch {
       return { ...emptyResult(), outcome: 'failed', reason: 'transaction-resume-failed' };
@@ -1204,7 +1224,8 @@ async function runLockedCheckpoint(lock, ctx) {
   return {
     outcome: agentResults.childDeferred ? 'deferred' : 'committed',
     reason: agentResults.childDeferred ? 'child-coverage-unavailable' : null, committedBoundaries,
-    enqueued, flush: options.skipFlush ? null : mergeFlushResults(flushes), flushes,
+    enqueued, routedCopies: options.sink ? null : emit.copies,
+    flush: options.skipFlush ? null : mergeFlushResults(flushes), flushes,
     sessionErrors: collectedErrors, skipped, rateLimits, agents: agentResults.agents,
     childrenSkipped: agentResults.childrenSkipped,
   };

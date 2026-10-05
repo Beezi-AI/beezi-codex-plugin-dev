@@ -7,10 +7,12 @@ import {
   findSessionWorkspaceByCwd,
   initSessionWorkspace,
   isMultiTenant,
+  isSingleTenant,
   listSessionWorkspaces,
   newFoldersOf,
   readSessionWorkspace,
   recordReadTenant,
+  recordSessionRoute,
   resolveTargets,
   resolveTenantRef,
   roleLabel,
@@ -21,7 +23,7 @@ import { releaseHeldQueue } from './workspace-queue.mjs';
 import { pluginRoot } from './workspace-prompt.mjs';
 import {
   bindSessionRoutes, createRouteContext, outsideKey, planUnruledRoutes, routeForDir, routeKeyForDir, rulesOf,
-  rulesTableLines, shortLabel,
+  rulesTableLines, shortLabel, usableIds,
 } from './workspace-rules.mjs';
 import { canonicalRemote } from './git.mjs';
 import { normPath, pathHasPrefix } from './repo-map.mjs';
@@ -176,6 +178,22 @@ function requireMulti(row) {
   }
 }
 
+// Same refusal as requireMulti, but only for workspaces that aren't known yet: a one-workspace account may still pass none.
+function requireKnownWorkspaces(row) {
+  const tenants = tenantsOf(row);
+  if (tenants == null || tenants.length === 0) {
+    throw new UserError(`${accountLabel(row)}'s workspaces are not known yet. Start a new Codex session, then try again.`);
+  }
+}
+
+// A one-workspace account's rule refs may only be `none`: there is nothing else to choose.
+function requireNoneForSingle(row, refs) {
+  if (!isSingleTenant(row)) return;
+  const values = refValues(refs);
+  if (values.length === 1 && values[0].toLowerCase() === 'none') return;
+  throw new UserError(`${accountLabel(row)} has one workspace, so a rule can only stop tracking a repo or folder. Pass none.`);
+}
+
 // The workspaces to offer, one line each; role= is last and may be empty.
 function printWorkspaces(cx, row) {
   for (const t of tenantsOf(row)) cx.lines.push(`W. ${t.name ? t.name : t.id} account=${row.key} tenant=${t.id} role=${roleLabel(t)}`);
@@ -290,8 +308,24 @@ async function rules(cx, argv) {
       cx.lines.push(`${accountLabel(row)}: workspaces not known yet; rules do not apply account=${row.key}`);
       continue;
     }
-    if (!isMultiTenant(row)) {
-      cx.lines.push(`${accountLabel(row)}: one workspace; rules do not apply account=${row.key}`);
+    if (isSingleTenant(row)) {
+      const stored = rulesOf(row);
+      const members = tenants.map((t) => t.id);
+      cx.lines.push(`${accountLabel(row)}: ${stored.length} rule(s) account=${row.key} workspaces=1`);
+      for (const r of stored) {
+        // A leftover rule whose stored workspace(s) are all gone is skipped by routing and must not
+        // say "tracked" (M-6): the folder is actually not tracked by it.
+        const usable = usableIds(r, members);
+        const label = usable === null ? 'ignored (workspace left)' : (usable.length === 0 ? 'not tracked' : 'tracked');
+        cx.lines.push(`R${r.index}. ${labeled(r)} → ${label} account=${row.key} rule=${r.index} kind=${r.kind} tenants=${idList(r.tenantIds)} match=${r.match}`);
+      }
+      const key = routeKeyForDir(dir, ctx);
+      if (key == null) {
+        cx.lines.push(`here: none account=${row.key}`);
+        continue;
+      }
+      const route = routeForDir(row, dir, ctx);
+      cx.lines.push(`here: ${labeled(key)} → ${route == null ? 'no rule' : `R${route.index}`} account=${row.key} rule=${route == null ? 'none' : route.index} kind=${key.kind} match=${key.match}`);
       continue;
     }
     const stored = rulesOf(row);
@@ -357,7 +391,8 @@ async function ruleAdd(cx, argv) {
   }
   if (target == null || refs.length === 0) throw new UserError(USAGE);
   const row = await resolveAccount(account);
-  requireMulti(row);
+  requireKnownWorkspaces(row);
+  requireNoneForSingle(row, refs);
   const ctx = createRouteContext();
   const current = await withSessionState(cx, resolveSession(cx, session), ctx);
   const key = ruleKey(cx, target, choiceDir(cx, current.state), ctx);
@@ -373,8 +408,9 @@ async function ruleSet(cx, argv) {
   const { account, rest } = await parseAccountFlag(afterSession);
   if (rest.length < 2) throw new UserError(USAGE);
   const row = await resolveAccount(account);
-  requireMulti(row);
+  requireKnownWorkspaces(row);
   const found = findRule(row, rest[0]);
+  requireNoneForSingle(row, rest.slice(1));
   const tenantIds = selection(row, rest.slice(1));
   const ctx = createRouteContext();
   const current = await withSessionState(cx, resolveSession(cx, session), ctx);
@@ -389,8 +425,22 @@ async function ruleRemove(cx, argv) {
   if (rest.length !== 1) throw new UserError(USAGE);
   const row = await resolveAccount(account);
   const removed = await removeWorkspaceRule(row.key, String(rest[0]).replace(/^R/i, ''));
-  cx.lines.push(`✓ Removed the rule for ${placeOf(removed)}. New sessions there follow New folders (${newFoldersLabel(row)}).`);
+  if (isSingleTenant(row)) {
+    cx.lines.push(`✓ Removed the rule for ${placeOf(removed)}. Beezi tracks it again unless another rule covers it.`);
+  } else {
+    cx.lines.push(`✓ Removed the rule for ${placeOf(removed)}. New sessions there follow New folders (${newFoldersLabel(row)}).`);
+  }
   cx.lines.push(`removed=${removed.index}`);
+  // Sessions bound to the removed rule keep their state until something re-binds them: re-route each to whatever still applies.
+  if (isSingleTenant(row)) {
+    const fresh = await resolveAccount(row.key);
+    const ctx = createRouteContext();
+    for (const entry of listSessionWorkspaces()) {
+      const bound = entry.state.route[row.key];
+      if (bound == null || bound.kind !== removed.kind || bound.match !== removed.match) continue;
+      recordSessionRoute(entry.sessionId, row.key, routeForDir(fresh, entry.state.cwd, ctx));
+    }
+  }
 }
 
 // One rule per repo or folder that `routes` lists, all sending to the same workspaces.

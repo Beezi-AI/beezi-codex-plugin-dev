@@ -508,6 +508,8 @@ function emptyAuditResult(options = {}) {
     // Multi-workspace runs only: sessions whose route leaves this workspace out, and those of them still waiting for a rule.
     routedElsewhere: 0,
     routeDeferred: 0,
+    // One-workspace runs only: sessions a matched rule excludes from tracking (`excludedSessionIds`).
+    excluded: 0,
     // Multi-workspace runs only: no session was routed to this workspace, so its pull stays open.
     nothingRouted: false,
     lastError: null,
@@ -697,6 +699,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const activeCutoffMs = now() - ACTIVE_SESSION_WINDOW_MS;
   const ageCutoffMs = now() - MAX_SESSION_AGE_MS;
   const sessionRoutes = orDefault(options.sessionRoutes, null);
+  const excludedSessionIds = orDefault(options.excludedSessionIds, null);
   // A rule that sends to this workspace can route single segments of any session here, so the
   // import and sync inspect rule-reachable sessions too. Reconciliation below visibly defers
   // sparse history whenever the server prefix cannot establish a safe replay boundary.
@@ -751,6 +754,10 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     if (entry.mtimeMs < ageCutoffMs) { result.tooOld += 1; continue; }
     if (options.sinceMs != null && entry.mtimeMs < options.sinceMs) continue;
     if (entry.size > MAX_TRANSCRIPT_BYTES) { result.oversize += 1; continue; }
+    // One-workspace accounts only: a matched Don't-track rule. Moved last (M-3, after active/tooOld)
+    // so the skipped count does not also include sessions that were never going to be uploaded
+    // anyway. Excluded sessions still never hold the seal.
+    if (excludedSessionIds != null && excludedSessionIds.has(entry.sessionId)) { result.excluded += 1; continue; }
     candidates.push(entry);
   }
 
@@ -772,6 +779,14 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // Per workspace on a multi-workspace account: each one answers /sessions/coverage for itself.
   const coverageRecord = loadCoverage(key, coverageBinding, {}, tenantId);
   let coverageDirty = false;
+  // A one-workspace account with rules (excludedSessionIds != null) hits the same hazard a
+  // multi-workspace account does: a rule can exclude a MIDDLE segment of a session, leaving a hole
+  // the server's contiguous prefix stops at while tracked lines sit past it (I-3). It gets the same
+  // split bookkeeping here — populated with no attempt evidence, since recordCoverageAttempts only
+  // ever runs for a preset (tenantId != null) workspace. The signal is present on every
+  // one-workspace-with-rules history run that reaches this reconciliation block: sync and the
+  // watcher's repair pass (backfill never reaches it — it is not syncMode).
+  const splitBookkeeping = multi || excludedSessionIds != null;
   if (syncMode && candidates.length > 0) {
     const coverage = await fetchCoverage(
       candidates.map((entry) => entry.sessionId),
@@ -795,7 +810,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         localCursor: liveCursorOf(entry.sessionId, deps),
         ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
       });
-      if (multi && verdict.reason !== DeferReason.UNAVAILABLE) {
+      if (splitBookkeeping && verdict.reason !== DeferReason.UNAVAILABLE) {
         // Parsed from the prefix either way: only that parse shows whether any of it routes here.
         startCursors.set(entry.sessionId, verdict.stored);
         if (attemptedLine === null || attemptedLine > verdict.stored) splitChecks.set(entry.sessionId, attemptedLine);

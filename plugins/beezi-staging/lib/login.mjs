@@ -1,6 +1,6 @@
 import { recordLoginFailure } from './telemetry-auth.mjs';
 import { AUTH_REASONS } from './diagnostics.mjs';
-import { currentSessionWorkspace, isMultiTenant, resolveTargets } from './workspace.mjs';
+import { currentSessionWorkspace, resolveTargets } from './workspace.mjs';
 // A DEFAULT import, not a named one: tools/hermetic-env.mjs patches the child_process object, and
 // a named binding is snapshotted at instantiation and bypasses that guard entirely.
 import childProcess from 'child_process';
@@ -308,14 +308,13 @@ async function resolveAnonymousRows(d, base) {
 // S's rule: one check-in per current target. A whoami without tenants keeps the stored list, so an
 // account in several workspaces never checks in headerless, and while this session's folder is
 // still unanswered it checks in nowhere. One or unknown workspaces check in once on `session`
-// itself, headerless, exactly as before. Sequential: a check-in can take rank-3 locks.
+// itself, headerless — unless a one-workspace Don't-track rule covers this folder, where it checks
+// in nowhere too. Sequential: a check-in can take rank-3 locks.
 async function checkInTargets(d, key, row, tenants, session, options) {
   const stored = orDefault(row, {});
   const merged = { ...stored, key, tenants: Array.isArray(tenants) ? tenants : stored.tenants };
   let state = null;
-  if (isMultiTenant(merged)) {
-    try { state = currentSessionWorkspace(); } catch { state = null; }
-  }
+  try { state = currentSessionWorkspace(); } catch { state = null; }
   const resolved = resolveTargets(merged, state);
   for (const tenantId of resolved.targets) {
     const target = resolved.multi ? { ...session, tenantId } : session;
