@@ -125,9 +125,10 @@ the last choice was picked (it wins over the others). Never rebuild the command 
 yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
 sent this time, and the next sync asks again.
 
-Write each command's first line verbatim. The rule commands write Beezi's settings under the user's
-home, outside the workspace: if the sandbox refuses one, run it again with escalated permissions so
-the user can approve it.
+Write each command's first line verbatim. The rule commands read Beezi's sign-in from the system
+credential store and write Beezi's settings under the user's home, outside the workspace, so the
+sandbox cannot run them: run each with escalated permissions from the start so the user can approve
+it.
 
 ### Step 2 — sync
 

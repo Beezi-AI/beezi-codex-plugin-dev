@@ -89,9 +89,74 @@ them rewritten to the launcher form on its first session after this release: tha
 trust granted again, and no upgrade after it does. And setting or changing `BEEZI_CODEX_HOME` moves
 the launcher, which changes the entries.
 
-Leaving any entry untrusted fails silently — an untrusted hook simply does not run, and nothing
-reports it. Skipping `SubagentStart` / `SubagentStop`, for example, still bills subagent tokens (the
-parent's checkpoint does that) but loses every spawned agent's name and its span on the timeline.
+An untrusted hook simply does not run, and Codex itself reports nothing. Skipping `SubagentStart` /
+`SubagentStop`, for example, still bills subagent tokens (the parent's checkpoint does that) but
+loses every spawned agent's name and its span on the timeline.
+
+#### The trust reminder
+
+So that an untrusted install does not stay silent, the plugin's MCP server — which needs no trust —
+asks Codex for the real trust state (`codex app-server` → `hooks/list`) in the background, and
+remembers the answer in `~/.beezi-codex/hook-trust.json`. While the Beezi entries are installed but
+**not trusted**, it keeps a short marked section in your global **`~/.codex/AGENTS.md`**. Codex reads
+that file into every session, so the next session starts with the model asking you first:
+
+> Beezi analytics hooks are not trusted in Codex, so this session isn't being tracked. Run `/hooks`,
+> trust the Beezi entries, then reply "done" — or "skip" to continue without analytics.
+
+- **"done"** — the model calls `beezi_status`, which asks Codex again (never the saved answer), and
+  starts your task only once its `Hook trust:` line says `trusted`. That same call **removes the
+  section from AGENTS.md**. If trust is still missing, the model tells you which entries.
+- **"skip"**, or asking a second time to just get on with it — the task starts, and the reminder
+  does not come back for the rest of that session. It comes back next session, until the hooks are
+  trusted.
+- A run with no one to answer (`codex exec`, a subagent) mentions the problem once and carries on;
+  it never waits.
+- **Untrusted again later** (you untrust them in `/hooks`, or a Codex update invalidates the trust) —
+  the next check finds it and puts the section back. A trusted machine is re-checked at least once a
+  day.
+
+What this touches in `AGENTS.md`: only the block between
+`<!-- beezi:hook-trust begin … -->` and `<!-- beezi:hook-trust end -->` (`beezi_staging:…` and so on
+for a variant). Everything else in the file is left byte-for-byte as it was; if the file held nothing
+but that block, it is deleted when the block goes. If you keep a `~/.codex/AGENTS.override.md` — which
+Codex reads *instead of* `AGENTS.md` — the block goes there, since that is the file Codex reads.
+
+The block comes out again when:
+
+- `beezi_status` (your "done") or a later session's check finds the hooks trusted, or switched off;
+- the session starts with no usable Beezi link (logged out, revoked, or no default account) — the
+  status check cannot confirm "done" then, so the block would only ever ask again;
+- you run `node scripts/hooks.mjs uninstall`;
+- the plugin was removed some other way: on your next "done" the model finds no `beezi_status` tool
+  and deletes the block itself, asking your approval to edit the file. (A block cannot tell the model
+  up front that its plugin is gone — measured, the model shows the reminder anyway — so the first
+  session after such a removal still asks once.) You can always delete the block by hand.
+
+What this is and is not:
+
+- **It is model-enforced, not a hard block.** Codex gives a plugin no way to stop a turn, and the one
+  thing that could — a hook — is the thing not running. The model follows the instruction; nothing
+  forces it to. Measured on codex-cli 0.160.0, an interactive session stopped and asked first in 3
+  of 4 runs; the one that did not went straight to a coding request. `codex exec` showed the
+  message and then did the task, as intended.
+- **Why AGENTS.md.** Measured on codex-cli 0.160.0: Codex drops an MCP server's `instructions`, and
+  loads MCP tool descriptions only on demand (`tool_search`), so neither reaches the model at the
+  start of a session. `~/.codex/AGENTS.md` does.
+- **It is one session behind.** Codex reads AGENTS.md when a session starts, and the check finishes
+  after that, so the reminder appears the session *after* the problem is found. Answering "done"
+  clears it at once.
+- **It never delays the session.** The check runs in the background; Codex's start-up handshake does
+  not wait for it.
+- **A trusted machine pays almost nothing.** While the saved answer says trusted (less than a day
+  old, and `hooks.json` unchanged), no check runs at all.
+- **Only your own entries count.** With `beezi` and a `beezi-staging` variant side by side, each
+  judges its own entries and keeps its own section.
+- **Disabled is your choice.** Entries you switched off in `/hooks` are reported by `beezi_status`
+  but never trigger the reminder.
+- `BEEZI_CODEX_APP_SERVER=0` turns the check off along with the plan lookup; with no answer, AGENTS.md
+  is never changed.
+- `CODEX_HOME` moves the file with it: the section goes into `$CODEX_HOME/AGENTS.md`.
 
 ## Several Beezi accounts on one machine
 
@@ -597,6 +662,14 @@ Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
   under `codex exec`. "One-time" is what the design guarantees rather than an observation: an
   upgrade changes only the launcher file the entries point at, so the entry bytes Codex hashes are
   unchanged and there is nothing for it to distrust.
+- **A sandboxed skill command cannot reach the macOS keychain.** Read from Codex's source, not
+  measured: the Seatbelt base profile has no `com.apple.SecurityServer` lookup — only the
+  network-enabled profile adds it — so a `node scripts/<x>.mjs` the model runs under the sandbox
+  reads the keychain as empty, while hooks and the MCP server, which Codex spawns unsandboxed, read
+  it fine. Sandbox and network settings can differ per project, which is the likely reason one
+  folder works and another does not.
+  The guard recognises it (Codex sets `CODEX_SANDBOX` on a sandboxed command), still refuses, and
+  tells the model to run the command again with escalated permissions.
 - **`SessionEnd` is not registered.** It is out of scope for this release, and the reason is
   `Stop`: that hook already runs the same checkpoint, timeline included, at every turn end, so a
   `SessionEnd` entry would cost you one more hook to review and trust for work already done.

@@ -102,9 +102,10 @@ When the answer arrives, run, with `<ids>` = the chosen workspaces' `tenant=` va
 node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> <ids>
 ```
 
-Show the user only its first line (a `✗` line too). The command writes Beezi's settings under the
-user's home, outside the workspace: if the sandbox refuses it, run it again with escalated
-permissions so the user can approve it. The held analytics then go where the answer says with the
+Show the user only its first line (a `✗` line too). The command reads Beezi's sign-in from the
+system credential store and writes Beezi's settings under the user's home, outside the workspace, so
+the sandbox cannot run it: run it with escalated permissions from the start so the user can approve
+it. The held analytics then go where the answer says with the
 next checkpoint — the next `track` run, while the hooks are not trusted. A skipped or declined
 question runs nothing and changes nothing: the analytics stay held, and the next `track` run asks
 again.

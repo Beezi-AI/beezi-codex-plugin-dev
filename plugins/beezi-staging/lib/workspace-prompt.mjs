@@ -139,7 +139,9 @@ function promptText(asks) {
     parts.push(`${lead} \`${a.command}\`. \`<ids>\` is ${idsOf} (${a.ids}), or \`none\` when "${a.dontTrack}" is chosen; it wins over the others.`);
   });
   // A hook message carries none of a skill's framing, so the sandbox escalation is spelled out here.
-  parts.push(`${one ? 'The command writes' : 'Each command writes'} Beezi's settings under the user's home, outside the workspace: if the sandbox refuses it, run it again with escalated permissions so the user can approve it.`);
+  // Up front, not on refusal: the write lands outside the workspace and the guard reads the OS
+  // credential store, which macOS Seatbelt blocks (lib/codex-sandbox.mjs), so a sandboxed run never succeeds.
+  parts.push(`${one ? 'The command reads' : 'Each command reads'} Beezi's sign-in from the system credential store and writes Beezi's settings under the user's home, outside the workspace, so the sandbox cannot run it: run it with escalated permissions from the start so the user can approve it.`);
   parts.push(one
     ? 'Show the user only the command\'s first line. If the user ignores or declines the question, run nothing and never ask it again in this session.'
     : 'Show the user only the first line of each command\'s output. If the user ignores or declines a question, run nothing for that account and never ask it again in this session.');

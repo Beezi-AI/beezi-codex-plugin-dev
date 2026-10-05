@@ -59,6 +59,9 @@ const SCRUBBED_ENV_KEYS = Object.freeze([
   'BEEZI_API_URL', 'BEEZI_MCP_URL', 'BEEZI_ENV', 'BEEZI_DEBUG',
   // Session routing must use fixture state, never the controller's live thread.
   'CODEX_THREAD_ID', 'CODEX_SESSION_ID',
+  // Set on a command Codex sandboxes. `npm test` run from inside Codex would otherwise take the
+  // sandboxed-credential-store wording (lib/codex-sandbox.mjs) instead of the one the suite pins.
+  'CODEX_SANDBOX', 'CODEX_SANDBOX_NETWORK_DISABLED',
 ]);
 
 // Filesystem entry points worth watching. Index 0 is a path for all of them; the rename/copy/link

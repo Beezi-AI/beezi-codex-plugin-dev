@@ -78,6 +78,8 @@ function routedBridge(deps, route) {
   const calls = [];
   const out = [];
   const bridge = createBridge({
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     ...deps,
     url: URL_UNDER_TEST,
     ensureHooks: () => NO_REPAIR,
@@ -333,6 +335,8 @@ test('9. a re-initialize provoked by a 404 does not pick up a session issued aft
 function statusBridge(deps, over = {}) {
   const out = [];
   const bridge = createBridge({
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     ...deps,
     url: URL_UNDER_TEST,
     ensureHooks: () => NO_REPAIR,
