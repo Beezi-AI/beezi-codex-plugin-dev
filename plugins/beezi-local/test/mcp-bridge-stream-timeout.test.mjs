@@ -141,6 +141,8 @@ function streamBridge(options) {
   const out = [];
   let signalSeen = null;
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
     ...LINKED_ACCOUNT,
     fetchImpl: async (url, init) => {
@@ -272,6 +274,8 @@ test('a discarded response releases its deadline instead of leaving one armed', 
   const timers = instrumentTimers(t);
   const out = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
     ...LINKED_ACCOUNT,
     // 401 is answered without the body ever being read, so nothing downstream would release it.

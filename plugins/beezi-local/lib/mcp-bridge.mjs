@@ -11,9 +11,19 @@ import { authHeaders } from './http.mjs';
 import { apiBase } from './config.mjs';
 import { performLogin as _performLogin } from './login.mjs';
 import {
-  linkStatus as _linkStatus, describeLink, describeReporting, LinkState, NO_DEFAULT_ACCOUNT,
+  linkStatus as _linkStatus, describeLink, describeReporting, describeTrust,
+  LinkState, NO_DEFAULT_ACCOUNT,
 } from './link-status.mjs';
 import { ensureHooks as _ensureHooks, TRUST_STEP } from './hooks-install.mjs';
+import {
+  TrustVerdict,
+  probeHookTrust as _probeHookTrust,
+  readCachedVerdict as _readCachedVerdict,
+} from './hook-trust.mjs';
+import {
+  syncTrustNotice as _syncTrustNotice,
+  removeTrustNotice as _removeTrustNotice,
+} from './agents-notice.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import { orDefault } from './compat.mjs';
 import {
@@ -77,9 +87,11 @@ export const STATUS_TOOL = Object.freeze({
   title: 'Beezi status',
   description:
     'Report whether this machine is linked to Beezi, which account it is linked as, which Beezi ' +
-    'API it is talking to, and whether the analytics hooks are installed. Call this when the user ' +
-    'asks about their Beezi link or connection status, or asks why their Beezi analytics are ' +
-    'empty or not being tracked. Prefer this over running any status script. Takes no arguments.',
+    'API it is talking to, and whether the analytics hooks are installed and trusted in Codex ' +
+    '(its "Hook trust:" line asks Codex afresh on every call). Call this when the user asks about ' +
+    'their Beezi link or connection status, asks why their Beezi analytics are empty or not being ' +
+    'tracked, or says they have trusted the Beezi hooks in /hooks. Prefer this over running any ' +
+    'status script. Takes no arguments.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
 });
 
@@ -569,11 +581,13 @@ export function createBridge(deps = {}) {
   // able to say so.
   let healed = false;
   let healNote = null;
+  let hooksInstalled = false;
   function selfHeal() {
     if (healed) return healNote;
     healed = true;
     try {
       const result = (deps.ensureHooks || _ensureHooks)();
+      hooksInstalled = result.state === 'installed';
       if (!result.repaired) return null;
       const swept = result.swept && result.swept.length
         ? ` ${result.swept.length} dead entr${result.swept.length === 1 ? 'y' : 'ies'} from an older install ${result.swept.length === 1 ? 'was' : 'were'} removed.`
@@ -585,6 +599,67 @@ export function createBridge(deps = {}) {
     } catch {
       return null;
     }
+  }
+
+  // ── does Codex trust our hooks ─────────────────────────────────────────────────────────────
+  //
+  // An untrusted hook does not run and nothing reports it. The hooks cannot say so themselves, and
+  // Codex has no way for a plugin to block a turn, so this process — which needs no trust — asks
+  // Codex (`hooks/list`, lib/hook-trust.mjs) and moves ~/.codex/AGENTS.md to match
+  // (lib/agents-notice.mjs): a strict reminder while untrusted, nothing once trusted. The model then
+  // holds the first task until the user trusts the hooks (verified through beezi_status below) or
+  // says skip.
+  //
+  // AGENTS.md, NOT `initialize.instructions`: MEASURED on codex-cli 0.160.0 (2026-10-05), Codex
+  // drops MCP server instructions and defers tool descriptions behind tool_search, while AGENTS.md
+  // reaches the model. The cost is one session of lag — Codex reads AGENTS.md when the session
+  // starts, and the verdict arrives after that — so the reminder shows up the session after the
+  // problem is found, and leaves the session after it is fixed (or at once, via "done").
+  //
+  // THE HANDSHAKE NEVER WAITS ON ANY OF THIS. The probe spawns `codex app-server` — about two
+  // seconds from inside a Codex-launched MCP server, measured — and a failed `initialize` takes
+  // the whole plugin down, skills included. It runs in the background and settles when it settles.
+  //
+  // Bounded like selfHeal: once per process, linked machines with our hooks installed only, no
+  // probe when a fresh cache already says trusted, and every step fully caught.
+  let trustStarted = false;
+  const probeTrust = () => (deps.probeHookTrust || _probeHookTrust)();
+  const cachedTrust = () => {
+    try { return (deps.readCachedTrust || _readCachedVerdict)(); } catch { return null; }
+  };
+  // `unknown` never reaches the file: "could not tell" neither nags nor un-nags.
+  const syncNotice = (trust) => {
+    if (!trust || trust.verdict === TrustVerdict.UNKNOWN) return;
+    try { (deps.syncTrustNotice || _syncTrustNotice)(trust); } catch { /* the reminder is best-effort */ }
+  };
+
+  // An UNLINKED machine only ever has the block taken out. Logged out of every account, or revoked:
+  // nothing is being reported whatever /hooks says, and beezi_status cannot re-check trust there,
+  // so a block written while the machine was linked could never be cleared by "done" — it would ask
+  // every session for a step that cannot be confirmed. Once per process; best-effort.
+  let unlinkedCleared = false;
+  function clearNoticeWhileUnlinked() {
+    if (unlinkedCleared) return;
+    unlinkedCleared = true;
+    try { (deps.removeTrustNotice || _removeTrustNotice)(); } catch { /* best-effort */ }
+  }
+
+  function startTrustProbe() {
+    if (trustStarted || !hooksInstalled) return;
+    trustStarted = true;
+    // Entries this process just wrote cannot have been trusted yet. (A repair that only swept dead
+    // entries AFTER ours is the one false positive; the probe below corrects it, and "done"
+    // verifies trusted in the meantime.)
+    if (healNote) syncNotice({ verdict: TrustVerdict.UNTRUSTED });
+    const cached = cachedTrust();
+    if (cached && cached.verdict === TrustVerdict.TRUSTED) {
+      // No probe, but still move the file: a block left by an earlier untrusted verdict goes.
+      syncNotice(cached);
+      return;
+    }
+    try {
+      Promise.resolve(probeTrust()).then(syncNotice, () => {});
+    } catch { /* a probe that cannot start leaves AGENTS.md as it is */ }
   }
 
   async function runStatusTool(id) {
@@ -626,8 +701,17 @@ export function createBridge(deps = {}) {
             ? NO_DEFAULT_ACCOUNT
             : 'The one the analytics tools read from cannot report just now — run the settings skill for each '
               + 'account’s own state, or the settings skill (Account → Default account) to read from a different one.');
-      const reporting = describeReporting(lifted);
-      toolText(id, [describeLink(lifted), reporting, note, repair].filter(Boolean).join('\n'));
+      // ASKED AFRESH on every call, cache or not: this is how "done" is verified after the user
+      // trusts the hooks in /hooks, and a cached "untrusted" would send them back for nothing. The
+      // answer also refreshes the cache (lib/hook-trust.mjs), and this session's own view.
+      let trust = null;
+      if (lifted.state === LinkState.LINKED && lifted.hooks && lifted.hooks.state === 'installed') {
+        trust = await probeTrust();
+        syncNotice(trust);
+      }
+      const reporting = describeReporting(lifted, trust);
+      const trustLine = trust ? describeTrust(trust) : null;
+      toolText(id, [describeLink(lifted), reporting, trustLine, note, repair].filter(Boolean).join('\n'));
     } catch (error) {
       toolText(id, `Beezi status check failed: ${error && error.message ? error.message : String(error)}`, true);
     }
@@ -777,6 +861,7 @@ export function createBridge(deps = {}) {
     }
     const resolved = await resolveAccount(isInitialize(msg));
     if (!resolved.session) {
+      clearNoticeWhileUnlinked();
       await handleUnlinked(msg, ids, await refusalFor(resolved));
       return;
     }
@@ -801,6 +886,10 @@ export function createBridge(deps = {}) {
     // user's behalf is the obviously right thing to do. Its verdict is dropped here and kept for
     // the status tool to surface; nothing about this message's handling depends on it.
     selfHeal();
+    // Right after the heal, which is what says whether our hooks are installed at all. Started
+    // here, on the first linked message (usually `initialize` itself), so a fast probe can settle
+    // while the portal round trip is in flight.
+    startTrustProbe();
     // Linked machines still ask for these ("re-link me", "why is nothing tracked?"); answer
     // locally rather than forwarding tools the portal does not have.
     const local = localToolCall(msg);

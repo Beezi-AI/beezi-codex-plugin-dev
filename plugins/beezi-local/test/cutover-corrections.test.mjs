@@ -36,6 +36,8 @@ test('MCP blocks login and token refresh, keeps local discovery/status, then ret
   let blocked = true, tokenReads = 0, logins = 0;
   const messages = [];
   const bridge = createBridge({ write: line => messages.push(JSON.parse(line)),
+    // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     checkEnvironment: () => ({ status: blocked ? 'deferred' : 'ok', message: 'Recovery pending' }),
     // REWRITTEN, not weakened: the bridge resolves the DEFAULT ACCOUNT and then that account's
     // credentials, so `getAccessToken` is no longer a seam it has. The counter sits on the first
