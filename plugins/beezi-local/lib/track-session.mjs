@@ -6,7 +6,7 @@ import {
   isUsableSessionId,
   resolveTranscriptByCwd as _resolveTranscriptByCwd,
 } from './transcript-codex.mjs';
-import { isMultiTenant, resolveTargets } from './workspace.mjs';
+import { isMultiTenant, isSingleTenant, readSessionWorkspace, resolveTargets } from './workspace.mjs';
 import { createRouteContext, routeForDir, routeKeyForDir } from './workspace-rules.mjs';
 import { orDefault } from './compat.mjs';
 
@@ -51,6 +51,14 @@ function heldHere(who, cwd, ctx) {
   if (key == null) return null;
   const route = routeForDir(who, cwd, ctx());
   return resolveTargets(who, { route: { [who.key]: route } }).pendingAsk ? key : null;
+}
+
+// A one-workspace account's session route is a stored `[]` rule (a Don't-track folder or repo): nothing this run
+// built was ever going to be routed anywhere for `who`, regardless of how many segments it enqueued.
+function excludedHere(who, state) {
+  if (who == null || !isSingleTenant(who)) return false;
+  const r = resolveTargets(who, state);
+  return r.source === 'rule' && r.targets.length === 0;
 }
 
 // A multi-workspace row's tenantName is the web-side workspace, so accounts are named by email.
@@ -124,7 +132,7 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
   // a cursor that the first run would advance, so a second pass would find nothing left to bill
   // and the later accounts would silently receive an empty report. runCheckpoint fans the one
   // delta out into every allowed account's queue itself and hands back a drain result each.
-  const { enqueued, flushes, outcome, reason } = await runCheckpoint(
+  const { enqueued, routedCopies, flushes, outcome, reason } = await runCheckpoint(
     {
       session_id: sessionId,
       transcript_path: transcriptPath,
@@ -149,6 +157,8 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
     if (routeCtx == null) routeCtx = createRouteContext();
     return routeCtx;
   };
+  let state = null;
+  try { state = readSessionWorkspace(sessionId); } catch { state = null; }
   const lines = [];
   const pending = [];
   let ok = true;
@@ -179,6 +189,11 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
         : `Beezi: analytics for ${label} are held, not sent: no workspace is chosen for this folder yet.`;
     } else if (enqueued === 0 && saved === 0) {
       text = `Beezi: nothing new to save for ${label} — already up to date.`;
+    } else if (saved === 0 && (many || orDefault(routedCopies, null) === 0) && excludedHere(who, state)) {
+      // `enqueued` counts built payloads, not routed ones (M-1): a Don't-track rule excludes every
+      // segment this run built, so nothing was ever headed anywhere — "analytics saved (0 segments)"
+      // would be a false claim.
+      text = `Beezi: ${label} is not tracked (your rule).`;
     } else {
       text = `Beezi: analytics saved for ${label} (${saved} segment${saved === 1 ? '' : 's'}).`;
     }

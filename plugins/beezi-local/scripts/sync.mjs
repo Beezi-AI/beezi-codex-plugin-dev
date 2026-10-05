@@ -8,6 +8,7 @@ import {
   AccountStatus, describeAccount, getAccount, listAccounts, parseAccountFlag,
 } from '../lib/accounts.mjs';
 import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf } from '../lib/workspace.mjs';
+import { usesRules } from '../lib/workspace-rules.mjs';
 
 // The repeatable history repair pass (G-3-3 engine, G-9-3 surface).
 //
@@ -77,6 +78,12 @@ async function runOne(key, many, options) {
     },
     { ...options, key },
   );
+
+  // The real count, after the live-session skip the audit already applies — not the pre-run plan,
+  // which also counts the live session and sessions still being written.
+  if (options.excludedLabel != null && result.excluded > 0) {
+    console.log(`Beezi (${options.excludedLabel}): ${plural(result.excluded, 'past session')} in repos or folders you don't track ${result.excluded === 1 ? 'is' : 'are'} skipped.`);
+  }
 
   // 'no-token' says two different things depending on whether this run was scoped. Unscoped it is
   // the machine: nothing here can report. SCOPED it is the account, which the caller has already
@@ -210,13 +217,19 @@ async function runOne(key, many, options) {
       + 'eligible — run sync again later.',
     );
   }
-  // An account in several workspaces only: this workspace's lines of the session are interleaved
-  // with another workspace's, and Beezi's contiguous prefix cannot say what it holds past the gap.
+  // An account in several workspaces: this workspace's lines of the session are interleaved with
+  // another workspace's. A one-workspace account with rules (I-3): an excluded segment left the
+  // same kind of hole, so the wording cannot say "split between workspaces" — there is only one.
+  // Either way Beezi's contiguous prefix cannot say what it holds past the gap.
   if (orDefault(result.deferredSplit, 0) > 0) {
     console.log(
-      `  ${plural(result.deferredSplit, 'session')} were left alone: their history was split between `
-      + 'workspaces, so what Beezi has for this workspace does not prove a safe resume point and '
-      + 're-uploading could double-count. A later run will not change that.',
+      options.excludedSessionIds != null
+        ? `  ${plural(result.deferredSplit, 'session')} were left alone: part of their history is in repos `
+          + 'or folders you don\'t track, so what Beezi has does not prove a safe resume point and '
+          + 're-uploading could double-count. A later run will not change that.'
+        : `  ${plural(result.deferredSplit, 'session')} were left alone: their history was split between `
+          + 'workspaces, so what Beezi has for this workspace does not prove a safe resume point and '
+          + 're-uploading could double-count. A later run will not change that.',
     );
   }
   if (result.deferredOverlap > 0) {
@@ -279,7 +292,15 @@ function routeSummary(row, plan) {
 async function syncAccount(row, many, options, argv) {
   const override = parseTenantFlags(argv, row).tenantIds;
   if (!isMultiTenant(row)) {
-    await runOne(row.key, many, options);
+    if (usesRules(row)) {
+      const plan = planWorkspaceRuns(row);
+      const excludedSessionIds = new Set(
+        [...plan.routes].filter(([, route]) => route.source === 'rule' && route.tenantIds.length === 0).map(([sessionId]) => sessionId),
+      );
+      await runOne(row.key, many, { ...options, excludedSessionIds, excludedLabel: describeAccount(row) });
+    } else {
+      await runOne(row.key, many, options);
+    }
     return;
   }
   // --tenant is an override: those workspaces get every past session, unrouted.

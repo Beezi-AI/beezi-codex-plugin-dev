@@ -8,7 +8,7 @@ import {
   roleLabel,
   tenantById,
 } from './workspace.mjs';
-import { bindSessionRoutes, createRouteContext, routeKeyForDir, shortLabel } from './workspace-rules.mjs';
+import { bindSessionRoutes, createRouteContext, routeKeyForDir, shortLabel, usesRules } from './workspace-rules.mjs';
 
 // Only a new session or a clear asks; resume and compact never do.
 const ASK_SOURCES = ['startup', 'clear'];
@@ -59,8 +59,18 @@ function nameOf(row, id) {
   return t != null && t.name ? t.name : id;
 }
 
+// "A", "A and B", "A, B and C".
 function names(row, ids) {
-  return ids.map((id) => nameOf(row, id)).join(', ');
+  const list = ids.map((id) => nameOf(row, id));
+  return list.length < 2 ? list.join('') : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
+}
+
+// How the targets notice names a place: a folder's ~ path, a repo's name, or sessions outside a project.
+function noticePlace(key) {
+  if (key == null) return 'this folder';
+  if (key.kind === 'outside') return 'sessions outside a project';
+  if (key.kind === 'folder' && key.label) return key.label;
+  return shortLabel(key) || 'this folder';
 }
 
 function lowerFirst(text) {
@@ -154,13 +164,15 @@ export async function markPendingWorkspace(input, deps = {}) {
   const sessionId = input.session_id;
   const cwd = inputCwd(input);
   const rows = await linkedRows(deps);
-  const multi = rows.filter(isMultiTenant);
-  if (multi.length === 0) return null;
+  const bound = rows.filter(usesRules);
+  if (bound.length === 0) return null;
   const ctx = createRouteContext();
   // Re-matched on every start, resume and compact: a rule added since binds, a removed one unbinds.
   // Written even when nothing is pending: it keeps this the newest session in its directory for the cwd fallback.
-  const state = bindSessionRoutes(sessionId, cwd, multi, ctx);
+  const state = bindSessionRoutes(sessionId, cwd, bound, ctx);
   if (state == null) return null;
+  // Pending/asks stay multi-only: a one-workspace row never has anything to ask.
+  const multi = rows.filter(isMultiTenant);
   const pending = multi
     .map((row) => ({ row, resolved: resolveTargets(row, state) }))
     .filter((r) => r.resolved.pendingAsk);
@@ -196,29 +208,33 @@ export async function buildTargetsNotice(input, deps = {}) {
   if (input == null || typeof input.session_id !== 'string' || input.session_id === '') return null;
   const rows = await linkedRows(deps);
   const state = readSessionWorkspace(input.session_id);
-  const shown = await withUsableLogin(rows.filter(isMultiTenant), deps);
+  // A no-rules one-workspace row can never produce a line here (resolveTargets gives 'single'), so
+  // skip its credential read (M2).
+  const shown = await withUsableLogin(rows.filter(usesRules), deps);
   const ctx = createRouteContext();
-  let here = null;
-  const place = () => {
-    if (here == null) here = shortLabel(routeKeyForDir(state != null && state.cwd != null ? state.cwd : inputCwd(input), ctx));
+  let here;
+  const hereKey = () => {
+    if (here === undefined) here = routeKeyForDir(state != null && state.cwd != null ? state.cwd : inputCwd(input), ctx);
     return here;
   };
   const lines = shown
     .map((row) => ({ row, resolved: resolveTargets(row, state) }))
-    .filter((r) => r.resolved.multi && !r.resolved.pendingAsk)
+    .filter((r) => (r.resolved.multi && !r.resolved.pendingAsk) || (r.resolved.source === 'rule' && r.resolved.targets.length === 0))
     .map(({ row, resolved }) => {
       const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
-      const where = resolved.rule != null ? shortLabel(resolved.rule) : place();
-      const at = where ? ` · ${where}` : '';
+      const key = resolved.rule != null ? resolved.rule : hereKey();
+      const where = noticePlace(key);
       let text;
-      if (resolved.source === 'rule') {
-        text = resolved.targets.length > 0 ? `${names(row, resolved.targets)}${at}` : `not tracked${at}`;
+      if (resolved.source === 'rule' && resolved.targets.length === 0) {
+        text = `${where} ${key != null && key.kind === 'outside' ? 'are' : 'is'} not tracked (your rule). Change it with the settings skill (Rules).`;
+      } else if (resolved.source === 'none') {
+        text = `analytics from ${where} are not uploaded (new folders: don't send). Change it with the settings skill (New folders).`;
       } else if (resolved.source === 'new-folders') {
-        text = `${names(row, resolved.targets)}${at} (new folder default)`;
+        text = `analytics from ${where} go to ${names(row, resolved.targets)} (new folder default). Change it with the settings skill (New folders).`;
       } else {
-        text = `not uploaded${at} (new folders: don't send)`;
+        text = `analytics from ${where} go to ${names(row, resolved.targets)}. Change it with the settings skill (Rules).`;
       }
-      return `${prefix} → ${text}`;
+      return `${prefix}: ${text}`;
     });
   return lines.length === 0 ? null : lines.join('\n');
 }

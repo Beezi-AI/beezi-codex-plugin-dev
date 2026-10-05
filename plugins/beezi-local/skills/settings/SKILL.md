@@ -48,10 +48,12 @@ node "<plugin-root>/scripts/settings.mjs" keys
 
 It prints:
 
-- `menu=<label>|<label>…` — the sections that apply here, in order: `Rules` and `New folders` only
-  when some linked account is in several workspaces, then `Account` and `Crash reports`;
-- one line per linked account: `account=<key> default=<yes|no> multi=<yes|no> status=<…> email=<email>`
-  (`multi=yes`: the account is in several workspaces; no such line: nothing is linked);
+- `menu=<label>|<label>…` — the sections that apply here, in order: `Rules` when some linked account
+  has at least one known workspace, `New folders` only when some linked account is in several
+  workspaces, then `Account` and `Crash reports`;
+- one line per linked account: `account=<key> default=<yes|no> multi=<yes|no> workspaces=<n>
+  status=<…> email=<email>` (`multi=yes`: the account is in several workspaces; `workspaces=<n>` is
+  its known workspace count, `0` when not known yet; no such line: nothing is linked);
 - `crash=<correlate|on|anonymous|off>`.
 
 Then, by what the user asked:
@@ -106,10 +108,13 @@ to the user — it is part of the output, so show it too. With several Beezi bui
 
 ## Choosing the account (Rules and New folders)
 
-Use the `account=` lines with `multi=yes`.
+Rules uses the `account=` lines with `multi=yes` or `workspaces=1`. New folders uses only the
+`account=` lines with `multi=yes`.
 
 - No `account=` line at all → say this machine is not linked and to use the login skill; stop.
-- None with `multi=yes` → say this setting applies only to an account in several workspaces; stop.
+- None qualify → for New folders, say this setting applies only to an account in several workspaces;
+  stop. For Rules, say the account's workspaces are not known yet, to start a new Codex session,
+  then try again; stop.
 - Exactly one → use it.
 - Several → ask "Whose rules?" (Rules) or "Whose New folders setting?" (New folders), one choice per
   such line, labelled with its `email=`. An email the user already named picks it without asking.
@@ -160,7 +165,7 @@ Then run (for you only; do not show it):
 node "<plugin-root>/scripts/workspace.mjs" rules --account <key>
 ```
 
-Its lines:
+For an account in several workspaces, its lines:
 
 - `W. <workspace> account=<key> tenant=<id> role=<role>` — one per workspace;
 - `R<n>. <short> (<label>) → <workspaces | not tracked> account=<key> rule=<n> kind=<…> tenants=<ids|none> match=<…>`
@@ -168,10 +173,17 @@ Its lines:
 - `here: <short> (<label>) → <R<n> | no rule> account=<key> rule=<n|none> kind=<…> match=<…>` — this
   folder, and the rule it follows now (`here: none account=<key>` when this session has no folder).
 
+For a one-workspace account (the chosen `account=` line has `workspaces=1`), there are no `W.` lines;
+the first line reads `<account>: <n> rule(s) account=<key> workspaces=1` instead, and each `R<n>.`
+line reads `→ <not tracked | tracked | ignored (workspace left)>` in place of naming workspaces (the
+last only for a leftover multi-workspace-era rule naming a workspace the account has left).
+
 A `kind=outside` line has no ` (<label>)`. `<here>` = the `here:` line's `<short>`, or "sessions
 outside a project" when its `kind=outside`. The `here:` line's rule is its own when that `R<n>.` line
 has the same `kind=` and `match=` as the `here:` line; otherwise it is a wider rule (a parent folder)
 that covers this repo or folder.
+
+For a one-workspace account, use One-workspace rules, below, instead of the rest of this section.
 
 Then by the request:
 
@@ -187,6 +199,8 @@ Then by the request:
     `<rule short>` is that `R<n>.` line's `<short>`, described by that line up to ` account=`;
   - "Add a rule just for <here>" — the `here:` line names a wider rule; described "Only <here>
     changes; R<n> keeps the rest";
+  - "Add a rule for another folder or repo…" — only when the `here:` line does not name a wider
+    rule; described "Pick a different repo or folder"; see Typed target, below;
   - "Change a rule" — there is an `R<n>.` line;
   - "Remove a rule" — there is an `R<n>.` line;
   - "Done" — only with `request_user_input`, and only when fewer than 3 choices come before it.
@@ -213,11 +227,23 @@ node "<plugin-root>/scripts/workspace.mjs" rule set <n> <ids> --account <key>
 about its `R<n>.` line, marking its current workspaces, then run the `rule set` command above with its
 number.
 
+**"Add a rule for another folder or repo…"** — go to Typed target, below, with `<ids>` from the
+workspace question it asks, then run, with the flag Typed target picked:
+
+```
+node "<plugin-root>/scripts/workspace.mjs" rule add --folder '<value>' <ids> --account <key>
+```
+
+```
+node "<plugin-root>/scripts/workspace.mjs" rule add --repo '<value>' <ids> --account <key>
+```
+
 **Remove** — with no `R<n>.` line, say the account has no rules and stop. With a number from the
 request: when no `R<n>.` line has it, say there is no rule R<n> and stop. Without one, pick a rule
 ("Which rule do you want to remove?"). Then confirm: ask "Remove R<n> (<short>)?" (`<short>` from
 that line) with the choices "Yes" (described "Delete the rule; new sessions there follow New
-folders") and "No" ("Keep it"); only a yes goes on. Run:
+folders", or for a one-workspace account "Delete the rule; Beezi tracks it again unless another rule
+covers it") and "No" ("Keep it"); only a yes goes on. Run:
 
 ```
 node "<plugin-root>/scripts/workspace.mjs" rule remove <n> --account <key>
@@ -229,6 +255,71 @@ The plain sentence names each rule as "R<n> <short> (<what it sends to>)"; the a
 number (drop a leading `R`). "Cancel" runs nothing.
 
 After `rule add`, `rule set` or `rule remove`, write its first line verbatim (a `✗` line too).
+
+### One-workspace rules
+
+For a one-workspace account (the chosen `account=` line has `workspaces=1`), there is no workspace
+question anywhere below. `<here>` and "its own rule" are defined above.
+
+By the rest of the request:
+
+- `remove <n>` → Remove, above, with rule `<n>` (drop a leading `R`).
+- `remove` → Remove, above.
+- Anything else, or nothing (including `add`, which has no single meaning here) → the menu below.
+
+Ask "What do you want to do with rules?", offering only the choices that apply, in this order:
+
+- "Don't track <here>" — the `here:` line has `rule=none`, or names a rule shown `→ tracked`. Run:
+
+  ```
+  node "<plugin-root>/scripts/workspace.mjs" rule add --current none --account <key>
+  ```
+
+- "Track <here> again" — `<here>`'s own rule is `not tracked`. Run, with that rule's number, and
+  without the Yes/No confirmation the general Remove flow uses:
+
+  ```
+  node "<plugin-root>/scripts/workspace.mjs" rule remove <n> --account <key>
+  ```
+
+- "Don't track another folder or repo…" — go to Typed target, below, then run, with the flag Typed
+  target picked:
+
+  ```
+  node "<plugin-root>/scripts/workspace.mjs" rule add --folder '<value>' none --account <key>
+  ```
+
+  ```
+  node "<plugin-root>/scripts/workspace.mjs" rule add --repo '<value>' none --account <key>
+  ```
+
+- "Remove a rule" — there is an `R<n>.` line. Use Remove, above.
+- "Done" — per the file's rule.
+
+Fit the file's choice-count rules; use a plain sentence where `request_user_input` doesn't apply.
+After any command, write its first line verbatim (a `✗` line too).
+
+### Typed target
+
+Shared by both account kinds. Ask in plain text, not `request_user_input`: "Which folder or repo?
+Reply with a folder path (like ~/work/client) or a repo URL." Then end your reply and wait for the
+answer.
+
+An empty reply, or "cancel", stops. A reply containing `://` or starting with `git@` is a repo (the
+`--repo` flag); so is a reply that does not start with `/`, `~` or `.` and whose first `/`-separated segment contains a dot (a host, like
+`github.com/org/repo` or `dev.azure.com/org/project/_git/repo`). Everything else, a relative path like
+`work/client` included, is a folder (the `--folder` flag).
+`<value>` is the reply exactly as typed, trimmed — the command templates above already quote it in
+single quotes: replace each `'` in the reply with `'\''` before substituting it in.
+
+For a one-workspace account, that is all: run the command the calling step named, with `none`. For
+an account in several workspaces, first ask the workspace question about it: `kind=` is `folder` or
+`repo` by the reply, `<label>` is the typed folder, and `<short>` is its last path segment (a repo's
+short name, the same way the workspace question already derives one). Then run the command the
+calling step named, with the resulting `<ids>`.
+
+Either way, the script validates the value (home, `/`, or a non-URL repo are refused), and its first
+line is shown verbatim, errors included.
 
 ## New folders
 
