@@ -142,7 +142,8 @@ function describeBrokenHooks(status) {
   return `Separately: ${broken.length} registered hook ${plural} at a file that no longer exists`
     + ` (${events.join(', ')}), so Codex reports those events as failed on every session.`
     + ` These are removed automatically the next time the hooks are installed or repaired;`
-    + ` ${statusCommand()} lists the paths.`;
+    + ` ${statusCommand()} lists the paths; it reads Beezi's sign-in from the system credential store,`
+    + ' so run it with escalated permissions from the start, never inside the sandbox.';
 }
 
 /**
