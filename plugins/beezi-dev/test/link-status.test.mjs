@@ -177,6 +177,9 @@ test('a healthy machine is still told about dead entries it does not own', async
   // runnable from the user's cwd (their repo, not the plugin root): this message reaches the
   // beezi_status MCP tool, whose reader will try to run what it is told.
   assert.match(text, /removed automatically/);
+  // ...and that reader runs it in the sandbox unless told otherwise, where the env guard cannot
+  // read the keychain or Credential Manager.
+  assert.match(text, /run it with escalated permissions from the start/);
   assert.match(text, /node "[^"]*hooks\.mjs" status/);
   assert.doesNotMatch(text, /Run node "[^"]*hooks\.mjs" install/);
   assert.doesNotMatch(text, /<plugin>/);
