@@ -39,6 +39,31 @@ offer sync only for what it actually is: filling in sessions Beezi never receive
 This file is at `<plugin-root>/skills/sync/SKILL.md`, so the scripts are at `<plugin-root>/scripts/`
 — use the absolute path. Two steps, in order. Do not read, open, or inspect any other files.
 
+**Check this session first.** Before the first Beezi script in this session, run
+`node "<plugin-root>/scripts/preflight.mjs"` as it is, inside the sandbox and not escalated: it only
+reads this Codex session's own log, and it is the one script that needs nothing the sandbox blocks.
+Its `preflight=` line is for you only. On `preflight=blocked` it first prints lines starting `✗`:
+show them verbatim and run no other Beezi script, because this session cannot let them out of the
+sandbox and those lines tell the user how to change that. A blocked answer holds only until then:
+the user may switch with `/permissions`, so run the preflight again before the next Beezi script. On
+`preflight=unknown`, judge from your own permissions instructions: an approval policy of `never`
+under a sandbox is the same answer, so tell the user to restart Codex with
+`codex --sandbox workspace-write --ask-for-approval on-request` (or, only on a machine they trust,
+`codex --dangerously-bypass-approvals-and-sandbox`) and run no Beezi script. Otherwise carry on.
+
+**Run every other script outside the sandbox.** Every other `node "<plugin-root>/scripts/…"` command
+in this skill reads Beezi's sign-in from the system credential store (Windows Credential Manager, the
+macOS keychain), reads and writes Beezi's data under the user's home folder, outside the
+workspace, and most of them call the Beezi server. The Codex sandbox blocks all three, so a
+sandboxed run fails, or can report a wrong answer such as "no account linked". Run each of them
+with escalated permissions from the first attempt, never in the sandbox first: set
+`sandbox_permissions` to `"require_escalated"` (or use whatever escalation your shell tool offers)
+with a one-sentence `justification` saying what the command does, so the user can approve it.
+When this session has no sandbox (full access), run the commands as they are. If the user declines
+the approval, run nothing further from this skill and say the step needs their approval. A command
+that ran in the sandbox and prints a line naming it is run once more, escalated; one that already
+ran escalated and still fails is not retried: show its line and stop.
+
 **Asking.** A question below uses `request_user_input` only when that tool is listed this turn and
 the question has 2–3 choices. Otherwise it is one plain sentence naming every choice — never a
 numbered list or a bullet menu — that ends your reply; when the answer arrives, run its command and
@@ -125,10 +150,7 @@ the last choice was picked (it wins over the others). Never rebuild the command 
 yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
 sent this time, and the next sync asks again.
 
-Write each command's first line verbatim. The rule commands read Beezi's sign-in from the system
-credential store and write Beezi's settings under the user's home, outside the workspace, so the
-sandbox cannot run them: run each with escalated permissions from the start so the user can approve
-it.
+Write each command's first line verbatim.
 
 ### Step 2 — sync
 

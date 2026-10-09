@@ -670,6 +670,34 @@ Measured against Codex CLI 0.153+ / 0.154.0 on Windows.
   folder works and another does not.
   The guard recognises it (Codex sets `CODEX_SANDBOX` on a sandboxed command), still refuses, and
   tells the model to run the command again with escalated permissions.
+- **On Windows the sandbox is a different user.** Measured in rollouts (2026-10-08, Codex 0.160,
+  `[windows] sandbox = "elevated"`): a sandboxed command runs as the local account
+  `CodexSandboxOffline` (`CodexSandboxOnline` with network). Credential Manager is per-user, so that
+  account sees no Beezi sign-in, and `accounts.mjs list` failed with "Committed credentials could not
+  be read" until the model retried it escalated. Codex does not set `CODEX_SANDBOX` there — only
+  `CODEX_SANDBOX_NETWORK_DISABLED=1` when the sandbox has no network — and `USERPROFILE` stays the
+  real user's (measured with `codex exec`, same day), so `lib/codex-sandbox.mjs` checks the account
+  name as well. Under either sandbox a
+  network or permission failure now also says "run it again with escalated permissions" rather than
+  "check your internet connection".
+  The real fix is up front, not on failure: every script reads the credential store and the data
+  root under the home folder, so every skill tells the model to run each script with escalated
+  permissions from the first attempt. In on-request mode the user approves each one; with no
+  sandbox (full access) the model runs them as they are.
+- **A session that cannot escalate is told so before anything runs.** Under a sandbox with approval
+  policy `never` (`codex exec`'s default, or `--ask-for-approval never`), or granular approvals with
+  `sandbox_approval` off, Codex refuses every escalation without asking, so no Beezi script can
+  work. Each skill first runs `scripts/preflight.mjs` inside the sandbox — it reads only the last
+  `turn_context` of this session's rollout, found by `CODEX_THREAD_ID` — and on that answer prints
+  what to restart with: `codex --sandbox workspace-write --ask-for-approval on-request`
+  (recommended), or `codex --dangerously-bypass-approvals-and-sandbox` (`--yolo`) on a trusted
+  machine, or the same two keys in `config.toml`, or `/permissions` in the running session. The
+  `turn_context` shapes it reads were measured on Codex 0.160 (2026-10-08); a shape it does not
+  recognise, or a rollout it cannot find, is `unknown` and the model judges from its own
+  permissions text instead. Measured end to end on Windows with `codex exec` (approval `never`,
+  `workspace-write`): the sandbox account read the real `~/.codex/sessions` and the preflight
+  answered `blocked`. A blocked answer is not cached — after `/permissions` the next Beezi request
+  runs the preflight again. Not yet run on macOS or Linux.
 - **`SessionEnd` is not registered.** It is out of scope for this release, and the reason is
   `Stop`: that hook already runs the same checkpoint, timeline included, at every turn end, so a
   `SessionEnd` entry would cost you one more hook to review and trust for work already done.

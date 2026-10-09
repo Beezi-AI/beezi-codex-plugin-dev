@@ -9,6 +9,31 @@ Checkpoints the current session's token usage and attributes it to the current r
 branch. This drives the same engine the lifecycle hooks use, so it works whether or not the hooks
 are installed and trusted. Work outside a git repo is tracked too, under the folder's name.
 
+**Check this session first.** Before the first Beezi script in this session, run
+`node "<plugin-root>/scripts/preflight.mjs"` as it is, inside the sandbox and not escalated: it only
+reads this Codex session's own log, and it is the one script that needs nothing the sandbox blocks.
+Its `preflight=` line is for you only. On `preflight=blocked` it first prints lines starting `✗`:
+show them verbatim and run no other Beezi script, because this session cannot let them out of the
+sandbox and those lines tell the user how to change that. A blocked answer holds only until then:
+the user may switch with `/permissions`, so run the preflight again before the next Beezi script. On
+`preflight=unknown`, judge from your own permissions instructions: an approval policy of `never`
+under a sandbox is the same answer, so tell the user to restart Codex with
+`codex --sandbox workspace-write --ask-for-approval on-request` (or, only on a machine they trust,
+`codex --dangerously-bypass-approvals-and-sandbox`) and run no Beezi script. Otherwise carry on.
+
+**Run every other script outside the sandbox.** Every other `node "<plugin-root>/scripts/…"` command
+in this skill reads Beezi's sign-in from the system credential store (Windows Credential Manager, the
+macOS keychain), reads and writes Beezi's data under the user's home folder, outside the
+workspace, and most of them call the Beezi server. The Codex sandbox blocks all three, so a
+sandboxed run fails, or can report a wrong answer such as "no account linked". Run each of them
+with escalated permissions from the first attempt, never in the sandbox first: set
+`sandbox_permissions` to `"require_escalated"` (or use whatever escalation your shell tool offers)
+with a one-sentence `justification` saying what the command does, so the user can approve it.
+When this session has no sandbox (full access), run the commands as they are. If the user declines
+the approval, run nothing further from this skill and say the step needs their approval. A command
+that ran in the sandbox and prints a line naming it is run once more, escalated; one that already
+ran escalated and still fails is not retried: show its line and stop.
+
 ## Running it
 
 This file is at `<plugin-root>/skills/track/SKILL.md`, so the script is at
@@ -102,11 +127,8 @@ When the answer arrives, run, with `<ids>` = the chosen workspaces' `tenant=` va
 node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> <ids>
 ```
 
-Show the user only its first line (a `✗` line too). The command reads Beezi's sign-in from the
-system credential store and writes Beezi's settings under the user's home, outside the workspace, so
-the sandbox cannot run it: run it with escalated permissions from the start so the user can approve
-it. The held analytics then go where the answer says with the
-next checkpoint — the next `track` run, while the hooks are not trusted. A skipped or declined
+Show the user only its first line (a `✗` line too). The held analytics then go where the answer
+says with the next checkpoint — the next `track` run, while the hooks are not trusted. A skipped or declined
 question runs nothing and changes nothing: the analytics stay held, and the next `track` run asks
 again.
 
