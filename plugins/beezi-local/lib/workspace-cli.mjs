@@ -1,15 +1,18 @@
 import os from 'os';
 import path from 'path';
 import {
-  AccountStatus, getDefaultKey, listAccounts, parseAccountFlag, removeWorkspaceRule, setNewFolders, setWorkspaceRule,
+  AccountStatus, getDefaultKey, listAccounts, markTenantsReviewed, parseAccountFlag, removeWorkspaceRule, setNewFolders,
+  setWorkspaceRule,
 } from './accounts.mjs';
 import {
   findSessionWorkspaceByCwd,
   initSessionWorkspace,
   isMultiTenant,
   isSingleTenant,
+  joinTenantNames,
   listSessionWorkspaces,
   newFoldersOf,
+  newTenantsOf,
   readSessionWorkspace,
   recordReadTenant,
   recordSessionRoute,
@@ -22,8 +25,8 @@ import {
 import { releaseHeldQueue } from './workspace-queue.mjs';
 import { pluginRoot } from './workspace-prompt.mjs';
 import {
-  bindSessionRoutes, createRouteContext, outsideKey, planUnruledRoutes, routeForDir, routeKeyForDir, rulesOf,
-  rulesTableLines, shortLabel, usableIds,
+  bindSessionRoutes, createRouteContext, outsideKey, placeNow, planReviewPlaces, planUnruledRoutes, routeForDir,
+  routeKeyForDir, rulesOf, rulesTableLines, shortLabel, usableIds,
 } from './workspace-rules.mjs';
 import { canonicalRemote } from './git.mjs';
 import { normPath, pathHasPrefix } from './repo-map.mjs';
@@ -44,6 +47,7 @@ const USAGE = 'Usage: workspace.mjs rules [--table] [--session <id>] [--account 
   + ' | rule remove <n> [--account <ref>]'
   + ' | rule add-all (<id|name|n>… | none) [--session <id>] [--account <ref>]'
   + ' | routes [--session <id>] [--account <ref>]'
+  + ' | joined [add-all | done] [--session <id>] [--account <ref>]'
   + ' | new-folders [ask | send <id|name|n>… | none] [--session <id>] [--account <ref>]'
   + ' | read <id|name|n> [--session <id>] [--account <ref>]';
 const NOT_LINKED = 'Beezi: this machine is not linked. Use the login skill to link an account.';
@@ -479,6 +483,11 @@ async function rule(cx, argv) {
   throw new UserError(USAGE);
 }
 
+// The rule-add target flag for a place; single quotes keep $, backticks, " and \ in the match literal.
+function ruleTargetFlag(place) {
+  return place.kind === 'outside' ? '--outside' : `--${place.kind} '${place.match.replace(/'/g, "'\\''")}'`;
+}
+
 // Past sessions waiting under New folders = Ask me, grouped by repo or folder, for the planning questions.
 async function routes(cx, argv) {
   const { session, rest: afterSession } = parseSessionFlag(argv);
@@ -502,8 +511,7 @@ async function routes(cx, argv) {
       for (const g of groups) {
         total += 1;
         cx.lines.push(`P${total}. ${labeled(g)}, ${sessionsCount(g.sessions)} account=${row.key} kind=${g.kind} match=${g.match}`);
-        // Single quotes keep $, backticks, " and \ in the match literal.
-        const where = g.kind === 'outside' ? '--outside' : `--${g.kind} '${g.match.replace(/'/g, "'\\''")}'`;
+        const where = ruleTargetFlag(g);
         cx.lines.push(`P${total}-command=${script} rule add ${where} --account ${row.key} <tenants>`);
       }
       cx.lines.push(`all-command=${script} rule add-all --account ${row.key} <tenants>`);
@@ -516,6 +524,93 @@ async function routes(cx, argv) {
     }
   }
   cx.lines.push(`routes=${total}`);
+}
+
+// A match or label holding a control character could forge a machine line, so `joined` leaves such a place out.
+const UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+
+// Accounts that joined a workspace since their last re-pick here: every place to re-pick, with where it sends now (login step 4a, sync step 1).
+async function joined(cx, argv) {
+  const [sub, ...after] = argv;
+  if (sub === 'add-all') { await joinedAddAll(cx, after); return; }
+  if (sub === 'done') { await joinedDone(cx, after); return; }
+  const { session, rest: afterSession } = parseSessionFlag(argv);
+  const { account, rest } = await parseAccountFlag(afterSession);
+  if (rest.length !== 0) throw new UserError(USAGE);
+  const rows = await selectedRows(account);
+  const { sessionId } = resolveSession(cx, session);
+  const ctx = createRouteContext();
+  const script = scriptCommand();
+  let entries = null;
+  let total = 0;
+  for (const row of rows) {
+    if (row.status !== AccountStatus.LINKED) continue;
+    const newIds = newTenantsOf(row);
+    if (newIds.length === 0) continue;
+    if (entries == null) entries = cx.listAllRollouts();
+    const places = planReviewPlaces(row, entries, ctx, { liveSessionId: sessionId })
+      .filter((place) => !UNSAFE_LINE.test(place.match) && !UNSAFE_LINE.test(place.label));
+    if (places.length === 0) continue;
+    const count = places.length === 1 ? '1 repo or folder' : `${places.length} repos or folders`;
+    cx.lines.push(`${accountLabel(row)}: you joined ${joinTenantNames(row, newIds)} — ${count} to review account=${row.key} new=${newIds.join(',')}`);
+    for (const t of tenantsOf(row)) {
+      cx.lines.push(`W. ${t.name ? t.name : t.id} account=${row.key} tenant=${t.id} new=${newIds.indexOf(t.id) === -1 ? 'no' : 'yes'} role=${roleLabel(t)}`);
+    }
+    for (const place of places) {
+      total += 1;
+      const now = placeNow(row, place, newIds);
+      const where = now.pending ? 'no rule yet' : sendList(row, now.ids);
+      cx.lines.push(`J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${now.pending ? 'pending' : idList(now.ids)}`);
+      cx.lines.push(`J${total}-command=${script} rule add ${ruleTargetFlag(place)} --account ${row.key} <tenants>`);
+    }
+    cx.lines.push(`add-all-command=${script} joined add-all --account ${row.key}`);
+    cx.lines.push(`done-command=${script} joined done --account ${row.key}`);
+  }
+  cx.lines.push(`joined=${total}`);
+}
+
+// Adds the new workspaces to every listed place that already sends somewhere; Don't-track and no-rule-yet places stay as they are. Then marks the join reviewed.
+async function joinedAddAll(cx, argv) {
+  const { session, rest: afterSession } = parseSessionFlag(argv);
+  const { account, rest } = await parseAccountFlag(afterSession);
+  if (rest.length !== 0) throw new UserError(USAGE);
+  const row = await resolveAccount(account);
+  requireMulti(row);
+  const newIds = newTenantsOf(row);
+  if (newIds.length === 0) {
+    cx.lines.push('✓ No new workspaces are waiting for a review.');
+    cx.lines.push('rules-added=0');
+    return;
+  }
+  const ctx = createRouteContext();
+  const current = await withSessionState(cx, resolveSession(cx, session), ctx);
+  const members = tenantsOf(row).map((t) => t.id);
+  const added = [];
+  for (const place of planReviewPlaces(row, cx.listAllRollouts(), ctx, { liveSessionId: current.sessionId })) {
+    const now = placeNow(row, place, newIds);
+    if (now.pending || now.ids.length === 0) continue;
+    const tenantIds = members.filter((id) => now.ids.indexOf(id) !== -1 || newIds.indexOf(id) !== -1);
+    added.push((await setWorkspaceRule(row.key, { kind: place.kind, match: place.match, label: place.label, tenantIds })).index);
+  }
+  await markTenantsReviewed(row.key, newIds);
+  const n = added.length;
+  const names = joinTenantNames(row, newIds);
+  cx.lines.push(n === 0
+    ? `✓ Nothing to add: no repo or folder sends anywhere yet. ${names} won't be asked about again.`
+    : `✓ ${names} now ${newIds.length === 1 ? 'gets' : 'get'} analytics from ${n === 1 ? '1 repo or folder' : `${n} repos and folders`}.`);
+  if (n > 0) await bindOpenSessions(cx, await resolveAccount(row.key), added, current, ctx);
+  cx.lines.push(`rules-added=${n}`);
+}
+
+// Marks the account's new workspaces reviewed, whatever the answers were.
+async function joinedDone(cx, argv) {
+  const { account, rest } = await parseAccountFlag(argv);
+  if (rest.length !== 0) throw new UserError(USAGE);
+  const row = await resolveAccount(account);
+  const newIds = newTenantsOf(row);
+  await markTenantsReviewed(row.key, newIds);
+  cx.lines.push(newIds.length === 0 ? '✓ No new workspaces were waiting for a review.' : `✓ Done reviewing ${joinTenantNames(row, newIds)}.`);
+  cx.lines.push(`reviewed=${idList(newIds)}`);
 }
 
 async function newFolders(cx, argv) {
@@ -579,6 +674,7 @@ export async function workspaceCommand(argv, deps = {}) {
     if (cmd === 'rules') await rules(cx, rest);
     else if (cmd === 'rule') await rule(cx, rest);
     else if (cmd === 'routes') await routes(cx, rest);
+    else if (cmd === 'joined') await joined(cx, rest);
     else if (cmd === 'new-folders') await newFolders(cx, rest);
     else if (cmd === 'read') await read(cx, rest);
     else throw new UserError(cmd == null ? USAGE : `Unknown command "${cmd}". ${USAGE}`);

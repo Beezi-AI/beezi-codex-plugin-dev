@@ -70,7 +70,85 @@ numbered list or a bullet menu — that ends your reply; when the answer arrives
 carry on from the next question, then step 2. Ask one question at a time. A skipped question runs
 nothing.
 
-### Step 1 — repos and folders with no rule
+### Step 1 — new workspaces, then repos and folders with no rule
+
+**First, new workspaces.** Run, adding `--account <account>` when the user named an account:
+
+```
+node "<plugin-root>/scripts/workspace.mjs" joined
+```
+
+Its output is for you only. For an account that joined a workspace since it was last reviewed on this
+machine, it lists every repo and folder with where its analytics go now. Its lines:
+
+- `<email>: you joined <names> — <N> repos or folders to review account=<key> new=<ids>` — starts the
+  block; `<names>` names the new workspaces;
+- `W. <workspace> account=<key> tenant=<id> new=<yes|no> role=<role>` — one per workspace; `new=yes`
+  is one just joined;
+- `J<i>. <short> (<full label>), <k> sessions, now: <where> account=<key> kind=<repo|folder> match=<match> now=<ids|none|pending>`
+  — one repo or folder (a `J` line). `<where>` is where its analytics go today: workspace names, `not
+  tracked`, or `no rule yet`. `J<i>. outside a project, <k> sessions, now: <where> … kind=outside match=outside`
+  is one too: sessions in the home folder, `/` or a temp folder;
+- `J<i>-command=<command>` — right after its `J` line: the rule command for it, ending in a literal
+  `<tenants>`. It is not a `J` line;
+- `add-all-command=<command>` — adds the new workspaces to every listed repo and folder that already
+  sends somewhere;
+- `done-command=<command>` — records that the new workspaces were reviewed;
+- `joined=<total>` — the number of `J` lines, always last.
+
+`joined=0` → nothing to ask; go to "Then, repos and folders with no rule" below.
+
+For each account with `J` lines (with several accounts, end every question with " (<email>)"), using
+that account's `W.` lines and commands:
+
+More than 4 `J` lines → first ask "You joined <names>. Where should analytics for these <N> repos and
+folders go?" (`<N>` = that account's number of `J` lines) with the choices "Add <names> to all <N>" (described
+"Repos you don't track, and ones with no rule yet, stay as they are"), "Choose per repo" ("One question
+per repo or folder") and "Leave them as they are" ("Nothing changes, and you're not asked about
+<names> again").
+
+- "Add <names> to all <N>" → run the `add-all-command=` text EXACTLY ONCE.
+- "Choose per repo" → the per-repo questions below.
+- "Leave them as they are" → run the `done-command=` text EXACTLY ONCE.
+- A skipped question → nothing; the next sync asks again.
+
+4 or fewer `J` lines → the per-repo questions.
+
+**The per-repo questions** — one question per `J` line, in turn, numbered across that account's `J`
+lines (`i` from 1, `N` = their number). This question counter restarts for each account; the printed
+`J` numbers are global across accounts. Preserve each printed `J` number to match its command; never
+use the question counter to look up a `J<i>-command`. `<short>` is the `J` line's text after `J<i>. ` up to ` (` or `,`,
+`<label>` the text in the parentheses after it, and `<where>` the text after `now: ` up to
+` account=`. The question and its last choice follow the line's `kind=`:
+
+| `kind=`   | Question                                                                                   | Last choice               |
+| --------- | ------------------------------------------------------------------------------------------ | ------------------------- |
+| `repo`    | "(i of N) Now: <where>. Where should analytics for <short> go?"                            | "Don't track this repo"   |
+| `folder`  | "(i of N) Now: <where>. Where should analytics for <label> (and everything inside it) go?" | "Don't track this folder" |
+| `outside` | "(i of N) Now: <where>. Where should analytics for sessions outside a project folder go?"  | "Don't track these"       |
+
+Choices: one per `W.` line — the workspace name (the text after `W. ` up to ` account=`), described by
+the line's `role=` value, with ", new" added for a `new=yes` line ("new" alone when the role is empty)
+— then the last choice, described "Nothing from <short> is uploaded" ("Nothing from sessions outside a
+project folder is uploaded" for `outside`). Several workspaces may be chosen.
+
+- `request_user_input` only with at most 2 `W.` lines (3 choices): header "Beezi", the question
+  followed by " Pick one, or name several under Other.", the labels exactly as above.
+- Otherwise the plain sentence: the question without its "?", a colon, each workspace as
+  "<name> (<description>)", then " — one or more — or <last choice, lower-case first letter>?". For
+  example: "(1 of 2) Now: Acme. Where should analytics for acme-api go: Acme (Owner), NewCo (User,
+  new) — one or more — or don't track this repo?"
+
+For each answered `J` line, run its `J<i>-command=` text EXACTLY ONCE, changing nothing except the
+final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` when the last
+choice was picked (it wins over the others). Never rebuild the command or re-quote its path yourself.
+A skipped question runs nothing for its line. After the last `J` question has been answered (not
+skipped or dismissed), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and
+the next login or sync asks again.
+
+Write each command's first line verbatim.
+
+**Then, repos and folders with no rule.**
 
 Run, adding `--account <account>` when the user named an account:
 

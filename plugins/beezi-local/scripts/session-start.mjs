@@ -3,7 +3,7 @@ import { runHook, importHookModule } from '../lib/hook-runner.mjs';
 import { DIAGNOSTIC_SOURCES } from '../lib/diagnostics.mjs';
 import { hookMayProceed, environmentNotice } from '../lib/env-guard.mjs';
 import { linkedSessions } from '../lib/accounts.mjs';
-import { markPendingWorkspace, buildWorkspacePrompt, buildTargetsNotice } from '../lib/workspace-prompt.mjs';
+import { markPendingWorkspace, buildWorkspacePrompt, buildTargetsNotice, buildJoinedNotice } from '../lib/workspace-prompt.mjs';
 
 const input = readHookInput();
 if (!input) process.exit(0);
@@ -61,14 +61,19 @@ async function main() {
   let additionalContext = null;
   try { additionalContext = await buildWorkspacePrompt(input, deps, marked); } catch { /* best-effort */ }
   let targetsNotice = null;
+  let joinedNotice = null;
   if (source !== 'compact') {
     try { targetsNotice = await buildTargetsNotice(input, deps); } catch { /* best-effort */ }
+    // Built only when the status line will be written, since building it marks the join announced.
+    if (failure == null) {
+      try { joinedNotice = await buildJoinedNotice(deps); } catch { /* best-effort */ }
+    }
   }
   if (failure != null) {
     write({ systemMessage: notice, additionalContext });
     throw failure;
   }
-  const status = message && targetsNotice ? `${message}\n${targetsNotice}` : (message || targetsNotice);
+  const status = [message, targetsNotice, joinedNotice].filter((part) => part != null && part !== '').join('\n') || null;
   write({ systemMessage: withNotice(status), additionalContext });
 }
 

@@ -415,6 +415,15 @@ async function performGuardedLogin(deps) {
       // stays the STORED client's — nothing about this account's link changed. recordWhoami is a
       // no-op on a null answer, so an unreachable portal leaves the cached policy alone.
       try { recordWhoami(existingByEmail.key, stillValid, existing.clientId); } catch { /* best-effort */ }
+      // Stores the probe's workspace list so a join made since session start reaches joined and the upload.
+      if (stillValid) {
+        try {
+          await updateAccount(existingByEmail.key, {
+            email: stillValid.email, name: stillValid.name,
+            tenantId: stillValid.tenantId, tenantName: stillValid.tenantName, tenants: stillValid.tenants,
+          }, d);
+        } catch { /* best-effort */ }
+      }
       // Check the account in, UNFORCED (G-2-1). A re-login on an unchanged machine is not news:
       // the payload hash still gates it, so this only refreshes last_seen_at once a week rather
       // than posting on every login a user runs to read their status back.

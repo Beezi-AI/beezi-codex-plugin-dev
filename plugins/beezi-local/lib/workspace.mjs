@@ -50,6 +50,43 @@ export function describeTenant(t) {
   return role ? `${name} (${role})` : name;
 }
 
+// When this account started on this machine: its link time, else its first refresh; null when neither is known.
+export function reviewBaselineMs(row) {
+  if (row == null) return null;
+  for (const at of [row.linkedAt, row.reviewBaselineAt]) {
+    const ms = typeof at === 'string' ? Date.parse(at) : NaN;
+    if (Number.isFinite(ms)) return ms;
+  }
+  return null;
+}
+
+// Workspaces whose membership began after the baseline (whoami joinedAt); [] for one or unknown workspaces.
+export function joinedAfterLink(row) {
+  if (!isMultiTenant(row)) return [];
+  const baseline = reviewBaselineMs(row);
+  if (baseline == null) return [];
+  return tenantsOf(row).filter((t) => {
+    const ms = typeof t.joinedAt === 'string' ? Date.parse(t.joinedAt) : NaN;
+    return Number.isFinite(ms) && ms > baseline;
+  }).map((t) => t.id);
+}
+
+// Joined after the baseline and not yet through the re-pick pass here.
+export function newTenantsOf(row) {
+  const reviewed = stringIds(row == null ? null : row.reviewedTenantIds) || [];
+  return joinedAfterLink(row).filter((id) => reviewed.indexOf(id) === -1);
+}
+
+// Workspace names for a sentence: "A", "A and B", "A, B and C".
+export function joinTenantNames(row, ids) {
+  const names = ids.map((id) => {
+    const t = tenantById(row, id);
+    return t != null && t.name ? t.name : id;
+  });
+  if (names.length <= 1) return names.join('');
+  return `${names.slice(0, -1).join(', ')} and ${names[names.length - 1]}`;
+}
+
 // Session ids name files in state/, so anything that could escape the directory is refused; sessionWorkspaceFile throws on these.
 function validSessionId(id) {
   return typeof id === 'string' && /^[A-Za-z0-9_-][A-Za-z0-9._-]*$/.test(id);

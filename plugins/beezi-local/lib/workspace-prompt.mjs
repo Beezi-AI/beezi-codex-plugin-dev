@@ -3,6 +3,8 @@ import url from 'url';
 import {
   describeTenant,
   isMultiTenant,
+  joinTenantNames,
+  newTenantsOf,
   readSessionWorkspace,
   resolveTargets,
   roleLabel,
@@ -236,5 +238,27 @@ export async function buildTargetsNotice(input, deps = {}) {
       }
       return `${prefix}: ${text}`;
     });
+  return lines.length === 0 ? null : lines.join('\n');
+}
+
+// SessionStart: one line per account with workspaces joined since the last notice here, which are then marked announced; null when none.
+export async function buildJoinedNotice(deps = {}) {
+  const rows = await linkedRows(deps);
+  const fresh = rows
+    .map((row) => {
+      const announced = Array.isArray(row.joinNoticedTenantIds) ? row.joinNoticedTenantIds : [];
+      return { row, ids: newTenantsOf(row).filter((id) => announced.indexOf(id) === -1) };
+    })
+    .filter((r) => r.ids.length > 0);
+  if (fresh.length === 0) return null;
+  const shown = await withUsableLogin(fresh.map((r) => r.row), deps);
+  const accounts = await import('./accounts.mjs');
+  const lines = [];
+  for (const { row, ids } of fresh) {
+    if (shown.indexOf(row) === -1) continue;
+    const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
+    lines.push(`${prefix}: you joined ${joinTenantNames(row, ids)}. Run the sync skill to choose which repos send analytics there.`);
+    try { await accounts.markJoinNoticed(row.key, ids); } catch { /* announced again next session */ }
+  }
   return lines.length === 0 ? null : lines.join('\n');
 }
