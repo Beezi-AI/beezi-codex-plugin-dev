@@ -2,6 +2,13 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { getJson, sessionOf } from './http.mjs';
 import { orDefault } from './compat.mjs';
 
+// Server-supplied names reach model-read lines, so control characters and line breaks collapse to one space.
+function oneLine(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+  return text === '' ? null : text;
+}
+
 // Absent list → null (unknown, old server), never []; entries without a string id are dropped.
 function parseTenants(raw) {
   if (!Array.isArray(raw)) return null;
@@ -9,9 +16,10 @@ function parseTenants(raw) {
     .filter((t) => t != null && typeof t.id === 'string')
     .map((t) => ({
       id: t.id,
-      name: typeof t.name === 'string' ? t.name : null,
-      role: typeof t.role === 'string' ? t.role : null,
-      type: typeof t.type === 'string' ? t.type : null,
+      name: oneLine(t.name),
+      role: oneLine(t.role),
+      type: oneLine(t.type),
+      joinedAt: typeof t.joinedAt === 'string' && Number.isFinite(Date.parse(t.joinedAt)) ? t.joinedAt : null,
     }));
 }
 

@@ -351,6 +351,60 @@ export function planUnruledRoutes(row, entries, ctx, options = {}) {
   return groups;
 }
 
+// The re-pick pass's places: the rule or rule-less place of every session the upload could send (no ledger filter, most sessions first), then stored rules with none.
+// Returns [{kind, match, label, sessions}].
+export function planReviewPlaces(row, entries, ctx, {
+  liveSessionId = null,
+  now = Date.now,
+  readState = readSessionWorkspace,
+  readCwd = null,
+} = {}) {
+  const context = ctx == null ? createRouteContext() : ctx;
+  const nowMs = typeof now === 'function' ? now() : now;
+  const places = [];
+  const byKey = new Map();
+  const add = (key, n) => {
+    const id = `${key.kind}\n${key.match}`;
+    let place = byKey.get(id);
+    if (place == null) {
+      place = { kind: key.kind, match: key.match, label: key.label, sessions: 0 };
+      byKey.set(id, place);
+      places.push(place);
+    }
+    place.sessions += n;
+  };
+  for (const entry of entries || []) {
+    if (entry == null || entry.sessionId == null) continue;
+    if (liveSessionId != null && entry.sessionId === liveSessionId) continue;
+    if (nowMs - entry.mtimeMs < ACTIVE_SESSION_WINDOW_MS) continue;
+    if (nowMs - entry.mtimeMs > MAX_SESSION_AGE_MS) continue;
+    if (entry.size > MAX_TRANSCRIPT_BYTES) continue;
+    const state = safeReadState(readState, entry.sessionId);
+    const dir = state != null && typeof state.cwd === 'string' && state.cwd !== '' ? state.cwd : entryCwdReader(readCwd, entry)();
+    if (dir == null) continue;
+    const key = routeForDir(row, dir, context) || routeKeyForDir(dir, context);
+    if (key != null) add(key, 1);
+  }
+  places.sort((a, b) => b.sessions - a.sessions || (a.label < b.label ? -1 : (a.label > b.label ? 1 : 0)));
+  for (const rule of rulesOf(row)) add(rule, 0);
+  return places;
+}
+
+// Where a place sends today: its rule (unless every workspace it names was left), else New folders, else under Ask me the one workspace the account had before the new ones, else pending.
+export function placeNow(row, place, newIds) {
+  const members = (tenantsOf(row) || []).map((t) => t.id);
+  for (const rule of rulesOf(row)) {
+    if (rule.kind !== place.kind || rule.match !== place.match) continue;
+    const ids = rule.tenantIds.filter((id) => members.indexOf(id) !== -1);
+    if (rule.tenantIds.length === 0 || ids.length > 0) return { ids, pending: false };
+  }
+  const newFolders = newFoldersOf(row);
+  if (newFolders.mode === 'send') return { ids: newFolders.tenantIds, pending: false };
+  if (newFolders.mode === 'none') return { ids: [], pending: false };
+  const before = members.filter((id) => newIds.indexOf(id) === -1);
+  return before.length === 1 ? { ids: before, pending: false } : { ids: [], pending: true };
+}
+
 const cell = (text) => String(text).replace(/\|/g, '\\|');
 
 function workspaceNames(row, ids) {
