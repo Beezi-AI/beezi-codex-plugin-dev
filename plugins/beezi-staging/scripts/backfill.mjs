@@ -1,11 +1,11 @@
-import { parseArgs, runAudit, planWorkspaceRuns, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
+import { parseArgs, runAudit, planWorkspaceRuns, ACCOUNT_TOKEN_UNUSABLE, SYNC_MODE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage, UserError } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
 import { fail, plural } from '../lib/cli.mjs';
 import { parseAccountFlag, linkedSessions, getAccount, describeAccount } from '../lib/accounts.mjs';
-import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf } from '../lib/workspace.mjs';
+import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf, joinedAfterLink } from '../lib/workspace.mjs';
 import { usesRules } from '../lib/workspace-rules.mjs';
 import { readTrackingState, matchesIdentity } from '../lib/tracking.mjs';
 
@@ -275,6 +275,52 @@ async function backfillOne(options) {
   return 0;
 }
 
+// A workspace joined after this machine linked the account got nothing live before the re-pick, so its
+// history resumes from what it already has (sync's coverage check). One that takes no uploads on
+// demand (audit-only) gets the one-time import instead, which has no link cutoff there.
+async function backfillJoinedOne(options) {
+  const result = await runAudit(
+    { onProgress: ({ processed, total }) => { console.log(`Beezi: ${processed}/${total} sessions read…`); } },
+    { ...options, mode: SYNC_MODE },
+  );
+  if (result.reason === 'audit-only' || result.halt === BackfillHalt.NOT_ALLOWED || result.halt === BackfillHalt.ALREADY_COMPLETED) {
+    return backfillOne(options);
+  }
+  // A stop the next run will not clear prints backfillOne's own ✗ line; busy and pending runs get the sync line below.
+  if (result.reason === 'no-token') {
+    return failed(ACCOUNT_TOKEN_UNUSABLE);
+  }
+  if (result.reason === 'lock-order' || result.reason === 'lock-failed') {
+    return failed(`Beezi: could not start the history upload (${orDefault(result.lastError, 'lock error')}).`);
+  }
+  if (result.halt === BackfillHalt.UNSUPPORTED_SERVER) {
+    return failed('Beezi: the server does not support the history pull yet — try again after the portal update.');
+  }
+  if (result.halt === BackfillHalt.FORBIDDEN) {
+    return failed(
+      `Beezi: the server refused the upload (${orDefault(result.lastError, 'forbidden')}). ` +
+        'Check your seat with your workspace admin, then sign in to Beezi again.',
+    );
+  }
+  if (options.dryRun) {
+    console.log(`✓ Beezi (dry run): would send ${plural(orDefault(result.plannedReports, 0), 'report')} to this workspace you joined — nothing was sent.`);
+    return 0;
+  }
+  const imported = orDefault(result.sessionsImported, 0);
+  // Split sessions are left alone for good (sync.mjs), so they don't keep the run incomplete.
+  const complete = result.reason == null && result.halt == null && result.coverageKnown !== false
+    && !(result.reportsFailed > 0) && !((result.deferred - orDefault(result.deferredSplit, 0)) > 0);
+  if (imported > 0) {
+    console.log(`✓ Beezi: uploaded ${plural(imported, 'session')} (${plural(orDefault(result.reportsStored, 0), 'report')} stored) to this workspace you joined.`);
+  } else if (complete) {
+    console.log('✓ Beezi: this workspace already has this machine\'s history.');
+  }
+  if (!complete) {
+    console.log('  Some history did not reach this workspace this time. Run the sync skill to send the rest and see why.');
+  }
+  return 0;
+}
+
 function tenantLabel(row, tenantId) {
   const t = tenantById(row, tenantId);
   return t != null && t.name ? t.name : tenantId;
@@ -364,12 +410,14 @@ async function main() {
     tenantIds = plan.tenantIds;
     routes = plan.routes;
   }
+  const joinedIds = joinedAfterLink(indexRow);
   let status = 0;
   for (const tenantId of tenantIds) {
     console.log(`\n— ${describeAccount(row)} · ${tenantLabel(row, tenantId)} —`);
     // One workspace's exception must not stop the rest.
     try {
-      if (await backfillOne({ ...options, tenantId, sessionRoutes: routes }) !== 0) status = 1;
+      const run = joinedIds.indexOf(tenantId) === -1 ? backfillOne : backfillJoinedOne;
+      if (await run({ ...options, tenantId, sessionRoutes: routes }) !== 0) status = 1;
     } catch (error) {
       console.error(`✗ ${friendlyMessage(error)}`);
       status = 1;
