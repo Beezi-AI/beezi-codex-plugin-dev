@@ -263,6 +263,8 @@ test('every subprocess call site in lib/ is behind an injectable seam, and no te
     // would launch a REAL Codex against the developer's own ~/.codex from any test that reaches
     // captureFromCodexAccount, so every caller of it in the suite injects this.
     'lib/codex-app-server.mjs': /deps\.spawn/,
+    // options.spawn || childProcess.spawn (setup-runner.mjs) — the setup wizard's script runner; its tests inject spawn.
+    'lib/setup-runner.mjs': /options\.spawn\s*\|\|/,
   };
   for (const [name, src] of sources('lib')) {
     if (!/from\s*['"](?:node:)?child_process['"]/.test(src)) continue;
