@@ -94,12 +94,11 @@ export const STILL_DEFAULT = /still reads from this machine/;
 export const LINKED_AS = /linked as (.+?)\. (?:Nothing changed|Credentials stored)/;
 export const TRUST_PENDING = /run \/hooks in Codex/;
 const HOOK_OUTCOME = /^(?:[✓⚠]|Beezi: another )/;
-const PLAN_PROGRESS = 'Checking your plan…';
-const SESSIONS_PROGRESS = 'Looking at your past sessions…';
+const PLAN_PROGRESS = '==> Checking your plan…';
+const SESSIONS_PROGRESS = '==> Looking at your past sessions…';
 const FINALIZE_NOTE = 'History import is now closed for this account: past sessions on other machines can no longer be imported. New sessions are still tracked everywhere Beezi is installed.';
 const DEFAULT_UNCHANGED = 'The default account is unchanged. The settings skill (Account → Default account) switches it later.';
 const TRUST_NOTE = 'One step left in Codex: run /hooks and trust the Beezi entries.';
-const DONE = 'Beezi is set up. Open Codex and keep working — restart it first if it was already open.';
 const CRASH_QUESTION = 'How should Beezi crash reports work?';
 export const CRASH_CHOICES = Object.freeze([
   { mode: 'correlate', label: 'Correlate (recommended)', description: 'attaches an installation ID so support can find your report' },
@@ -160,10 +159,11 @@ async function chooseCrashMode(ctx) {
   report(ctx, await ctx.run('telemetry.mjs', [CRASH_CHOICES[pick].mode]));
 }
 
+// A blank line and the /hooks trust reminder, only when the sign-in or hooks check asked for it.
 function finish(ctx, hooksOutput) {
+  if (!TRUST_PENDING.test(hooksOutput)) return;
   ctx.print('');
-  if (TRUST_PENDING.test(hooksOutput)) ctx.print(TRUST_NOTE);
-  ctx.print(DONE);
+  ctx.print(TRUST_NOTE);
 }
 
 // The login skill's steps in the terminal: 0 when done, 1 when the sign-in failed or the account question was dismissed.
