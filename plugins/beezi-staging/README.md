@@ -309,6 +309,8 @@ Each skill runs a script under `scripts/`; those stay directly runnable from a t
 `login.mjs`, `accounts.mjs [list|use <account>]`, `logout.mjs [--list|--account <a>|--all]`,
 `settings.mjs`, `workspace.mjs`, `telemetry.mjs [status|correlate|on|anonymous|off]`,
 `hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`.
+`setup.mjs` asks the login skill's questions in the terminal instead of a Codex thread; the
+one-line installers run it after installing the plugin.
 
 ## How analytics work
 
