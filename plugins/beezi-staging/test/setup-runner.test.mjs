@@ -18,7 +18,7 @@ function sink() {
 }
 
 // The fake closes with child.code once both streams have ended, like a real ChildProcess.
-function setup(script) {
+function setup(script, extra) {
   const calls = [];
   const stdout = sink();
   const stderr = sink();
@@ -35,10 +35,10 @@ function setup(script) {
     setImmediate(() => script(child));
     return child;
   };
-  const run = createRunner({
+  const run = createRunner(Object.assign({
     root: '/plugin', cwd: '/tmp/beezi-setup-x', env: { PATH: '/bin', CLAUDE_PID: '9', KEEP: 'y' },
     sessionKeys: ['CLAUDE_PID'], spawn, execPath: '/usr/bin/node', stdout, stderr,
-  });
+  }, extra));
   return { run, calls, stdout, stderr };
 }
 
@@ -90,4 +90,25 @@ test('a non-zero exit is reported, a signal kill becomes 1, and a spawn error be
   assert.equal((await killed.run('x.mjs', [])).code, 1);
   const missing = setup((child) => { child.emit('error', new Error('spawn ENOENT')); });
   assert.deepEqual(await missing.run('x.mjs', []), { code: 127, stdout: '', stderr: 'spawn ENOENT' });
+});
+
+test('stream paints every echoed stdout and stderr line, but never hidden or captured output', async () => {
+  const h = setup((child) => {
+    child.code = 0;
+    child.stdout.write('✓ linked\naccount=ab12\n');
+    child.stderr.write('⚠ slow\n');
+    child.stdout.end('tail');
+    child.stderr.end();
+  }, { paint: (line) => `<${line}>` });
+  const result = await h.run('login.mjs', [], { stream: true, hide: /^account=/ });
+  assert.equal(h.stdout.text(), '<✓ linked>\n<tail>\n');
+  assert.equal(h.stderr.text(), '<⚠ slow>\n');
+  assert.equal(result.stdout, '✓ linked\naccount=ab12\ntail');
+  assert.equal(result.stderr, '⚠ slow\n');
+});
+
+test('a painted run that does not stream echoes nothing', async () => {
+  const h = setup((child) => { child.code = 0; child.stdout.end('✓ quiet\n'); child.stderr.end(); }, { paint: (line) => `<${line}>` });
+  assert.deepEqual(await h.run('x.mjs', []), { code: 0, stdout: '✓ quiet\n', stderr: '' });
+  assert.equal(h.stdout.text(), '');
 });

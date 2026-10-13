@@ -14,6 +14,9 @@ const NO_FOLDER = /^\d+ other past sessions? ha(?:s|ve) no recorded folder and (
 const JOINED_NAMES = / you joined (.+) — \d+ repos? or folders? to review account=/;
 const MACHINE_LINES = [/^[\w-]+=/, /^[A-Z]\d*\. .* account=/, /-command=/, /^\s*[{[]/];
 const STOPPED = '✗ That step stopped unexpectedly.';
+// Writes leave the upload to the wizard's backfill that follows.
+const DEFER = '--defer-upload';
+const CONSENT = ' Their past sessions will be sent there too.';
 
 export function outputLines(text) {
   return String(text || '').split(/\r?\n/);
@@ -96,12 +99,14 @@ export function parsePlaces(text, letter) {
   });
 }
 
+// A joined place (one with a `now:`) also says its past sessions follow the answer.
 export function placeQuestion(place, i, n) {
   const prefix = `(${i} of ${n}) ${place.where === null ? '' : `Now: ${place.where}. `}`;
-  if (place.kind === 'outside') return `${prefix}Where should analytics for sessions outside a project folder go?`;
+  const consent = place.where === null ? '' : CONSENT;
+  if (place.kind === 'outside') return `${prefix}Where should analytics for sessions outside a project folder go?${consent}`;
   const folder = place.label !== null ? place.label : place.match;
-  if (place.kind === 'folder') return `${prefix}Where should analytics for ${folder} (and everything inside it) go?`;
-  return `${prefix}Where should analytics for ${place.short} go?`;
+  if (place.kind === 'folder') return `${prefix}Where should analytics for ${folder} (and everything inside it) go?${consent}`;
+  return `${prefix}Where should analytics for ${place.short} go?${consent}`;
 }
 
 export function workspaceOptions(workspaces) {
@@ -125,7 +130,7 @@ export function tenantsArg(picked, workspaces) {
 
 export function ruleArgv(place, key, tenants) {
   const target = place.kind === 'outside' ? ['--outside'] : [`--${place.kind}`, place.match];
-  return ['rule', 'add'].concat(target, ['--account', key, tenants]);
+  return ['rule', 'add'].concat(target, ['--account', key, tenants, DEFER]);
 }
 
 async function runAndReport(ctx, argv) {
@@ -141,13 +146,13 @@ export async function askNewFolders(ctx, key) {
   const last = lastLine(listing.stdout, /^new-folders=/);
   if (last === null || token(last, 'set') !== 'no') return;
   const choice = await ctx.ask.choose('Where should analytics go for repos and folders with no rule yet?', NEW_FOLDER_OPTIONS, { defaultIndex: 0 });
-  if (choice === 0) await runAndReport(ctx, ['new-folders', 'ask', '--account', key]);
-  if (choice === 2) await runAndReport(ctx, ['new-folders', 'none', '--account', key]);
+  if (choice === 0) await runAndReport(ctx, ['new-folders', 'ask', '--account', key, DEFER]);
+  if (choice === 2) await runAndReport(ctx, ['new-folders', 'none', '--account', key, DEFER]);
   if (choice !== 1) return;
   const workspaces = parseWorkspaces(listing.stdout);
   const picked = await ctx.ask.chooseMany('Which workspaces should get analytics for repos and folders with no rule?', workspaceOptions(workspaces));
   if (picked === null || picked.length === 0) return;
-  await runAndReport(ctx, ['new-folders', 'send', tenantsArg(picked, workspaces), '--account', key]);
+  await runAndReport(ctx, ['new-folders', 'send', tenantsArg(picked, workspaces), '--account', key, DEFER]);
 }
 
 // One question per place; true when the last place got an answer.
@@ -179,12 +184,12 @@ export async function reviewJoined(ctx, key) {
   if (places.length > 4) {
     const names = joinedNames(listing.stdout, workspaces);
     const n = places.length;
-    const choice = await ctx.ask.choose(`You joined ${names}. Where should analytics for these ${n} repos and folders go?`, [
+    const choice = await ctx.ask.choose(`You joined ${names}. Where should analytics for these ${n} repos and folders go?${CONSENT}`, [
       { label: `Add ${names} to all ${n}`, description: "Repos you don't track, and ones with no rule yet, stay as they are" },
       { label: 'Choose per repo', description: 'One question per repo or folder' },
       { label: 'Leave them as they are', description: `Nothing changes, and you're not asked about ${names} again` },
     ]);
-    if (choice === 0) await runAndReport(ctx, ['joined', 'add-all', '--account', key]);
+    if (choice === 0) await runAndReport(ctx, ['joined', 'add-all', '--account', key, DEFER]);
     if (choice === 2) await runAndReport(ctx, ['joined', 'done', '--account', key]);
     if (choice !== 1) return;
   }
@@ -212,7 +217,7 @@ export async function reviewRoutes(ctx, key) {
     if (choice === 0) {
       const picked = await ctx.ask.chooseMany(`Which workspaces should get analytics for these ${n} repos and folders?`, workspaceOptions(workspaces));
       if (picked !== null && picked.length > 0) {
-        await runAndReport(ctx, ['rule', 'add-all', '--account', key, tenantsArg(picked, workspaces)]);
+        await runAndReport(ctx, ['rule', 'add-all', '--account', key, tenantsArg(picked, workspaces), DEFER]);
       }
     }
     if (choice !== 1) return;

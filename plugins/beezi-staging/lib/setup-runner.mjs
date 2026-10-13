@@ -10,11 +10,11 @@ export function childEnv(env, sessionKeys) {
   return out;
 }
 
-// Writes complete lines as they arrive, skipping the ones matching hide.
-function lineEcho(write, hide) {
+// Writes complete lines through paint as they arrive, skipping the ones matching hide.
+function lineEcho(write, hide, paint) {
   let pending = '';
   const emit = (line) => {
-    if (hide === null || !hide.test(line)) write(`${line}\n`);
+    if (hide === null || !hide.test(line)) write(`${paint(line)}\n`);
   };
   return {
     push(chunk) {
@@ -35,6 +35,7 @@ export function createRunner(options) {
   const stdout = options.stdout || process.stdout;
   const stderr = options.stderr || process.stderr;
   const env = childEnv(options.env, options.sessionKeys);
+  const paint = options.paint || ((line) => line);
 
   return function run(script, argv, opts) {
     const stream = Boolean(opts && opts.stream);
@@ -42,8 +43,8 @@ export function createRunner(options) {
     return new Promise((resolve) => {
       let out = '';
       let err = '';
-      const echoOut = lineEcho((s) => stdout.write(s), hide);
-      const echoErr = lineEcho((s) => stderr.write(s), null);
+      const echoOut = lineEcho((s) => stdout.write(s), hide, paint);
+      const echoErr = lineEcho((s) => stderr.write(s), null, paint);
       const child = spawn(execPath, [path.join(options.root, 'scripts', script)].concat(argv), {
         cwd: options.cwd,
         env,

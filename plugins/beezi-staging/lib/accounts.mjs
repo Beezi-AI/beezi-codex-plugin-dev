@@ -15,6 +15,9 @@ import {
   readLegacyCredential, deleteLegacyCredential, setCredentials,
   subjectAuthorityPath, LEGACY_SUBJECT,
 } from './credentials.mjs';
+import {
+  ruleRequestIds, removalRequestIds, newFoldersSendIds, gainedIds, requestHistory, noteAttempt, settleHistory, takeResults, SettleState,
+} from './pending-history.mjs';
 
 // The one definition of "which Beezi accounts are linked on this machine". accounts.json is its
 // only home; lib/paths.mjs names the file and every per-account directory under it.
@@ -344,7 +347,9 @@ export async function setNewFolders(key, { mode, tenantIds = [] } = {}, deps = {
     const index = readIndexForMutation();
     const found = index.accounts.find((a) => a.key === key);
     if (!found) throw new UserError('No such linked account.');
+    const before = newFoldersSendIds(found);
     found.newFolders = { mode, tenantIds: mode === 'send' ? ids : [] };
+    requestHistory(found, gainedIds(before, newFoldersSendIds(found)), new Date().toISOString());
     writeIndex(index);
     return found.newFolders;
   });
@@ -374,9 +379,39 @@ export async function markTenantsReviewed(key, ids, deps = {}) {
   return addTenantIds(key, 'reviewedTenantIds', ids, deps);
 }
 
-// Workspaces the session-start notice already announced on this machine.
-export async function markJoinNoticed(key, ids, deps = {}) {
-  return addTenantIds(key, 'joinNoticedTenantIds', ids, deps);
+// The history worker stamps the start of its pass on the entries it is about to run.
+export async function notePendingAttempt(key, tenantIds, nowIso, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) return;
+    noteAttempt(found, tenantIds, nowIso);
+    writeIndex(index);
+  });
+}
+
+// One workspace's run outcome, applied under the index lock (lib/pending-history.mjs settleHistory).
+export async function settlePendingHistory(key, tenantId, run, timing, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) return SettleState.MISSING;
+    const state = settleHistory(found, tenantId, run, timing);
+    writeIndex(index);
+    return state;
+  });
+}
+
+// Removes and returns the account's finished-upload results for the session-start notice.
+export async function takeHistoryResults(key, limit = null, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found || !Array.isArray(found.historyResults) || found.historyResults.length === 0) return [];
+    const taken = takeResults(found, limit);
+    writeIndex(index);
+    return taken;
+  });
 }
 
 // Loaded on use, outside the synchronous lock section, as linkedSessions loads token.mjs: keeps its
@@ -419,6 +454,8 @@ export async function setWorkspaceRule(key, { kind, match, label = null, tenantI
       n = stored.length;
     }
     found.workspaceRules = stored;
+    // Every workspace the rule sends to is owed its history; the worker skips what it already has (lib/pending-history.mjs).
+    requestHistory(found, ruleRequestIds(found, tenantIds), new Date().toISOString());
     writeIndex(index);
     return { index: n, rule };
   });
@@ -435,6 +472,7 @@ export async function removeWorkspaceRule(key, n, deps = {}) {
     const rule = Number.isInteger(position) ? rulesOf(found).find((r) => r.index === position) : null;
     if (rule == null) throw new UserError(`There is no rule ${n}. Ask the settings skill to list the rules.`);
     found.workspaceRules.splice(position - 1, 1);
+    requestHistory(found, removalRequestIds(found), new Date().toISOString());
     writeIndex(index);
     return rule;
   });

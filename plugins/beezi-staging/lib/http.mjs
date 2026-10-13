@@ -4,6 +4,7 @@
 import { machineHeaders } from './machine-identity.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import { orDefault } from './compat.mjs';
+import { gzipJson } from './gzip-body.mjs';
 
 // Exported so a caller working against a deadline can shrink it to what the budget has left,
 // rather than discovering the overrun after the fact.
@@ -51,6 +52,11 @@ export async function postJson(url, session, body, deps = {}) {
   const headers = { ...authHeaders(session), 'Content-Type': 'application/json' };
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_TIMEOUT_MS);
+  if (deps.gzip === true) {
+    // Compressed before bounded() starts its timer; Content-Type stays JSON and the API inflates the body.
+    headers['Content-Encoding'] = 'gzip';
+    return bounded(fetchImpl, url, { method: 'POST', headers, body: await gzipJson(body) }, timeoutMs);
+  }
   return bounded(fetchImpl, url, {
     method: 'POST',
     headers,

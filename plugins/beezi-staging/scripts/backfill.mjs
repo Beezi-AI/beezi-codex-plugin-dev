@@ -1,4 +1,4 @@
-import { parseArgs, runAudit, planWorkspaceRuns, ACCOUNT_TOKEN_UNUSABLE, SYNC_MODE } from '../lib/session-audit.mjs';
+import { parseArgs, runAudit, planWorkspaceRuns, dontTrackSessionIds, ACCOUNT_TOKEN_UNUSABLE, SYNC_MODE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage, UserError } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
@@ -8,6 +8,7 @@ import { parseAccountFlag, linkedSessions, getAccount, describeAccount } from '.
 import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf, joinedAfterLink } from '../lib/workspace.mjs';
 import { usesRules } from '../lib/workspace-rules.mjs';
 import { readTrackingState, matchesIdentity } from '../lib/tracking.mjs';
+import { startHistoryWorker } from '../lib/history-trigger.mjs';
 
 // The login flow's final step: uploads this machine's past Codex sessions into Beezi. There is
 // no standalone skill for it — the login skill runs it after the link and plan capture, and
@@ -348,6 +349,11 @@ function routeSummary(row, plan) {
   return clauses.length === 0 ? null : `Beezi (${describeAccount(row)}): ${clauses.join('; ')}.`;
 }
 
+// Pending history (rules gained a workspace) gets its own coverage-based pass once this upload let go of the lock.
+async function startAfterBackfill(key, options) {
+  if (!options.dryRun) await startHistoryWorker(key);
+}
+
 async function main() {
   if (!cliMayProceed()) { process.exitCode = 1; return; }
   const flagged = await parseAccountFlag(process.argv.slice(2));
@@ -384,14 +390,12 @@ async function main() {
     const sealed = !options.force && usesRules(planningRow) && trackingValid
       && tracking != null && tracking.backfillCompleted === true;
     if (usesRules(planningRow) && !sealed) {
-      const plan = planWorkspaceRuns(planningRow);
-      const excludedSessionIds = new Set(
-        [...plan.routes].filter(([, route]) => route.source === 'rule' && route.tenantIds.length === 0).map(([sessionId]) => sessionId),
-      );
-      options.excludedSessionIds = excludedSessionIds;
+      options.excludedSessionIds = dontTrackSessionIds(planWorkspaceRuns(planningRow));
       options.excludedLabel = describeAccount(indexRow);
     }
-    if (await backfillOne(options) !== 0) process.exitCode = 1;
+    const status = await backfillOne(options);
+    await startAfterBackfill(key, options);
+    if (status !== 0) process.exitCode = 1;
     return;
   }
   const row = session;
@@ -423,6 +427,7 @@ async function main() {
       status = 1;
     }
   }
+  await startAfterBackfill(key, options);
   if (status !== 0) process.exitCode = 1;
 }
 

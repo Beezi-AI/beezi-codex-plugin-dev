@@ -8,7 +8,8 @@ import { hookMayProceed, shouldCheckEnvironment } from './env-guard.mjs';
 import { isUsableSessionId, listRolloutFiles as _listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
 import { readRolloutHead as _readRolloutHead, subagentIdentityFrom as _subagentIdentityFrom } from './subagent-codex.mjs';
 import { runCheckpoint as _runCheckpoint, reconcileSession } from './checkpoint.mjs';
-import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, SYNC_MODE } from './session-audit.mjs';
+import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE } from './session-audit.mjs';
+import { runDuePendingHistory } from './pending-history-run.mjs';
 import { linkedSessions as _linkedSessions } from './accounts.mjs';
 import { pruneStale as _pruneStale } from './prune.mjs';
 import { readTrackingState, isLiveTrackingAllowed, isTenantDark } from './tracking.mjs';
@@ -846,10 +847,7 @@ export async function runWatchPass(deps = {}, options = {}) {
       for (const session of sessions) {
         if (!isMultiTenant(session)) {
           if (usesRules(session)) {
-            const plan = planWorkspaceRuns(session);
-            const excludedSessionIds = new Set(
-              [...plan.routes].filter(([, route]) => route.source === 'rule' && route.tenantIds.length === 0).map(([sessionId]) => sessionId),
-            );
+            const excludedSessionIds = dontTrackSessionIds(planWorkspaceRuns(session));
             histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key, excludedSessionIds }));
           } else {
             histories.push(await runAudit({}, { mode: SYNC_MODE, key: session.key }));
@@ -871,6 +869,11 @@ export async function runWatchPass(deps = {}, options = {}) {
     }
     record.historyAt = nowFn();
     dirty = true;
+  }
+
+  // A rule that gained a workspace owes it its history: due accounts run here, after Path C let go of the run lock.
+  if (!shouldStop()) {
+    try { await runDuePendingHistory({ shouldStop }); } catch { result.errors += 1; }
   }
 
   if (dirty) {

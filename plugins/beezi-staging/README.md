@@ -310,7 +310,9 @@ Each skill runs a script under `scripts/`; those stay directly runnable from a t
 `settings.mjs`, `workspace.mjs`, `telemetry.mjs [status|correlate|on|anonymous|off]`,
 `hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`.
 `setup.mjs` asks the login skill's questions in the terminal instead of a Codex thread; the
-one-line installers run it after installing the plugin.
+one-line installers run it after installing the plugin. Its questions are colourful arrow-key
+menus (↑/↓, then Enter), with typed numbers as the fallback where keys cannot be read;
+`NO_COLOR` turns the colours off.
 
 ## How analytics work
 

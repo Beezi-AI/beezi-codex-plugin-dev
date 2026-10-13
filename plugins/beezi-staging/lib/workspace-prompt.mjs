@@ -11,6 +11,7 @@ import {
   tenantById,
 } from './workspace.mjs';
 import { bindSessionRoutes, createRouteContext, routeKeyForDir, shortLabel, usesRules } from './workspace-rules.mjs';
+import { resultLine } from './pending-history.mjs';
 
 // Only a new session or a clear asks; resume and compact never do.
 const ASK_SOURCES = ['startup', 'clear'];
@@ -241,24 +242,53 @@ export async function buildTargetsNotice(input, deps = {}) {
   return lines.length === 0 ? null : lines.join('\n');
 }
 
-// SessionStart: one line per account with workspaces joined since the last notice here, which are then marked announced; null when none.
-export async function buildJoinedNotice(deps = {}) {
-  const rows = await linkedRows(deps);
-  const fresh = rows
-    .map((row) => {
-      const announced = Array.isArray(row.joinNoticedTenantIds) ? row.joinNoticedTenantIds : [];
-      return { row, ids: newTenantsOf(row).filter((id) => announced.indexOf(id) === -1) };
-    })
-    .filter((r) => r.ids.length > 0);
+function joinedPromptText(rows, root, sessionId) {
+  const who = rows.length === 1 ? `${emailOf(rows[0])} joined ${joinTenantNames(rows[0], newTenantsOf(rows[0]))}` : 'these Beezi accounts joined new workspaces';
+  const commands = rows.map((row) => `\`node "${root}/scripts/workspace.mjs" joined --account ${row.key}\``).join(', then ');
+  const parts = [
+    `Beezi: ${who}.`,
+    `Before anything else, run EXACTLY ${commands} with escalated permissions from the start: it reads Beezi's sign-in from the system credential store and writes Beezi's settings outside the workspace, so the sandbox cannot run it.`,
+    'If it prints joined=0, say nothing about this.',
+    `Otherwise read "${root}/skills/sync/SKILL.md" and follow its "First, new workspaces" part from "Its output is for you only. For an account that joined" up to the paragraph that begins "**Then, repos and folders with no rule.**", for that output only, running every command it prints with escalated permissions too, with these changes:`,
+    '(1) always ask the first question ("You joined …") first, even with 4 or fewer J lines;',
+    '(2) leave out the "Add … to all" choice when every J line ends in now=pending or now=none;',
+    '(3) ask with request_user_input (header "Beezi") where the skill allows request_user_input and that tool is available this turn; otherwise do the user\'s request first and end your reply with that question as one plain sentence, and act on the answer when it arrives;',
+    '(4) a skipped or ignored question runs nothing; it is asked again next session;',
+    '(5) stop after that part: run neither routes nor sync.mjs, because the upload starts by itself.',
+  ];
+  // The current-folder question below was built before this pass, so it is asked only if the pass left this folder without a rule.
+  if (sessionId != null) {
+    parts.push(`If Beezi's separate question about where this session's own folder goes follows (it begins "Beezi is holding this session's analytics"), ask it only after that part is finished (its last question answered or skipped and its commands run): first run EXACTLY \`node "${root}/scripts/workspace.mjs" rules --session ${sessionId} --account <key>\` with escalated permissions too, for each account it asks about (\`<key>\` is the \`--account\` value in that account's command), and ask that account's question only when the \`here:\` line shows \`no rule\`; otherwise skip it.`);
+  }
+  parts.push('Then continue with the user\'s request.');
+  return parts.join(' ');
+}
+
+// SessionStart: the joined re-pick, asked on startup or clear until the join is reviewed; null when nothing is new.
+export async function buildJoinedPrompt(input, deps = {}) {
+  if (input == null) return null;
+  if (input.source != null && ASK_SOURCES.indexOf(input.source) === -1) return null;
+  const fresh = (await linkedRows(deps)).filter((row) => newTenantsOf(row).length > 0);
   if (fresh.length === 0) return null;
-  const shown = await withUsableLogin(fresh.map((r) => r.row), deps);
-  const accounts = await import('./accounts.mjs');
+  const rows = await withUsableLogin(fresh, deps);
+  const sessionId = typeof input.session_id === 'string' && input.session_id !== '' ? input.session_id : null;
+  return rows.length === 0 ? null : joinedPromptText(rows, pluginRoot(deps), sessionId);
+}
+
+// SessionStart: one user-only line per finished history upload, shown once on startup or clear.
+export async function buildHistoryNotice(input, deps = {}) {
+  if (input == null) return null;
+  if (input.source != null && ASK_SOURCES.indexOf(input.source) === -1) return null;
+  const rows = await linkedRows(deps);
+  const waiting = rows.filter((row) => Array.isArray(row.historyResults) && row.historyResults.length > 0);
+  if (waiting.length === 0) return null;
+  const take = deps.takeHistoryResults == null ? (await import('./accounts.mjs')).takeHistoryResults : deps.takeHistoryResults;
   const lines = [];
-  for (const { row, ids } of fresh) {
-    if (shown.indexOf(row) === -1) continue;
+  for (const row of waiting) {
+    let taken = [];
+    try { taken = await take(row.key); } catch { continue; }
     const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
-    lines.push(`${prefix}: you joined ${joinTenantNames(row, ids)}. Run the sync skill to choose which repos send analytics there.`);
-    try { await accounts.markJoinNoticed(row.key, ids); } catch { /* announced again next session */ }
+    for (const result of taken) lines.push(resultLine(result, { prefix, nameOf: (id) => nameOf(row, id), syncName: 'the sync skill' }));
   }
   return lines.length === 0 ? null : lines.join('\n');
 }

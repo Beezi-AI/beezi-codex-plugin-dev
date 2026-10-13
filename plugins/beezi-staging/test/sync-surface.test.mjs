@@ -156,9 +156,10 @@ test('skill — routes history before syncing, with scripts derived from its own
   assert.match(skill, /node "<plugin-root>\/scripts\/sync\.mjs"/);
   const commands = skill.match(/^node .+$/gm) || [];
   assert.deepEqual(commands, [
-    'node "<plugin-root>/scripts/workspace.mjs" routes',
+    'node "<plugin-root>/scripts/workspace.mjs" joined --defer-upload',
+    'node "<plugin-root>/scripts/workspace.mjs" routes --defer-upload',
     'node "<plugin-root>/scripts/sync.mjs"',
-  ], 'pending routes are resolved before the history upload');
+  ], 'joined workspaces and pending routes are resolved before the history upload, which carries their history');
   assert.match(skill, /P<i>-command=/);
   assert.match(skill, /all-command=/);
   assert.match(skill, /global across accounts/);
