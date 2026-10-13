@@ -265,6 +265,8 @@ test('every subprocess call site in lib/ is behind an injectable seam, and no te
     'lib/codex-app-server.mjs': /deps\.spawn/,
     // options.spawn || childProcess.spawn (setup-runner.mjs) — the setup wizard's script runner; its tests inject spawn.
     'lib/setup-runner.mjs': /options\.spawn\s*\|\|/,
+    // deps.spawnImpl, else childProcess.spawn (background-spawn.mjs) — the detached history worker; workspace-CLI tests stub startHistoryWorker above it.
+    'lib/background-spawn.mjs': /deps\.spawnImpl\s*==\s*null\s*\?/,
   };
   for (const [name, src] of sources('lib')) {
     if (!/from\s*['"](?:node:)?child_process['"]/.test(src)) continue;

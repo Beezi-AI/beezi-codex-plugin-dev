@@ -78,6 +78,23 @@ function readLineCount(value) {
   return { ok: true, lines: value };
 }
 
+// One batch's `held` table merged into `into`; null once any batch lacks a valid one (an older portal).
+function readHeld(table, batch, into) {
+  if (into == null || table == null || typeof table !== 'object' || Array.isArray(table)) return null;
+  for (const sessionId of batch) {
+    const read = readLineCount(table[sessionId]);
+    if (!read.ok) return null;
+    if (read.lines > 0) into.set(sessionId, read.lines);
+  }
+  return into;
+}
+
+// What the workspace holds of one session (0 = nothing), or null when the server did not say.
+export function heldLineOf(coverage, sessionId) {
+  if (coverage == null || !(coverage.held instanceof Map)) return null;
+  return coverage.held.has(sessionId) ? coverage.held.get(sessionId) : 0;
+}
+
 function chunkIds(ids, size) {
   const out = [];
   for (let i = 0; i < ids.length; i += size) out.push(ids.slice(i, i + size));
@@ -105,6 +122,7 @@ export async function fetchCoverage(sessionIds, session, deps = {}, options = {}
   const timeoutMs = orDefault(options.timeoutMs, COVERAGE_TIMEOUT_MS);
   const url = `${apiBase()}${ENDPOINTS.sessionsCoverage}`;
 
+  let held = new Map();
   for (const batch of chunkIds([...new Set(ids)], MAX_COVERAGE_IDS)) {
     let res;
     try {
@@ -129,7 +147,9 @@ export async function fetchCoverage(sessionIds, session, deps = {}, options = {}
       if (!read.ok) return null;
       if (read.lines > 0) coverage.set(sessionId, read.lines);
     }
+    held = readHeld(parsed.held, batch, held);
   }
+  if (held != null) coverage.held = held;
   return coverage;
 }
 
@@ -350,6 +370,8 @@ export const DeferReason = Object.freeze({
  * @param contiguous     true once the caller has proven this workspace's lines contiguous (it
  *                        parsed them); anything else defers attempts past the prefix, and missing
  *                        evidence, as SPLIT. Otherwise the decision is the single-workspace one.
+ * @param held           the server's highest stored line for this workspace (sync mode only); null
+ *                        when unknown.
  */
 export function decideReplay(sessionId, facts = {}) {
   const coverage = orDefault(facts.coverage, null);
@@ -357,6 +379,7 @@ export function decideReplay(sessionId, facts = {}) {
   const localCursor = Number.isInteger(facts.localCursor) && facts.localCursor > 0 ? facts.localCursor : 0;
   const ledgerDelivered = facts.ledgerDelivered === true;
   const attemptedLine = orDefault(facts.attemptedLine, null);
+  const held = Number.isInteger(facts.held) && facts.held >= 0 ? facts.held : null;
 
   if (coverage === null) {
     return { decision: ReplayDecision.DEFER, reason: DeferReason.UNAVAILABLE, startCursor: null };
@@ -367,6 +390,13 @@ export function decideReplay(sessionId, facts = {}) {
   if (facts.contiguous !== true
     && ((attemptedLine !== null && attemptedLine > stored) || (facts.multi === true && attemptedLine === null))) {
     return { decision: ReplayDecision.DEFER, reason: DeferReason.SPLIT, startCursor: null, stored };
+  }
+
+  // The server said what it holds: a clean prefix replays from its end whatever this machine sent to
+  // other workspaces; anything past the prefix is a proven gap. Sync mode only (its queue drained first).
+  if (held !== null) {
+    if (held > stored) return { decision: ReplayDecision.DEFER, reason: DeferReason.GAP, startCursor: null, stored };
+    return { decision: ReplayDecision.REPLAY, reason: null, startCursor: stored, stored };
   }
 
   if (stored > 0) {

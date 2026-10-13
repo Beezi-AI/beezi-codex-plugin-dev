@@ -36,6 +36,7 @@ import { getAuthentication as _getAuthentication } from './token.mjs';
 import { syncAccountIfNeeded as _syncAccountIfNeeded } from './account-sync.mjs';
 import { sharedLock, withLock } from './single-instance-lock.mjs';
 import { orDefault } from './compat.mjs';
+import { startHistoryWorker as _startHistoryWorker, takeDeferFlag } from './history-trigger.mjs';
 
 // What scripts/workspace.mjs runs for the settings, login, sync and analytics skills: rules, New
 // folders, the past-session routes pass and the read workspace. Line 1 of each command is for the
@@ -63,6 +64,7 @@ function context(deps) {
     listAllRollouts: orDefault(deps.listAllRollouts, _listAllRollouts),
     getAuthentication: orDefault(deps.getAuthentication, _getAuthentication),
     syncAccountIfNeeded: orDefault(deps.syncAccountIfNeeded, _syncAccountIfNeeded),
+    startHistoryWorker: orDefault(deps.startHistoryWorker, _startHistoryWorker),
     lines: [],
     stderr: [],
   };
@@ -71,6 +73,13 @@ function context(deps) {
 // Printed commands spell the script path out, so the model can run them from any directory.
 function scriptCommand() {
   return `node "${pluginRoot()}/scripts/workspace.mjs"`;
+}
+
+const deferText = (cx) => (cx.deferUpload ? ' --defer-upload' : '');
+
+// Starts the history upload a write just requested, unless the calling flow uploads next.
+async function afterRuleWrite(cx, key) {
+  if (!cx.deferUpload) await cx.startHistoryWorker(key);
 }
 
 function parseSessionFlag(argv) {
@@ -404,6 +413,7 @@ async function ruleAdd(cx, argv) {
   const n = (await setWorkspaceRule(row.key, { kind: key.kind, match: key.match, label: key.label, tenantIds })).index;
   cx.lines.push(ruleDone(row, key, tenantIds, false));
   await bindOpenSessions(cx, await resolveAccount(row.key), [n], current, ctx);
+  await afterRuleWrite(cx, row.key);
   cx.lines.push(`rule=${n}`);
 }
 
@@ -421,6 +431,7 @@ async function ruleSet(cx, argv) {
   await setWorkspaceRule(row.key, { kind: found.kind, match: found.match, label: found.label, tenantIds });
   cx.lines.push(ruleDone(row, found, tenantIds, true));
   await bindOpenSessions(cx, await resolveAccount(row.key), [found.index], current, ctx);
+  await afterRuleWrite(cx, row.key);
   cx.lines.push(`rule=${found.index}`);
 }
 
@@ -434,6 +445,7 @@ async function ruleRemove(cx, argv) {
   } else {
     cx.lines.push(`✓ Removed the rule for ${placeOf(removed)}. New sessions there follow New folders (${newFoldersLabel(row)}).`);
   }
+  await afterRuleWrite(cx, row.key);
   cx.lines.push(`removed=${removed.index}`);
   // Sessions bound to the removed rule keep their state until something re-binds them: re-route each to whatever still applies.
   if (isSingleTenant(row)) {
@@ -471,6 +483,7 @@ async function ruleAddAll(cx, argv) {
     cx.lines.push(`✓ Added ${n} rule${n === 1 ? '' : 's'}: ${where}.`);
     await bindOpenSessions(cx, await resolveAccount(row.key), added, current, ctx);
   }
+  await afterRuleWrite(cx, row.key);
   cx.lines.push(`rules-added=${n}`);
 }
 
@@ -512,9 +525,9 @@ async function routes(cx, argv) {
         total += 1;
         cx.lines.push(`P${total}. ${labeled(g)}, ${sessionsCount(g.sessions)} account=${row.key} kind=${g.kind} match=${g.match}`);
         const where = ruleTargetFlag(g);
-        cx.lines.push(`P${total}-command=${script} rule add ${where} --account ${row.key} <tenants>`);
+        cx.lines.push(`P${total}-command=${script} rule add ${where} --account ${row.key}${deferText(cx)} <tenants>`);
       }
-      cx.lines.push(`all-command=${script} rule add-all --account ${row.key} <tenants>`);
+      cx.lines.push(`all-command=${script} rule add-all --account ${row.key}${deferText(cx)} <tenants>`);
     }
     const lost = groups.noDirectory;
     if (lost > 0) {
@@ -561,9 +574,9 @@ async function joined(cx, argv) {
       const now = placeNow(row, place, newIds);
       const where = now.pending ? 'no rule yet' : sendList(row, now.ids);
       cx.lines.push(`J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${now.pending ? 'pending' : idList(now.ids)}`);
-      cx.lines.push(`J${total}-command=${script} rule add ${ruleTargetFlag(place)} --account ${row.key} <tenants>`);
+      cx.lines.push(`J${total}-command=${script} rule add ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenants>`);
     }
-    cx.lines.push(`add-all-command=${script} joined add-all --account ${row.key}`);
+    cx.lines.push(`add-all-command=${script} joined add-all --account ${row.key}${deferText(cx)}`);
     cx.lines.push(`done-command=${script} joined done --account ${row.key}`);
   }
   cx.lines.push(`joined=${total}`);
@@ -598,7 +611,10 @@ async function joinedAddAll(cx, argv) {
   cx.lines.push(n === 0
     ? `✓ Nothing to add: no repo or folder sends anywhere yet. ${names} won't be asked about again.`
     : `✓ ${names} now ${newIds.length === 1 ? 'gets' : 'get'} analytics from ${n === 1 ? '1 repo or folder' : `${n} repos and folders`}.`);
-  if (n > 0) await bindOpenSessions(cx, await resolveAccount(row.key), added, current, ctx);
+  if (n > 0) {
+    await bindOpenSessions(cx, await resolveAccount(row.key), added, current, ctx);
+    await afterRuleWrite(cx, row.key);
+  }
   cx.lines.push(`rules-added=${n}`);
 }
 
@@ -648,6 +664,7 @@ async function newFolders(cx, argv) {
       if (before.targets.indexOf(id) === -1) await checkIn(cx, fresh, id);
     }
   }
+  await afterRuleWrite(cx, row.key);
   cx.lines.push(`new-folders=${mode}`);
 }
 
@@ -668,8 +685,10 @@ async function read(cx, argv) {
 // `{ ok, lines, stderr }` — never throws, never prints; lines go to stdout, stderr lines (check-in notes, the ✗ line) to stderr.
 // Lines printed before a failure are kept: a rule saved before a later step failed still says so.
 export async function workspaceCommand(argv, deps = {}) {
+  const taken = takeDeferFlag(Array.isArray(argv) ? argv : []);
   const cx = context(deps);
-  const [cmd, ...rest] = Array.isArray(argv) ? argv : [];
+  cx.deferUpload = taken.deferUpload;
+  const [cmd, ...rest] = taken.argv;
   try {
     if (cmd === 'rules') await rules(cx, rest);
     else if (cmd === 'rule') await rule(cx, rest);

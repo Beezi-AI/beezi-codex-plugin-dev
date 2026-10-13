@@ -3,7 +3,8 @@ import { runHook, importHookModule } from '../lib/hook-runner.mjs';
 import { DIAGNOSTIC_SOURCES } from '../lib/diagnostics.mjs';
 import { hookMayProceed, environmentNotice } from '../lib/env-guard.mjs';
 import { linkedSessions } from '../lib/accounts.mjs';
-import { markPendingWorkspace, buildWorkspacePrompt, buildTargetsNotice, buildJoinedNotice } from '../lib/workspace-prompt.mjs';
+import { markPendingWorkspace, buildWorkspacePrompt, buildTargetsNotice, buildJoinedPrompt, buildHistoryNotice } from '../lib/workspace-prompt.mjs';
+import { maybeStartPendingHistory } from '../lib/history-trigger.mjs';
 
 const input = readHookInput();
 if (!input) process.exit(0);
@@ -58,22 +59,28 @@ async function main() {
   }
   // Re-binds with the workspaces runSessionStart just refreshed; asks only on startup or clear.
   // A refused re-bind asks from the first bind's answer rather than dropping the question.
-  let additionalContext = null;
-  try { additionalContext = await buildWorkspacePrompt(input, deps, marked); } catch { /* best-effort */ }
+  let joinedPrompt = null;
+  let workspacePrompt = null;
+  try { joinedPrompt = await buildJoinedPrompt(input, deps); } catch { /* best-effort */ }
+  try { workspacePrompt = await buildWorkspacePrompt(input, deps, marked); } catch { /* best-effort */ }
+  // The joined re-pick comes first, so the current-folder question sees its answers.
+  const additionalContext = [joinedPrompt, workspacePrompt].filter(Boolean).join('\n\n') || null;
   let targetsNotice = null;
-  let joinedNotice = null;
+  let historyNotice = null;
   if (source !== 'compact') {
     try { targetsNotice = await buildTargetsNotice(input, deps); } catch { /* best-effort */ }
-    // Built only when the status line will be written, since building it marks the join announced.
+    // Built only when the status line will be written, since building it takes the results.
     if (failure == null) {
-      try { joinedNotice = await buildJoinedNotice(deps); } catch { /* best-effort */ }
+      try { historyNotice = await buildHistoryNotice(input, deps); } catch { /* best-effort */ }
+      // Awaited: the hook exits once main resolves. Never throws.
+      await maybeStartPendingHistory();
     }
   }
   if (failure != null) {
     write({ systemMessage: notice, additionalContext });
     throw failure;
   }
-  const status = [message, targetsNotice, joinedNotice].filter((part) => part != null && part !== '').join('\n') || null;
+  const status = [message, targetsNotice, historyNotice].filter((part) => part != null && part !== '').join('\n') || null;
   write({ systemMessage: withNotice(status), additionalContext });
 }
 
