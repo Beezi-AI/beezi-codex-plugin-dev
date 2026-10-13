@@ -103,7 +103,7 @@ test('placeQuestion and placeOptions follow the login wording per kind', () => {
   assert.equal(placeQuestion(folder, 2, 3), '(2 of 3) Where should analytics for ~/My (old) docs (and everything inside it) go?');
   assert.equal(placeQuestion(outside, 3, 3), '(3 of 3) Where should analytics for sessions outside a project folder go?');
   const [joinedRepo] = parsePlaces(JOINED, 'J');
-  assert.equal(placeQuestion(joinedRepo, 1, 2), '(1 of 2) Now: Acme. Where should analytics for api go?');
+  assert.equal(placeQuestion(joinedRepo, 1, 2), '(1 of 2) Now: Acme. Where should analytics for api go? Their past sessions will be sent there too.');
   assert.deepEqual(placeOptions(repo, workspaces), [
     { label: 'Acme', description: 'Owner' },
     { label: 'Beta Team', description: 'Beezi workspace' },
@@ -121,7 +121,7 @@ test('a folder label with unbalanced parentheses is asked about by its path, nev
   const question = placeQuestion(place, 1, 1);
   assert.equal(question, '(1 of 1) Where should analytics for /Users/dev/notes :) (and everything inside it) go?');
   assert.doesNotMatch(question, /null/);
-  assert.deepEqual(ruleArgv(place, 'k1', 't1'), ['rule', 'add', '--folder', '/Users/dev/notes :)', '--account', 'k1', 't1']);
+  assert.deepEqual(ruleArgv(place, 'k1', 't1'), ['rule', 'add', '--folder', '/Users/dev/notes :)', '--account', 'k1', 't1', '--defer-upload']);
 });
 
 test('tenantsArg joins picked tenants; the Don\'t track option wins', () => {
@@ -133,11 +133,11 @@ test('tenantsArg joins picked tenants; the Don\'t track option wins', () => {
 
 test('ruleArgv builds argv without shell quoting', () => {
   const [repo, folder, outside] = parsePlaces(ROUTES, 'P');
-  assert.deepEqual(ruleArgv(repo, 'k1', 't1'), ['rule', 'add', '--repo', 'github.com/acme/api', '--account', 'k1', 't1']);
-  assert.deepEqual(ruleArgv(folder, 'k1', 'none'), ['rule', 'add', '--folder', '/Users/dev/My (old) docs', '--account', 'k1', 'none']);
-  assert.deepEqual(ruleArgv(outside, 'k1', 't1,t2'), ['rule', 'add', '--outside', '--account', 'k1', 't1,t2']);
+  assert.deepEqual(ruleArgv(repo, 'k1', 't1'), ['rule', 'add', '--repo', 'github.com/acme/api', '--account', 'k1', 't1', '--defer-upload']);
+  assert.deepEqual(ruleArgv(folder, 'k1', 'none'), ['rule', 'add', '--folder', '/Users/dev/My (old) docs', '--account', 'k1', 'none', '--defer-upload']);
+  assert.deepEqual(ruleArgv(outside, 'k1', 't1,t2'), ['rule', 'add', '--outside', '--account', 'k1', 't1,t2', '--defer-upload']);
   const quoted = parsePlaces("P1. it's $HOME (~/it's $HOME), 1 session account=k1 kind=folder match=/Users/dev/it's $HOME", 'P')[0];
-  assert.deepEqual(ruleArgv(quoted, 'k1', 't1'), ['rule', 'add', '--folder', "/Users/dev/it's $HOME", '--account', 'k1', 't1']);
+  assert.deepEqual(ruleArgv(quoted, 'k1', 't1'), ['rule', 'add', '--folder', "/Users/dev/it's $HOME", '--account', 'k1', 't1', '--defer-upload']);
 });
 
 test('report prints the first stdout line on success and the error lines on failure', () => {
@@ -173,17 +173,17 @@ test('askNewFolders asks only when set=no and runs the picked mode', async () =>
   await askNewFolders(ask, 'k1');
   assert.equal(ask.asked[0].question, 'Where should analytics go for repos and folders with no rule yet?');
   assert.deepEqual(ask.asked[0].options.map((o) => o.label), ['Ask me (recommended)', 'Send to…', "Don't send"]);
-  assert.deepEqual(ask.runs, ['workspace.mjs new-folders --account k1', 'workspace.mjs new-folders ask --account k1']);
+  assert.deepEqual(ask.runs, ['workspace.mjs new-folders --account k1', 'workspace.mjs new-folders ask --account k1 --defer-upload']);
   assert.deepEqual(ask.printed, ['✓ done']);
 
   const none = fakeCtx({ 'new-folders --account k1': ok(unset) }, [2]);
   await askNewFolders(none, 'k1');
-  assert.equal(none.runs[1], 'workspace.mjs new-folders none --account k1');
+  assert.equal(none.runs[1], 'workspace.mjs new-folders none --account k1 --defer-upload');
 
   const send = fakeCtx({ 'new-folders --account k1': ok(unset) }, [1, [1, 0]]);
   await askNewFolders(send, 'k1');
   assert.equal(send.asked[1].question, 'Which workspaces should get analytics for repos and folders with no rule?');
-  assert.equal(send.runs[1], 'workspace.mjs new-folders send t2,t1 --account k1');
+  assert.equal(send.runs[1], 'workspace.mjs new-folders send t2,t1 --account k1 --defer-upload');
 
   const sendNothing = fakeCtx({ 'new-folders --account k1': ok(unset) }, [1, []]);
   await askNewFolders(sendNothing, 'k1');
@@ -211,8 +211,8 @@ test('reviewRoutes with 4 or fewer places asks per place and prints the no-folde
   ]);
   assert.deepEqual(ctx.runs, [
     'workspace.mjs routes --account k1',
-    'workspace.mjs rule add --repo github.com/acme/api --account k1 t1',
-    'workspace.mjs rule add --outside --account k1 none',
+    'workspace.mjs rule add --repo github.com/acme/api --account k1 t1 --defer-upload',
+    'workspace.mjs rule add --outside --account k1 none --defer-upload',
   ]);
   assert.equal(ctx.printed[0], '2 other past sessions have no recorded folder and are not sent.');
 });
@@ -239,7 +239,7 @@ test('reviewRoutes with more than 4 places offers send-all, per repo or skip', a
   assert.equal(all.asked[0].question, 'Where should analytics for these 5 repos and folders go?');
   assert.deepEqual(all.asked[0].options.map((o) => o.label), ['Send all 5 to the same workspaces…', 'Choose per repo', 'Skip']);
   assert.equal(all.asked[1].question, 'Which workspaces should get analytics for these 5 repos and folders?');
-  assert.equal(all.runs[1], 'workspace.mjs rule add-all --account k1 t1,t2');
+  assert.equal(all.runs[1], 'workspace.mjs rule add-all --account k1 t1,t2 --defer-upload');
 
   const skip = fakeCtx({ 'routes --account k1': ok(manyRoutes(5)) }, [2]);
   await reviewRoutes(skip, 'k1');
@@ -249,19 +249,19 @@ test('reviewRoutes with more than 4 places offers send-all, per repo or skip', a
   await reviewRoutes(perRepo, 'k1');
   assert.equal(perRepo.asked.length, 6);
   assert.deepEqual(perRepo.runs.slice(1), [
-    'workspace.mjs rule add --repo github.com/acme/r1 --account k1 t1',
-    'workspace.mjs rule add --repo github.com/acme/r5 --account k1 t2',
+    'workspace.mjs rule add --repo github.com/acme/r1 --account k1 t1 --defer-upload',
+    'workspace.mjs rule add --repo github.com/acme/r5 --account k1 t2 --defer-upload',
   ]);
 });
 
 test('reviewJoined asks per place, then records the review when the last place is answered', async () => {
   const ctx = fakeCtx({ 'joined --account k1': ok(JOINED) }, [[0, 1], [1]]);
   await reviewJoined(ctx, 'k1');
-  assert.equal(ctx.asked[1].question, '(2 of 2) Now: no rule yet. Where should analytics for ~/My notes (and everything inside it) go?');
+  assert.equal(ctx.asked[1].question, '(2 of 2) Now: no rule yet. Where should analytics for ~/My notes (and everything inside it) go? Their past sessions will be sent there too.');
   assert.deepEqual(ctx.runs, [
     'workspace.mjs joined --account k1',
-    'workspace.mjs rule add --repo github.com/acme/api --account k1 t1,t2',
-    'workspace.mjs rule add --folder /Users/dev/My notes --account k1 t2',
+    'workspace.mjs rule add --repo github.com/acme/api --account k1 t1,t2 --defer-upload',
+    'workspace.mjs rule add --folder /Users/dev/My notes --account k1 t2 --defer-upload',
     'workspace.mjs joined done --account k1',
   ]);
 });
@@ -285,9 +285,9 @@ function manyJoined(n) {
 test('reviewJoined with more than 4 places offers add-all, per repo or leave', async () => {
   const add = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [0]);
   await reviewJoined(add, 'k1');
-  assert.equal(add.asked[0].question, 'You joined Beta Team. Where should analytics for these 5 repos and folders go?');
+  assert.equal(add.asked[0].question, 'You joined Beta Team. Where should analytics for these 5 repos and folders go? Their past sessions will be sent there too.');
   assert.deepEqual(add.asked[0].options.map((o) => o.label), ['Add Beta Team to all 5', 'Choose per repo', 'Leave them as they are']);
-  assert.equal(add.runs[1], 'workspace.mjs joined add-all --account k1');
+  assert.equal(add.runs[1], 'workspace.mjs joined add-all --account k1 --defer-upload');
 
   const leave = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [2]);
   await reviewJoined(leave, 'k1');

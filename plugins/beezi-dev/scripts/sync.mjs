@@ -1,4 +1,4 @@
-import { runAudit, planWorkspaceRuns, SYNC_MODE, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
+import { runAudit, planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
@@ -9,6 +9,7 @@ import {
 } from '../lib/accounts.mjs';
 import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf } from '../lib/workspace.mjs';
 import { usesRules } from '../lib/workspace-rules.mjs';
+import { startHistoryWorker } from '../lib/history-trigger.mjs';
 
 // The repeatable history repair pass (G-3-3 engine, G-9-3 surface).
 //
@@ -293,10 +294,7 @@ async function syncAccount(row, many, options, argv) {
   const override = parseTenantFlags(argv, row).tenantIds;
   if (!isMultiTenant(row)) {
     if (usesRules(row)) {
-      const plan = planWorkspaceRuns(row);
-      const excludedSessionIds = new Set(
-        [...plan.routes].filter(([, route]) => route.source === 'rule' && route.tenantIds.length === 0).map(([sessionId]) => sessionId),
-      );
+      const excludedSessionIds = dontTrackSessionIds(planWorkspaceRuns(row));
       await runOne(row.key, many, { ...options, excludedSessionIds, excludedLabel: describeAccount(row) });
     } else {
       await runOne(row.key, many, options);
@@ -324,18 +322,12 @@ async function syncAccount(row, many, options, argv) {
   }
 }
 
-async function main() {
-  if (!cliMayProceed()) { process.exitCode = 1; return; }
-  const argv = process.argv.slice(2);
-  // The two flag refusals stay FIRST and unconditional. They are the mechanical half of "sync is
-  // not a way around the one-time import", and a refused run must still be refused before anything
-  // is read — including the accounts index.
-  const options = parseSyncArgs(argv);
-  const { account, rest } = await parseAccountFlag(argv);
-
+// Runs the sync for the named account, else every linked one; → the accounts it ran for.
+async function syncRows(account, options, rest) {
   if (account !== null) {
-    await syncAccount((await getAccount(account)) || { key: account }, false, options, rest);
-    return;
+    const row = (await getAccount(account)) || { key: account };
+    await syncAccount(row, false, options, rest);
+    return [row];
   }
 
   const linked = (await listAccounts()).filter((a) => a.status === AccountStatus.LINKED);
@@ -344,7 +336,7 @@ async function main() {
   // in, which is the message that path must still produce.
   if (linked.length === 0) {
     await runOne(null, false, options);
-    return;
+    return [];
   }
   // A workspace name means nothing without the account it belongs to.
   if (linked.length > 1 && rest.indexOf('--tenant') !== -1) {
@@ -353,7 +345,7 @@ async function main() {
   // One account: no heading.
   if (linked.length === 1) {
     await syncAccount(linked[0], false, options, rest);
-    return;
+    return linked;
   }
   for (let i = 0; i < linked.length; i += 1) {
     if (i > 0) console.log('');
@@ -363,6 +355,20 @@ async function main() {
     console.log(`── Account: ${describeAccount(linked[i])} [${linked[i].key}] ──`);
     await syncAccount(linked[i], true, options, rest);
   }
+  return linked;
+}
+
+async function main() {
+  if (!cliMayProceed()) { process.exitCode = 1; return; }
+  const argv = process.argv.slice(2);
+  // The two flag refusals stay FIRST and unconditional. They are the mechanical half of "sync is
+  // not a way around the one-time import", and a refused run must still be refused before anything
+  // is read — including the accounts index.
+  const options = parseSyncArgs(argv);
+  const { account, rest } = await parseAccountFlag(argv);
+  const rows = await syncRows(account, options, rest);
+  // Pending history (rules gained a workspace) gets its own coverage-based pass once this sync let go of the lock.
+  if (!options.dryRun) for (const row of rows) await startHistoryWorker(row.key);
 }
 
 main().catch((error) => fail(friendlyMessage(error)));

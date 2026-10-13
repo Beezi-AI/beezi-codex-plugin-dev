@@ -129,7 +129,7 @@ not start reporting analytics. The `analytics-hooks` skill covers that.
 Run this after step 1 produced a key — a fresh link or an account that was already linked:
 
 ```
-node "<plugin-root>/scripts/workspace.mjs" new-folders --account <key>
+node "<plugin-root>/scripts/workspace.mjs" new-folders --account <key> --defer-upload
 ```
 
 Its output is for you only. Its last line is
@@ -144,8 +144,8 @@ folders with no rule yet?" with the choices "Ask me (recommended)" (described "B
 repo or folder, when a session starts there"), "Send to…" ("Pick the workspaces that get them") and
 "Don't send" ("Nothing from a repo or folder with no rule is uploaded").
 
-- "Ask me (recommended)" → run `node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key>`
-- "Don't send" → run `node "<plugin-root>/scripts/workspace.mjs" new-folders none --account <key>`
+- "Ask me (recommended)" → run `node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload`
+- "Don't send" → run `node "<plugin-root>/scripts/workspace.mjs" new-folders none --account <key> --defer-upload`
 - "Send to…" → ask "Which workspaces should get analytics for repos and folders with no rule?", one
   choice per `W.` line — the workspace name (the text after `W. ` up to ` account=`), described by
   the line's `role=` value — several allowed: `request_user_input` only with at most 3 `W.` lines,
@@ -154,7 +154,7 @@ repo or folder, when a session starts there"), "Send to…" ("Pick the workspace
   Otherwise run, with the chosen lines' `tenant=` values joined by commas:
 
   ```
-  node "<plugin-root>/scripts/workspace.mjs" new-folders send <ids> --account <key>
+  node "<plugin-root>/scripts/workspace.mjs" new-folders send <ids> --account <key> --defer-upload
   ```
 
 Write the command's first line verbatim. A skipped question runs nothing (the next login asks again).
@@ -177,7 +177,7 @@ chosen `tenant=` values joined by commas, or `none` when the last choice was pic
 others):
 
 ```
-node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> <ids>
+node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> --defer-upload <ids>
 ```
 
 and write its first line verbatim. Nothing chosen or a skipped question runs nothing. Then continue
@@ -280,7 +280,7 @@ uploads history, so this step is still yours to run.
 **First, new workspaces.**
 
 ```
-node "<plugin-root>/scripts/workspace.mjs" joined --account <key>
+node "<plugin-root>/scripts/workspace.mjs" joined --account <key> --defer-upload
 ```
 
 Its output is for you only. For an account that joined a workspace since it was last reviewed on this
@@ -304,10 +304,10 @@ machine, it lists every repo and folder with where its analytics go now. Its lin
 `joined=0` → nothing to ask; go to "Then, repos and folders with no rule" below.
 
 More than 4 `J` lines → first ask "You joined <names>. Where should analytics for these <N> repos and
-folders go?" (`<N>` = the number of `J` lines) with the choices "Add <names> to all <N>" (described
-"Repos you don't track, and ones with no rule yet, stay as they are"), "Choose per repo" ("One question
-per repo or folder") and "Leave them as they are" ("Nothing changes, and you're not asked about
-<names> again").
+folders go? Their past sessions will be sent there too." (`<N>` = the number of `J` lines) with the
+choices "Add <names> to all <N>" (described "Repos you don't track, and ones with no rule yet, stay as
+they are"), "Choose per repo" ("One question per repo or folder") and "Leave them as they are"
+("Nothing changes, and you're not asked about <names> again").
 
 - "Add <names> to all <N>" → run the `add-all-command=` text EXACTLY ONCE.
 - "Choose per repo" → the per-repo questions below.
@@ -321,23 +321,24 @@ from 1, `N` = their number). `<short>` is the `J` line's text after `J<i>. ` up 
 `<label>` the text in the parentheses after it, and `<where>` the text after `now: ` up to
 ` account=`. The question and its last choice follow the line's `kind=`:
 
-| `kind=`   | Question                                                                                   | Last choice               |
-| --------- | ------------------------------------------------------------------------------------------ | ------------------------- |
-| `repo`    | "(i of N) Now: <where>. Where should analytics for <short> go?"                            | "Don't track this repo"   |
-| `folder`  | "(i of N) Now: <where>. Where should analytics for <label> (and everything inside it) go?" | "Don't track this folder" |
-| `outside` | "(i of N) Now: <where>. Where should analytics for sessions outside a project folder go?"  | "Don't track these"       |
+| `kind=`   | Question                                                                                                                               | Last choice               |
+| --------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
+| `repo`    | "(i of N) Now: <where>. Where should analytics for <short> go? Their past sessions will be sent there too."                            | "Don't track this repo"   |
+| `folder`  | "(i of N) Now: <where>. Where should analytics for <label> (and everything inside it) go? Their past sessions will be sent there too." | "Don't track this folder" |
+| `outside` | "(i of N) Now: <where>. Where should analytics for sessions outside a project folder go? Their past sessions will be sent there too."  | "Don't track these"       |
 
 Choices: one per `W.` line — the workspace name (the text after `W. ` up to ` account=`), described by
 the line's `role=` value, with ", new" added for a `new=yes` line ("new" alone when the role is empty)
 — then the last choice, described "Nothing from <short> is uploaded" ("Nothing from sessions outside a
 project folder is uploaded" for `outside`). Several workspaces may be chosen.
 
-- `request_user_input` only with at most 2 `W.` lines (3 choices): header "Beezi", the question
-  followed by " Pick one, or name several under Other.", the labels exactly as above.
-- Otherwise the plain sentence: the question without its "?", a colon, each workspace as
-  "<name> (<description>)", then " — one or more — or <last choice, lower-case first letter>?". For
-  example: "(1 of 2) Now: Acme. Where should analytics for acme-api go: Acme (Owner), NewCo (User,
-  new) — one or more — or don't track this repo?"
+- `request_user_input` only with at most 2 `W.` lines (3 choices): header "Beezi", the question with
+  " Pick one, or name several under Other." put before its last sentence, the labels exactly as above.
+- Otherwise the plain sentence: the question up to "go" (without the "?" and the sentence after it),
+  a colon, each workspace as "<name> (<description>)", then " — one or more — or <last choice,
+  lower-case first letter>?" and " Their past sessions will be sent there too.". For example:
+  "(1 of 2) Now: Acme. Where should analytics for acme-api go: Acme (Owner), NewCo (User, new) — one
+  or more — or don't track this repo? Their past sessions will be sent there too."
 
 For each answered `J` line, run its `J<i>-command=` text EXACTLY ONCE, changing nothing except the
 final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` when the last
@@ -351,7 +352,7 @@ Write each command's first line verbatim.
 **Then, repos and folders with no rule.**
 
 ```
-node "<plugin-root>/scripts/workspace.mjs" routes --account <key>
+node "<plugin-root>/scripts/workspace.mjs" routes --account <key> --defer-upload
 ```
 
 Its output is for you only, except the one line named below. It lists repos and folders whose past

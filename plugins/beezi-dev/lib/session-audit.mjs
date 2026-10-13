@@ -21,6 +21,7 @@ import {
   attemptEvidence,
   currentBinding,
   decideReplay,
+  heldLineOf,
   syncEndpoint,
   ReplayDecision,
   DeferReason,
@@ -369,6 +370,16 @@ export function planWorkspaceRuns(row, { markWaiting = false } = {}) {
   return { scanned: entries.length, routes, counts, tenantIds };
 }
 
+// A one-workspace account's Don't-track sessions, from a planWorkspaceRuns plan.
+export function dontTrackSessionIds(plan) {
+  return new Set([...plan.routes].filter(([, route]) => route.source === 'rule' && route.tenantIds.length === 0).map(([sessionId]) => sessionId));
+}
+
+// Sessions a run skipped for being open or just touched: the history worker waits for the ones older than its request.
+function noteRecent(result, entry) {
+  if (typeof entry.transcriptPath === 'string') result.recent.push({ sessionId: entry.sessionId, path: entry.transcriptPath });
+}
+
 // Backfill every past Codex session on this machine into Beezi via the chunked backfill route,
 // then seal the one-time pull. Timelines ride IN the chunk payload (the tracking-gated standalone
 // timeline route is unreachable for audit tenants); only rate-limit error reports remain a
@@ -438,6 +449,8 @@ function emptyAuditResult(options = {}) {
     scanned: 0,
     live: 0,
     active: 0,
+    // The live and active sessions this workspace waits for: [{ sessionId, path }].
+    recent: [],
     liveTracked: 0,
     alreadyImported: 0,
     oversize: 0,
@@ -708,11 +721,18 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const viaRuleOnly = new Set();
   // Sessions this run routes here: by their own route, or by a rule that yields reports here.
   let routedHere = 0;
+  // The live skip runs before the route filter, so it notes the session only when its route reaches this workspace.
+  const routesHere = (entry) => {
+    if (sessionRoutes == null) return true;
+    const route = sessionRoutes.get(entry.sessionId);
+    return route != null && route.tenantIds.indexOf(tenantId) !== -1;
+  };
 
   const candidates = [];
   for (const entry of all) {
     if (live && (entry.sessionId === live.sessionId || entry.transcriptPath === live.transcriptPath)) {
       result.live += 1;
+      if (routesHere(entry)) noteRecent(result, entry);
       continue;
     }
     // Filtered before the ledger, so a later rule can still send it here.
@@ -735,7 +755,12 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     }
     // Kept in BOTH modes: a rollout still being written is an open session in another window, and
     // R2 requires reconciliation to coordinate with live writers rather than race them.
-    if (entry.mtimeMs > activeCutoffMs) { result.active += 1; continue; }
+    // One kept only because a rule might route a segment here is not a session this workspace waits for.
+    if (entry.mtimeMs > activeCutoffMs) {
+      result.active += 1;
+      if (!viaRuleOnly.has(entry.sessionId)) noteRecent(result, entry);
+      continue;
+    }
     // The three exclusions below are all "we believe this was already delivered" heuristics, and
     // every one of them is exactly backwards under sync: a session the live hooks started and the
     // server never received is the PRIME repair candidate. In sync they do not exclude anything —
@@ -809,6 +834,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         checkpointLine: checkpointLineFor(coverageRecord, entry.sessionId),
         localCursor: liveCursorOf(entry.sessionId, deps),
         ledgerDelivered: ledgerDelivered(ledger, entry.sessionId),
+        held: syncMode ? heldLineOf(coverage, entry.sessionId) : null,
       });
       if (splitBookkeeping && verdict.reason !== DeferReason.UNAVAILABLE) {
         // Parsed from the prefix either way: only that parse shows whether any of it routes here.

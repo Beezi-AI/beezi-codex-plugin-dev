@@ -105,9 +105,9 @@ test('a fresh single-workspace link runs every step in order and ends with the C
 test('a multi-workspace account answers New folders, then joined workspaces, then repos with no rule, before the upload', async () => {
   const ctx = fakeCtx(flow({
     [NEW_FOLDERS]: ok(['New folders: Ask me', ...W, `new-folders=ask set=no multi=yes account=${KEY}`, ''].join('\n')),
-    [`workspace.mjs new-folders ask ${ACCOUNT}`]: ok('✓ New folders: Ask me — Beezi asks once per repo or folder.\nnew-folders=ask\n'),
+    [`workspace.mjs new-folders ask ${ACCOUNT} --defer-upload`]: ok('✓ New folders: Ask me — Beezi asks once per repo or folder.\nnew-folders=ask\n'),
     [JOINED]: joinedListing(5),
-    [`workspace.mjs joined add-all ${ACCOUNT}`]: ok('✓ Beta now gets analytics from 5 repos and folders.\nrules-added=5\n'),
+    [`workspace.mjs joined add-all ${ACCOUNT} --defer-upload`]: ok('✓ Beta now gets analytics from 5 repos and folders.\nrules-added=5\n'),
     [ROUTES]: ok([
       `ann@example.com: 1 repo or folder has past sessions with no rule (2 sessions) account=${KEY}`,
       ...W,
@@ -117,20 +117,20 @@ test('a multi-workspace account answers New folders, then joined workspaces, the
       '1 other past session has no recorded folder and is not sent.',
       'routes=1',
     ].join('\n')),
-    [`workspace.mjs rule add --repo github.com/acme/api ${ACCOUNT} t2`]: ok('✓ Analytics for api go to Beta.\nrule=1\n'),
+    [`workspace.mjs rule add --repo github.com/acme/api ${ACCOUNT} t2 --defer-upload`]: ok('✓ Analytics for api go to Beta.\nrule=1\n'),
   }), [0, 0, [1]]);
   assert.equal(await runSetup(ctx), 0);
   assert.deepEqual(ctx.runs, [
     'accounts.mjs list', 'login.mjs',
-    NEW_FOLDERS, `workspace.mjs new-folders ask ${ACCOUNT}`,
+    NEW_FOLDERS, `workspace.mjs new-folders ask ${ACCOUNT} --defer-upload`,
     CAPTURE,
-    JOINED, `workspace.mjs joined add-all ${ACCOUNT}`,
-    ROUTES, `workspace.mjs rule add --repo github.com/acme/api ${ACCOUNT} t2`,
+    JOINED, `workspace.mjs joined add-all ${ACCOUNT} --defer-upload`,
+    ROUTES, `workspace.mjs rule add --repo github.com/acme/api ${ACCOUNT} t2 --defer-upload`,
     BACKFILL, KEYS,
   ]);
   assert.deepEqual(ctx.asked.map((a) => a.question), [
     'Where should analytics go for repos and folders with no rule yet?',
-    'You joined Beta. Where should analytics for these 5 repos and folders go?',
+    'You joined Beta. Where should analytics for these 5 repos and folders go? Their past sessions will be sent there too.',
     '(1 of 1) Where should analytics for api go?',
     'How should Beezi crash reports work?',
   ]);

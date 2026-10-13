@@ -366,6 +366,8 @@ test('10. skips recently-active rollouts', async () => {
 
   assert.equal(result.active, 1);
   assert.equal(result.candidates, 1);
+  assert.deepEqual(result.recent.map((r) => r.sessionId), ['open']);
+  assert.equal(typeof result.recent[0].path, 'string');
 });
 
 // Live-tracking tenants: everything after the machine link was tracked live; re-sending it

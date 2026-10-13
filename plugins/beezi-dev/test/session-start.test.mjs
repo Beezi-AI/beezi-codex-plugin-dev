@@ -167,7 +167,7 @@ test('a valid whoami refreshes an already-named account and its workspace member
   );
   assert.equal(message, null);
   assert.deepEqual(patches, [{ key: ACCOUNT.key, patch: {
-    email: 'someone@example.com', name: 'Dev', tenantId: null, tenantName: null, tenants,
+    email: 'someone@example.com', name: 'Dev', tenantId: null, tenantName: null, tenants: [{ ...tenants[0], joinedAt: null }],
   } }], 'known identities still refresh membership on every valid answer');
 });
 
