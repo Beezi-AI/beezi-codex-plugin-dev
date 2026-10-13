@@ -326,3 +326,10 @@ test('the preload does not live under test/, where Node would count it as a test
     .map((e) => path.join(e.parentPath || e.path, e.name));
   assert.deepEqual(strays, [], 'a non-test .mjs under test/ is collected AND counted by node --test');
 });
+
+// lib/repo-root-fast.mjs defaults to fs.realpathSync.native; without it every shortcut in the suite silently fell back.
+test('fs.realpathSync.native survives the preload, guarded like realpathSync', () => {
+  assert.equal(typeof fs.realpathSync.native, 'function');
+  assert.equal(fs.realpathSync.native.name, 'hermetic', 'the native realpath is guarded too');
+  assert.equal(typeof fs.realpathSync.native(SANDBOX), 'string');
+});
