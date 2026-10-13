@@ -608,7 +608,8 @@ async function runLockedCheckpoint(lock, ctx) {
     collectedErrors, skipped, emptyResult,
   } = ctx;
   const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
-  const gitImpl = orDefault(deps.gitImpl, git);
+  // The history run's memo wins over deps.gitImpl, so each (cwd, args) spawns git once per run.
+  const gitImpl = deps.runCache != null ? deps.runCache.git : orDefault(deps.gitImpl, git);
   const computeDelta = orDefault(deps.computeDelta, _computeDelta);
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const durable = options.persistState !== false;
@@ -724,7 +725,8 @@ async function runLockedCheckpoint(lock, ctx) {
   const map = loadRepoMap();
   let mapDirty = false;
 
-  const repoRootOf = (dir) => resolveRepoRoot(gitImpl, dir, rootCache, map);
+  // Only the history run's cache turns on the one-git-call-per-repository shortcut.
+  const repoRootOf = (dir) => resolveRepoRoot(gitImpl, dir, rootCache, map, deps.runCache == null ? null : deps.runCache.gitRoots);
 
   const projectInstructionsOf = (root) => {
     if (projectInstructionsCache.has(root)) return projectInstructionsCache.get(root);

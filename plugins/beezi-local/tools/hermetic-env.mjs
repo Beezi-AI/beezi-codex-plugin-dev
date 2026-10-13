@@ -158,17 +158,20 @@ function install() {
   const wrapFs = (target, name, indices) => {
     const original = target[name];
     if (typeof original !== 'function') return;
-    target[name] = function hermetic(...args) {
+    const guard = (fn, label) => function hermetic(...args) {
       for (const i of indices) {
         const arg = args[i];
         // URL and Buffer paths are converted rather than guessed at; anything else is not a path.
         const asPath = typeof arg === 'string' ? arg
           : (arg instanceof URL && arg.protocol === 'file:') ? arg.pathname.replace(/^\/(?=[A-Za-z]:)/, '')
             : null;
-        if (escapes(asPath)) record(`fs.${name}(${asPath})`);
+        if (escapes(asPath)) record(`fs.${label}(${asPath})`);
       }
-      return original.apply(this, args);
+      return fn.apply(this, args);
     };
+    target[name] = guard(original, name);
+    // fs.realpathSync.native hangs off the function itself; carry it over, guarded the same way.
+    if (typeof original.native === 'function') target[name].native = guard(original.native, `${name}.native`);
   };
 
   // Every lib/ module imports the default binding (`import fs from 'fs'`), which for a core module

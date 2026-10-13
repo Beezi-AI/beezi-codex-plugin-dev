@@ -4,6 +4,8 @@ import { postJson as _postJson } from './http.mjs';
 import fs from 'fs';
 import path from 'path';
 import { getAccessToken as _getAccessToken } from './token.mjs';
+import { git as _git } from './git.mjs';
+import { memoizeGit } from './git-memo.mjs';
 import { linkedSessions as _linkedSessions, getDefaultKey as _getDefaultKey } from './accounts.mjs';
 import { runCheckpoint as _runCheckpoint, flushQueue as _flushQueue } from './checkpoint.mjs';
 import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
@@ -80,6 +82,9 @@ const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 // Error posts are single small upserts, so a little parallelism is free — but not unbounded,
 // or a 200-session run opens 200 sockets at once.
 const FOLLOWUP_CONCURRENCY = 4;
+
+// Batches uploading at once: safe on today's server with whole sessions per batch and the last batch alone.
+const UPLOAD_LANES = 2;
 
 const AUDIT_TIMEOUT_MS = 60_000;
 
@@ -957,6 +962,29 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   let processed = 0;
   let halted = false;
 
+  // Renews the run's token at most once per stale token; concurrent callers share one refresh.
+  let renewal = null;
+  // Tokens already refreshed from or minted by a refresh; a 401 on one of them answers null with no new refresh.
+  const spentTokens = new Set();
+  const renewSession = (stale) => {
+    if (stale.token !== session.token) return Promise.resolve(session);
+    if (renewal) return renewal;
+    if (spentTokens.has(stale.token)) return Promise.resolve(null);
+    spentTokens.add(stale.token);
+    // Keyed to this account; only the bearer moves, a refresh does not mint a new client id.
+    renewal = getAccessToken(key, {}, { forceRefresh: true }).catch(() => null).then((next) => {
+      renewal = null;
+      if (!next || next === session.token) return null;
+      spentTokens.add(next);
+      session = { ...session, token: next };
+      return session;
+    });
+    return renewal;
+  };
+
+  // One per run, shared by every flush: the first proxy refusal of gzip turns it off for the rest of the run.
+  const compression = { enabled: true };
+
   const dispatchBatch = async (batch) => {
     result.plannedReports += batch.reduce((sum, g) => sum + g.reports.length, 0);
     if (options.dryRun) {
@@ -972,18 +1000,20 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // stay unledgered and eligible, exactly like the halt path.
     const renewed = lockHandle.renew({ leaseMs: RUN_LEASE_MS });
     if (!renewed.ok && renewed.reason !== 'contended') {
-      result.halt = BackfillHalt.LOCK_LOST;
+      // With two lanes the first halt is the one reported, so a later one cannot mask LOCK_LOST.
+      if (result.halt === null) result.halt = BackfillHalt.LOCK_LOST;
       halted = true;
       result.lastError = `history run lock ${renewed.reason}`;
       for (const group of batch) followups.delete(group.sessionId);
       return;
     }
 
+    // The current session, and the run's shared renewal so a 401 on either lane refreshes once.
     const flushed = await flushBackfillChunks(
       batch,
       key,
       session,
-      { fetchImpl },
+      { fetchImpl, renewSession, compression },
       // The historical replay goes to the tracking-policy-aware sync route, never to the one-time
       // backfill route: /sessions/backfill is what the seal governs, and R2 forbids the repair
       // pass from consuming or reopening it.
@@ -1070,7 +1100,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     }
 
     if (flushed.halt) {
-      result.halt = flushed.halt;
+      if (result.halt === null) result.halt = flushed.halt;
       halted = true;
       // The seal is the one-time import's, so only the import may record it. A sync run that
       // somehow provoked this halt must leave the local caches exactly as it found them.
@@ -1099,23 +1129,44 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     onProgress({ processed, total: candidates.length, ...result });
   };
 
-  // One-deep pipeline: at most one batch in flight while the loop parses the next sessions —
-  // the run used to alternate CPU-bound parsing (network idle) with awaiting the upload (CPU
-  // idle). Dispatches stay strictly sequential (await the previous flight before starting the
-  // next), so the ledger writes and the never-two-POSTs invariant are untouched, and peak
-  // memory grows by exactly one pending batch.
-  let inFlight = null;
-  const dispatch = async () => {
+  // Up to UPLOAD_LANES batches upload while the loop parses; each holds whole sessions, so a split session stays in one flush.
+  const flights = new Set();
+  let flightFailure = null;
+  // Waits for every flight; a failed one surfaces here, once the other lane has settled.
+  const drain = async () => {
+    while (flights.size > 0) await Promise.race(flights);
+    if (flightFailure) throw flightFailure.error;
+  };
+  const dispatch = async ({ alone = false } = {}) => {
+    if (flightFailure) await drain();
     if (pending.length === 0) return;
     const batch = pending;
     pending = [];
     pendingBytes = 0;
     pendingItems = 0;
-    if (inFlight) await inFlight;
-    // A halt discovered by the previous flight drops this batch — its sessions stay
+    // The last batch goes alone, so its chunk is the one the server commits last.
+    while (flights.size >= (alone ? 1 : UPLOAD_LANES)) await Promise.race(flights);
+    if (flightFailure) await drain();
+    // A halt discovered by an earlier flight drops this batch — its sessions stay
     // unledgered and eligible, exactly like the loop break below.
     if (halted) return;
-    inFlight = dispatchBatch(batch);
+    // Settles without rejecting; a failure is kept for the next dispatch or drain instead of going unhandled.
+    const flight = dispatchBatch(batch).then(
+      () => { flights.delete(flight); },
+      (error) => {
+        flights.delete(flight);
+        if (flightFailure === null) flightFailure = { error };
+      },
+    );
+    flights.add(flight);
+  };
+
+  // A full batch launches only when the next group arrives, so batches close exactly where they always did.
+  const queueGroup = async (group, bytes, items) => {
+    if (pending.length > 0 && (pendingBytes >= MAX_BODY_BYTES || pendingItems >= MAX_CHUNK_ITEMS)) await dispatch();
+    pending.push(group);
+    pendingBytes += bytes;
+    pendingItems += items;
   };
 
   // First failure earns a retry and holds the pull open; a second one does not, so a permanently
@@ -1137,192 +1188,203 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     return subagentIndex.find(sessionId, opts);
   };
 
+  // Each git question (cwd, args) runs once per run; checkpoints keep their own Maps and repo map, so answers stay exact.
+  const runCache = { git: memoizeGit(deps.gitImpl == null ? _git : deps.gitImpl), gitRoots: new Map() };
+
   // Parsing itself stays strictly sequential. computeDelta reads and JSON.parses the whole
   // transcript, so parsing sessions in parallel multiplies peak memory with no gain on a
   // single thread.
-  for (const entry of candidates) {
-    if (halted) break;
-    const reports = [];
-    let sessionErrors = [];
-    let skipped = null;
-    let agents = {};
-    // Backfill has no coverage answer and never had one: persistState:false already starts it at
-    // line 0, which is the whole-history read the one-time import is for.
-    const startCursor = syncMode ? orDefault(startCursors.get(entry.sessionId), 0) : 0;
-    // Parent lines the current rules send to another workspace (or none), for the split check.
-    const splitAt = splitChecks.get(entry.sessionId);
-    const elsewhere = [];
-    try {
-      // transcript_path is passed through so runCheckpoint's resolver takes it as-is instead of
-      // walking the whole rollout tree per session; cwd rode in on the discovery head-read.
-      const checkpoint = await runCheckpoint(
-        {
-          session_id: entry.sessionId,
-          transcript_path: entry.transcriptPath,
-          cwd: orDefault(entry.cwd, null),
-        },
-        // gitImpl rides along so the audit's checkpoint resolves repo roots through whatever the
-        // caller handed in. Unforwarded it was the one reader the audit could not steer, and the
-        // suite's only protection against `git` running against the developer's own repository is
-        // that seam — tools/hermetic-env.mjs records the spawn but does not stop it.
-        //
-        // `session` is this run's clone. On a multi-workspace account its tenantId is the preset
-        // workspace: the checkpoint routes each segment by its own directory's rule and hands the
-        // sink only what routes here — or, under `unrouted` (a --tenant override), every segment.
-        {
-          linkedSessions: async () => [session], fetchImpl, gitImpl: deps.gitImpl, recoveryPermit: lockHandle.token,
-          findSubagentRollouts: findSubagents,
-        },
-        {
-          sink: (payload) => reports.push({ ...payload, ...subscriptionIdentity }),
-          ...(splitAt === undefined ? {} : {
-            elsewhere: (payload) => {
-              if (payload && payload.is_subagent !== true && Number.isInteger(payload.from_line)) elsewhere.push(payload.from_line);
-            },
-          }),
-          unrouted: sessionRoutes == null,
-          skipFlush: true,
-          collectSessionErrors: true,
-          persistState: false,
-          // The server is the authority on what actually landed: a local cursor can sit at EOF
-          // while the upload was lost, and it can sit at 0 for a session the server holds in full.
-          // A non-zero value here means "start immediately after the confirmed contiguous prefix",
-          // which is what makes the replay append-only. 0 in backfill mode is today's behaviour.
-          startCursor,
-          // Children are billed whole from their fork boundary in both modes. Recovery would make
-          // the engine defer every child with no durable cursor — under persistState:false, all of
-          // them — and past sessions' sidecars are pruned at 14 days, so the rollout-tree sweep is
-          // the only way their subagents are found at all.
-          recovery: false,
-          sweepSubagents: true,
-          // The sync fill: leave children live capture still owns (lib/checkpoint.mjs). The import
-          // keeps its own rule — it never touches a live-tracked session in the first place.
-          childFill: syncMode ? { activeSinceMs: activeCutoffMs } : null,
-          skipLiveTrackingGate: true,
-        },
-      );
-      sessionErrors = orDefault((checkpoint || {}).sessionErrors, []);
-      skipped = orDefault((checkpoint || {}).skipped, null);
-      if (!checkpoint || checkpoint.outcome !== 'committed') {
-        reports.length = 0;
-        if (!skipped || (!skipped.deltaFailed && !skipped.noRemote && !skipped.emitFailed)) {
-          skipped = { ...(skipped || {}), emitFailed: 1 };
+  try {
+    for (const entry of candidates) {
+      // One yield per session lets an in-flight upload's I/O progress while the loop parses.
+      await new Promise((resolve) => setImmediate(resolve));
+      if (halted) break;
+      const reports = [];
+      let sessionErrors = [];
+      let skipped = null;
+      let agents = {};
+      // Backfill has no coverage answer and never had one: persistState:false already starts it at
+      // line 0, which is the whole-history read the one-time import is for.
+      const startCursor = syncMode ? orDefault(startCursors.get(entry.sessionId), 0) : 0;
+      // Parent lines the current rules send to another workspace (or none), for the split check.
+      const splitAt = splitChecks.get(entry.sessionId);
+      const elsewhere = [];
+      try {
+        // transcript_path is passed through so runCheckpoint's resolver takes it as-is instead of
+        // walking the whole rollout tree per session; cwd rode in on the discovery head-read.
+        const checkpoint = await runCheckpoint(
+          {
+            session_id: entry.sessionId,
+            transcript_path: entry.transcriptPath,
+            cwd: orDefault(entry.cwd, null),
+          },
+          // gitImpl rides along so the audit's checkpoint resolves repo roots through whatever the
+          // caller handed in. Unforwarded it was the one reader the audit could not steer, and the
+          // suite's only protection against `git` running against the developer's own repository is
+          // that seam — tools/hermetic-env.mjs records the spawn but does not stop it.
+          //
+          // `session` is this run's clone. On a multi-workspace account its tenantId is the preset
+          // workspace: the checkpoint routes each segment by its own directory's rule and hands the
+          // sink only what routes here — or, under `unrouted` (a --tenant override), every segment.
+          {
+            linkedSessions: async () => [session], fetchImpl, gitImpl: deps.gitImpl, recoveryPermit: lockHandle.token,
+            findSubagentRollouts: findSubagents, runCache,
+          },
+          {
+            sink: (payload) => reports.push({ ...payload, ...subscriptionIdentity }),
+            ...(splitAt === undefined ? {} : {
+              elsewhere: (payload) => {
+                if (payload && payload.is_subagent !== true && Number.isInteger(payload.from_line)) elsewhere.push(payload.from_line);
+              },
+            }),
+            unrouted: sessionRoutes == null,
+            skipFlush: true,
+            collectSessionErrors: true,
+            persistState: false,
+            // The server is the authority on what actually landed: a local cursor can sit at EOF
+            // while the upload was lost, and it can sit at 0 for a session the server holds in full.
+            // A non-zero value here means "start immediately after the confirmed contiguous prefix",
+            // which is what makes the replay append-only. 0 in backfill mode is today's behaviour.
+            startCursor,
+            // Children are billed whole from their fork boundary in both modes. Recovery would make
+            // the engine defer every child with no durable cursor — under persistState:false, all of
+            // them — and past sessions' sidecars are pruned at 14 days, so the rollout-tree sweep is
+            // the only way their subagents are found at all.
+            recovery: false,
+            sweepSubagents: true,
+            // The sync fill: leave children live capture still owns (lib/checkpoint.mjs). The import
+            // keeps its own rule — it never touches a live-tracked session in the first place.
+            childFill: syncMode ? { activeSinceMs: activeCutoffMs } : null,
+            skipLiveTrackingGate: true,
+          },
+        );
+        sessionErrors = orDefault((checkpoint || {}).sessionErrors, []);
+        skipped = orDefault((checkpoint || {}).skipped, null);
+        if (!checkpoint || checkpoint.outcome !== 'committed') {
+          reports.length = 0;
+          if (!skipped || (!skipped.deltaFailed && !skipped.noRemote && !skipped.emitFailed)) {
+            skipped = { ...(skipped || {}), emitFailed: 1 };
+          }
         }
+        agents = orDefault((checkpoint || {}).agents, {});
+        if (syncMode) result.childrenDeferred += orDefault((checkpoint || {}).childrenSkipped, 0);
+      } catch {
+        processed += 1;
+        // A session parsed only to classify its deferral stays deferred when the parse fails.
+        if (gapDeferred.has(entry.sessionId)) {
+          result.deferred += 1;
+          result.deferredGap += 1;
+          continue;
+        }
+        // One unreadable transcript must not end the run — but it is no longer silent.
+        result.unreadable += 1;
+        noteUnreadable(entry.sessionId);
+        continue;
       }
-      agents = orDefault((checkpoint || {}).agents, {});
-      if (syncMode) result.childrenDeferred += orDefault((checkpoint || {}).childrenSkipped, 0);
-    } catch {
       processed += 1;
-      // A session parsed only to classify its deferral stays deferred when the parse fails.
+      if (syncMode) fillSubagents(reports, entry, startCursor, ledger, result, rolloutStartedAtImpl);
+      if (reports.length === 0) {
+        if (gapDeferred.has(entry.sessionId)
+          && ((skipped && skipped.deltaFailed) || orDefault((skipped || {}).emitFailed, 0) > 0)) {
+          result.deferred += 1;
+          result.deferredGap += 1;
+          continue;
+        }
+        // Classify rather than drop on the floor. `empty` is the only benign outcome, so it is the
+        // fallback ONLY once every reason worth reporting has been ruled out — telling a user that
+        // a session we failed to upload "held no usage data" is the silent loss this exists to end.
+        // A deferred multi-workspace session with nothing here owes this workspace nothing more.
+        if (skipped && skipped.deltaFailed) {
+          result.unreadable += 1;
+          noteUnreadable(entry.sessionId);
+        } else if (orDefault((skipped || {}).emitFailed, 0) > 0) result.emitFailed += 1;
+        else if (viaRuleOnly.has(entry.sessionId)) result.routedElsewhere += 1;
+        else if (orDefault((skipped || {}).noRemote, 0) > 0) result.noRemote += 1;
+        else result.empty += 1;
+        continue;
+      }
+      if (viaRuleOnly.has(entry.sessionId)) routedHere += 1;
+
+      // Ruling 16: a segment another workspace (or none) took before this workspace's last attempted
+      // line splits its history, and resuming from the prefix would re-send what it may already
+      // hold past that gap. Contiguous history resumes like a single-workspace account's. Without
+      // attempt evidence, any such segment followed by one routed here counts as split (Ruling 20).
+      if (splitAt !== undefined && splitHistory(splitAt, elsewhere, reports)) {
+        result.deferred += 1;
+        result.deferredSplit += 1;
+        continue;
+      }
       if (gapDeferred.has(entry.sessionId)) {
         result.deferred += 1;
         result.deferredGap += 1;
         continue;
       }
-      // One unreadable transcript must not end the run — but it is no longer silent.
-      result.unreadable += 1;
-      noteUnreadable(entry.sessionId);
-      continue;
-    }
-    processed += 1;
-    if (syncMode) fillSubagents(reports, entry, startCursor, ledger, result, rolloutStartedAtImpl);
-    if (reports.length === 0) {
-      if (gapDeferred.has(entry.sessionId)
-        && ((skipped && skipped.deltaFailed) || orDefault((skipped || {}).emitFailed, 0) > 0)) {
+
+      // ── The overlap ban, enforced on the built payloads ────────────────────────────────────
+      // A segment id encodes `fromLine-toLine`, so a replay partitioned differently from the live
+      // run produces new ids for lines the server already holds and the two cannot supersede each
+      // other. The replay protocol is therefore APPEND ONLY, and this is the check that it held:
+      // every parent segment must begin strictly after the confirmed prefix. If any does not — the
+      // engine ignored startCursor, or the transcript was re-anchored underneath us — the whole
+      // session is dropped unsent and deferred. Overlap is never reconciled, only refused.
+      //
+      // Subagent payloads are exempt by construction: their line numbers index their OWN rollout,
+      // an unrelated coordinate system from the parent's, and the child repair policy has already
+      // decided whether they may be swept at all.
+      const parentReports = reports.filter((payload) => payload && payload.is_subagent !== true);
+      const overlaps = parentReports.some(
+        (payload) => Number.isInteger(payload.from_line) && payload.from_line <= startCursor,
+      );
+      if (startCursor > 0 && overlaps) {
         result.deferred += 1;
-        result.deferredGap += 1;
+        result.deferredOverlap += 1;
         continue;
       }
-      // Classify rather than drop on the floor. `empty` is the only benign outcome, so it is the
-      // fallback ONLY once every reason worth reporting has been ruled out — telling a user that
-      // a session we failed to upload "held no usage data" is the silent loss this exists to end.
-      // A deferred multi-workspace session with nothing here owes this workspace nothing more.
-      if (skipped && skipped.deltaFailed) {
-        result.unreadable += 1;
-        noteUnreadable(entry.sessionId);
-      } else if (orDefault((skipped || {}).emitFailed, 0) > 0) result.emitFailed += 1;
-      else if (viaRuleOnly.has(entry.sessionId)) result.routedElsewhere += 1;
-      else if (orDefault((skipped || {}).noRemote, 0) > 0) result.noRemote += 1;
-      else result.empty += 1;
-      continue;
-    }
-    if (viaRuleOnly.has(entry.sessionId)) routedHere += 1;
+      let parentMaxLine = startCursor;
+      for (const payload of parentReports) {
+        if (Number.isInteger(payload.to_line) && payload.to_line > parentMaxLine) parentMaxLine = payload.to_line;
+      }
 
-    // Ruling 16: a segment another workspace (or none) took before this workspace's last attempted
-    // line splits its history, and resuming from the prefix would re-send what it may already
-    // hold past that gap. Contiguous history resumes like a single-workspace account's. Without
-    // attempt evidence, any such segment followed by one routed here counts as split (Ruling 20).
-    if (splitAt !== undefined && splitHistory(splitAt, elsewhere, reports)) {
-      result.deferred += 1;
-      result.deferredSplit += 1;
-      continue;
-    }
-    if (gapDeferred.has(entry.sessionId)) {
-      result.deferred += 1;
-      result.deferredGap += 1;
-      continue;
-    }
+      // Session-level data goes only where the live path sends it: the session's own route. One kept
+      // only because a rule sends some of its segments here gets those reports and nothing else.
+      const sessionLevel = !viaRuleOnly.has(entry.sessionId);
 
-    // ── The overlap ban, enforced on the built payloads ────────────────────────────────────
-    // A segment id encodes `fromLine-toLine`, so a replay partitioned differently from the live
-    // run produces new ids for lines the server already holds and the two cannot supersede each
-    // other. The replay protocol is therefore APPEND ONLY, and this is the check that it held:
-    // every parent segment must begin strictly after the confirmed prefix. If any does not — the
-    // engine ignored startCursor, or the transcript was re-anchored underneath us — the whole
-    // session is dropped unsent and deferred. Overlap is never reconciled, only refused.
-    //
-    // Subagent payloads are exempt by construction: their line numbers index their OWN rollout,
-    // an unrelated coordinate system from the parent's, and the child repair policy has already
-    // decided whether they may be swept at all.
-    const parentReports = reports.filter((payload) => payload && payload.is_subagent !== true);
-    const overlaps = parentReports.some(
-      (payload) => Number.isInteger(payload.from_line) && payload.from_line <= startCursor,
-    );
-    if (startCursor > 0 && overlaps) {
-      result.deferred += 1;
-      result.deferredOverlap += 1;
-      continue;
-    }
-    let parentMaxLine = startCursor;
-    for (const payload of parentReports) {
-      if (Number.isInteger(payload.to_line) && payload.to_line > parentMaxLine) parentMaxLine = payload.to_line;
-    }
+      // Timeline travels with the session's own chunk. Best-effort: a timeline that fails to
+      // compute never blocks the usage upload. The agent map is handed over rather than re-read —
+      // the checkpoint's sweep entries are ones the (possibly pruned) sidecars would not show.
+      //
+      // Not for a children-only upload (the sync's subagent fill on a parent Beezi already holds):
+      // the server REPLACES a session's timeline, and its subagent spans come only from hook sidecars,
+      // which are pruned at 14 days — re-deriving it here could wipe spans the server already has.
+      let timeline = null;
+      if (sessionLevel && parentReports.length > 0) {
+        try {
+          const computed = computeSessionTimeline(entry.transcriptPath, entry.sessionId, {
+            readAgents: () => agents,
+          });
+          if (
+            computed &&
+            (computed.periods.length > 0 || computed.subagents.length > 0 || computed.plan_events.length > 0)
+          ) {
+            timeline = { sessionId: entry.sessionId, ...computed };
+            result.timelinesOffered += 1;
+          }
+        } catch { /* best-effort */ }
+      }
 
-    // Session-level data goes only where the live path sends it: the session's own route. One kept
-    // only because a rule sends some of its segments here gets those reports and nothing else.
-    const sessionLevel = !viaRuleOnly.has(entry.sessionId);
-
-    // Timeline travels with the session's own chunk. Best-effort: a timeline that fails to
-    // compute never blocks the usage upload. The agent map is handed over rather than re-read —
-    // the checkpoint's sweep entries are ones the (possibly pruned) sidecars would not show.
-    //
-    // Not for a children-only upload (the sync's subagent fill on a parent Beezi already holds):
-    // the server REPLACES a session's timeline, and its subagent spans come only from hook sidecars,
-    // which are pruned at 14 days — re-deriving it here could wipe spans the server already has.
-    let timeline = null;
-    if (sessionLevel && parentReports.length > 0) {
-      try {
-        const computed = computeSessionTimeline(entry.transcriptPath, entry.sessionId, {
-          readAgents: () => agents,
-        });
-        if (
-          computed &&
-          (computed.periods.length > 0 || computed.subagents.length > 0 || computed.plan_events.length > 0)
-        ) {
-          timeline = { sessionId: entry.sessionId, ...computed };
-          result.timelinesOffered += 1;
-        }
-      } catch { /* best-effort */ }
+      followups.set(entry.sessionId, { sessionErrors: sessionLevel ? sessionErrors : [] });
+      await queueGroup(
+        { sessionId: entry.sessionId, reports, timeline, parentMaxLine },
+        Buffer.byteLength(JSON.stringify({ reports, timeline }), 'utf-8'),
+        reports.length,
+      );
     }
-
-    followups.set(entry.sessionId, { sessionErrors: sessionLevel ? sessionErrors : [] });
-    pending.push({ sessionId: entry.sessionId, reports, timeline, parentMaxLine });
-    pendingBytes += Buffer.byteLength(JSON.stringify({ reports, timeline }), 'utf-8');
-    pendingItems += reports.length;
-    if (pendingBytes >= MAX_BODY_BYTES || pendingItems >= MAX_CHUNK_ITEMS) await dispatch();
+  } finally {
+    // A throw from the loop itself still waits for every flight (drain without its rethrow), so none writes after the lock is released.
+    await Promise.all(flights);
   }
-  await dispatch();
-  if (inFlight) await inFlight;
+  await dispatch({ alone: true });
+  await drain();
 
   // A run can hit unreadable transcripts and dispatch nothing at all, so this cannot ride on the
   // per-dispatch save — without it the retry marker is lost and the next run blocks again.
