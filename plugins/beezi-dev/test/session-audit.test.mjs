@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseArgs, runAudit, shouldFinalize } from '../lib/session-audit.mjs';
+import { parseArgs, runAudit, shouldFinalize, createRunCache } from '../lib/session-audit.mjs';
 import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 
@@ -1104,6 +1104,40 @@ test('37. one run cache per run, handed to every checkpoint, its git memo wrappi
   assert.equal(seen[0].git(['rev-parse', '--abbrev-ref', 'HEAD'], '/r'), 'main');
   assert.equal(seen[0].git(['rev-parse', '--abbrev-ref', 'HEAD'], '/r'), 'main');
   assert.deepEqual(asked, ['rev-parse --abbrev-ref HEAD @ /r'], 'the memo wraps deps.gitImpl and asks it once');
+});
+
+test('37b. an injected run cache is handed to every checkpoint across runs instead of a fresh one', async () => {
+  const seen = [];
+  const asked = [];
+  const shared = createRunCache({ gitImpl: (args, cwd) => { asked.push(`${args.join(' ')} @ ${cwd}`); return 'main'; } });
+  const make = () => makeDeps({
+    listRollouts: () => [rollout('s1'), rollout('s2')],
+    runCache: shared,
+    runCheckpointImpl: async (input, d, options) => {
+      seen.push(d.runCache);
+      d.runCache.git(['rev-parse', '--show-toplevel'], '/r');
+      options.sink(report(input.session_id));
+      return checkpointResult();
+    },
+  }).deps;
+
+  await runAudit(make(), {});
+  await runAudit(make(), {});
+
+  assert.equal(seen.length, 4);
+  assert.ok(seen.every((c) => c === shared), 'every checkpoint of both runs gets the injected cache');
+  assert.deepEqual(asked, ['rev-parse --show-toplevel @ /r'], 'the second run reuses the first run\'s git answer');
+});
+
+test('37c. createRunCache builds the same shape the run builds on its own', () => {
+  const asked = [];
+  const cache = createRunCache({ gitImpl: (args) => { asked.push(args.join(' ')); return 'x'; } });
+  assert.deepEqual(Object.keys(cache).sort(), ['git', 'gitRoots']);
+  assert.ok(cache.gitRoots instanceof Map);
+  assert.equal(cache.git(['status'], '/r'), 'x');
+  assert.equal(cache.git(['status'], '/r'), 'x');
+  assert.deepEqual(asked, ['status']);
+  assert.notEqual(createRunCache({ gitImpl: () => 'x' }), cache);
 });
 
 test('38. no runCheckpoint caller but the history run passes a run cache', () => {

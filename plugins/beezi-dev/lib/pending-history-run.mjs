@@ -1,4 +1,4 @@
-import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE } from './session-audit.mjs';
+import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, createRunCache as _createRunCache, dontTrackSessionIds, SYNC_MODE } from './session-audit.mjs';
 import { BackfillHalt } from './audit-flush.mjs';
 import { isMultiTenant } from './workspace.mjs';
 import { usesRules } from './workspace-rules.mjs';
@@ -61,11 +61,13 @@ export async function runPendingHistory(key, deps = {}) {
   await accounts.notePendingAttempt(key, entries.map((e) => e.tenantId), new Date(plannedAtMs).toISOString());
   const done = [];
   let busy = false;
+  // One git cache for every workspace pass, so each rollout's repository is resolved once.
+  const runCache = (deps.createRunCache == null ? _createRunCache : deps.createRunCache)();
   for (const { entry, options } of plannedRuns(row, entries, planRuns)) {
     let run = { outcome: busy ? RunOutcome.BUSY : RunOutcome.CLEAN, sent: 0, skipped: 0 };
     if (!busy && options != null) {
       // A throwing run settles as failed (classifyRun(null)) rather than leaving later entries unsettled.
-      const result = await runAudit({}, { ...options, key, mode: SYNC_MODE }).catch(() => null);
+      const result = await runAudit({ runCache }, { ...options, key, mode: SYNC_MODE }).catch(() => null);
       const ran = result == null ? {} : result;
       const recent = Array.isArray(ran.recent) ? ran.recent.map((r) => startedAtMs(r, startedAt)) : [];
       run = {

@@ -27,9 +27,9 @@ const JOINED = [
   'W. Acme account=k1 tenant=t1 new=no role=Owner',
   'W. Beta Team account=k1 tenant=t2 new=yes role=Member',
   'J1. api (github.com/acme/api), 4 sessions, now: Acme account=k1 kind=repo match=github.com/acme/api now=t1',
-  "J1-command=node \"/p/scripts/workspace.mjs\" rule add --repo 'github.com/acme/api' --account k1 <tenants>",
+  "J1-command=node \"/p/scripts/workspace.mjs\" joined pick --repo 'github.com/acme/api' --account k1 <tenant>",
   'J2. notes (~/My notes), 1 session, now: no rule yet account=k1 kind=folder match=/Users/dev/My notes now=pending',
-  "J2-command=node \"/p/scripts/workspace.mjs\" rule add --folder '/Users/dev/My notes' --account k1 <tenants>",
+  "J2-command=node \"/p/scripts/workspace.mjs\" joined pick --folder '/Users/dev/My notes' --account k1 <tenant>",
   'add-all-command=node "/p/scripts/workspace.mjs" joined add-all --account k1',
   'done-command=node "/p/scripts/workspace.mjs" joined done --account k1',
   'joined=2',
@@ -102,8 +102,6 @@ test('placeQuestion and placeOptions follow the login wording per kind', () => {
   assert.equal(placeQuestion(repo, 1, 3), '(1 of 3) Where should analytics for api go?');
   assert.equal(placeQuestion(folder, 2, 3), '(2 of 3) Where should analytics for ~/My (old) docs (and everything inside it) go?');
   assert.equal(placeQuestion(outside, 3, 3), '(3 of 3) Where should analytics for sessions outside a project folder go?');
-  const [joinedRepo] = parsePlaces(JOINED, 'J');
-  assert.equal(placeQuestion(joinedRepo, 1, 2), '(1 of 2) Now: Acme. Where should analytics for api go? Their past sessions will be sent there too.');
   assert.deepEqual(placeOptions(repo, workspaces), [
     { label: 'Acme', description: 'Owner' },
     { label: 'Beta Team', description: 'Beezi workspace' },
@@ -254,22 +252,31 @@ test('reviewRoutes with more than 4 places offers send-all, per repo or skip', a
   ]);
 });
 
-test('reviewJoined asks per place, then records the review when the last place is answered', async () => {
-  const ctx = fakeCtx({ 'joined --account k1': ok(JOINED) }, [[0, 1], [1]]);
+test('reviewJoined asks repos per new tenant and runs joined pick per picked place', async () => {
+  const ctx = fakeCtx({ 'joined --account k1': ok(JOINED) }, [[0, 1]]);
   await reviewJoined(ctx, 'k1');
-  assert.equal(ctx.asked[1].question, '(2 of 2) Now: no rule yet. Where should analytics for ~/My notes (and everything inside it) go? Their past sessions will be sent there too.');
+  const picks = ctx.runs.filter((r) => /^workspace\.mjs joined pick /.test(r));
+  assert.equal(picks.length, 2);
+  assert.ok(picks.every((r) => / --defer-upload$/.test(r)));
+  assert.match(ctx.asked[0].question, /repos and folders should also send analytics to Beta Team/i);
   assert.deepEqual(ctx.runs, [
     'workspace.mjs joined --account k1',
-    'workspace.mjs rule add --repo github.com/acme/api --account k1 t1,t2 --defer-upload',
-    'workspace.mjs rule add --folder /Users/dev/My notes --account k1 t2 --defer-upload',
-    'workspace.mjs joined done --account k1',
+    'workspace.mjs joined pick --repo github.com/acme/api --account k1 t2 --defer-upload',
+    'workspace.mjs joined pick --folder /Users/dev/My notes --account k1 t2 --defer-upload',
+    'workspace.mjs joined done --account k1 --defer-upload',
   ]);
 });
 
-test('reviewJoined does not record the review when the last place is skipped', async () => {
-  const ctx = fakeCtx({ 'joined --account k1': ok(JOINED) }, [[0], []]);
+test('reviewJoined stops without recording the review when a repo screen is dismissed', async () => {
+  const ctx = fakeCtx({ 'joined --account k1': ok(JOINED) }, [null]);
   await reviewJoined(ctx, 'k1');
-  assert.equal(ctx.runs.indexOf('workspace.mjs joined done --account k1'), -1);
+  assert.equal(ctx.runs.indexOf('workspace.mjs joined done --account k1 --defer-upload'), -1);
+});
+
+test('reviewJoined records the review when a repo screen is a clean no-op', async () => {
+  const ctx = fakeCtx({ 'joined --account k1': ok(JOINED) }, [[]]);
+  await reviewJoined(ctx, 'k1');
+  assert.deepEqual(ctx.runs, ['workspace.mjs joined --account k1', 'workspace.mjs joined done --account k1 --defer-upload']);
 });
 
 function manyJoined(n) {
@@ -282,20 +289,55 @@ function manyJoined(n) {
   return lines.join('\n');
 }
 
-test('reviewJoined with more than 4 places offers add-all, per repo or leave', async () => {
+test('reviewJoined with more than 4 places offers add-all, choose repos or leave', async () => {
   const add = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [0]);
   await reviewJoined(add, 'k1');
   assert.equal(add.asked[0].question, 'You joined Beta Team. Where should analytics for these 5 repos and folders go? Their past sessions will be sent there too.');
-  assert.deepEqual(add.asked[0].options.map((o) => o.label), ['Add Beta Team to all 5', 'Choose per repo', 'Leave them as they are']);
+  assert.deepEqual(add.asked[0].options.map((o) => o.label), ['Add Beta Team to all 5', 'Choose repos', 'Leave them as they are']);
   assert.equal(add.runs[1], 'workspace.mjs joined add-all --account k1 --defer-upload');
 
   const leave = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [2]);
   await reviewJoined(leave, 'k1');
-  assert.equal(leave.runs[1], 'workspace.mjs joined done --account k1');
+  assert.equal(leave.runs[1], 'workspace.mjs joined done --account k1 --defer-upload');
 
   const dismissed = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [null]);
   await reviewJoined(dismissed, 'k1');
   assert.equal(dismissed.runs.length, 1);
+});
+
+test('reviewJoined chunks more than 4 places into 4+1 screens for one tenant', async () => {
+  const ctx = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [1, [0], [0]]);
+  await reviewJoined(ctx, 'k1');
+  const screens = ctx.asked.filter((a) => a.kind === 'chooseMany');
+  assert.equal(screens.length, 2);
+  assert.equal(screens[1].options.length, 1);
+  assert.equal(ctx.runs[ctx.runs.length - 1], 'workspace.mjs joined done --account k1 --defer-upload');
+});
+
+function twoNewJoined() {
+  return [
+    'dev@example.com: you joined Acme and Beta — 2 repos or folders to review account=k1 new=t1,t2',
+    'W. Acme account=k1 tenant=t1 new=yes role=Owner',
+    'W. Beta account=k1 tenant=t2 new=yes role=Member',
+    'J1. r1 (github.com/acme/r1), 1 session, now: no rule yet account=k1 kind=repo match=github.com/acme/r1 now=pending',
+    'J2. r2 (github.com/acme/r2), 1 session, now: no rule yet account=k1 kind=repo match=github.com/acme/r2 now=pending',
+    'joined=2',
+  ].join('\n');
+}
+
+test('reviewJoined asks one repo picker per new tenant', async () => {
+  const ctx = fakeCtx({ 'joined --account k1': ok(twoNewJoined()) }, [[0], [1]]);
+  await reviewJoined(ctx, 'k1');
+  const screens = ctx.asked.filter((a) => a.kind === 'chooseMany');
+  assert.equal(screens.length, 2);
+  assert.match(screens[0].question, /send analytics to Acme/);
+  assert.match(screens[1].question, /send analytics to Beta/);
+  assert.deepEqual(ctx.runs, [
+    'workspace.mjs joined --account k1',
+    'workspace.mjs joined pick --repo github.com/acme/r1 --account k1 t1 --defer-upload',
+    'workspace.mjs joined pick --repo github.com/acme/r2 --account k1 t2 --defer-upload',
+    'workspace.mjs joined done --account k1 --defer-upload',
+  ]);
 });
 
 test('reviewJoined with joined=0 asks nothing', async () => {
