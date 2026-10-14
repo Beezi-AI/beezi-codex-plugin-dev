@@ -25,7 +25,7 @@ import {
 import { releaseHeldQueue } from './workspace-queue.mjs';
 import { pluginRoot } from './workspace-prompt.mjs';
 import {
-  bindSessionRoutes, createRouteContext, outsideKey, placeNow, planReviewPlaces, planUnruledRoutes, routeForDir,
+  bindSessionRoutes, createRouteContext, keepCurrentRules, outsideKey, placeNow, planReviewPlaces, planUnruledRoutes, routeForDir,
   routeKeyForDir, rulesOf, rulesTableLines, shortLabel, usableIds,
 } from './workspace-rules.mjs';
 import { canonicalRemote } from './git.mjs';
@@ -48,7 +48,7 @@ const USAGE = 'Usage: workspace.mjs rules [--table] [--session <id>] [--account 
   + ' | rule remove <n> [--account <ref>]'
   + ' | rule add-all (<id|name|n>… | none) [--session <id>] [--account <ref>]'
   + ' | routes [--session <id>] [--account <ref>]'
-  + ' | joined [add-all | done] [--session <id>] [--account <ref>]'
+  + ' | joined [add-all | done | pick (--repo <url> | --folder <path> | --outside) <id|name|n>] [--session <id>] [--account <ref>]'
   + ' | new-folders [ask | send <id|name|n>… | none] [--session <id>] [--account <ref>]'
   + ' | read <id|name|n> [--session <id>] [--account <ref>]';
 const NOT_LINKED = 'Beezi: this machine is not linked. Use the login skill to link an account.';
@@ -385,23 +385,29 @@ function findRule(row, ref) {
   return found;
 }
 
-async function ruleAdd(cx, argv) {
-  const { session, rest: afterSession } = parseSessionFlag(argv);
-  const { account, rest } = await parseAccountFlag(afterSession);
+// Pulls the one rule target flag (--current/--repo/--folder/--outside) out of argv; everything else is workspace refs.
+function parseTarget(argv) {
   let target = null;
   const refs = [];
-  for (let i = 0; i < rest.length; i += 1) {
-    const arg = rest[i];
+  for (let i = 0; i < argv.length; i += 1) {
+    const arg = argv[i];
     if (TARGET_FLAGS.indexOf(arg) === -1) {
       refs.push(arg);
       continue;
     }
     if (target != null) throw new UserError('Pass only one of --current, --repo <url>, --folder <path> or --outside.');
     const bare = arg === '--current' || arg === '--outside';
-    const value = bare ? null : rest[++i];
+    const value = bare ? null : argv[++i];
     if (!bare && (value == null || value.trim() === '')) throw new UserError(`${arg} needs a value.`);
     target = { flag: arg, value };
   }
+  return { target, refs };
+}
+
+async function ruleAdd(cx, argv) {
+  const { session, rest: afterSession } = parseSessionFlag(argv);
+  const { account, rest } = await parseAccountFlag(afterSession);
+  const { target, refs } = parseTarget(rest);
   if (target == null || refs.length === 0) throw new UserError(USAGE);
   const row = await resolveAccount(account);
   requireKnownWorkspaces(row);
@@ -547,6 +553,7 @@ async function joined(cx, argv) {
   const [sub, ...after] = argv;
   if (sub === 'add-all') { await joinedAddAll(cx, after); return; }
   if (sub === 'done') { await joinedDone(cx, after); return; }
+  if (sub === 'pick') { await joinedPick(cx, after); return; }
   const { session, rest: afterSession } = parseSessionFlag(argv);
   const { account, rest } = await parseAccountFlag(afterSession);
   if (rest.length !== 0) throw new UserError(USAGE);
@@ -574,12 +581,41 @@ async function joined(cx, argv) {
       const now = placeNow(row, place, newIds);
       const where = now.pending ? 'no rule yet' : sendList(row, now.ids);
       cx.lines.push(`J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${now.pending ? 'pending' : idList(now.ids)}`);
-      cx.lines.push(`J${total}-command=${script} rule add ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenants>`);
+      cx.lines.push(`J${total}-command=${script} joined pick ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenant>`);
     }
     cx.lines.push(`add-all-command=${script} joined add-all --account ${row.key}${deferText(cx)}`);
-    cx.lines.push(`done-command=${script} joined done --account ${row.key}`);
+    cx.lines.push(`done-command=${script} joined done --account ${row.key}${deferText(cx)}`);
   }
   cx.lines.push(`joined=${total}`);
+}
+
+// The ids a place should hold once addIds join it: its current targets (pending counts as empty), plus addIds, kept to current members and order.
+function extendedTenantIds(row, place, addIds, newIds) {
+  const members = tenantsOf(row).map((t) => t.id);
+  const now = placeNow(row, place, newIds);
+  const base = now.pending ? [] : now.ids;
+  return members.filter((id) => base.indexOf(id) !== -1 || addIds.indexOf(id) !== -1);
+}
+
+// Adds one joined workspace to one place, extending its current targets (empty and pending places kept, since the user chose them). Does not mark the join reviewed.
+async function joinedPick(cx, argv) {
+  const { session, rest: afterSession } = parseSessionFlag(argv);
+  const { account, rest } = await parseAccountFlag(afterSession);
+  const { target, refs } = parseTarget(rest);
+  if (target == null || target.flag === '--current' || refs.length !== 1) throw new UserError(USAGE);
+  const row = await resolveAccount(account);
+  requireMulti(row);
+  const ctx = createRouteContext();
+  const current = await withSessionState(cx, resolveSession(cx, session), ctx);
+  const place = ruleKey(cx, target, choiceDir(cx, current.state), ctx);
+  const newIds = newTenantsOf(row);
+  const tenantId = resolveTenantRef(row, refs[0]);
+  const tenantIds = extendedTenantIds(row, place, [tenantId], newIds);
+  const n = (await setWorkspaceRule(row.key, { kind: place.kind, match: place.match, label: place.label, tenantIds })).index;
+  cx.lines.push(ruleDone(row, place, tenantIds, true));
+  await bindOpenSessions(cx, await resolveAccount(row.key), [n], current, ctx);
+  await afterRuleWrite(cx, row.key);
+  cx.lines.push(`rule=${n}`);
 }
 
 // Adds the new workspaces to every listed place that already sends somewhere; Don't-track and no-rule-yet places stay as they are. Then marks the join reviewed.
@@ -597,12 +633,11 @@ async function joinedAddAll(cx, argv) {
   }
   const ctx = createRouteContext();
   const current = await withSessionState(cx, resolveSession(cx, session), ctx);
-  const members = tenantsOf(row).map((t) => t.id);
   const added = [];
   for (const place of planReviewPlaces(row, cx.listAllRollouts(), ctx, { liveSessionId: current.sessionId })) {
     const now = placeNow(row, place, newIds);
     if (now.pending || now.ids.length === 0) continue;
-    const tenantIds = members.filter((id) => now.ids.indexOf(id) !== -1 || newIds.indexOf(id) !== -1);
+    const tenantIds = extendedTenantIds(row, place, newIds, newIds);
     added.push((await setWorkspaceRule(row.key, { kind: place.kind, match: place.match, label: place.label, tenantIds })).index);
   }
   await markTenantsReviewed(row.key, newIds);
@@ -618,15 +653,31 @@ async function joinedAddAll(cx, argv) {
   cx.lines.push(`rules-added=${n}`);
 }
 
-// Marks the account's new workspaces reviewed, whatever the answers were.
+// Under Ask me, pins every rule-less place to where it sends now (so unpicked places keep sending), then marks the new workspaces reviewed.
 async function joinedDone(cx, argv) {
-  const { account, rest } = await parseAccountFlag(argv);
+  const { session, rest: afterSession } = parseSessionFlag(argv);
+  const { account, rest } = await parseAccountFlag(afterSession);
   if (rest.length !== 0) throw new UserError(USAGE);
   const row = await resolveAccount(account);
   const newIds = newTenantsOf(row);
+  const kept = [];
+  let ctx = null;
+  let current = null;
+  if (newIds.length > 0 && newFoldersOf(row).mode === 'ask') {
+    ctx = createRouteContext();
+    current = await withSessionState(cx, resolveSession(cx, session), ctx);
+    const places = planReviewPlaces(row, cx.listAllRollouts(), ctx, { liveSessionId: current.sessionId })
+      .filter((place) => !UNSAFE_LINE.test(place.match) && !UNSAFE_LINE.test(place.label));
+    for (const r of keepCurrentRules(row, places, newIds)) kept.push((await setWorkspaceRule(row.key, r)).index);
+  }
   await markTenantsReviewed(row.key, newIds);
   cx.lines.push(newIds.length === 0 ? '✓ No new workspaces were waiting for a review.' : `✓ Done reviewing ${joinTenantNames(row, newIds)}.`);
   cx.lines.push(`reviewed=${idList(newIds)}`);
+  if (kept.length > 0) {
+    await bindOpenSessions(cx, await resolveAccount(row.key), kept, current, ctx);
+    await afterRuleWrite(cx, row.key);
+  }
+  cx.lines.push(`kept=${kept.length}`);
 }
 
 async function newFolders(cx, argv) {

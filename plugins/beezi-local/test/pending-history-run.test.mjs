@@ -13,6 +13,7 @@ const clean = (over = {}) => ({
 
 function harness({ row, results, plan, starts = {} }) {
   const audits = [];
+  const auditDeps = [];
   const settled = [];
   const accounts = {
     AccountStatus: { LINKED: 'linked' },
@@ -24,10 +25,10 @@ function harness({ row, results, plan, starts = {} }) {
     accounts,
     now: () => T0,
     planWorkspaceRuns: () => plan,
-    runAudit: async (d, options) => { audits.push(options); return results.shift(); },
+    runAudit: async (d, options) => { audits.push(options); auditDeps.push(d); return results.shift(); },
     rolloutStartedAt: (p) => (starts[p] == null ? null : starts[p]),
   };
-  return { deps, audits, settled };
+  return { deps, audits, auditDeps, settled };
 }
 
 const multiRow = (pending) => ({ key: 'k1', status: 'linked', tenants: [{ id: 'A' }, { id: 'B' }], pendingHistory: pending });
@@ -132,6 +133,28 @@ test('a one-workspace account runs headerless with its Don\'t-track exclusions',
   assert.equal(h.audits[0].tenantId, null);
   assert.equal(h.audits[0].key, 'k1');
   assert.deepEqual([...h.audits[0].excludedSessionIds], ['s1']);
+});
+
+test('every workspace pass shares one run cache built once', async () => {
+  const row = multiRow([{ tenantId: 'A', requestedAt: REQ }, { tenantId: 'B', requestedAt: REQ }]);
+  const h = harness({ row, results: [clean(), clean()], plan: { tenantIds: ['A', 'B'], routes: new Map() } });
+  const cache = { git: () => '', gitRoots: new Map() };
+  let built = 0;
+  h.deps.createRunCache = () => { built += 1; return cache; };
+  await runPendingHistory('k1', h.deps);
+  assert.equal(built, 1);
+  assert.equal(h.auditDeps.length, 2);
+  assert.equal(h.auditDeps[0].runCache, cache);
+  assert.equal(h.auditDeps[1].runCache, cache);
+});
+
+test('without an override the real factory builds the shared cache', async () => {
+  const row = multiRow([{ tenantId: 'A', requestedAt: REQ }, { tenantId: 'B', requestedAt: REQ }]);
+  const h = harness({ row, results: [clean(), clean()], plan: { tenantIds: ['A', 'B'], routes: new Map() } });
+  await runPendingHistory('k1', h.deps);
+  assert.ok(h.auditDeps[0].runCache != null);
+  assert.ok(h.auditDeps[0].runCache.gitRoots instanceof Map);
+  assert.equal(h.auditDeps[1].runCache, h.auditDeps[0].runCache);
 });
 
 test('classifyRun — Codex reasons', () => {

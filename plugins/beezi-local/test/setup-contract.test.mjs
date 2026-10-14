@@ -94,7 +94,7 @@ const USAGE = [
   ' | rule add (--current | --repo <url> | --folder <path> | --outside) (<id|name|n>… | none) [--session <id>] [--account <ref>]',
   ' | rule add-all (<id|name|n>… | none) [--session <id>] [--account <ref>]',
   ' | routes [--session <id>] [--account <ref>]',
-  ' | joined [add-all | done] [--session <id>] [--account <ref>]',
+  ' | joined [add-all | done | pick (--repo <url> | --folder <path> | --outside) <id|name|n>] [--session <id>] [--account <ref>]',
   ' | new-folders [ask | send <id|name|n>… | none] [--session <id>] [--account <ref>]',
 ];
 
@@ -113,6 +113,9 @@ test('the place shapes and summary lines setup-routing relies on are unchanged',
 test('workspace.mjs still takes the argv the setup builds', () => {
   const cli = read('lib', 'workspace-cli.mjs');
   for (const usage of USAGE) assert.ok(cli.includes(usage), usage);
+  assert.ok(cli.includes("if (sub === 'pick') { await joinedPick(cx, after); return; }"), 'joined pick dispatch');
+  assert.ok(cli.includes('J${total}-command=${script} joined pick ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenant>'), 'J-command is joined pick');
+  assert.ok(cli.includes('done-command=${script} joined done --account ${row.key}${deferText(cx)}'), 'done-command carries the defer flag');
 });
 
 test('every sign-in failure exits non-zero, so the setup needs no failure text of its own', () => {

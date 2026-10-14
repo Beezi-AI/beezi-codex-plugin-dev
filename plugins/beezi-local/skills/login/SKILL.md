@@ -294,58 +294,58 @@ machine, it lists every repo and folder with where its analytics go now. Its lin
   — one repo or folder (a `J` line). `<where>` is where its analytics go today: workspace names, `not
   tracked`, or `no rule yet`. `J<i>. outside a project, <k> sessions, now: <where> … kind=outside match=outside`
   is one too: sessions in the home folder, `/` or a temp folder;
-- `J<i>-command=<command>` — right after its `J` line: the rule command for it, ending in a literal
-  `<tenants>`. It is not a `J` line;
+- `J<i>-command=<command>` — right after its `J` line: the command that adds one workspace to it,
+  ending in a literal `<tenant>`. It is not a `J` line;
 - `add-all-command=<command>` — adds the new workspaces to every listed repo and folder that already
   sends somewhere;
-- `done-command=<command>` — records that the new workspaces were reviewed;
+- `done-command=<command>` — records that the new workspaces were reviewed, and keeps every repo and folder
+  the user did not pick sending where it sends now;
 - `joined=<total>` — the number of `J` lines, always last.
 
 `joined=0` → nothing to ask; go to "Then, repos and folders with no rule" below.
 
 More than 4 `J` lines → first ask "You joined <names>. Where should analytics for these <N> repos and
-folders go? Their past sessions will be sent there too." (`<N>` = the number of `J` lines) with the
-choices "Add <names> to all <N>" (described "Repos you don't track, and ones with no rule yet, stay as
-they are"), "Choose per repo" ("One question per repo or folder") and "Leave them as they are"
-("Nothing changes, and you're not asked about <names> again").
+folders go? Their past sessions will be sent there too." (`<N>` = the number of `J` lines)
+with the choices "Add <names> to all <N>" (described "Repos you don't track, and ones with no rule
+yet, stay as they are"), "Choose repos" ("Pick which repos and folders go to each new workspace") and
+"Leave them as they are" ("Nothing changes, and you're not asked about <names> again").
 
 - "Add <names> to all <N>" → run the `add-all-command=` text EXACTLY ONCE.
-- "Choose per repo" → the per-repo questions below.
+- "Choose repos" → the per-workspace repo picks below.
 - "Leave them as they are" → run the `done-command=` text EXACTLY ONCE.
 - A skipped question → nothing; the next login or the `sync` skill asks again.
 
-4 or fewer `J` lines → the per-repo questions.
+4 or fewer `J` lines → the per-workspace repo picks.
 
-**The per-repo questions** — one question per `J` line, in turn, numbered across the `J` lines (`i`
-from 1, `N` = their number). `<short>` is the `J` line's text after `J<i>. ` up to ` (` or `,`,
-`<label>` the text in the parentheses after it, and `<where>` the text after `now: ` up to
-` account=`. The question and its last choice follow the line's `kind=`:
+**The per-workspace repo picks** — one question per `new=yes` `W.` line (a workspace just joined), in
+turn. Each question offers the `J` lines as its choices and asks which repos and folders
+should also send analytics to that one workspace. `<short>` is the `J` line's text after `J<i>. ` up to
+` (` or `,`, and `<where>` the text after `now: ` up to ` account=`. The question:
 
-| `kind=`   | Question                                                                                                                               | Last choice               |
-| --------- | -------------------------------------------------------------------------------------------------------------------------------------- | ------------------------- |
-| `repo`    | "(i of N) Now: <where>. Where should analytics for <short> go? Their past sessions will be sent there too."                            | "Don't track this repo"   |
-| `folder`  | "(i of N) Now: <where>. Where should analytics for <label> (and everything inside it) go? Their past sessions will be sent there too." | "Don't track this folder" |
-| `outside` | "(i of N) Now: <where>. Where should analytics for sessions outside a project folder go? Their past sessions will be sent there too."  | "Don't track these"       |
+"Which repos and folders should also send analytics to <workspace>? Their past sessions will be sent
+there too." — `<workspace>` is the `new=yes` line's name (the text after `W. ` up to ` account=`).
 
-Choices: one per `W.` line — the workspace name (the text after `W. ` up to ` account=`), described by
-the line's `role=` value, with ", new" added for a `new=yes` line ("new" alone when the role is empty)
-— then the last choice, described "Nothing from <short> is uploaded" ("Nothing from sessions outside a
-project folder is uploaded" for `outside`). Several workspaces may be chosen.
+Choices: one per `J` line — its `<short>`, described by its `<where>` ("Now: <where>", e.g. "Now:
+Acme" or "Now: no rule yet"). Several repos and folders may be chosen.
 
-- `request_user_input` only with at most 2 `W.` lines (3 choices): header "Beezi", the question with
-  " Pick one, or name several under Other." put before its last sentence, the labels exactly as above.
-- Otherwise the plain sentence: the question up to "go" (without the "?" and the sentence after it),
-  a colon, each workspace as "<name> (<description>)", then " — one or more — or <last choice,
-  lower-case first letter>?" and " Their past sessions will be sent there too.". For example:
-  "(1 of 2) Now: Acme. Where should analytics for acme-api go: Acme (Owner), NewCo (User, new) — one
-  or more — or don't track this repo? Their past sessions will be sent there too."
+- `request_user_input` only with at most 2 `J` lines and at most 3 `new=yes` `W.` lines (so at most 3
+  choices and 3 questions): header "Beezi", the question with " Pick one, or name several under Other."
+  put before its last sentence, a last choice "None of these" (described "This workspace gets none of
+  them"), the labels exactly as above.
+- Otherwise the plain sentence: the question up to "<workspace>" (without the sentence after it), a
+  colon, the `J` lines as a numbered list "1) <short> (Now: <where>), 2) …", then " — reply with the
+  numbers to send, or none —" and " Their past sessions will be sent there too.". For example: "Which
+  repos and folders should also send analytics to NewCo: 1) acme-api (Now: Acme), 2) notes (Now: no
+  rule yet) — reply with the numbers to send, or none — Their past sessions will be sent there too."
 
-For each answered `J` line, run its `J<i>-command=` text EXACTLY ONCE, changing nothing except the
-final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` when the last
-choice was picked (it wins over the others). Never rebuild the command or re-quote its path yourself.
-A skipped question runs nothing for its line. After the last `J` question has been answered (not
-skipped or dismissed), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and
-the next login or sync asks again.
+For each repo and folder the user picked for a workspace, run its `J<i>-command=` text EXACTLY ONCE,
+changing nothing except the final `<tenant>`: that workspace's `tenant=` value (its `W.` line's
+`tenant=`, e.g. `t2`). Map each answered position to the `J` line it listed, then run that line's
+own `J<i>-command=` (J numbers are global across accounts and need not start at 1); never rebuild the
+command or re-quote its path yourself. A repo the
+user did not pick for a workspace runs nothing for that workspace. After the last `new=yes` workspace's
+question has been answered (not skipped or dismissed), run the `done-command=` text EXACTLY ONCE;
+otherwise run no `done-command`, and the next login or sync asks again.
 
 Write each command's first line verbatim.
 
