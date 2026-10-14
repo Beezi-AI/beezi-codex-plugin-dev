@@ -399,6 +399,11 @@ function noteRecent(result, entry) {
 // A multi-workspace account runs once per workspace: `options.tenantId` names it (without one the
 // run returns `workspace-required`), and `options.sessionRoutes` (planWorkspaceRuns().routes, or
 // null for an unrouted --tenant override) keeps only the sessions routed to it.
+// One history run's git memo and repo-root answers; a caller running several workspaces passes one in as deps.runCache to share it.
+export function createRunCache(deps = {}) {
+  return { git: memoizeGit(deps.gitImpl == null ? _git : deps.gitImpl), gitRoots: new Map() };
+}
+
 export async function runAudit(deps = {}, options = {}) {
   const acquire = orDefault(deps.acquireLockImpl, _acquireLock);
   let lock;
@@ -1189,7 +1194,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   };
 
   // Each git question (cwd, args) runs once per run; checkpoints keep their own Maps and repo map, so answers stay exact.
-  const runCache = { git: memoizeGit(deps.gitImpl == null ? _git : deps.gitImpl), gitRoots: new Map() };
+  const runCache = deps.runCache == null ? createRunCache(deps) : deps.runCache;
 
   // Parsing itself stays strictly sequential. computeDelta reads and JSON.parses the whole
   // transcript, so parsing sessions in parallel multiplies peak memory with no gain on a

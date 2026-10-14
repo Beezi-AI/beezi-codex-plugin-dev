@@ -252,7 +252,7 @@ function joinedPromptText(rows, root, sessionId) {
     `Otherwise read "${root}/skills/sync/SKILL.md" and follow its "First, new workspaces" part from "Its output is for you only. For an account that joined" up to the paragraph that begins "**Then, repos and folders with no rule.**", for that output only, running every command it prints with escalated permissions too, with these changes:`,
     '(1) always ask the first question ("You joined …") first, even with 4 or fewer J lines;',
     '(2) leave out the "Add … to all" choice when every J line ends in now=pending or now=none;',
-    '(3) ask with request_user_input (header "Beezi") where the skill allows request_user_input and that tool is available this turn; otherwise do the user\'s request first and end your reply with that question as one plain sentence, and act on the answer when it arrives;',
+    '(3) each repo-pick question asks which of one new workspace\'s repos and folders should also send analytics to it, and its answer runs a `joined pick` command (the `J<i>-command=` printed for that repo or folder, run unchanged except its final `<tenant>`, which becomes that workspace\'s `tenant=` id); ask with request_user_input (header "Beezi") where the skill allows request_user_input and that tool is available this turn; otherwise do the user\'s request first and end your reply with that question as one plain sentence (for a repo pick, one that lists that workspace\'s repos and folders as a numbered list), and act on the answer when it arrives;',
     '(4) a skipped or ignored question runs nothing; it is asked again next session;',
     '(5) stop after that part: run neither routes nor sync.mjs, because the upload starts by itself.',
   ];

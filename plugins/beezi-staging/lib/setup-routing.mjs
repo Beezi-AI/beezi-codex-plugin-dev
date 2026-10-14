@@ -99,14 +99,13 @@ export function parsePlaces(text, letter) {
   });
 }
 
-// A joined place (one with a `now:`) also says its past sessions follow the answer.
+// One routes question per place, numbered i of n.
 export function placeQuestion(place, i, n) {
-  const prefix = `(${i} of ${n}) ${place.where === null ? '' : `Now: ${place.where}. `}`;
-  const consent = place.where === null ? '' : CONSENT;
-  if (place.kind === 'outside') return `${prefix}Where should analytics for sessions outside a project folder go?${consent}`;
+  const prefix = `(${i} of ${n}) `;
+  if (place.kind === 'outside') return `${prefix}Where should analytics for sessions outside a project folder go?`;
   const folder = place.label !== null ? place.label : place.match;
-  if (place.kind === 'folder') return `${prefix}Where should analytics for ${folder} (and everything inside it) go?${consent}`;
-  return `${prefix}Where should analytics for ${place.short} go?${consent}`;
+  if (place.kind === 'folder') return `${prefix}Where should analytics for ${folder} (and everything inside it) go?`;
+  return `${prefix}Where should analytics for ${place.short} go?`;
 }
 
 export function workspaceOptions(workspaces) {
@@ -172,6 +171,26 @@ function joinedNames(text, workspaces) {
   return workspaces.filter((w) => w.isNew).map((w) => w.name).join(', ');
 }
 
+// Up to 4 places per screen; each picked place runs `joined pick` for this one joined workspace. False when a screen is dismissed.
+async function askReposForTenant(ctx, key, tenant, places) {
+  const name = tenant.name ? tenant.name : tenant.tenant;
+  for (let i = 0; i < places.length; i += 4) {
+    const batch = places.slice(i, i + 4);
+    const options = batch.map((place) => ({
+      label: place.short,
+      description: place.where === null ? 'No rule yet' : `Now: ${place.where}`,
+    }));
+    const picked = await ctx.ask.chooseMany(`Which repos and folders should also send analytics to ${name}?${CONSENT}`, options);
+    if (picked === null) return false;
+    for (const j of picked) {
+      const place = batch[j];
+      const target = place.kind === 'outside' ? ['--outside'] : [`--${place.kind}`, place.match];
+      await runAndReport(ctx, ['joined', 'pick'].concat(target, ['--account', key, tenant.tenant, DEFER]));
+    }
+  }
+  return true;
+}
+
 export async function reviewJoined(ctx, key) {
   const listing = await ctx.run('workspace.mjs', ['joined', '--account', key]);
   if (listing.code !== 0) {
@@ -181,19 +200,24 @@ export async function reviewJoined(ctx, key) {
   const places = parsePlaces(listing.stdout, 'J');
   if (places.length === 0) return;
   const workspaces = parseWorkspaces(listing.stdout);
+  const newTenants = workspaces.filter((w) => w.isNew);
   if (places.length > 4) {
     const names = joinedNames(listing.stdout, workspaces);
     const n = places.length;
     const choice = await ctx.ask.choose(`You joined ${names}. Where should analytics for these ${n} repos and folders go?${CONSENT}`, [
       { label: `Add ${names} to all ${n}`, description: "Repos you don't track, and ones with no rule yet, stay as they are" },
-      { label: 'Choose per repo', description: 'One question per repo or folder' },
+      { label: 'Choose repos', description: 'Pick which repos and folders go to each new workspace' },
       { label: 'Leave them as they are', description: `Nothing changes, and you're not asked about ${names} again` },
     ]);
-    if (choice === 0) await runAndReport(ctx, ['joined', 'add-all', '--account', key, DEFER]);
-    if (choice === 2) await runAndReport(ctx, ['joined', 'done', '--account', key]);
+    if (choice === 0) { await runAndReport(ctx, ['joined', 'add-all', '--account', key, DEFER]); return; }
+    if (choice === 2) { await runAndReport(ctx, ['joined', 'done', '--account', key, DEFER]); return; }
     if (choice !== 1) return;
   }
-  if (await askPerPlace(ctx, key, places, workspaces)) await runAndReport(ctx, ['joined', 'done', '--account', key]);
+  let answered = true;
+  for (const tenant of newTenants) {
+    if (!(await askReposForTenant(ctx, key, tenant, places))) { answered = false; break; }
+  }
+  if (answered) await runAndReport(ctx, ['joined', 'done', '--account', key, DEFER]);
 }
 
 export async function reviewRoutes(ctx, key) {

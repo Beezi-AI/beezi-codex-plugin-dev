@@ -1,4 +1,4 @@
-import { runAudit, planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
+import { runAudit, createRunCache, planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE, ACCOUNT_TOKEN_UNUSABLE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
@@ -70,9 +70,13 @@ function refuse(message, many) {
   process.exitCode = 1;
 }
 
+// One git cache for the whole process, so every workspace pass reuses the first one's git answers.
+const runCache = createRunCache();
+
 async function runOne(key, many, options) {
   const result = await runAudit(
     {
+      runCache,
       onProgress: ({ processed, total }) => {
         console.log(`Beezi: ${processed}/${total} sessions read…`);
       },

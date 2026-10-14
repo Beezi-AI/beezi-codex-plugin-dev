@@ -1,4 +1,4 @@
-import { parseArgs, runAudit, planWorkspaceRuns, dontTrackSessionIds, ACCOUNT_TOKEN_UNUSABLE, SYNC_MODE } from '../lib/session-audit.mjs';
+import { parseArgs, runAudit, createRunCache, planWorkspaceRuns, dontTrackSessionIds, ACCOUNT_TOKEN_UNUSABLE, SYNC_MODE } from '../lib/session-audit.mjs';
 import { BackfillHalt } from '../lib/audit-flush.mjs';
 import { friendlyMessage, UserError } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
@@ -44,6 +44,9 @@ function failed(message) {
   return 1;
 }
 
+// One git cache for the whole process, so every workspace pass reuses the first one's git answers.
+const runCache = createRunCache();
+
 // One run — the account's only one, or one workspace's. Returns the exit status instead of exiting
 // mid-loop.
 async function backfillOne(options) {
@@ -51,6 +54,7 @@ async function backfillOne(options) {
 
   const result = await runAudit(
     {
+      runCache,
       // "read", not "sent": `processed` counts candidates PARSED, and a parsed session may still
       // produce nothing to upload. Calling it "sent" is what made the final totals look like they
       // had lost sessions when the arithmetic was simply against a different number.
@@ -281,7 +285,7 @@ async function backfillOne(options) {
 // demand (audit-only) gets the one-time import instead, which has no link cutoff there.
 async function backfillJoinedOne(options) {
   const result = await runAudit(
-    { onProgress: ({ processed, total }) => { console.log(`Beezi: ${processed}/${total} sessions read…`); } },
+    { runCache, onProgress: ({ processed, total }) => { console.log(`Beezi: ${processed}/${total} sessions read…`); } },
     { ...options, mode: SYNC_MODE },
   );
   if (result.reason === 'audit-only' || result.halt === BackfillHalt.NOT_ALLOWED || result.halt === BackfillHalt.ALREADY_COMPLETED) {

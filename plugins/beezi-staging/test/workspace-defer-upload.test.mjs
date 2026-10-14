@@ -9,15 +9,15 @@ const TENANTS = [
   { id: 'B', name: 'NewCo', joinedAt: '2026-10-10T00:00:00.000Z' },
 ];
 
-test('joined --defer-upload prints rule commands that carry the flag before <tenants>', async (t) => {
+test('joined --defer-upload prints pick commands that carry the flag before <tenant>', async (t) => {
   linkAccount(makeHome(t), TEST_KEY, { tenants: TENANTS, linkedAt: '2026-10-01T00:00:00.000Z' });
   await setWorkspaceRule(TEST_KEY, { kind: 'repo', match: 'github.com/acme/api', tenantIds: ['A'] });
   const out = await workspaceCommand(['joined', '--defer-upload', '--account', TEST_KEY], { startHistoryWorker: async () => { throw new Error('must not start'); } });
   assert.equal(out.ok, true, out.stderr.join('\n'));
   const j = out.lines.find((l) => /^J\d+-command=/.test(l));
-  assert.match(j, new RegExp(`--account ${TEST_KEY} --defer-upload <tenants>$`));
+  assert.match(j, new RegExp(`joined pick --repo .* --account ${TEST_KEY} --defer-upload <tenant>$`));
   assert.match(out.lines.find((l) => l.startsWith('add-all-command=')), /--defer-upload$/);
-  assert.doesNotMatch(out.lines.find((l) => l.startsWith('done-command=')), /--defer-upload/);
+  assert.match(out.lines.find((l) => l.startsWith('done-command=')), new RegExp(`joined done --account ${TEST_KEY} --defer-upload$`));
 });
 
 test('rule add starts the worker unless deferred', async (t) => {
