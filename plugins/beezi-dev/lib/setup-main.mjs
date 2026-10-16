@@ -5,7 +5,7 @@ import { removeDirSync } from './compat.mjs';
 import { finaleLines } from './setup-finale.mjs';
 import { createPrompt, openTerminal } from './setup-prompt.mjs';
 import { createRunner } from './setup-runner.mjs';
-import { canReadKeys, colorEnabled, createStyle, paint } from './setup-style.mjs';
+import { canReadKeys, colorEnabled, createStyle, formatLine, paint } from './setup-style.mjs';
 import { runSetup } from './setup-wizard.mjs';
 
 // Session-id variables Codex exports to shell commands; the runner drops them from every child's env.
@@ -42,7 +42,9 @@ export function setupMain(root, deps) {
   }
   // Shows the cursor again on process exit.
   if (stdout.isTTY) (d.onExit || onProcessExit)(() => { stdout.write(SHOW_CURSOR); });
-  const print = (line) => { stdout.write(`${paint(style, line)}\n`); };
+  // Wrapped to the width on a terminal; a log keeps each line whole.
+  const format = (line) => (stdout.isTTY ? formatLine(style, line, stdout.columns || 80) : paint(style, line));
+  const print = (line) => { stdout.write(`${format(line)}\n`); };
   const removeDir = d.removeDir || removeDirSync;
   const exit = d.exit || ((code) => process.exit(code));
   const cwd = (d.makeTempDir || makeTempDir)();
@@ -51,8 +53,10 @@ export function setupMain(root, deps) {
     prompt.close();
     removeDir(cwd);
   };
-  // Shared by SIGINT and Ctrl+C inside an arrow-key menu.
+  let run = null;
+  // Shared by SIGINT and Ctrl+C inside an arrow-key menu; a drawn activity line is cleared first.
   const stop = () => {
+    if (run !== null) run.clearActivity();
     cleanup();
     print('');
     print(STOPPED);
@@ -62,10 +66,12 @@ export function setupMain(root, deps) {
     input, output: stdout, style, interactive: canReadKeys({ input, output: stdout, env }), onInterrupt: stop,
   });
   (d.onInterrupt || onSigint)(stop);
-  const run = (d.createRunner || createRunner)({
-    root, cwd, env, sessionKeys: SESSION_KEYS, paint: (line) => paint(style, line),
+  run = (d.createRunner || createRunner)({
+    root, cwd, env, sessionKeys: SESSION_KEYS, paint: format, stdout, stderr,
+    output: stdout, activity: stdout.isTTY === true && env.TERM !== 'dumb',
   });
-  return (d.runSetup || runSetup)({ run, ask: prompt, print })
+  const progress = (label) => { run.setLabel(label); };
+  return (d.runSetup || runSetup)({ run, ask: prompt, print, progress })
     .finally(cleanup)
     .then((code) => {
       if (code === 0) {

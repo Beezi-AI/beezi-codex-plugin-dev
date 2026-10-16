@@ -8,7 +8,7 @@ import { CRASH_MODES } from '../lib/diagnostics.mjs';
 import { keysLines } from '../lib/settings-cli.mjs';
 import { lastLine, parsePlaces, parseWorkspaces, token } from '../lib/setup-routing.mjs';
 import {
-  ACCOUNT_LINE, CRASH_CHOICES, FINALIZED, LINKED_AS, PLAN_EXPIRED, STILL_DEFAULT, TIER_CHOICES, TRUST_PENDING,
+  ACCOUNT_LINE, CRASH_CHOICES, FINALIZED, LINKED_AS, PLAN_EXPIRED, STILL_DEFAULT, TIER_CHOICES, TRUST_PENDING, UPLOAD_PROGRESS,
   crashModeOf, parseLinkedAccounts, planSettled,
 } from '../lib/setup-wizard.mjs';
 import { linkAccount, makeHome } from '../tools/account-fixtures.mjs';
@@ -78,6 +78,8 @@ const LINES = [
   [['lib', 'workspace-cli.mjs'], 'J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${',
     `J1. api (github.com/acme/api), 1 session, now: Acme account=${KEY} kind=repo match=github.com/acme/api now=t1`,
     (line) => parsePlaces(line, 'J')[0].where === 'Acme' && parsePlaces(line, 'J')[0].match === 'github.com/acme/api'],
+  [['scripts', 'backfill.mjs'], 'Beezi: ${processed}/${total} sessions read…', 'Beezi: 3/12 sessions read…',
+    (line) => UPLOAD_PROGRESS.test(line)],
 ];
 
 // Shapes setup-routing splits on whose reading its own tests already cover.
