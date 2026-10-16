@@ -2,7 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { CHATGPT_PLANS } from '../lib/billing.mjs';
 import {
-  TIER_CHOICES, capturePlan, parseLinkedAccounts, pickAccount, planSettled, signIn,
+  SIGN_IN_LABEL, TIER_CHOICES, capturePlan, parseLinkedAccounts, pickAccount, planSettled, signIn,
 } from '../lib/setup-wizard.mjs';
 import { failed, fakeCtx, ok } from '../tools/setup-fixtures.mjs';
 
@@ -77,7 +77,7 @@ test('signIn streams login.mjs, hides its key line and takes the last key', asyn
   assert.equal(result.key, KEY);
   assert.match(result.output, /linked as Ann/);
   assert.deepEqual(ctx.runs, ['login.mjs']);
-  assert.deepEqual(ctx.opts['login.mjs'], { stream: true, hide: /^account=/ });
+  assert.deepEqual(ctx.opts['login.mjs'], { stream: true, hide: /^account=/, label: SIGN_IN_LABEL });
   assert.deepEqual(ctx.printed, []);
 });
 

@@ -6,6 +6,15 @@ import {
 // One `accounts.mjs list` row: "  <n>. <description> [<key>]", then "  (default, revoked)" marks when any.
 const LISTED_ACCOUNT = /^ {2}\d+\. (.+) \[([0-9a-f]{8})\](?: {2}\(([a-z, ]+)\))?$/;
 export const ACCOUNT_LINE = /^account=([0-9a-f]{8})$/;
+export const MACHINE_LABEL = 'Checking this machine…';
+export const SIGN_IN_LABEL = 'Waiting for you to sign in in your browser…';
+export const WORKSPACES_LABEL = 'Checking your workspaces…';
+export const PLAN_LABEL = 'Checking your plan…';
+export const SESSIONS_LABEL = 'Looking at your past sessions…';
+export const UPLOAD_LABEL = 'Uploading past sessions…';
+// backfill.mjs prints this once per batch; the wizard shows it on the activity line instead.
+export const UPLOAD_PROGRESS = /^Beezi: (\d+)\/(\d+) sessions read…$/;
+export const SETTINGS_LABEL = 'Saving your settings…';
 const CAPTURED = / source=(\S+) plan=([^\s.]+)/;
 export const PLAN_EXPIRED = /Codex sign-in expired/;
 const ACCOUNT_QUESTION = 'This machine is already linked to Beezi. Which account should setup use?';
@@ -58,7 +67,7 @@ export async function pickAccount(ctx) {
 
 // Streams login.mjs with its key line hidden; the key is null unless it exited 0 with an `account=` line.
 export async function signIn(ctx) {
-  const result = await ctx.run('login.mjs', [], { stream: true, hide: /^account=/ });
+  const result = await ctx.run('login.mjs', [], { stream: true, hide: /^account=/, label: SIGN_IN_LABEL });
   const last = lastLine(result.stdout, ACCOUNT_LINE);
   return { key: result.code === 0 && last !== null ? ACCOUNT_LINE.exec(last)[1] : null, output: result.stdout };
 }
@@ -94,8 +103,6 @@ export const STILL_DEFAULT = /still reads from this machine/;
 export const LINKED_AS = /linked as (.+?)\. (?:Nothing changed|Credentials stored)/;
 export const TRUST_PENDING = /run \/hooks in Codex/;
 const HOOK_OUTCOME = /^(?:[✓⚠]|Beezi: another )/;
-const PLAN_PROGRESS = '==> Checking your plan…';
-const SESSIONS_PROGRESS = '==> Looking at your past sessions…';
 const FINALIZE_NOTE = 'History import is now closed for this account: past sessions on other machines can no longer be imported. New sessions are still tracked everywhere Beezi is installed.';
 const DEFAULT_UNCHANGED = 'The default account is unchanged. The settings skill (Account → Default account) switches it later.';
 const TRUST_NOTE = 'One step left in Codex: run /hooks and trust the Beezi entries.';
@@ -116,7 +123,7 @@ async function checkHooks(ctx) {
 }
 
 async function uploadHistory(ctx, key) {
-  const result = await ctx.run('backfill.mjs', ['--via', 'login', '--account', key], { stream: true });
+  const result = await ctx.run('backfill.mjs', ['--via', 'login', '--account', key], { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
   if (FINALIZED.test(result.stdout)) ctx.print(FINALIZE_NOTE);
 }
 
@@ -168,6 +175,7 @@ function finish(ctx, hooksOutput) {
 
 // The login skill's steps in the terminal: 0 when done, 1 when the sign-in failed or the account question was dismissed.
 export async function runSetup(ctx) {
+  ctx.progress(MACHINE_LABEL);
   let key = await pickAccount(ctx);
   let signInOutput = '';
   let hooksOutput;
@@ -181,13 +189,15 @@ export async function runSetup(ctx) {
   } else {
     hooksOutput = await checkHooks(ctx);
   }
+  ctx.progress(WORKSPACES_LABEL);
   await askNewFolders(ctx, key);
-  ctx.print(PLAN_PROGRESS);
+  ctx.progress(PLAN_LABEL);
   await capturePlan(ctx, key);
-  ctx.print(SESSIONS_PROGRESS);
+  ctx.progress(SESSIONS_LABEL);
   await reviewJoined(ctx, key);
   await reviewRoutes(ctx, key);
   await uploadHistory(ctx, key);
+  ctx.progress(SETTINGS_LABEL);
   await offerDefault(ctx, key, signInOutput);
   await chooseCrashMode(ctx);
   finish(ctx, hooksOutput);
