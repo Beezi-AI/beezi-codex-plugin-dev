@@ -49,34 +49,33 @@ the approval, run nothing further from this skill and say the step needs their a
 that ran in the sandbox and prints a line naming it is run once more, escalated; one that already
 ran escalated and still fails is not retried: show its line and stop.
 
-**Several accounts can be linked at once, so always see what is there first:**
+**Run this one command first** — several accounts can be linked at once, and it settles which case
+this is:
 
 ```
-node "<plugin-root>/scripts/logout.mjs" --list
+node "<plugin-root>/scripts/logout.mjs" --single
 ```
-
-`--list` resolves no token and makes no request. It prints the same numbered list the `settings`
-skill (Account → Default account) does.
 
 Report every output verbatim, and never echo a token or the contents of the credentials file.
 
-## Then choose, by how many are linked
+## Then, by what it printed
 
-- **Zero.** Nothing to do; say so and stop.
-- **Exactly one.** Run the bare command — it logs that one account out.
-
-  ```
-  node "<plugin-root>/scripts/logout.mjs"
-  ```
-
-- **Two or more.** Ask whether the user means **one** of them or **all** of them; never guess.
+- **None linked.** It says the machine is not linked and there is nothing to do: stop.
+- **Exactly one.** It logged that account out in the same call: its output is the logout result, so
+  relay it as "Reading the answer" below says, and stop.
+- **Two or more.** It logs nothing out and makes no request: it prints
+  `✗ More than one account is linked — pick one.` and then the same numbered list the `settings`
+  skill (Account → Default account) does. That `✗` line is not a failure to stop on: show the list
+  and ask whether the user means **one** of them or **all** of them; never guess.
 
   ```
   node "<plugin-root>/scripts/logout.mjs" --account <n>
   node "<plugin-root>/scripts/logout.mjs" --all
   ```
 
-  `<n>` is the position from the list. The account's key or email works too.
+  `<n>` is the position from the list. The account's key or email works too. To show the list again
+  without logging anything out, run `node "<plugin-root>/scripts/logout.mjs" --list`; it resolves no
+  token and makes no request.
 
 **If the account being logged out is the current default and other accounts remain**, ask which of
 the remaining accounts should become the one analytics are read from, and pass it:
@@ -115,8 +114,8 @@ Two things are still yours to do, because they are not interpretation:
 - **Offer the follow-up skill the output names.** If a line mentions the analytics default, the
   `settings` skill (Account → Default account) changes it; if a line says to sign in again, that is the `login` skill.
 - **Never retry in a loop, and never delete a credentials file by hand.** If the command refuses —
-  a `✗` line, or the environment guard's refusal, which carries no `✗` and is usually several
-  lines — relay it and stop.
+  a `✗` line (other than `--single`'s "More than one account is linked" above), or the environment
+  guard's refusal, which carries no `✗` and is usually several lines — relay it and stop.
 
 ## After logging out
 

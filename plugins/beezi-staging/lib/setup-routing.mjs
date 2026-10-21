@@ -3,11 +3,8 @@ const DONT_TRACK = {
   folder: "Don't track this folder",
   outside: "Don't track these",
 };
-const NEW_FOLDER_OPTIONS = [
-  { label: 'Ask me (recommended)', description: 'Beezi asks once per repo or folder, when a session starts there' },
-  { label: 'Send to…', description: 'Pick the workspaces that get them' },
-  { label: "Don't send", description: 'Nothing from a repo or folder with no rule is uploaded' },
-];
+const SETUP_QUESTION = 'Where should analytics from this machine go?';
+const PER_REPO = { label: 'Let me choose per repo', description: 'Beezi asks about each repo and folder with history next, and new ones when a session starts there' };
 const LABEL_END = /\), \d+ sessions?\b/;
 const PLAIN_PLACE = /^(.*?), \d+ sessions?\b/;
 const NO_FOLDER = /^\d+ other past sessions? ha(?:s|ve) no recorded folder and (?:is|are) not sent\.$/;
@@ -117,8 +114,8 @@ export function workspaceOptions(workspaces) {
 
 export function placeOptions(place, workspaces) {
   const nothing = place.kind === 'outside'
-    ? 'Nothing from sessions outside a project folder is uploaded'
-    : `Nothing from ${place.short} is uploaded`;
+    ? 'Not tracked: nothing from sessions outside a project folder is sent'
+    : `Not tracked: nothing from ${place.short} is sent`;
   return workspaceOptions(workspaces).concat([{ label: DONT_TRACK[place.kind], description: nothing }]);
 }
 
@@ -136,22 +133,40 @@ async function runAndReport(ctx, argv) {
   report(ctx, await ctx.run('workspace.mjs', argv));
 }
 
+const plural = (n, one, many) => (n === 1 ? `1 ${one}` : `${n} ${many}`);
+
+// The `history=<N> places=<M>` counts, or null when the line is missing or malformed.
+export function parseHistory(text) {
+  const line = lastLine(text, /^history=/);
+  const found = line === null ? null : /^history=(\d+) places=(\d+)$/.exec(line.trimEnd());
+  return found ? { sessions: Number(found[1]), places: Number(found[2]) } : null;
+}
+
+// One option per workspace, each sending everything there, then the per-repo option.
+export function setupOptions(workspaces, history) {
+  const sessions = history === null ? '' : plural(history.sessions, 'past session', 'past sessions');
+  let description = 'Everything goes here, starting with new repos and folders';
+  if (history !== null && history.sessions > 0) {
+    description = history.places > 0
+      ? `Everything goes here: new repos and folders, and ${history.places} with history (${sessions})`
+      : `Everything goes here: new repos and folders, and ${sessions}`;
+  }
+  return workspaces.map((w) => ({ label: w.name, description })).concat([PER_REPO]);
+}
+
 export async function askNewFolders(ctx, key) {
-  const listing = await ctx.run('workspace.mjs', ['new-folders', '--account', key]);
+  const listing = await ctx.run('workspace.mjs', ['new-folders', '--history', '--account', key]);
   if (listing.code !== 0) {
     report(ctx, listing);
     return;
   }
   const last = lastLine(listing.stdout, /^new-folders=/);
-  if (last === null || token(last, 'set') !== 'no') return;
-  const choice = await ctx.ask.choose('Where should analytics go for repos and folders with no rule yet?', NEW_FOLDER_OPTIONS, { defaultIndex: 0 });
-  if (choice === 0) await runAndReport(ctx, ['new-folders', 'ask', '--account', key, DEFER]);
-  if (choice === 2) await runAndReport(ctx, ['new-folders', 'none', '--account', key, DEFER]);
-  if (choice !== 1) return;
+  if (last === null || token(last, 'set') !== 'no' || token(last, 'multi') !== 'yes') return;
   const workspaces = parseWorkspaces(listing.stdout);
-  const picked = await ctx.ask.chooseMany('Which workspaces should get analytics for repos and folders with no rule?', workspaceOptions(workspaces));
-  if (picked === null || picked.length === 0) return;
-  await runAndReport(ctx, ['new-folders', 'send', tenantsArg(picked, workspaces), '--account', key, DEFER]);
+  const choice = await ctx.ask.choose(SETUP_QUESTION, setupOptions(workspaces, parseHistory(listing.stdout)), { defaultIndex: 0 });
+  if (choice === null) return;
+  if (choice === workspaces.length) await runAndReport(ctx, ['new-folders', 'ask', '--account', key, DEFER]);
+  else await runAndReport(ctx, ['new-folders', 'send', workspaces[choice].tenant, '--account', key, DEFER]);
 }
 
 // One question per place; true when the last place got an answer.

@@ -156,10 +156,18 @@ test('skill — routes history before syncing, with scripts derived from its own
   assert.match(skill, /node "<plugin-root>\/scripts\/sync\.mjs"/);
   const commands = skill.match(/^node .+$/gm) || [];
   assert.deepEqual(commands, [
-    'node "<plugin-root>/scripts/workspace.mjs" joined --defer-upload',
-    'node "<plugin-root>/scripts/workspace.mjs" routes --defer-upload',
+    'node "<plugin-root>/scripts/sync.mjs" --review',
+    'node "<plugin-root>/scripts/sync.mjs" --review-routes',
     'node "<plugin-root>/scripts/sync.mjs"',
   ], 'joined workspaces and pending routes are resolved before the history upload, which carries their history');
+  // One call when nothing needs an answer: the skill reads the sync's output after review=0 and runs nothing more.
+  assert.match(skill, /`review=<n>`/);
+  assert.match(skill, /On `review=0` it goes straight on to the sync/);
+  assert.match(skill, /its output is everything after that\s+`review=0` line\. Run nothing more\./);
+  assert.match(skill, /Run nothing for them after `joined=0`/);
+  assert.match(skill, /counts as nothing to ask/);
+  assert.match(skill, /J<i>-command=/);
+  assert.match(skill, /done-command=/);
   assert.match(skill, /P<i>-command=/);
   assert.match(skill, /all-command=/);
   assert.match(skill, /global across accounts/);
@@ -175,6 +183,7 @@ test('skill — states the flag policy in the same terms the script enforces', (
   assert.match(skill, /--tenant <workspace>/);
   assert.match(skill, /only when the user asks/);
   assert.match(skill, /takes no other flags/i);
+  assert.match(skill, /`--review` or `--review-routes`/);
   assert.match(skill, /--since/);
   assert.match(skill, /--force/);
   assert.doesNotMatch(skill, /takes no flags/i, 'it takes --account — saying otherwise hides it');
@@ -297,4 +306,13 @@ test('skill — track points at sync for history it cannot repair', () => {
   const track = fs.readFileSync(path.join(pluginRoot, 'skills', 'track', 'SKILL.md'), 'utf-8');
   assert.match(track, /the `sync` skill/);
   assert.match(track, /only ever saves \*\*the session it is run from\*\*/);
+});
+
+// Spec §4: the last choice of a place's workspace question says nothing is sent, never "uploaded".
+test('skill — a place\'s Don\'t track choice is described as nothing sent', () => {
+  const flat = skill.replace(/\s+/g, ' ');
+  assert.ok(flat.includes('"Not tracked: nothing from <short> is sent"'));
+  assert.ok(flat.includes('"Not tracked: nothing from sessions outside a project folder is sent"'));
+  assert.ok(!flat.includes('Nothing from <short> is uploaded'));
+  assert.ok(!flat.includes('outside a project folder is uploaded'));
 });

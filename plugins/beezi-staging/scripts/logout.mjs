@@ -9,10 +9,11 @@ import { cliMayProceed } from '../lib/env-guard.mjs';
 // alone — is in lib/logout.mjs, where it can be tested without spawning a process.
 
 function parseArgs(argv) {
-  const flags = { list: false, all: false, account: null, nextDefault: null };
+  const flags = { list: false, single: false, all: false, account: null, nextDefault: null };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--list') { flags.list = true; continue; }
+    if (arg === '--single') { flags.single = true; continue; }
     if (arg === '--all') { flags.all = true; continue; }
     if (arg === '--account') {
       i += 1;
@@ -26,7 +27,10 @@ function parseArgs(argv) {
       flags.nextDefault = argv[i];
       continue;
     }
-    throw new UserError(`Unknown option "${arg}". logout.mjs takes --list, --account <account>, --next-default <account> and --all.`);
+    throw new UserError(`Unknown option "${arg}". logout.mjs takes --list, --single, --account <account>, --next-default <account> and --all.`);
+  }
+  if (flags.single && (flags.list || flags.all || flags.account !== null || flags.nextDefault !== null)) {
+    throw new UserError('--single logs out the only linked account, so it cannot be combined with another option.');
   }
   if (flags.all && flags.account !== null) {
     throw new UserError('--all logs out every account, so it cannot be combined with --account.');
@@ -72,6 +76,11 @@ async function main() {
     key = await resolveAccountRef(flags.account);
   } else if (accounts.length === 1) {
     key = accounts[0].key;
+  } else if (flags.single) {
+    // Not an error exit: the logout skill reads the list below and asks which account.
+    console.log('✗ More than one account is linked — pick one.');
+    console.log(await renderList());
+    return;
   } else {
     console.log(await renderList());
     console.log('');

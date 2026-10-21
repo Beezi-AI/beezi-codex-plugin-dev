@@ -3,7 +3,7 @@ import { runHook, importHookModule } from '../lib/hook-runner.mjs';
 import { DIAGNOSTIC_SOURCES } from '../lib/diagnostics.mjs';
 import { hookMayProceed, environmentNotice } from '../lib/env-guard.mjs';
 import { linkedSessions } from '../lib/accounts.mjs';
-import { markPendingWorkspace, buildWorkspacePrompt, buildTargetsNotice, buildJoinedPrompt, buildHistoryNotice } from '../lib/workspace-prompt.mjs';
+import { markPendingWorkspace, buildWorkspacePrompt, buildJoinedPrompt, buildHistoryNotice } from '../lib/workspace-prompt.mjs';
 import { maybeStartPendingHistory } from '../lib/history-trigger.mjs';
 
 const input = readHookInput();
@@ -36,7 +36,7 @@ if (!proceed) {
   process.exit(0);
 }
 
-// Resolved once and shared: the ask and the notice only need to know which accounts can produce a
+// Resolved once and shared: the asks only need to know which accounts can produce a
 // token, which runSessionStart has already asked every credential store.
 let linked = null;
 const deps = {
@@ -65,10 +65,8 @@ async function main() {
   try { workspacePrompt = await buildWorkspacePrompt(input, deps, marked); } catch { /* best-effort */ }
   // The joined re-pick comes first, so the current-folder question sees its answers.
   const additionalContext = [joinedPrompt, workspacePrompt].filter(Boolean).join('\n\n') || null;
-  let targetsNotice = null;
   let historyNotice = null;
   if (source !== 'compact') {
-    try { targetsNotice = await buildTargetsNotice(input, deps); } catch { /* best-effort */ }
     // Built only when the status line will be written, since building it takes the results.
     if (failure == null) {
       try { historyNotice = await buildHistoryNotice(input, deps); } catch { /* best-effort */ }
@@ -80,7 +78,7 @@ async function main() {
     write({ systemMessage: notice, additionalContext });
     throw failure;
   }
-  const status = [message, targetsNotice, historyNotice].filter((part) => part != null && part !== '').join('\n') || null;
+  const status = [message, historyNotice].filter((part) => part != null && part !== '').join('\n') || null;
   write({ systemMessage: withNotice(status), additionalContext });
 }
 

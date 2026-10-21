@@ -201,7 +201,7 @@ export function createPrompt(io) {
         output.write(SHOW_CURSOR);
       }
       function finish(value, answer) {
-        output.write(`${erase(drawn)}${style.green('✔')} ${style.bold(question)} ${answer}\n`);
+        output.write(`${erase(drawn)}${style.green('✓')} ${style.bold(question)} ${answer}\n`);
         stop();
         resolve(value);
       }

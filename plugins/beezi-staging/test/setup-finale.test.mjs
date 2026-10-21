@@ -70,7 +70,7 @@ function finale(agent, color, fun, columns) {
     '',
     head,
     '',
-    `  ${ok('✔ Everything is set up. Happy hacking! =)')}`,
+    `  ${ok('✓ Everything is set up. Happy hacking! =)')}`,
     `  Open ${agent} and keep working — restart it first if it was already open.`,
     `  ${soft(`🐝 ${fun}`)}`,
     '',
@@ -100,7 +100,7 @@ test('wide output puts the wordmark beside mark rows 3-8 and "× <agent>" beside
   assert.equal(out[4], '  \x1b[38;5;141m▄▄██████████▀      ▄▄███▄  \x1b[0m  \x1b[1m██████╗ ███████╗███████╗███████╗██╗\x1b[0m');
   assert.equal(out[11], '  \x1b[38;5;61m▀██████▀     ▄▄██████████▀ \x1b[0m  \x1b[2m×\x1b[0m \x1b[1mClaude Code\x1b[0m');
   assert.equal(out[15], '');
-  assert.equal(out[16], '  \x1b[1;32m✔ Everything is set up. Happy hacking! =)\x1b[0m');
+  assert.equal(out[16], '  \x1b[1;32m✓ Everything is set up. Happy hacking! =)\x1b[0m');
   assert.equal(out[17], '  Open Claude Code and keep working — restart it first if it was already open.');
   assert.equal(out[18], `  \x1b[2m🐝 ${DEMO_FUN[0]}\x1b[0m`);
   assert.equal(out[19], '');
@@ -113,7 +113,7 @@ test('under 72 columns the art becomes one ▰ line', () => {
     '',
     '  ▰ beezi × Codex',
     '',
-    '  ✔ Everything is set up. Happy hacking! =)',
+    '  ✓ Everything is set up. Happy hacking! =)',
     '  Open Codex and keep working — restart it first if it was already open.',
     `  🐝 ${DEMO_FUN[3]}`,
     '',

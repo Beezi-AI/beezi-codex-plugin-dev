@@ -10,6 +10,7 @@ import {
 import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf } from '../lib/workspace.mjs';
 import { usesRules } from '../lib/workspace-rules.mjs';
 import { startHistoryWorker } from '../lib/history-trigger.mjs';
+import { syncReview } from '../lib/workspace-cli.mjs';
 
 // The repeatable history repair pass (G-3-3 engine, G-9-3 surface).
 //
@@ -41,6 +42,9 @@ import { startHistoryWorker } from '../lib/history-trigger.mjs';
 // session, unrouted.
 //
 // `--dry-run` builds everything and sends nothing, so a run can be previewed.
+//
+// `--review` is the sync skill's step 1 in the same call: the joined and routes listings first, and the upload only
+// when neither needs an answer. `--review-routes` starts at the routes listing, after the joined questions.
 
 function parseSyncArgs(argv) {
   for (const flag of argv) {
@@ -58,6 +62,15 @@ function parseSyncArgs(argv) {
     }
   }
   return { mode: SYNC_MODE, dryRun: argv.indexOf('--dry-run') !== -1 };
+}
+
+const REVIEW_FLAGS = ['--review', '--review-routes'];
+
+// The review flag passed, or null.
+function reviewFlagOf(argv) {
+  const flags = argv.filter((arg) => REVIEW_FLAGS.indexOf(arg) !== -1);
+  if (flags.length > 1) fail('Beezi: pass --review or --review-routes, not both.');
+  return flags.length === 0 ? null : flags[0];
 }
 
 // A refusal, worded identically either way — but the fan-out must not let one account's refusal
@@ -362,7 +375,14 @@ async function main() {
   // not a way around the one-time import", and a refused run must still be refused before anything
   // is read — including the accounts index.
   const options = parseSyncArgs(argv);
-  const { account, rest } = await parseAccountFlag(argv);
+  const reviewFlag = reviewFlagOf(argv);
+  const { account, rest } = await parseAccountFlag(argv.filter((arg) => REVIEW_FLAGS.indexOf(arg) === -1));
+  if (reviewFlag !== null) {
+    const listed = await syncReview(reviewFlag === '--review-routes', account);
+    for (const line of listed.lines) console.log(line);
+    // Something to ask: the skill asks, then runs the next step itself.
+    if (listed.review > 0) return;
+  }
   const rows = await syncRows(account, options, rest);
   // Pending history (rules gained a workspace) gets its own coverage-based pass once this sync let go of the lock.
   if (!options.dryRun) for (const row of rows) await startHistoryWorker(row.key);

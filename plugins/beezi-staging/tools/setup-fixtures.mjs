@@ -7,18 +7,22 @@ export function fakeCtx(outputs, answers) {
   const opts = {};
   const asked = [];
   const printed = [];
+  const labels = {};
+  let label = null;
   const queue = answers.slice();
   const answer = (entry) => {
     asked.push(entry);
     return Promise.resolve(queue.length ? queue.shift() : null);
   };
   return {
-    runs, opts, asked, printed,
+    runs, opts, asked, printed, labels,
+    progress: (next) => { label = next; },
     print: (line) => { printed.push(line); },
     run: (script, argv, options) => {
       const command = [script].concat(argv).join(' ');
       runs.push(command);
       opts[command] = options === undefined ? {} : options;
+      labels[command] = label;
       return Promise.resolve(Object.hasOwn(outputs, command) ? outputs[command] : ok(''));
     },
     ask: {

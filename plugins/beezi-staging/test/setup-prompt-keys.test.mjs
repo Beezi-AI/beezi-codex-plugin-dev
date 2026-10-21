@@ -55,7 +55,7 @@ function terminal(opts) {
   };
 }
 
-test('choose draws the question, a ❯ on the default and the hint, then collapses to one ✔ line', async () => {
+test('choose draws the question, a ❯ on the default and the hint, then collapses to one ✓ line', async () => {
   const t = terminal();
   const answer = t.prompt.choose('Where?', OPTIONS, { defaultIndex: 1 });
   await t.press('\r');
@@ -68,7 +68,7 @@ test('choose draws the question, a ❯ on the default and the hint, then collaps
     "  Don't send — Nothing is uploaded\n",
     '  ↑/↓ move · Enter select\n',
     ERASE_MENU,
-    '✔ Where? Send to…\n',
+    '✓ Where? Send to…\n',
     SHOW,
   ].join(''));
   assert.deepEqual(t.raw, [true, false]);
@@ -90,7 +90,7 @@ test('a digit moves the highlight without submitting, out-of-range digits are ig
   const t = terminal();
   const answer = t.prompt.choose('Q?', OPTIONS, { defaultIndex: 0 });
   await t.press('3');
-  assert.equal(count(t.text(), '✔'), 0);
+  assert.equal(count(t.text(), '✓'), 0);
   await t.press('9', '0', '\r');
   assert.equal(await answer, 2);
   const typed = t.prompt.choose('Q?', OPTIONS, { defaultIndex: 0 });
@@ -133,15 +133,15 @@ test('the question, options and hint are cut to one row with …', async () => {
     '❯ Acme — Owner of the …',
     '  A workspace with a v…',
     '  ↑/↓ move · Enter sel…',
-    '✔ Where should analytics for this repo go? Acme',
+    '✓ Where should analytics for this repo go? Acme',
     '? Which workspaces sho…',
     '❯ ◯ Acme — Owner of th…',
     '  ◯ A workspace with a…',
     '  ↑/↓ move · Space sel…',
-    '✔ Which workspaces should get analytics? skipped',
+    '✓ Which workspaces should get analytics? skipped',
     '? Show Beezi i… [Y/n]',
     '? Show Beezi i… [Y/n] y',
-    '✔ Show Beezi in the status line? Yes',
+    '✓ Show Beezi in the status line? Yes',
     '',
   ]);
   assert.equal(count(t.text(), '\x1b[4A\x1b[0J'), 2);
@@ -162,7 +162,7 @@ test('wide characters count as two columns, so a CJK label is cut to fit and the
     '  工作区名…',
     '❯ B',
     '  ↑/↓ move …',
-    '✔ Q? B',
+    '✓ Q? B',
     '',
   ]);
   assert.equal(count(t.text(), '\x1b[4A\x1b[0J'), 2);
@@ -177,7 +177,7 @@ test('consecutive digits compose one option number live, and any other key start
   assert.match(t.text(), /❯ Option 12\n/);
   await t.press('\r');
   assert.equal(await one, 11);
-  assert.match(t.text(), /✔ Q\? Option 12\n/);
+  assert.match(t.text(), /✓ Q\? Option 12\n/);
   const many = t.prompt.chooseMany('Which?', twelve);
   await t.press('10,12\r');
   assert.deepEqual(await many, [9, 11]);
@@ -257,7 +257,7 @@ test('Esc skips a choice that has no default, and Enter still submits option 1',
   await t.press(ESC);
   assert.equal(await skipped, null);
   assert.match(t.text(), /  ↑\/↓ move · Enter select · Esc skip\n/);
-  assert.match(t.text(), /✔ Q\? skipped\n/);
+  assert.match(t.text(), /✓ Q\? skipped\n/);
   const first = t.prompt.choose('Q?', OPTIONS);
   await t.press('\r');
   assert.equal(await first, 0);
@@ -269,7 +269,7 @@ test('Esc is ignored when the choice has a default', async () => {
   const answer = t.prompt.choose('Q?', OPTIONS, { defaultIndex: 2 });
   await t.press(ESC);
   await sleep(ESC_WAIT_MS);
-  assert.equal(count(t.text(), '✔'), 0);
+  assert.equal(count(t.text(), '✓'), 0);
   await t.press('\r');
   assert.equal(await answer, 2);
   t.prompt.close();
@@ -293,7 +293,7 @@ test('chooseMany toggles with Space and digits, ignores commas, and returns sort
   await t.press(' ', DOWN, DOWN, ' ', '\r');
   assert.deepEqual(await spaced, [0, 2]);
   assert.match(t.text(), /❯ ◉ Ask me \(recommended\) — Beezi asks once\n/);
-  assert.match(t.text(), /✔ Which\? Ask me \(recommended\), Don't send\n/);
+  assert.match(t.text(), /✓ Which\? Ask me \(recommended\), Don't send\n/);
   const typed = t.prompt.chooseMany('Which?', OPTIONS);
   await t.press('1,3\r');
   assert.deepEqual(await typed, [0, 2]);
@@ -312,7 +312,7 @@ test('chooseMany with nothing ticked, or dismissed with Esc, returns [] and show
   const dismissed = t.prompt.chooseMany('Which?', OPTIONS);
   await t.press(' ', ESC);
   assert.deepEqual(await dismissed, []);
-  assert.equal(count(t.text(), '✔ Which? skipped\n'), 2);
+  assert.equal(count(t.text(), '✓ Which? skipped\n'), 2);
   t.prompt.close();
 });
 
@@ -330,9 +330,9 @@ test('confirm keeps the literal [Y/n], sets the answer with y/n, and submits on 
   const out = t.text();
   assert.match(out, /\? Upload\? \[Y\/n\]\n/);
   assert.match(out, /\? Switch\? \[y\/N\] n\n/);
-  assert.match(out, /✔ Upload\? Yes\n/);
-  assert.match(out, /✔ Switch\? No\n/);
-  assert.match(out, /✔ Switch\? Yes\n/);
+  assert.match(out, /✓ Upload\? Yes\n/);
+  assert.match(out, /✓ Switch\? No\n/);
+  assert.match(out, /✓ Switch\? Yes\n/);
   assert.equal(count(out, ERASE_ROW), 6);
   t.prompt.close();
 });
@@ -345,7 +345,7 @@ test('Ctrl+C restores raw mode and the cursor, then calls onInterrupt', async ()
   assert.equal(t.interrupts.length, 1);
   assert.deepEqual(t.interrupts[0].raw, [true, false]);
   assert.ok(t.interrupts[0].text.endsWith(SHOW));
-  assert.equal(count(t.text(), '✔'), 0);
+  assert.equal(count(t.text(), '✓'), 0);
   t.prompt.close();
 });
 
@@ -427,7 +427,7 @@ test('non-interactive mode never touches raw mode, even on a TTY', async () => {
   t.prompt.close();
 });
 
-test('with colour on, the menu and the ✔ line use the contract styles', async () => {
+test('with colour on, the menu and the ✓ line use the contract styles', async () => {
   const t = terminal({ style: COLOR });
   const answer = t.prompt.choose('Q?', OPTIONS, { defaultIndex: 0 });
   await t.press('\r');
@@ -443,11 +443,11 @@ test('with colour on, the menu and the ✔ line use the contract styles', async 
   assert.ok(out.includes('\x1b[36m❯\x1b[0m \x1b[36mAsk me (recommended)\x1b[0m\x1b[2m — Beezi asks once\x1b[0m\n'));
   assert.ok(out.includes('\n  Send to…\n'));
   assert.ok(out.includes('\x1b[2m  ↑/↓ move · Enter select\x1b[0m\n'));
-  assert.ok(out.includes('\x1b[32m✔\x1b[0m \x1b[1mQ?\x1b[0m \x1b[36mAsk me (recommended)\x1b[0m\n'));
+  assert.ok(out.includes('\x1b[32m✓\x1b[0m \x1b[1mQ?\x1b[0m \x1b[36mAsk me (recommended)\x1b[0m\n'));
   assert.ok(out.includes('\x1b[36m❯\x1b[0m \x1b[2m◯\x1b[0m \x1b[36mAsk me (recommended)\x1b[0m'));
-  assert.ok(out.includes('\x1b[32m✔\x1b[0m \x1b[1mWhich?\x1b[0m \x1b[2mskipped\x1b[0m\n'));
+  assert.ok(out.includes('\x1b[32m✓\x1b[0m \x1b[1mWhich?\x1b[0m \x1b[2mskipped\x1b[0m\n'));
   assert.ok(out.includes('\x1b[1;36m?\x1b[0m \x1b[1mUpload?\x1b[0m \x1b[1;36m[Y/n]\x1b[0m\n'));
-  assert.ok(out.includes('\x1b[32m✔\x1b[0m \x1b[1mUpload?\x1b[0m \x1b[36mYes\x1b[0m\n'));
+  assert.ok(out.includes('\x1b[32m✓\x1b[0m \x1b[1mUpload?\x1b[0m \x1b[36mYes\x1b[0m\n'));
   t.prompt.close();
 });
 

@@ -7,6 +7,8 @@ const URL_UNDER_TEST = 'https://api.test/api/mcp';
 // The bridge repairs the hook registry on a linked machine's first message. Stubbed by default so
 // a unit test of the message loop does no filesystem work; the heal itself is tested below.
 const NO_REPAIR = { repaired: false, before: 'installed', state: 'installed', swept: [] };
+// beezi_status's plugin line without a plugin.json read; no session state is recorded, so no route line (no git walk).
+const STATUS_LOCAL = { pluginInfo: () => ({ installed: '0.23.0', latest: null, checkedAt: null }) };
 
 const ACCOUNT_KEY = 'a1b2c3d4';
 const CLIENT_ID = 'c-a1b2c3d4';
@@ -446,6 +448,7 @@ test('beezi_status reports the link, the API it checked, and the analytics half'
     // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
     probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
+    ...STATUS_LOCAL,
     ...accountDeps(() => null),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
@@ -468,6 +471,8 @@ test('beezi_status reports the link, the API it checked, and the analytics half'
   // And it explains why analytics are empty instead of leaving the user to guess.
   assert.match(text, /NOT being reported/i);
   assert.match(text, /hooks are not installed/i);
+  // The plugin block follows the link answer after a blank line.
+  assert.match(text, /\n\nPlugin: 0\.23\.0 \(could not check for updates\)$/);
 });
 
 // ── the bridge repairs the hooks nobody else can ────────────────────────────
@@ -500,6 +505,7 @@ test('a repair the bridge performed is reported by beezi_status, with the trust 
   const out = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
+    ...STATUS_LOCAL,
     ...accountDeps(() => 'tok'),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
@@ -539,6 +545,7 @@ test('beezi_status answers on an unlinked machine too', async () => {
     // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
     probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
     url: URL_UNDER_TEST,
+    ...STATUS_LOCAL,
     ...accountDeps(() => null),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
@@ -692,6 +699,7 @@ test('trust — beezi_status re-asks Codex every time and moves AGENTS.md with t
   const synced = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
+    ...STATUS_LOCAL,
     ...accountDeps(() => 'tok'),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),
@@ -725,6 +733,7 @@ test('trust — beezi_status does not probe a machine whose hooks are not instal
   const probes = [];
   const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
     url: URL_UNDER_TEST,
+    ...STATUS_LOCAL,
     ...accountDeps(() => null),
     fetchImpl: async () => { throw new Error('must not reach the network'); },
     write: (line) => out.push(JSON.parse(line)),

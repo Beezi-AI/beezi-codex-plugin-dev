@@ -5,7 +5,6 @@ import {
   isMultiTenant,
   joinTenantNames,
   newTenantsOf,
-  readSessionWorkspace,
   resolveTargets,
   roleLabel,
   tenantById,
@@ -14,7 +13,7 @@ import { bindSessionRoutes, createRouteContext, routeKeyForDir, shortLabel, uses
 import { resultLine } from './pending-history.mjs';
 
 // Only a new session or a clear asks; resume and compact never do.
-const ASK_SOURCES = ['startup', 'clear'];
+export const ASK_SOURCES = ['startup', 'clear'];
 // request_user_input is single-choice with a forced "Other", 2-3 options and at most 3 questions; past these caps the ask is a plain sentence.
 const TOOL_MAX_WORKSPACES = 2;
 const TOOL_MAX_QUESTIONS = 3;
@@ -62,20 +61,6 @@ function nameOf(row, id) {
   return t != null && t.name ? t.name : id;
 }
 
-// "A", "A and B", "A, B and C".
-function names(row, ids) {
-  const list = ids.map((id) => nameOf(row, id));
-  return list.length < 2 ? list.join('') : `${list.slice(0, -1).join(', ')} and ${list[list.length - 1]}`;
-}
-
-// How the targets notice names a place: a folder's ~ path, a repo's name, or sessions outside a project.
-function noticePlace(key) {
-  if (key == null) return 'this folder';
-  if (key.kind === 'outside') return 'sessions outside a project';
-  if (key.kind === 'folder' && key.label) return key.label;
-  return shortLabel(key) || 'this folder';
-}
-
 function lowerFirst(text) {
   return text.charAt(0).toLowerCase() + text.slice(1);
 }
@@ -86,16 +71,18 @@ function placeOf(key) {
     return {
       question: 'Where should analytics for sessions outside a project folder go?',
       dontTrack: 'Don\'t track these',
-      nothing: 'Nothing from sessions outside a project folder is uploaded',
+      nothing: 'Not tracked: nothing from sessions outside a project folder is sent',
     };
   }
   const short = shortLabel(key);
-  // A folder rule covers everything under it, so its question names the whole path and says so.
-  const asked = key != null && key.kind === 'folder' ? `${key.label} (and everything inside it)` : short;
+  // This session's own directory, named as the one you're in; a folder rule covers everything under it, so its question names the whole path and says so.
+  const asked = key != null && key.kind === 'folder'
+    ? `${key.label}, the folder you're in (and everything inside it),`
+    : `${short}, the repo you're in,`;
   return {
     question: `Where should analytics for ${asked} go?`,
-    dontTrack: key != null && key.kind === 'repo' ? 'Don\'t track this repo' : 'Don\'t track this folder',
-    nothing: `Nothing from ${short} is uploaded`,
+    dontTrack: `Don't track ${short}`,
+    nothing: `Not tracked: nothing from ${short} is sent`,
   };
 }
 
@@ -204,42 +191,6 @@ export async function buildWorkspacePrompt(input, deps = {}, earlier = null) {
     sessionId: input.session_id, root, several: marked.several,
   }));
   return promptText(asks);
-}
-
-// SessionStart: one line per multi-workspace account that is not waiting for an answer, or null.
-export async function buildTargetsNotice(input, deps = {}) {
-  if (input == null || typeof input.session_id !== 'string' || input.session_id === '') return null;
-  const rows = await linkedRows(deps);
-  const state = readSessionWorkspace(input.session_id);
-  // A no-rules one-workspace row can never produce a line here (resolveTargets gives 'single'), so
-  // skip its credential read (M2).
-  const shown = await withUsableLogin(rows.filter(usesRules), deps);
-  const ctx = createRouteContext();
-  let here;
-  const hereKey = () => {
-    if (here === undefined) here = routeKeyForDir(state != null && state.cwd != null ? state.cwd : inputCwd(input), ctx);
-    return here;
-  };
-  const lines = shown
-    .map((row) => ({ row, resolved: resolveTargets(row, state) }))
-    .filter((r) => (r.resolved.multi && !r.resolved.pendingAsk) || (r.resolved.source === 'rule' && r.resolved.targets.length === 0))
-    .map(({ row, resolved }) => {
-      const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
-      const key = resolved.rule != null ? resolved.rule : hereKey();
-      const where = noticePlace(key);
-      let text;
-      if (resolved.source === 'rule' && resolved.targets.length === 0) {
-        text = `${where} ${key != null && key.kind === 'outside' ? 'are' : 'is'} not tracked (your rule). Change it with the settings skill (Rules).`;
-      } else if (resolved.source === 'none') {
-        text = `analytics from ${where} are not uploaded (new folders: don't send). Change it with the settings skill (New folders).`;
-      } else if (resolved.source === 'new-folders') {
-        text = `analytics from ${where} go to ${names(row, resolved.targets)} (new folder default). Change it with the settings skill (New folders).`;
-      } else {
-        text = `analytics from ${where} go to ${names(row, resolved.targets)}. Change it with the settings skill (Rules).`;
-      }
-      return `${prefix}: ${text}`;
-    });
-  return lines.length === 0 ? null : lines.join('\n');
 }
 
 function joinedPromptText(rows, root, sessionId) {

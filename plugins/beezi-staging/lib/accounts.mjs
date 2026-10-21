@@ -11,6 +11,7 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { withLock, acquireLock, sharedLock } from './single-instance-lock.mjs';
 import { UserError } from './friendly-error.mjs';
 import { removeDirSync, removeFileSync } from './compat.mjs';
+import { routingOf, sameRouting } from './rule-undo.mjs';
 import {
   readLegacyCredential, deleteLegacyCredential, setCredentials,
   subjectAuthorityPath, LEGACY_SUBJECT,
@@ -475,6 +476,22 @@ export async function removeWorkspaceRule(key, n, deps = {}) {
     requestHistory(found, removalRequestIds(found), new Date().toISOString());
     writeIndex(index);
     return rule;
+  });
+}
+
+// Puts `before` back only while the row still routes as `expected`: 'missing', 'changed' or 'restored'.
+export async function restoreRouting(key, { expected, before }, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found || found.status !== AccountStatus.LINKED) return 'missing';
+    if (!sameRouting(routingOf(found), expected)) return 'changed';
+    found.workspaceRules = before.workspaceRules;
+    if (before.newFolders == null) delete found.newFolders; else found.newFolders = before.newFolders;
+    // Every workspace the restored rules or New folders reach is owed its history; over-requesting is harmless.
+    requestHistory(found, removalRequestIds(found), new Date().toISOString());
+    writeIndex(index);
+    return 'restored';
   });
 }
 

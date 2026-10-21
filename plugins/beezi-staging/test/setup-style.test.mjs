@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { canReadKeys, colorEnabled, createStyle, paint } from '../lib/setup-style.mjs';
+import { canReadKeys, colorEnabled, createStyle, formatLine, paint, paintRows, wrapLines } from '../lib/setup-style.mjs';
 
 const on = createStyle({ enabled: true });
 const off = createStyle({ enabled: false });
@@ -74,4 +74,30 @@ test('canReadKeys needs a raw-capable TTY input, a TTY output and a TERM other t
   assert.equal(canReadKeys({ input, output: { isTTY: false }, env: {} }), false);
   assert.equal(canReadKeys({ input, output: {}, env: {} }), false);
   assert.equal(canReadKeys({ input, output, env: { TERM: 'dumb' } }), false);
+});
+
+test('wrapLines keeps a line that fits, and breaks a long one at spaces under min(columns − 1, 100)', () => {
+  assert.deepEqual(wrapLines('short line', 80), ['short line']);
+  assert.deepEqual(wrapLines('Next: restart Claude Code, then run /beezi:login.', 40), ['Next: restart Claude Code, then run', '  /beezi:login.']);
+  const long = `${'word '.repeat(40)}end`;
+  wrapLines(long, 300).forEach((row) => assert.ok(Array.from(row).length <= 100, row));
+});
+
+test('wrapLines indents later rows 2 more than the line, and keeps a long word whole', () => {
+  assert.deepEqual(wrapLines('  ✓ History import is now closed for this account', 30), ['  ✓ History import is now', '    closed for this account']);
+  assert.deepEqual(wrapLines('⚠ see https://example.com/a/very/long/path/that/does/not/fit', 20), ['⚠ see', '  https://example.com/a/very/long/path/that/does/not/fit']);
+});
+
+test('paintRows colours every row in the tone of the first row\'s mark', () => {
+  const on = createStyle({ enabled: true });
+  assert.equal(paintRows(on, ['✓ one', '  two']), '\x1b[32m✓ one\x1b[0m\n  \x1b[32mtwo\x1b[0m');
+  assert.equal(paintRows(on, ['plain', '  rest']), 'plain\n  rest');
+  assert.equal(paintRows(createStyle({ enabled: false }), ['✗ one', '  two']), '✗ one\n  two');
+});
+
+test('formatLine wraps and paints each \\n-separated part on its own', () => {
+  const on = createStyle({ enabled: true });
+  assert.equal(formatLine(on, '\nSetup stopped.', 80), '\n\x1b[31mSetup stopped.\x1b[0m');
+  assert.equal(formatLine(on, '✓ alpha beta gamma delta', 21), '\x1b[32m✓ alpha beta gamma\x1b[0m\n  \x1b[32mdelta\x1b[0m');
+  assert.deepEqual(wrapLines('a b c d e f g h i j k l m n o p q r s t u v w x y z', 5), ['a b c d e f g h i j', '  k l m n o p q r s', '  t u v w x y z']);
 });

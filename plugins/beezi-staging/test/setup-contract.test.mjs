@@ -6,9 +6,9 @@ import { fileURLToPath } from 'node:url';
 import { renderList } from '../lib/accounts-cli.mjs';
 import { CRASH_MODES } from '../lib/diagnostics.mjs';
 import { keysLines } from '../lib/settings-cli.mjs';
-import { lastLine, parsePlaces, parseWorkspaces, token } from '../lib/setup-routing.mjs';
+import { lastLine, parseHistory, parsePlaces, parseWorkspaces, token } from '../lib/setup-routing.mjs';
 import {
-  ACCOUNT_LINE, CRASH_CHOICES, FINALIZED, LINKED_AS, PLAN_EXPIRED, STILL_DEFAULT, TIER_CHOICES, TRUST_PENDING,
+  ACCOUNT_LINE, CRASH_CHOICES, FINALIZED, LINKED_AS, PLAN_EXPIRED, STILL_DEFAULT, TIER_CHOICES, TRUST_PENDING, UPLOAD_PROGRESS,
   crashModeOf, parseLinkedAccounts, planSettled,
 } from '../lib/setup-wizard.mjs';
 import { linkAccount, makeHome } from '../tools/account-fixtures.mjs';
@@ -66,6 +66,8 @@ const LINES = [
     (line) => token(lastLine(line, /^new-folders=/), 'set') === 'no'],
   [['lib', 'workspace-cli.mjs'], 'new-folders=n/a multi=no account=${row.key}', `new-folders=n/a multi=no account=${KEY}`,
     (line) => token(lastLine(line, /^new-folders=/), 'set') === null],
+  [['lib', 'workspace-cli.mjs'], 'history=${counts.sessions} places=${counts.places}', 'history=37 places=4',
+    (line) => parseHistory(line).sessions === 37 && parseHistory(line).places === 4],
   [['lib', 'workspace-cli.mjs'], 'W. ${t.name ? t.name : t.id} account=${row.key} tenant=${t.id} role=${roleLabel(t)}',
     `W. Acme Team account=${KEY} tenant=t1 role=Owner`,
     (line) => parseWorkspaces(line)[0].name === 'Acme Team' && parseWorkspaces(line)[0].tenant === 't1'],
@@ -78,6 +80,8 @@ const LINES = [
   [['lib', 'workspace-cli.mjs'], 'J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${',
     `J1. api (github.com/acme/api), 1 session, now: Acme account=${KEY} kind=repo match=github.com/acme/api now=t1`,
     (line) => parsePlaces(line, 'J')[0].where === 'Acme' && parsePlaces(line, 'J')[0].match === 'github.com/acme/api'],
+  [['scripts', 'backfill.mjs'], 'Beezi: ${processed}/${total} sessions read…', 'Beezi: 3/12 sessions read…',
+    (line) => UPLOAD_PROGRESS.test(line)],
 ];
 
 // Shapes setup-routing splits on whose reading its own tests already cover.
@@ -95,7 +99,7 @@ const USAGE = [
   ' | rule add-all (<id|name|n>… | none) [--session <id>] [--account <ref>]',
   ' | routes [--session <id>] [--account <ref>]',
   ' | joined [add-all | done | pick (--repo <url> | --folder <path> | --outside) <id|name|n>] [--session <id>] [--account <ref>]',
-  ' | new-folders [ask | send <id|name|n>… | none] [--session <id>] [--account <ref>]',
+  ' | new-folders [ask | send <id|name|n>… | none] [--history] [--session <id>] [--account <ref>]',
 ];
 
 test('every line the setup reads is still printed in that shape, and the setup still reads it', () => {
@@ -113,6 +117,7 @@ test('the place shapes and summary lines setup-routing relies on are unchanged',
 test('workspace.mjs still takes the argv the setup builds', () => {
   const cli = read('lib', 'workspace-cli.mjs');
   for (const usage of USAGE) assert.ok(cli.includes(usage), usage);
+  assert.ok(cli.includes("argv.indexOf('--history') !== -1"), 'new-folders reads --history');
   assert.ok(cli.includes("if (sub === 'pick') { await joinedPick(cx, after); return; }"), 'joined pick dispatch');
   assert.ok(cli.includes('J${total}-command=${script} joined pick ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenant>'), 'J-command is joined pick');
   assert.ok(cli.includes('done-command=${script} joined done --account ${row.key}${deferText(cx)}'), 'done-command carries the defer flag');

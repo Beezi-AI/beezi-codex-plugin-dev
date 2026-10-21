@@ -53,7 +53,8 @@ comes back to ask.
 
 **Asking.** A question below uses `request_user_input` only when that tool is listed this turn and
 the question has 2–3 choices. Otherwise it is one plain sentence naming every choice — never a
-numbered list or a bullet menu — that ends your reply. Ask one question at a time. When the answer
+bullet menu, and a numbered list only where a step below says so — that ends your reply. Ask one
+question at a time. When the answer
 arrives, run that step's command and continue from the next step: never start over from step 1, and
 never run a later step while a question is still open. A skipped question runs nothing.
 If a workspace command fails, relay its error verbatim and stop; do not proceed as if a routing
@@ -66,24 +67,67 @@ workspaces itself, and step 4 routes each past session by its own repo or folder
 no such line, match its output against the outcome list below before doing anything else: two of
 those outcomes mean the sign-in is still running, not that it failed.
 
+### How the steps run
+
+Steps 1 to 4a come from ONE script, which runs them in order and stops at the first one that needs a
+question. Start at step 1: when a `beezi_login` tool is available, call it first and run the script
+with `--from setup`; run it bare, as below, only without that tool.
+
+```
+node "<plugin-root>/scripts/login-flow.mjs"
+```
+
+Give it a long timeout (10 minutes) when your shell tool takes one: the sign-in waits for the
+browser. Each step's output is a block: a `<name …>` line, the output, then a `</name>` line. Its
+LAST line says what to do now: `next=<step> account=<key>`, or just `next=stop` when the sign-in
+linked nothing. `<key>` is the account just linked.
+
+| `next=`    | Go to                                                  |
+| ---------- | ------------------------------------------------------ |
+| `stop`     | Step 1: relay the `<sign-in>` block, run nothing else  |
+| `setup`    | Step 1w, where analytics from this machine go          |
+| `here`     | Step 1w, this session's own folder                     |
+| `tier`     | Step 3                                                 |
+| `joined`   | Step 4a, new workspaces                                |
+| `routes`   | Step 4a, repos and folders with no rule                |
+| `backfill` | Step 4b                                                |
+
+After a question's answers (or its dismissal) and the commands they call for, carry on with
+EXACTLY this, where the step names `<step>`:
+
+```
+node "<plugin-root>/scripts/login-flow.mjs" --account <key> --from <step>
+```
+
+It prints the blocks of the steps from there on and a new `next=` line. A listing that fails shows
+a `✗` line inside its block and the script goes on: write that line verbatim. Output that ends
+without any `next=` line means the script itself failed or refused to run: show what it printed
+verbatim and stop (running this login skill again resumes safely). Never run the commands behind the blocks yourself
+(`login.mjs`, `billing-capture.mjs --from-codex`, the `workspace.mjs` `rules`, `joined` and `routes`
+listings): the blocks hold their output. Before doing what `next=` says, write out what each block
+printed this time calls for, in order, as its step below says (step 1's sign-in output, step 2's
+capture line, the no-folder line in step 4a).
+
 ### Step 1 — sign in
 
 **Prefer the MCP tool.** If a `beezi_login` tool is available, call it — it runs the same browser
 sign-in inside the already-running Beezi server, and the Beezi tools become available immediately
-afterwards without restarting the session. Takes no arguments.
+afterwards without restarting the session. Takes no arguments. Once it has linked an account, run
+the script from the next step on, with the key it printed:
+
+```
+node "<plugin-root>/scripts/login-flow.mjs" --account <key> --from setup
+```
 
 **Use this plugin's own server.** Each Beezi build has its own MCP server, and every one of them
 offers a `beezi_login`, so with production and a variant installed together there are two. The
 server key follows the plugin name in this skill's own name: `beezi:login` uses server `beezi`,
 `beezi-staging:login` uses `beezi_staging`, `beezi-dev:login` `beezi_dev`, `beezi-local:login`
 `beezi_local`. Call the `beezi_login` on that server and no other — the other one signs in to a
-different environment. If this plugin's server offers no `beezi_login`, use the script below.
+different environment. If this plugin's server offers no `beezi_login`, use the script.
 
-If that tool is not available, run:
-
-```
-node "<plugin-root>/scripts/login.mjs"
-```
+If that tool is not available, run `login-flow.mjs` with no arguments (above): its `<sign-in>` block
+holds the sign-in's output.
 
 Either way a browser window opens for the user to sign in with their Beezi account. If the browser
 does not open, the output contains the URL — pass it to the user verbatim. The flow blocks until
@@ -93,11 +137,12 @@ they finish or it times out; say so rather than assuming it failed.
 already signed in as; to add a different one the user signs out of Beezi in the browser first, or
 uses a private window. The output says so before it opens, and names the accounts already linked.
 
-Report the result verbatim, then read it. There are four outcomes; only the first lets the rest of
-this flow run, and each is named by a sentence the output actually carries:
+Report the result verbatim, except its last line `account=<key>`, then read it. There are four
+outcomes; only the first lets the rest of this flow run, and each is named by a sentence the output
+actually carries:
 
 - `account=<key>` on the last line — an account was linked, re-linked, or was already linked. Use
-  that key for every step below.
+  that key for every step below. With the script, it already went on to the next steps.
 - **`The sign-in is still running here`** — only the `beezi_login` tool prints this, and it is
   ordinary rather than exceptional: the tool answers after about 25 seconds, and a real browser
   sign-in routinely takes longer than that. **Nothing has failed.** Relay the text as given,
@@ -107,127 +152,135 @@ this flow run, and each is named by a sentence the output actually carries:
   prints none, and step 4 refuses to run without one. Run
   `node "<plugin-root>/scripts/accounts.mjs" list`: every row carries its key in brackets. If more
   than one row is listed, ask the user which account they signed in as rather than guessing — the
-  list marks the default and revoked rows, not which row is new. With the key in hand, continue from
-  step 1w.
+  list marks the default and revoked rows, not which row is new. With the key in hand, continue
+  with `--from setup`.
 - **`A Beezi sign-in is already in progress`** — only the `beezi_login` tool prints this, and only
   while an earlier call of it is still waiting on the browser. It is a refusal to start a SECOND
   sign-in, not a failed one: the first is still live. Relay the text as given and wait, exactly as
   for the outcome above — do not call the tool again and do not run the later steps yet. When the
   user says they have finished in the browser, pick the key up the same way, from `accounts.mjs list`.
-- **Anything else, with no `account=` line** — the sign-in failed. The script prints `✗ <reason>`;
-  the tool prints `Beezi sign-in failed: <reason>`. The commonest cause is the plainest: the browser
-  tab was never finished and the wait timed out. It can also be an unreachable server, a locked
-  keyring, or a pending environment migration. **Relay that line verbatim and do not diagnose it** —
-  in particular say nothing about workspaces, other accounts, or logging out. Offer to run step 1
-  again. Do not run the later steps.
+- **Anything else, with no `account=` line** (the script ends `next=stop`) — the sign-in failed. The
+  script prints `✗ <reason>`; the tool prints `Beezi sign-in failed: <reason>`. The commonest cause
+  is the plainest: the browser tab was never finished and the wait timed out. It can also be an
+  unreachable server, a locked keyring, or a pending environment migration. **Relay that line
+  verbatim and do not diagnose it** — in particular say nothing about workspaces, other accounts, or
+  logging out. Offer to run step 1 again. Do not run the later steps.
 
 If the output ends with steps for installing analytics hooks, repeat them — logging in alone does
 not start reporting analytics. The `analytics-hooks` skill covers that.
 
-### Step 1w — where this account's analytics go
+### Step 1w — where this machine's analytics go
 
-Run this after step 1 produced a key — a fresh link or an account that was already linked:
+The script stops with `next=setup` only for an account in several workspaces that has never set New
+folders. Without a `<setup>` block, say nothing about it.
 
-```
-node "<plugin-root>/scripts/workspace.mjs" new-folders --account <key> --defer-upload
-```
+The `<setup account="<key>">` block is for you only: one `W. <workspace> account=<key> tenant=<id>
+role=<role>` line per workspace, then `sessions=<N> places=<M>` (the past sessions the history upload
+would send, and the repos and folders they ran in) or a `✗` line when they could not be counted
+(write it verbatim), then the options as `O<i>. <label> — <description>` lines. `O<i>` for `i` up to
+the number of `W.` lines is the `i`-th `W.` line's workspace; the last `O` line is "Let me choose
+per repo".
 
-Its output is for you only. Its last line is
-`new-folders=<ask|send|none> set=<yes|no> multi=yes account=<key>` for an account in several
-workspaces, or `new-folders=n/a multi=no account=<key>` for one in a single workspace (or whose
-workspaces are not known yet) — then say nothing about it and go to step 2. The lines before it
-include one `W. <workspace> account=<key> tenant=<id> role=<role>` line per workspace.
+Ask ONE single-select question, "Where should analytics from this machine go?":
 
-Ask only when the last line contains both `multi=yes` and `set=no` (their order does not matter):
-"Where should analytics go for repos and
-folders with no rule yet?" with the choices "Ask me (recommended)" (described "Beezi asks once per
-repo or folder, when a session starts there"), "Send to…" ("Pick the workspaces that get them") and
-"Don't send" ("Nothing from a repo or folder with no rule is uploaded").
+- **`request_user_input`** only when that tool is listed this turn **and** there are at most 2 `W.`
+  lines (3 choices): header "Beezi", one choice per `O` line in order, its text after `O<i>. `
+  split at the last ` — ` into the label and the description, exactly. A typed answer (Other) that
+  names a `W.` line's workspace (ignoring case) is that workspace; one that names none is a dismissal.
+- **Otherwise** — the tool is not listed, or there are 3 or more `W.` lines — one plain sentence
+  with the `O` lines as a numbered list, never a 4-option `request_user_input` call: the question
+  without its "?", a colon, each `O` line's text after its `O` ("1. Acme — Everything goes here: …"),
+  joined by ", " with "or " before the last, then "?". The user answers with a number or a
+  workspace name; anything else is a dismissal.
 
-- "Ask me (recommended)" → run `node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload`
-- "Don't send" → run `node "<plugin-root>/scripts/workspace.mjs" new-folders none --account <key> --defer-upload`
-- "Send to…" → ask "Which workspaces should get analytics for repos and folders with no rule?", one
-  choice per `W.` line — the workspace name (the text after `W. ` up to ` account=`), described by
-  the line's `role=` value — several allowed: `request_user_input` only with at most 3 `W.` lines,
-  the question followed by " Pick one, or name several under Other."; otherwise the plain sentence,
-  each workspace as "<name> (<role>)", ending " — one or more?". Nothing chosen → run nothing.
-  Otherwise run, with the chosen lines' `tenant=` values joined by commas:
+Then, by the answer:
+
+- a workspace → run, with that `W.` line's `tenant=` value:
 
   ```
-  node "<plugin-root>/scripts/workspace.mjs" new-folders send <ids> --account <key> --defer-upload
+  node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenant> --account <key> --defer-upload
   ```
 
-Write the command's first line verbatim. A skipped question runs nothing (the next login asks again).
+  write its first line verbatim, then carry on with `--from plan` (this folder now follows New
+  folders, so there is no question about it).
+- "Let me choose per repo" → run
+  `node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload`,
+  write its first line verbatim, then carry on with `--from here`.
+- A dismissal → run nothing (the next login asks again), then carry on with `--from here`.
 
 **Then this session's own folder.** A session that started before this account was linked was never
-asked where its analytics go, and under Ask me they would wait. Only when the setting is now Ask me —
-the last line said `new-folders=ask` and no `new-folders send` or `new-folders none` command
-succeeded just now — run (its output is for you only):
+asked where its analytics go, and under Ask me they would wait. The script checks it by itself
+whenever the setting is Ask me, and stops with `next=here` only when this folder has no rule. Then
+the `<rules account="<key>">` block holds the `workspace.mjs rules` listing, for you only.
 
-```
-node "<plugin-root>/scripts/workspace.mjs" rules --account <key>
-```
+Its `here:` line is
+`here: <short> (<label>) → <R<n> | no rule> now=<ids|none|pending> path=<path> account=<key> rule=<n|none> kind=<…> match=<…>`
+(no ` (<label>)` and no ` path=` when `kind=outside`): `<short>` is the text after `here: ` up to
+` (` or ` →`, `<label>` the text in the parentheses, `now=` where its analytics go today and
+`path=` its repo root or folder (its value may hold spaces and runs up to ` account=`). Ask, by
+`kind=`:
 
-Its `here:` line is `here: <short> (<label>) → <R<n> | no rule> account=<key> rule=<n|none>
-kind=<repo|folder|outside> match=<…>` (no ` (<label>)` when `kind=outside`): `<short>` is the text
-after `here: ` up to ` (` or ` →`, `<label>` the text in the parentheses (`here: none` → nothing
-to ask). Only when it has `rule=none`, ask the workspace question about it — the one step 4a asks about a `P` line, without
-the "(i of N) " prefix, with choices from this output's `W.` lines — then run, with `<ids>` = the
-chosen `tenant=` values joined by commas, or `none` when the last choice was picked (it wins over the
-others):
+| `kind=`   | Question                                                                                   | Last choice           |
+| --------- | ------------------------------------------------------------------------------------------ | --------------------- |
+| `repo`    | "Where should analytics for <short>, the repo you're in, go?"                              | "Don't track <short>" |
+| `folder`  | "Where should analytics for <label>, the folder you're in (and everything inside it), go?" | "Don't track <short>" |
+| `outside` | "Where should analytics for sessions outside a project folder go?"                         | "Don't track these"   |
+
+Choices: one per `W.` line of this block, as in step 4a, then the last choice, described "Not
+tracked: nothing from <short> is sent" ("Not tracked: nothing from sessions outside a project folder
+is sent" for `outside`); shown the way step 4a shows its question. Then run, with `<ids>` = the
+chosen `tenant=` values joined by commas, or `none` when the last choice was picked (it wins over
+the others):
 
 ```
 node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> --defer-upload <ids>
 ```
 
-and write its first line verbatim. Nothing chosen or a skipped question runs nothing. Then continue
-to step 2.
+and write its first line verbatim. Nothing chosen or a skipped question runs nothing. Then carry on
+with `--from plan`.
 
 ### Step 2 — capture the ChatGPT plan
 
-Run this after step 1 succeeded, **including when step 1 said the machine was already linked** (the
-user's tier may have changed), and **including when step 1 used the `beezi_login` tool** — that tool
-links the machine but never reads the plan.
-
-```
-node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via login --account <key>
-```
+The `<capture>` block: the script ran it after step 1w on every login outcome, **including when step
+1 said the machine was already linked** (the user's tier may have changed), and **including when
+step 1 used the `beezi_login` tool** — that tool links the machine but never reads the plan. It is
+`node "<plugin-root>/scripts/billing-capture.mjs" --from-codex --via login --account <key>`'s output.
 
 The plan itself is the MACHINE's — one Codex install, one subscription paying for it — so the
 questions below do not change with the number of linked accounts. `--account` only says which
 account's Beezi row to tell about it.
 
 It asks Codex itself which account it is signed in as (a short-lived `codex app-server` child
-process), and falls back to the plan label in `~/.codex/auth.json`. It may take a few seconds the
-first time. No token is read and none leaves the machine — only the plan label, the account id and
-the address. When a plan is captured the line ends with `via=app-server` or `via=auth-json`, naming
-which one answered; the other outcomes below print their own message instead.
-Report its one-line output verbatim, then decide:
+process), and falls back to the plan label in `~/.codex/auth.json`. No token is read and none leaves
+the machine — only the plan label, the account id and the address. When a plan is captured the line
+ends with `via=app-server` or `via=auth-json`, naming which one answered; the other outcomes below
+print their own message instead. Report its one-line output verbatim. The script already decided
+what comes next:
 
-**Skip step 3 and continue to step 4** — the plan is settled — when the output either
+**It went on to step 4** — the plan is settled — when the output either
 
 - names a real plan (`plan=free`, `plan=plus`, `plan=pro_5x`, `plan=pro_20x`, `plan=go`,
   `plan=team`, `plan=business`, `plan=enterprise`, `plan=edu`), or
 - shows `source=openai_api_key` or `source=third_party`. Those machines do not bill a ChatGPT
   subscription, so a tier question does not apply to them.
 
+**Otherwise it stopped with `next=tier`: go to step 3.** That covers every other output, including
+`nothing captured`, `keeping the self-reported plan`, `plan=unknown`, `plan=n/a`, and
+`source=unknown` — a machine whose output is not on the settled list is exactly the machine that
+needs asking.
+
 **If it says the Codex sign-in expired**, that has a cheaper fix than step 3: the stored ChatGPT
 token is stale, not the plan unknowable. Tell the user to run `codex login` again — the plan is then
-picked up automatically on their next session. Offer step 3 only if they would rather not, or if
-signing in again does not clear it.
-
-**Otherwise go to step 3.** That covers every other output, including `nothing captured`,
-`keeping the self-reported plan`, `plan=unknown`, `plan=n/a`, and `source=unknown`. Treat this as
-"anything not on the settled list" rather than matching a fixed list of failures — a machine whose
-output you do not recognise is exactly the machine that needs asking.
+picked up automatically on their next session — and ask step 3's question only if they would rather
+name the plan now; when they would not, carry on with `--from joined`.
 
 ### Step 3 — ask the user their tier
 
 The tier question has ten choices, so it is always this one plain sentence — never a numbered
 list. Ask it as the last thing in your reply and then **stop and wait for the user's reply**. Do not
-guess a tier, do not run the capture command in the same turn, and **do not run step 4 in the same
-turn either** — an unanswered question followed by backfill output is how this step gets silently
-skipped. Both the capture and step 4 happen on the next turn, once the user has answered.
+guess a tier, do not run the capture command in the same turn, and **do not carry on to step 4 in the
+same turn either** — an unanswered question followed by backfill output is how this step gets
+silently skipped. Both the capture and step 4 happen on the next turn, once the user has answered.
 
 > How does this machine pay for Codex: ChatGPT Free, ChatGPT Plus, ChatGPT Pro — $100/mo (5× Plus
 > usage), ChatGPT Pro — $200/mo (20× Plus usage), ChatGPT Go, ChatGPT Team, ChatGPT Business, ChatGPT
@@ -264,7 +317,8 @@ node "<plugin-root>/scripts/billing-capture.mjs" --plan <value> --via login-user
 ```
 
 Report its one-line output. If the user dismisses the question or answers something not in the
-table, skip the capture — the link itself already succeeded, say that and continue to step 4.
+table, skip the capture — the link itself already succeeded, say that. Either way, then carry on with
+`--from joined`.
 
 ### Step 4 — upload past sessions
 
@@ -273,15 +327,14 @@ source, or step 3 was answered or dismissed) —
 never while step 3's question is still waiting for a reply. That holds for both parts, 4a and then
 4b. With that condition met, it runs on every login outcome: fresh links, accounts that were already
 linked, **and when step 1 used the `beezi_login` MCP tool** — that tool links the account but never
-uploads history, so this step is still yours to run.
+uploads history, so this step is still yours to run. The script prints step 4a's listings itself;
+step 4b is yours.
 
 #### Step 4a — new workspaces, then repos and folders with no rule
 
-**First, new workspaces.**
-
-```
-node "<plugin-root>/scripts/workspace.mjs" joined --account <key> --defer-upload
-```
+**First, new workspaces:** the `<joined account="<key>">` block, the
+`workspace.mjs joined --account <key> --defer-upload` listing. The script stops after it with
+`next=joined` only when it is not `joined=0`.
 
 Its output is for you only. For an account that joined a workspace since it was last reviewed on this
 machine, it lists every repo and folder with where its analytics go now. Its lines:
@@ -302,7 +355,7 @@ machine, it lists every repo and folder with where its analytics go now. Its lin
   the user did not pick sending where it sends now;
 - `joined=<total>` — the number of `J` lines, always last.
 
-`joined=0` → nothing to ask; go to "Then, repos and folders with no rule" below.
+`joined=0` → nothing to ask; the script went on to "Then, repos and folders with no rule" below.
 
 More than 4 `J` lines → first ask "You joined <names>. Where should analytics for these <N> repos and
 folders go? Their past sessions will be sent there too." (`<N>` = the number of `J` lines)
@@ -314,6 +367,8 @@ yet, stay as they are"), "Choose repos" ("Pick which repos and folders go to eac
 - "Choose repos" → the per-workspace repo picks below.
 - "Leave them as they are" → run the `done-command=` text EXACTLY ONCE.
 - A skipped question → nothing; the next login or the `sync` skill asks again.
+
+Except for "Choose repos", then carry on with `--from routes`.
 
 4 or fewer `J` lines → the per-workspace repo picks.
 
@@ -347,13 +402,11 @@ user did not pick for a workspace runs nothing for that workspace. After the las
 question has been answered (not skipped or dismissed), run the `done-command=` text EXACTLY ONCE;
 otherwise run no `done-command`, and the next login or sync asks again.
 
-Write each command's first line verbatim.
+Write each command's first line verbatim, then carry on with `--from routes`.
 
-**Then, repos and folders with no rule.**
-
-```
-node "<plugin-root>/scripts/workspace.mjs" routes --account <key> --defer-upload
-```
+**Then, repos and folders with no rule:** the `<routes account="<key>">` block, the
+`workspace.mjs routes --account <key> --defer-upload` listing. The script stops after it with
+`next=routes` only when it is not `routes=0`.
 
 Its output is for you only, except the one line named below. It lists repos and folders whose past
 sessions have no rule yet — only for an account in several workspaces whose New folders setting is
@@ -373,7 +426,7 @@ Ask me. Its lines:
   about it;
 - `routes=<total>` — the number of `P` lines, always last.
 
-`routes=0` → nothing to ask; go to step 4b.
+`routes=0` → nothing to ask; the script ended with `next=backfill`: go to step 4b.
 
 More than 4 `P` lines → first ask "Where should analytics for these <N> repos and folders go?"
 (`<N>` = the number of `P` lines) with the choices "Send all <N> to the same workspaces…" (described
@@ -403,9 +456,9 @@ from 1, `N` = their number). `<short>` is the `P` line's text after `P<i>. ` up 
 | `outside` | "(i of N) Where should analytics for sessions outside a project folder go?"  | "Don't track these"       |
 
 Choices: one per `W.` line — the workspace name (the text after `W. ` up to ` account=`), described
-by the line's `role=` value (nothing when it is empty) — then the last choice, described "Nothing
-from <short> is uploaded" ("Nothing from sessions outside a project folder is uploaded" for
-`outside`). Several workspaces may be chosen.
+by the line's `role=` value (nothing when it is empty) — then the last choice, described "Not
+tracked: nothing from <short> is sent" ("Not tracked: nothing from sessions outside a project folder
+is sent" for `outside`). Several workspaces may be chosen.
 
 - `request_user_input` only with at most 2 `W.` lines (3 choices): header "Beezi", the question
   followed by " Pick one, or name several under Other.", the labels exactly as above.
@@ -420,7 +473,7 @@ the last choice was picked (it wins over the others). Never rebuild the command 
 yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
 sent this time, and the next login or the `sync` skill asks again.
 
-Write each command's first line verbatim.
+Write each command's first line verbatim, then go to step 4b.
 
 #### Step 4b — the one-time upload
 
@@ -478,7 +531,8 @@ For an account in several workspaces the output has a few more lines; relay each
 
 ### Step 5 — offer to make this the analytics default
 
-Only when step 1's output said the analytics skill still reads from a different account. Logging in
+Only when step 1's output (the `<sign-in>` block, or the `beezi_login` tool's answer) said the
+analytics skill still reads from a different account. Logging in
 never switches the default by itself, because a second workspace signing in must not silently take
 over the analytics the user was reading.
 

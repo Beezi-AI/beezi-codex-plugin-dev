@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { FUN_LINES, finaleLines } from '../lib/setup-finale.mjs';
 import { NO_TERMINAL, SESSION_KEYS, STOPPED, setupMain } from '../lib/setup-main.mjs';
-import { createStyle, paint } from '../lib/setup-style.mjs';
+import { createStyle, formatLine, paint } from '../lib/setup-style.mjs';
 
 const COLOR = createStyle({ enabled: true });
 const PLAIN = createStyle({ enabled: false });
@@ -18,7 +18,9 @@ function sink() {
 }
 
 function harness(over) {
-  const seen = { closed: 0, removed: [], runner: null, prompt: null, ctx: null, exit: null, interrupt: null, exitHandlers: [] };
+  const seen = {
+    closed: 0, removed: [], runner: null, run: null, prompt: null, ctx: null, exit: null, interrupt: null, exitHandlers: [], labels: [], cleared: 0,
+  };
   const stdout = sink();
   const stderr = sink();
   const terminal = { isTTY: true };
@@ -31,7 +33,14 @@ function harness(over) {
     makeTempDir: () => '/tmp/beezi-setup-x1',
     removeDir: (dir) => { seen.removed.push(dir); },
     createPrompt: (io) => { seen.prompt = io; return { close: () => { seen.closed += 1; } }; },
-    createRunner: (options) => { seen.runner = options; return 'run-fn'; },
+    createRunner: (options) => {
+      seen.runner = options;
+      const run = () => Promise.resolve({ code: 0, stdout: '', stderr: '' });
+      run.setLabel = (label) => { seen.labels.push(label); };
+      run.clearActivity = () => { seen.cleared += 1; };
+      seen.run = run;
+      return run;
+    },
     runSetup: (ctx) => { seen.ctx = ctx; return Promise.resolve(0); },
     onInterrupt: (handler) => { seen.interrupt = handler; },
     onExit: (handler) => { seen.exitHandlers.push(handler); },
@@ -87,11 +96,14 @@ test('it runs the wizard from a fresh temp cwd with the session keys stripped, t
   const h = harness({});
   assert.equal(await setupMain('/plugin', h.deps), 0);
   const { paint: runnerPaint, ...runner } = h.seen.runner;
-  assert.deepEqual(runner, { root: '/plugin', cwd: '/tmp/beezi-setup-x1', env: h.deps.env, sessionKeys: SESSION_KEYS });
+  assert.deepEqual(runner, {
+    root: '/plugin', cwd: '/tmp/beezi-setup-x1', env: h.deps.env, sessionKeys: SESSION_KEYS,
+    stdout: h.stdout, stderr: h.stderr, output: h.stdout, activity: false,
+  });
   assert.equal(runnerPaint('✓ done'), '✓ done');
   assert.equal(h.seen.prompt.input, h.terminal);
   assert.equal(h.seen.prompt.output, h.stdout);
-  assert.equal(h.seen.ctx.run, 'run-fn');
+  assert.equal(h.seen.ctx.run, h.seen.run);
   assert.equal(typeof h.seen.ctx.ask.close, 'function');
   h.stdout.chunks.length = 0;
   h.seen.ctx.print('✓ done');
@@ -129,7 +141,7 @@ test('Ctrl+C inside a menu takes the same stop path, with the stop line in red',
   assert.equal(typeof h.seen.prompt.onInterrupt, 'function');
   assert.equal(h.seen.prompt.onInterrupt, h.seen.interrupt);
   h.seen.prompt.onInterrupt();
-  assert.equal(h.stdout.text(), `\n${paint(COLOR, STOPPED)}\n`);
+  assert.equal(h.stdout.text(), `\n${formatLine(COLOR, STOPPED, 100)}\n`);
   assert.match(h.stdout.text(), ESC);
   assert.equal(h.seen.exit, 130);
   assert.equal(h.seen.closed, 1);
@@ -200,4 +212,54 @@ test('by default the cwd is a new, empty beezi-setup- folder in the OS temp dir,
   });
   assert.equal(await setupMain('/plugin', h.deps), 0);
   assert.equal(fs.existsSync(cwd), false);
+});
+
+test('the runner gets the output and an activity line only on a TTY whose TERM is not dumb', async () => {
+  const tty = colourTerminal(harness(), 100);
+  assert.equal(await setupMain('/plugin', tty.deps), 0);
+  assert.equal(tty.seen.runner.output, tty.stdout);
+  assert.equal(tty.seen.runner.activity, true);
+  const dumb = colourTerminal(harness({ env: { PATH: '/bin', TERM: 'dumb' } }), 100);
+  assert.equal(await setupMain('/plugin', dumb.deps), 0);
+  assert.equal(dumb.seen.runner.activity, false);
+  const piped = harness();
+  piped.stdout.isTTY = false;
+  assert.equal(await setupMain('/plugin', piped.deps), 0);
+  assert.equal(piped.seen.runner.activity, false);
+});
+
+test('ctx.progress sets the runner label', async () => {
+  const h = colourTerminal(harness({ runSetup: (ctx) => { ctx.progress('Checking your plan…'); return Promise.resolve(1); } }), 100);
+  assert.equal(await setupMain('/plugin', h.deps), 1);
+  assert.deepEqual(h.seen.labels, ['Checking your plan…']);
+});
+
+test('print and streamed lines wrap to the terminal width with a hanging indent', async () => {
+  const long = '✓ History import is now closed for this account: past sessions on other machines can no longer be imported.';
+  const h = colourTerminal(harness({ env: { PATH: '/bin', NO_COLOR: '1' }, runSetup: (ctx) => { ctx.print(long); return Promise.resolve(1); } }), 40);
+  assert.equal(await setupMain('/plugin', h.deps), 1);
+  h.stdout.text().split('\n').forEach((row) => assert.ok(Array.from(row).length <= 39, row));
+  assert.ok(h.stdout.text().startsWith('✓ History import is now closed for this\n  account:'));
+  assert.equal(h.seen.runner.paint(long), h.stdout.text().replace(/\n$/, ''));
+});
+
+test('the stop path clears the activity line before printing the stop line', async () => {
+  // The fake clearActivity marks the output stream, so the order of the clear and the stop line shows.
+  const h = colourTerminal(harness({
+    runSetup: () => new Promise(() => {}),
+    createRunner: () => {
+      const run = () => Promise.resolve({ code: 0, stdout: '', stderr: '' });
+      run.setLabel = () => {};
+      run.clearActivity = () => { h.stdout.chunks.push('clear'); };
+      return run;
+    },
+  }), 100);
+  setupMain('/plugin', h.deps);
+  await new Promise((resolve) => setImmediate(resolve));
+  h.seen.interrupt();
+  const clear = h.stdout.chunks.indexOf('clear');
+  const stop = h.stdout.chunks.findIndex((s) => s.includes('Setup stopped.'));
+  assert.ok(clear >= 0, 'clears the activity line');
+  assert.ok(stop > clear, 'prints the stop line after the clear');
+  assert.equal(h.seen.exit, 130);
 });

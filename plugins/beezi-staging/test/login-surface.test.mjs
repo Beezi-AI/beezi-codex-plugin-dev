@@ -62,3 +62,56 @@ test('login — the MCP tool prints its key only on a completed sign-in', () => 
   assert.ok(key > pending && key > failed, 'the key is composed after both keyless exits have returned');
   assert.match(bridge, /const key = result\.key \? `\\naccount=\$\{result\.key\}` : '';/);
 });
+
+const flat = (text) => text.replace(/\s+/g, ' ');
+
+test('login skill — one script runs the steps, and the beezi_login path resumes it at setup', () => {
+  const text = flat(skill);
+  assert.match(skill, /^node "<plugin-root>\/scripts\/login-flow\.mjs"$/m);
+  assert.ok(text.includes('node "<plugin-root>/scripts/login-flow.mjs" --account <key> --from setup'));
+  assert.ok(text.includes('node "<plugin-root>/scripts/login-flow.mjs" --account <key> --from <step>'));
+  // Every stop the script can print has a row in the skill's table, and the script still prints it.
+  const flow = read('scripts', 'login-flow.mjs');
+  for (const step of ['stop', 'setup', 'here', 'tier', 'joined', 'routes', 'backfill']) {
+    assert.ok(flow.includes(`'${step}'`), `login-flow.mjs no longer prints next=${step}`);
+    assert.match(skill, new RegExp(`^\\| \`${step}\` +\\|`, 'm'), `the skill has no row for next=${step}`);
+  }
+  assert.ok(!text.includes('workspace.mjs" new-folders --account <key>'), 'the New folders listing is the script\'s now');
+});
+
+test('login skill — the one setup question uses the tool for at most 2 workspaces, else one numbered sentence', () => {
+  const text = flat(skill);
+  assert.ok(text.includes('"Where should analytics from this machine go?"'));
+  assert.ok(!text.includes('<preview'), 'Codex options carry no previews (spec D5)');
+  assert.match(text, /`O<i>\. <label> — <description>`/);
+  assert.match(text, /\*\*`request_user_input`\*\* only when that tool is listed this turn \*\*and\*\* there are at most 2 `W\.` lines \(3 choices\)/);
+  assert.match(text, /split at the last ` — ` into the label and the description/);
+  assert.match(text, /3 or more `W\.` lines — one plain sentence with the `O` lines as a numbered list, never a 4-option `request_user_input` call/);
+  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenant> --account <key> --defer-upload'));
+  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload'));
+  assert.ok(!text.includes('"Ask me (recommended)"'), 'the old three-way New folders question is gone');
+});
+
+test('login skill — describes the here: line as workspace.mjs prints it', () => {
+  assert.ok(read('lib', 'workspace-cli.mjs').includes("now=${now.reason.kind === 'pending' ? 'pending' : idList(now.ids)}${where} account="));
+  assert.ok(flat(skill).includes('here: <short> (<label>) → <R<n> | no rule> now=<ids|none|pending> path=<path> account=<key> rule=<n|none> kind=<…> match=<…>'));
+});
+
+// Spec §4: this session's own folder is asked about as the one you're in, and Don't track says nothing is sent.
+test('login — the here question names the folder you\'re in, and the last choice sends nothing', () => {
+  const flat = skill.replace(/\s+/g, ' ');
+  for (const phrase of [
+    '"Where should analytics for <short>, the repo you\'re in, go?"',
+    '"Where should analytics for <label>, the folder you\'re in (and everything inside it), go?"',
+    '"Where should analytics for sessions outside a project folder go?"',
+    '"Don\'t track <short>"',
+    '"Don\'t track these"',
+    '"Not tracked: nothing from <short> is sent"',
+    '"Not tracked: nothing from sessions outside a project folder is sent"',
+  ]) {
+    assert.ok(flat.includes(phrase), phrase);
+  }
+  assert.ok(!flat.includes('without the "(i of N) " prefix'), 'the here question has its own wording, not step 4a\'s');
+  assert.ok(!flat.includes('Nothing from <short> is uploaded'));
+  assert.ok(!flat.includes('outside a project folder is uploaded'));
+});
