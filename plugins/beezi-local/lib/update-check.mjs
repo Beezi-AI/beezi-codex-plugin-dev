@@ -75,6 +75,11 @@ function readState(deps) {
   return obj && typeof obj === 'object' ? obj : {};
 }
 
+/** The last check checkForUpdate remembered, `{ checkedAt, latest }` or `{}`; reads the file, never the network. */
+export function cachedUpdate(deps = {}) {
+  return readState(deps);
+}
+
 function writeState(state, deps) {
   const write = orDefault(deps.writeJsonSecure, writeJsonSecure);
   const file = orDefault(deps.updateCheckFile, updateCheckFile);

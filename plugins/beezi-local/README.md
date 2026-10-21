@@ -23,8 +23,9 @@ Then start a **new** Codex thread so the plugin's skills and MCP server load.
 
 Nothing to run by hand. Ask Codex for anything Beezi — the MCP server starts with every session and
 serves two tools of its own: `beezi_login` (browser sign-in, after which the drafting tools appear
-in the same session) and `beezi_status` (is this machine linked, as whom, against which API, and
-are the analytics hooks installed).
+in the same session) and `beezi_status` (is this machine linked, as whom, against which API, are
+the analytics hooks installed, where this folder's analytics go, and which plugin version is
+installed, with the update steps when a newer one is out).
 
 Both are answered **inside the MCP server**, deliberately. That process is spawned by Codex and
 inherits `BEEZI_API_URL` and the credential store; a script the model runs through the shell tool
@@ -34,6 +35,15 @@ about the link should go through `beezi_status`.
 Codex's own MCP OAuth is not used: it only covers streamable-HTTP servers, and it would put the
 token in Codex's store while the analytics hooks read `~/.beezi-codex/credentials.json` — so the machine
 would have to be linked twice.
+
+After the browser sign-in, an account in several workspaces is asked one question, "Where should
+analytics from this machine go?": each workspace (described with how many past sessions go there)
+or "Let me choose per repo", which goes on to a question per repo and folder. With two workspaces
+it is a choice; with more, Codex asks it as one sentence with a numbered list.
+
+Once signed in, every new Codex thread starts with a short banner: the account you're signed in
+as, its workspaces, and where this folder's analytics go (or that it has no rule yet). It needs the
+`SessionStart` hook [installed and trusted](#analytics-needs-the-hooks-installed-and-trusted).
 
 Signing in a second time adds a second account rather than replacing the first — see
 [Several Beezi accounts on one machine](#several-beezi-accounts-on-one-machine).
@@ -174,11 +184,12 @@ also lists linked accounts and their sign-in health, and Account → Refresh pla
 captured ChatGPT plan.
 
 **To remove one**, the `logout` skill logs out a named account or every account at once and reports
-the outcome for each.
+the outcome for each. With only one account linked, it logs that one out in a single step.
 
 Each account and workspace has its own history import. Login and sync ask where past sessions with
-no rule should go before uploading them. Two users of the same workspace can both link the machine;
-if both send to that workspace, it counts the same sessions twice.
+no rule should go before uploading them; with nothing to ask, sync goes straight to the upload.
+Two users of the same workspace can both link the machine; if both send to that workspace, it
+counts the same sessions twice.
 
 An account linked before this layout existed may show `linked account (no name or email recorded)`.
 The next successful identity refresh records the name, email and workspaces Beezi returns.
@@ -194,6 +205,18 @@ The `settings` skill manages two choices for each account:
   SSH host aliases are not resolved when matching remotes.
 - **New folders** decides what happens without a rule: **Ask me**, **Send to…**, or **Don't send**.
   If every selected workspace is no longer available, Send to… falls back to Ask me.
+
+The settings menu shows where this folder's analytics go, and each option shows its current state.
+The Rules menu ends with **Close**, which leaves it. The rules table has a **Default** row for
+everything without a rule, marks the rule that covers the folder you're in with **← you're here**,
+and lists each rule's **Path or remote** and its sessions over the **Last 30 days**. A rule for a
+workspace the account has left shows as `Ignored (workspace left)`. **Stop tracking another folder** (with several
+workspaces, adding a rule for another folder) offers your most-used repos and folders to pick from
+instead of typing a path.
+
+A rule or New folders change made in settings ends with "Undo: ask the settings skill to undo."
+Asking it to undo puts the last change back; if the rules changed again since, it says so and
+changes nothing.
 
 With Ask me, a new or cleared session asks where that repo or folder's analytics should go.
 Resuming or compacting a session does not ask again. The answer creates a rule. Until answered,
@@ -274,6 +297,11 @@ Three things about that command are deliberate:
 - **A new Codex thread is required.** Skills and the MCP server are loaded once per thread, so the
   running session keeps the old build until it is restarted.
 
+`beezi_status` names the installed version and, when the last check found a newer one, the same
+update steps. It and the `release-notes` skill answer from that remembered reading only, so neither
+calls the network. The `release-notes` skill shows what changed in the installed version, with the
+three releases before it; ask it for all of them, or name one version.
+
 **The hooks do not need re-trusting.** The registry entries name a fixed launcher rather than a
 plugin version, so an upgrade rewrites the launcher's bytes and leaves each entry — and its hash —
 exactly as trusted. The one exception is the upgrade *to* this release: a machine whose entries
@@ -301,6 +329,7 @@ exist.
 | `track` | Checkpoint the current branch now, without hooks |
 | `analytics` | Your own spend and session summary, for 7 or 30 days |
 | `sync` | Repair history a machine missed while its hooks were untrusted |
+| `release-notes` | What changed in the installed version, every release, or one named version |
 
 Two flows are MCP tools rather than skills, because they have to run in the server's process:
 `beezi_login` and `beezi_status`. The skills prefer them and fall back to the scripts.
@@ -308,8 +337,10 @@ Two flows are MCP tools rather than skills, because they have to run in the serv
 Each skill runs a script under `scripts/`; those stay directly runnable from a terminal —
 `login.mjs`, `accounts.mjs [list|use <account>]`, `logout.mjs [--list|--account <a>|--all]`,
 `settings.mjs`, `workspace.mjs`, `telemetry.mjs [status|correlate|on|anonymous|off]`,
-`hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`.
-`setup.mjs` asks the login skill's questions in the terminal instead of a Codex thread; the
+`hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`,
+`release-notes.mjs [all|<version>]`.
+`setup.mjs` asks the login skill's questions in the terminal instead of a Codex thread, starting
+with the same single "Where should analytics from this machine go?"; the
 one-line installers run it after installing the plugin. Its questions are colourful arrow-key
 menus (↑/↓, then Enter), with typed numbers as the fallback where keys cannot be read;
 `NO_COLOR` turns the colours off.

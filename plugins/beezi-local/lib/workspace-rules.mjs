@@ -1,13 +1,16 @@
 import os from 'os';
 import { loadRepoMap, normPath, pathHasPrefix, resolveRepoForRouting } from './repo-map.mjs';
 import { canonicalRemote } from './git.mjs';
-import { isMultiTenant, isSingleTenant, tenantsOf, tenantById, resolveTargets, readSessionWorkspace, newFoldersOf, initSessionWorkspace } from './workspace.mjs';
+import { isMultiTenant, isSingleTenant, joinTenantNames, tenantsOf, resolveTargets, readSessionWorkspace, newFoldersOf, initSessionWorkspace } from './workspace.mjs';
 import { loadLedger, isImported } from './audit-ledger.mjs';
+import { listAllRollouts } from './transcript-index-codex.mjs';
+import { isLiveTrackingAllowed } from './tracking.mjs';
+import { defaultRoute, kindWords, placeOfDir, routeOfDir, routeTarget, sameKey } from './route-describe.mjs';
 
 // Copied from session-audit.mjs so planning skips what the backfill skips.
-const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
-const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
-const MAX_SESSION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
+export const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+export const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
+export const MAX_SESSION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const OUTSIDE_LABEL = 'outside a project';
 
 function stringIds(value) {
@@ -87,7 +90,7 @@ function isUnsafeKeyPath(p) {
   return home != null && pathHasPrefix(home, n);
 }
 
-function displayPath(p) {
+export function displayPath(p) {
   const home = homePath();
   return home != null && pathHasPrefix(p, home) ? `~${p.slice(home.length)}` : p;
 }
@@ -422,51 +425,96 @@ export function keepCurrentRules(row, places, newIds) {
 }
 
 const cell = (text) => String(text).replace(/\|/g, '\\|');
+// An empty cell stays one space wide, so the header's unnamed column reads `| |`.
+const tableRow = (cells) => `|${cells.map((c) => (c === '' ? ' ' : ` ${cell(c)} `)).join('|')}|`;
+const sessionsText = (n) => `${n} session${n === 1 ? '' : 's'}`;
+const HERE_MARK = '← you\'re here';
 
-function workspaceNames(row, ids) {
-  if (ids.length === 0) return 'not tracked';
-  return ids.map((id) => {
-    const t = tenantById(row, id);
-    return t != null && t.name ? t.name : id;
-  }).join(', ');
+// Last-30-days sessions from planReviewPlaces: { rules: Map<index, n>, default: n }; a place equal to a stored rule counts for it, the rest for Default.
+// A rule whose workspaces were all left counts none: routing skips it, so its sessions go to the next rule or Default.
+export function ruleSessionCounts(row, places) {
+  const stored = rulesOf(row);
+  const members = (tenantsOf(row) || []).map((t) => t.id);
+  const live = stored.filter((r) => usableIds(r, members) !== null);
+  const counts = { rules: new Map(stored.map((r) => [r.index, 0])), default: 0 };
+  for (const place of places) {
+    const rule = live.find((r) => sameKey(r, place));
+    if (rule == null) counts.default += place.sessions;
+    else counts.rules.set(rule.index, counts.rules.get(rule.index) + place.sessions);
+  }
+  return counts;
+}
+
+// "You're in **labacus-suite**, a git repo at /work/labacus-suite." and why its analytics go where they go.
+export function hereSentences(row, place, route) {
+  const at = place.path == null ? '' : ` at ${place.path}`;
+  const first = place.kind === 'outside'
+    ? 'You\'re outside a project folder (home, / or a temp folder).'
+    : `You're in **${place.short}**, ${kindWords(place)}${at}.`;
+  return [first, whySentence(row, route)];
+}
+
+function whySentence(row, route) {
+  const reason = route.reason;
+  const to = routeTarget(row, route);
+  // Audit mode or disabled: a one-workspace account sends no new sessions, whatever the default says.
+  if (isSingleTenant(row) && route.ids.length > 0 && !isLiveTrackingAllowed(row.key)) {
+    return 'Live tracking is off for this workspace, so new sessions are not sent; these rules apply when history is uploaded.';
+  }
+  if (reason.kind === 'pending') return 'It has no rule yet. Beezi asks where its analytics go when a session starts here.';
+  if (reason.kind === 'rule') {
+    const wider = reason.own === false;
+    const name = wider ? `Rule R${reason.index} for ${reason.short} covers it` : `Rule R${reason.index}`;
+    if (route.ids.length === 0) return wider ? `${name}: nothing is sent.` : `${name} stops tracking it: nothing is sent.`;
+    return wider ? `${name} and sends its analytics to ${to}.` : `${name} sends its analytics to ${to}.`;
+  }
+  if (!isMultiTenant(row)) return `Its sessions send analytics to ${to}, the default for every repo and folder.`;
+  return route.ids.length === 0
+    ? 'It has no rule of its own, and the default is Don\'t send: nothing is sent.'
+    : `It has no rule of its own, so the default applies: analytics go to ${to}.`;
+}
+
+// Where Default sends: the one workspace, New folders' workspaces, "not tracked" or "ask me".
+export function defaultTarget(row) {
+  const route = defaultRoute(row);
+  return route.reason.kind === 'pending' ? 'ask me' : routeTarget(row, route);
+}
+
+// A rule's "Sends to" cell; routing skips a rule whose workspaces were all left (usableIds → null), so it reads ignored (M-6).
+function ruleTarget(row, rule, members) {
+  if (usableIds(rule, members) === null) return 'Ignored (workspace left)';
+  return rule.tenantIds.length === 0 ? 'not tracked' : joinTenantNames(row, rule.tenantIds);
 }
 
 // The user-facing rules table, as lines: accounts with known workspaces, no machine fields.
-export function rulesTableLines(rows, dir, ctx) {
+// options: `entries` (rollouts; default every one on this machine) and planReviewPlaces' own options.
+export function rulesTableLines(rows, dir, ctx, options = {}) {
   const known = rows.filter((row) => isMultiTenant(row) || isSingleTenant(row));
-  if (known.length === 0) return ['Rules need the account\'s workspaces, which are not known yet. Start a new Codex session and try again.'];
+  if (known.length === 0) return ['Rules need the account\'s workspaces, which are not known yet. Start a new Codex thread and try again.'];
+  const { entries = null, ...planOptions } = options;
+  const rollouts = entries == null ? listAllRollouts() : entries;
+  const context = ctx == null ? createRouteContext() : ctx;
+  const place = placeOfDir(dir, context);
   const out = [];
   known.forEach((row, i) => {
     if (known.length > 1) {
       if (i > 0) out.push('');
       out.push(`**${row.email || row.name || row.key}**`, '');
     }
-    const stored = rulesOf(row);
-    const single = isSingleTenant(row);
-    if (stored.length === 0) {
-      out.push('No rules yet.');
-    } else if (single) {
-      out.push('| Rule | Repo or folder | Where | Tracked |', '|---|---|---|---|');
-      const members = tenantsOf(row).map((t) => t.id);
-      for (const r of stored) {
-        const where = r.kind === 'outside' ? 'home, / or temp folders' : r.label;
-        // A leftover rule whose stored workspace(s) are all gone is skipped by routing (usableIds
-        // → null) and must not read "Yes": the folder is actually not tracked by it (M-6).
-        const usable = usableIds(r, members);
-        const tracked = usable === null ? 'Ignored (workspace left)' : (usable.length === 0 ? 'No' : 'Yes');
-        out.push(`| R${r.index} | ${cell(shortLabel(r))} | ${cell(where)} | ${tracked} |`);
-      }
-    } else {
-      out.push('| Rule | Repo or folder | Where | Sends to |', '|---|---|---|---|');
-      for (const r of stored) {
-        const where = r.kind === 'outside' ? 'home, / or temp folders' : r.label;
-        out.push(`| R${r.index} | ${cell(shortLabel(r))} | ${cell(where)} | ${cell(workspaceNames(row, r.tenantIds))} |`);
-      }
+    const route = place == null ? null : routeOfDir(row, dir, context);
+    if (route != null) out.push(...hereSentences(row, place, route), '');
+    const hereRule = route != null && route.reason.kind === 'rule' ? route.reason.index : null;
+    const mark = (isHere) => (route == null ? [] : [isHere ? HERE_MARK : '']);
+    const counts = ruleSessionCounts(row, planReviewPlaces(row, rollouts, context, planOptions));
+    const members = tenantsOf(row).map((t) => t.id);
+    const header = ['Rule', 'Repo or folder', 'Path or remote', 'Sends to', 'Last 30 days'].concat(route == null ? [] : ['']);
+    out.push(tableRow(header), `|${header.map(() => '---').join('|')}|`);
+    for (const r of rulesOf(row)) {
+      const where = r.kind === 'outside' ? 'home, / or temp folders' : r.label;
+      out.push(tableRow([`R${r.index}`, shortLabel(r), where, ruleTarget(row, r, members), sessionsText(counts.rules.get(r.index))].concat(mark(hereRule === r.index))));
     }
-    const key = routeKeyForDir(dir, ctx);
-    if (key == null) return;
-    const route = routeForDir(row, dir, ctx);
-    out.push('', `This folder: ${shortLabel(key)} — ${route == null ? 'no rule yet' : `R${route.index}`}`);
+    const scope = isMultiTenant(row) ? 'new repos and folders' : 'every repo and folder';
+    out.push(tableRow(['Default', scope, '', defaultTarget(row), sessionsText(counts.default)].concat(mark(hereRule == null))));
   });
   return out;
 }

@@ -176,7 +176,9 @@ test('L2 — every root lib/paths.mjs resolves is inside the sandbox', () => {
   // sweep below proves it lands in the sandbox the same way the other root-level files do.
   // 31: codexAgentsFile() (~/.codex/AGENTS.md, lib/agents-notice.mjs) joins codexHome(), so a run
   // can never write the reminder block into the developer's real global instructions file.
-  assert.equal(roots.length, 31, `the path surface changed — add the new accessor's reasoning here`);
+  // 32: ruleUndoFile() (lib/rule-undo.mjs's last routing change) joins beeziCodexHome(), so an
+  // undo record a test writes lands in the sandbox, never in the developer's real data root.
+  assert.equal(roots.length, 32,`the path surface changed — add the new accessor's reasoning here`);
   // The two roots a run must never touch, named rather than the whole home: on Windows the temp
   // directory sits under %USERPROFILE%, so "not under the home" would also forbid the sandbox.
   const forbidden = [path.join(REAL_HOME, '.codex'), path.join(REAL_HOME, '.beezi-codex')];

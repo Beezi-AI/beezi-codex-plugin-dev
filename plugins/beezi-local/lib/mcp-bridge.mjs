@@ -29,6 +29,9 @@ import { orDefault } from './compat.mjs';
 import {
   isMultiTenant, newestSessionWorkspace, readSessionWorkspace, resolveReadTenant, tenantById,
 } from './workspace.mjs';
+import { createRouteContext } from './workspace-rules.mjs';
+import { readTrackingState } from './tracking.mjs';
+import { pluginInfo as _pluginInfo, statusExtraLines } from './status-extra.mjs';
 
 // Stdio ⇄ Streamable-HTTP bridge for the Beezi MCP server. Codex runs the
 // bridge as a local stdio MCP server, so it never sees the portal's OAuth
@@ -90,8 +93,9 @@ export const STATUS_TOOL = Object.freeze({
     'API it is talking to, and whether the analytics hooks are installed and trusted in Codex ' +
     '(its "Hook trust:" line asks Codex afresh on every call). Call this when the user asks about ' +
     'their Beezi link or connection status, asks why their Beezi analytics are empty or not being ' +
-    'tracked, or says they have trusted the Beezi hooks in /hooks. Prefer this over running any ' +
-    'status script. Takes no arguments.',
+    'tracked, says they have trusted the Beezi hooks in /hooks, or asks which Beezi version is ' +
+    'installed, how to update it, or where this folder’s analytics go — it also reports those. ' +
+    'Prefer this over running any status script. Takes no arguments.',
   inputSchema: { type: 'object', properties: {}, additionalProperties: false },
 });
 
@@ -711,9 +715,33 @@ export function createBridge(deps = {}) {
       }
       const reporting = describeReporting(lifted, trust);
       const trustLine = trust ? describeTrust(trust) : null;
-      toolText(id, [describeLink(lifted), reporting, trustLine, note, repair].filter(Boolean).join('\n'));
+      const base = [describeLink(lifted), reporting, trustLine, note, repair].filter(Boolean).join('\n');
+      const extra = await statusExtra();
+      toolText(id, extra.length === 0 ? base : [base, ''].concat(extra).join('\n'));
     } catch (error) {
       toolText(id, `Beezi status check failed: ${error && error.message ? error.message : String(error)}`, true);
+    }
+  }
+
+  // Local reads only — the index, tracking state, repo map and the cached update check. Best-effort:
+  // a failure here must not turn the link answer above into "status check failed".
+  async function statusExtra() {
+    try {
+      const rows = orDefault(await listAccounts(deps), []);
+      const tracking = {};
+      rows.forEach((row) => {
+        try { tracking[row.key] = readTrackingState(row.key); } catch { tracking[row.key] = null; }
+      });
+      // Only this thread's own recorded folder: process.cwd() is the plugin cache (.mcp.json "cwd": "."), and the
+      // newest session recorded can be another thread's.
+      let state = null;
+      try { state = readSessionWorkspace(process.env.CODEX_THREAD_ID); } catch { state = null; }
+      const dir = state != null && state.cwd != null ? state.cwd : null;
+      const plugin = (deps.pluginInfo || _pluginInfo)();
+      const ctx = deps.loadRepoMap == null ? createRouteContext() : createRouteContext({ loadRepoMapImpl: deps.loadRepoMap });
+      return statusExtraLines({ rows, dir, ctx, tracking, plugin });
+    } catch {
+      return [];
     }
   }
 

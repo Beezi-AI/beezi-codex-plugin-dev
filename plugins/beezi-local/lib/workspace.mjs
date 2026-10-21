@@ -374,7 +374,18 @@ function envSessionWithState(value) {
   return fs.existsSync(sessionWorkspaceFile(value)) ? value : null;
 }
 
-// The workspace state of the Codex session a command runs in: the thread id Codex exports to shell commands, else the newest session here.
+// The Codex session a command runs in, { sessionId, state }: the thread id Codex exports to shell commands, even before its
+// state file exists, else the newest session recorded for this directory. Every live-session lookup shares this rule.
+export function currentSession(cwd = process.cwd(), env = process.env) {
+  for (const id of [env.CODEX_THREAD_ID, env.CODEX_SESSION_ID]) {
+    if (validSessionId(id)) return { sessionId: id, state: readSessionWorkspace(id) };
+  }
+  const byCwd = findSessionWorkspaceByCwd(cwd);
+  return byCwd == null ? { sessionId: null, state: null } : byCwd;
+}
+
+// The workspace state of the Codex session a command runs in: an env id's state when it has one, else the newest session here.
+// Unlike currentSession, an env id with no state yet falls through: these callers want a state to read, not the id.
 export function currentSessionWorkspace(cwd = process.cwd()) {
   const candidates = [process.env.CODEX_THREAD_ID, process.env.CODEX_SESSION_ID];
   for (const candidate of candidates) {

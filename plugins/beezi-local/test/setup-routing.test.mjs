@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  askNewFolders, lastLine, parsePlaces, parseWorkspaces, placeOptions, placeQuestion, report,
-  reviewJoined, reviewRoutes, ruleArgv, tenantsArg, token, workspaceOptions,
+  askNewFolders, lastLine, parseHistory, parsePlaces, parseWorkspaces, placeOptions, placeQuestion, report,
+  reviewJoined, reviewRoutes, ruleArgv, setupOptions, tenantsArg, token, workspaceOptions,
 } from '../lib/setup-routing.mjs';
 
 const W_LINES = [
@@ -105,11 +105,11 @@ test('placeQuestion and placeOptions follow the login wording per kind', () => {
   assert.deepEqual(placeOptions(repo, workspaces), [
     { label: 'Acme', description: 'Owner' },
     { label: 'Beta Team', description: 'Beezi workspace' },
-    { label: "Don't track this repo", description: 'Nothing from api is uploaded' },
+    { label: "Don't track this repo", description: 'Not tracked: nothing from api is sent' },
   ]);
   assert.equal(placeOptions(folder, workspaces)[2].label, "Don't track this folder");
   assert.deepEqual(placeOptions(outside, workspaces)[2], {
-    label: "Don't track these", description: 'Nothing from sessions outside a project folder is uploaded',
+    label: "Don't track these", description: 'Not tracked: nothing from sessions outside a project folder is sent',
   });
   assert.deepEqual(workspaceOptions(parseWorkspaces(JOINED))[1], { label: 'Beta Team', description: 'Member, new' });
 });
@@ -157,43 +157,73 @@ test('report never prints machine lines from stdout when a failing step has no s
   assert.deepEqual(mixed.printed, ['✗ Could not read your rules.']);
 });
 
-test('askNewFolders asks only when set=no and runs the picked mode', async () => {
-  const settled = fakeCtx({ 'new-folders --account k1': ok(`${W_LINES.join('\n')}\nnew-folders=ask set=yes multi=yes account=k1\n`) }, []);
+const LISTING = 'new-folders --history --account k1';
+const SETUP_QUESTION = 'Where should analytics from this machine go?';
+const PER_REPO = { label: 'Let me choose per repo', description: 'Beezi asks about each repo and folder with history next, and new ones when a session starts there' };
+const unset = (history) => ok(`${W_LINES.join('\n')}\n${history}new-folders=ask set=no multi=yes account=k1\n`);
+
+test('askNewFolders asks only when set=no on a multi-workspace account', async () => {
+  const settled = fakeCtx({ [LISTING]: ok(`${W_LINES.join('\n')}\nhistory=3 places=2\nnew-folders=ask set=yes multi=yes account=k1\n`) }, []);
   await askNewFolders(settled, 'k1');
   assert.equal(settled.asked.length, 0);
+  assert.deepEqual(settled.runs, ['workspace.mjs new-folders --history --account k1']);
 
-  const single = fakeCtx({ 'new-folders --account k1': ok('new-folders=n/a multi=no account=k1\n') }, []);
+  const single = fakeCtx({ [LISTING]: ok('new-folders=n/a multi=no account=k1\n') }, []);
   await askNewFolders(single, 'k1');
   assert.equal(single.asked.length, 0);
+});
 
-  const unset = `${W_LINES.join('\n')}\nnew-folders=ask set=no multi=yes account=k1\n`;
-  const ask = fakeCtx({ 'new-folders --account k1': ok(unset) }, [0]);
-  await askNewFolders(ask, 'k1');
-  assert.equal(ask.asked[0].question, 'Where should analytics go for repos and folders with no rule yet?');
-  assert.deepEqual(ask.asked[0].options.map((o) => o.label), ['Ask me (recommended)', 'Send to…', "Don't send"]);
-  assert.deepEqual(ask.runs, ['workspace.mjs new-folders --account k1', 'workspace.mjs new-folders ask --account k1 --defer-upload']);
-  assert.deepEqual(ask.printed, ['✓ done']);
+test('askNewFolders asks one question: a workspace each, then per repo', async () => {
+  const ctx = fakeCtx({ [LISTING]: unset('history=143 places=12\n') }, [1]);
+  await askNewFolders(ctx, 'k1');
+  assert.equal(ctx.asked[0].question, SETUP_QUESTION);
+  const everything = 'Everything goes here: new repos and folders, and 12 with history (143 past sessions)';
+  assert.deepEqual(ctx.asked[0].options, [
+    { label: 'Acme', description: everything },
+    { label: 'Beta Team', description: everything },
+    PER_REPO,
+  ]);
+  assert.deepEqual(ctx.runs, ['workspace.mjs new-folders --history --account k1', 'workspace.mjs new-folders send t2 --account k1 --defer-upload']);
+  assert.deepEqual(ctx.printed, ['✓ done']);
 
-  const none = fakeCtx({ 'new-folders --account k1': ok(unset) }, [2]);
-  await askNewFolders(none, 'k1');
-  assert.equal(none.runs[1], 'workspace.mjs new-folders none --account k1 --defer-upload');
+  const perRepo = fakeCtx({ [LISTING]: unset('history=143 places=12\n') }, [2]);
+  await askNewFolders(perRepo, 'k1');
+  assert.equal(perRepo.runs[1], 'workspace.mjs new-folders ask --account k1 --defer-upload');
 
-  const send = fakeCtx({ 'new-folders --account k1': ok(unset) }, [1, [1, 0]]);
-  await askNewFolders(send, 'k1');
-  assert.equal(send.asked[1].question, 'Which workspaces should get analytics for repos and folders with no rule?');
-  assert.equal(send.runs[1], 'workspace.mjs new-folders send t2,t1 --account k1 --defer-upload');
+  const first = fakeCtx({ [LISTING]: unset('') }, [0]);
+  await askNewFolders(first, 'k1');
+  assert.equal(first.runs[1], 'workspace.mjs new-folders send t1 --account k1 --defer-upload');
 
-  const sendNothing = fakeCtx({ 'new-folders --account k1': ok(unset) }, [1, []]);
-  await askNewFolders(sendNothing, 'k1');
-  assert.equal(sendNothing.runs.length, 1);
-
-  const dismissed = fakeCtx({ 'new-folders --account k1': ok(unset) }, [null]);
+  const dismissed = fakeCtx({ [LISTING]: unset('history=143 places=12\n') }, [null]);
   await askNewFolders(dismissed, 'k1');
   assert.equal(dismissed.runs.length, 1);
+  assert.deepEqual(dismissed.printed, []);
+});
+
+test('one question, one option per workspace plus per repo, with history in the descriptions', () => {
+  const options = setupOptions([{ name: 'Acme', tenant: 'A' }, { name: 'Beta', tenant: 'B' }], { sessions: 37, places: 4 });
+  assert.deepEqual(options.map((o) => o.label), ['Acme', 'Beta', 'Let me choose per repo']);
+  assert.equal(options[0].description, 'Everything goes here: new repos and folders, and 4 with history (37 past sessions)');
+  assert.equal(setupOptions([{ name: 'Acme' }], { sessions: 1, places: 0 })[0].description, 'Everything goes here: new repos and folders, and 1 past session');
+  assert.equal(setupOptions([{ name: 'Acme' }], null)[0].description, 'Everything goes here, starting with new repos and folders');
+});
+
+test('setupOptions words the history counts, singular and zero; a bad history line reads as zero', () => {
+  const workspaces = parseWorkspaces(W_LINES.join('\n'));
+  assert.equal(setupOptions(workspaces, { sessions: 1, places: 1 })[0].description,
+    'Everything goes here: new repos and folders, and 1 with history (1 past session)');
+  assert.equal(setupOptions(workspaces, { sessions: 0, places: 0 })[1].description, 'Everything goes here, starting with new repos and folders');
+  assert.equal(setupOptions(workspaces, null)[0].description, 'Everything goes here, starting with new repos and folders');
+  assert.equal(setupOptions(workspaces, { sessions: 4, places: 0 })[0].description, 'Everything goes here: new repos and folders, and 4 past sessions');
+  assert.deepEqual(setupOptions(workspaces, null).at(-1), PER_REPO);
+  assert.deepEqual(parseHistory('W. x\nhistory=143 places=12\nnew-folders=ask'), { sessions: 143, places: 12 });
+  assert.equal(parseHistory('history=lots places=12'), null);
+  assert.equal(parseHistory('history=3'), null);
+  assert.equal(parseHistory('new-folders=ask'), null);
 });
 
 test('askNewFolders reports a failing listing and asks nothing', async () => {
-  const ctx = fakeCtx({ 'new-folders --account k1': { code: 1, stdout: '', stderr: '✗ Not linked.\n' } }, []);
+  const ctx = fakeCtx({ [LISTING]: { code: 1, stdout: '', stderr: '✗ Not linked.\n' } }, []);
   await askNewFolders(ctx, 'k1');
   assert.deepEqual(ctx.printed, ['✗ Not linked.']);
   assert.equal(ctx.asked.length, 0);
