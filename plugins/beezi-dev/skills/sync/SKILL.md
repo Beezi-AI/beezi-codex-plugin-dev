@@ -70,13 +70,23 @@ numbered list or a bullet menu — that ends your reply; when the answer arrives
 carry on from the next question, then step 2. Ask one question at a time. A skipped question runs
 nothing.
 
-### Step 1 — new workspaces, then repos and folders with no rule
+### Step 1 — new workspaces, then repos and folders with no rule, then the sync
 
-**First, new workspaces.** Run, adding `--account <account>` when the user named an account:
+Run this one command, adding `--account <account>` when the user named an account (and step 2's
+`--tenant` override when the user asked for it):
 
 ```
-node "<plugin-root>/scripts/workspace.mjs" joined --defer-upload
+node "<plugin-root>/scripts/sync.mjs" --review
 ```
+
+It prints a `<joined>` block (new workspaces, below) and stops there when that block's last line is
+not `joined=0`. Otherwise it prints a `<routes>` block (repos and folders with no rule, below) and
+stops there when its last line is not `routes=0`. Its next line, `review=<n>`, is for you only: the
+number of `J` or `P` lines waiting for an answer. On `review=0` it goes straight on to the sync:
+everything after that line is step 2's output, and no other command runs. A listing that fails shows
+a `✗` line inside its block instead and counts as nothing to ask: write that line verbatim.
+
+**First, new workspaces.** The `<joined>` block is what `workspace.mjs joined` prints.
 
 Its output is for you only. For an account that joined a workspace since it was last reviewed on this
 machine, it lists every repo and folder with where its analytics go now. Its lines:
@@ -99,7 +109,8 @@ machine, it lists every repo and folder with where its analytics go now. Its lin
 
 Run the printed commands unchanged; whatever they route gets its history uploaded.
 
-`joined=0` → nothing to ask; go to "Then, repos and folders with no rule" below.
+`joined=0` → nothing to ask: the same call already printed the `<routes>` block; go to "Then, repos
+and folders with no rule" below.
 
 For each account with `J` lines (with several accounts, put " (<email>)" right before every
 question's closing " Their past sessions will be sent there too."), using that account's `W.` lines
@@ -152,15 +163,20 @@ Write each command's first line verbatim.
 
 **Then, repos and folders with no rule.**
 
-Run, adding `--account <account>` when the user named an account:
+Run nothing for them after `joined=0`: the step 1 command already printed the `<routes>` block.
+After the `J` questions (answered or skipped) and their commands, run, with the same `--account`
+and `--tenant` as step 1's command:
 
 ```
-node "<plugin-root>/scripts/workspace.mjs" routes --defer-upload
+node "<plugin-root>/scripts/sync.mjs" --review-routes
 ```
 
-Its output is for you only, except the one line named below. It lists, per account in several
-workspaces whose New folders setting is Ask me, the repos and folders whose past sessions have no
-rule yet. Its lines:
+It prints the `<routes>` block and `review=<n>`, and on `review=0` goes straight on to the sync as
+step 1's command does.
+
+The `<routes>` block is what `workspace.mjs routes` prints. It is for you only, except the one line
+named below. It lists, per account in several workspaces whose New folders setting is Ask me, the
+repos and folders whose past sessions have no rule yet. Its lines:
 
 - `<email>: <N> repos or folders have past sessions with no rule (<M> sessions) account=<key>` —
   starts one account's block;
@@ -177,7 +193,8 @@ rule yet. Its lines:
   about it;
 - `routes=<total>` — the number of `P` lines, always last.
 
-Not linked, or `routes=0` → nothing to ask; go to step 2.
+Not linked, or `routes=0` → nothing to ask: the sync already ran in the same call; go to step 2 for
+its output.
 
 For each account with `P` lines (with several accounts, end every question with " (<email>)"):
 
@@ -214,8 +231,8 @@ the line's `kind=`:
 
 Choices: one per `W.` line of that account — the workspace name (the text after `W. ` up to
 ` account=`), described by the line's `role=` value (nothing when it is empty) — then the last
-choice, described "Nothing from <short> is uploaded" ("Nothing from sessions outside a project
-folder is uploaded" for `outside`). Several workspaces may be chosen.
+choice, described "Not tracked: nothing from <short> is sent" ("Not tracked: nothing from sessions
+outside a project folder is sent" for `outside`). Several workspaces may be chosen.
 
 - `request_user_input` only with at most 2 `W.` lines (3 choices): header "Beezi", the question
   followed by " Pick one, or name several under Other.", the labels exactly as above.
@@ -233,6 +250,10 @@ sent this time, and the next sync asks again.
 Write each command's first line verbatim.
 
 ### Step 2 — sync
+
+When the last listing printed `review=0`, the sync already ran: its output is everything after that
+`review=0` line. Run nothing more. Only after the `P` questions (answered or skipped) and their
+commands, run, with the same `--account` and `--tenant` as step 1's command:
 
 ```
 node "<plugin-root>/scripts/sync.mjs"
@@ -254,7 +275,7 @@ not sent this time). Add `--tenant <workspace>[,<workspace>…]` only when the u
 specific workspaces instead: that is an override that sends every past session to those workspaces,
 ignoring rules, and with several accounts linked it needs `--account <account>` too.
 
-**It takes no other flags** than `--account` and `--tenant`. Not `--since`, not `--force` — the
+**It takes no other flags** than `--account`, `--tenant` and step 1's `--review` or `--review-routes`. Not `--since`, not `--force` — the
 script rejects both with an explanation, and neither exists to be worked around. `--since` filters on
 when a session last ran, which would skip exactly the old half-uploaded sessions this command is for;
 `--force` has no seal to force past on this path. If the user pushes for either, say the command

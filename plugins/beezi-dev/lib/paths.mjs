@@ -290,6 +290,11 @@ export function repoMapFile() {
   return path.join(beeziCodexHome(), 'repo-map.json');
 }
 
+// The last routing change, kept so the settings skill can undo it (lib/rule-undo.mjs).
+export function ruleUndoFile() {
+  return path.join(beeziCodexHome(), 'rule-undo.json');
+}
+
 // The PRE-0.13 credential file, at the machine root. It is not an account's file and never gains
 // a key: lib/credentials.mjs resolves the legacy subject here so the one-time migration can still
 // find what a single-account install left behind, and nothing else may write it.

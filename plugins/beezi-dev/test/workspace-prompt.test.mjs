@@ -4,6 +4,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { buildJoinedPrompt, buildWorkspacePrompt } from '../lib/workspace-prompt.mjs';
+import { loadRepoMap, saveRepoMap, upsertRoot } from '../lib/repo-map.mjs';
 import { tmpHome } from '../tools/suite-fixtures.mjs';
 
 const KEY = 'a1b2c3d4';
@@ -48,4 +49,19 @@ test('the joined prompt instructs joined pick and a per-workspace numbered repo 
   assert.match(text, /runs a `joined pick` command \(the `J<i>-command=` printed for that repo or folder, run unchanged except its final `<tenant>`, which becomes that workspace's `tenant=` id\)/);
   assert.doesNotMatch(text, /rule add/);
   assert.match(text, /one plain sentence \(for a repo pick, one that lists that workspace's repos and folders as a numbered list\)/);
+});
+
+// The session-start question names this session's own repo as the one you're in, and its last choice names it too.
+test('the workspace question names the repo you are in and what not tracking it means', async (t) => {
+  tmpHome(t, 'workspace-prompt-');
+  const repo = '/work/labacus-suite';
+  saveRepoMap(upsertRoot(loadRepoMap(), repo, 'https://github.com/acme/labacus-suite.git'));
+  const text = await buildWorkspacePrompt({ session_id: 'session-1', cwd: repo, source: 'startup' }, {
+    pluginRoot: '/plugin',
+    listAccounts: async () => [ROW],
+    linkedSessions: async () => [{ key: KEY }],
+  });
+  assert.ok(text.includes('"Where should analytics for labacus-suite, the repo you\'re in, go? Pick one, or name several under Other."'), text);
+  assert.ok(text.includes('"Don\'t track labacus-suite" (description "Not tracked: nothing from labacus-suite is sent")'), text);
+  assert.ok(text.includes('— one or more — or don\'t track labacus-suite?'), text);
 });

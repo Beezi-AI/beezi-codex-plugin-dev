@@ -28,7 +28,11 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson } from './http.mjs';
 import { whoami } from './whoami.mjs';
 import { recordWhoami, readTrackingState, allowsLiveFor } from './tracking.mjs';
-import { readSessionWorkspace, expandTargets, isMultiTenant, tenantById } from './workspace.mjs';
+import { readSessionWorkspace, expandTargets, isMultiTenant, tenantById, tenantsOf } from './workspace.mjs';
+import { placeOfDir } from './route-describe.mjs';
+import { createRouteContext } from './workspace-rules.mjs';
+import { buildBanner } from './session-banner.mjs';
+import { ASK_SOURCES } from './workspace-prompt.mjs';
 import { BillingSource } from './billing.mjs';
 import {
   readBillingConfig as _readBillingConfig,
@@ -132,6 +136,24 @@ async function announceRepo(remote, session, fetchImpl) {
       ? `Beezi: repo connected${projectName ? ` to "${projectName}"` : ''}. Sessions here are tracked.`
       : 'Beezi: this repo is not connected to a Beezi project. Sessions are still tracked, against the repo itself.';
   } catch { return null; } // offline — silent
+}
+
+// The type of the workspace a target sends to ('analytics', a platform type, or null when unknown).
+function workspaceType(target) {
+  const tenants = tenantsOf(target);
+  const t = target.tenantId != null ? tenantById(target, target.tenantId) : (tenants != null && tenants.length === 1 ? tenants[0] : null);
+  return t == null || t.type == null ? null : t.type;
+}
+
+// An analytics workspace answers connected for every repo, so its line says nothing; the banner says where analytics go.
+const probesRepo = (target) => workspaceType(target) !== 'analytics';
+
+// The hook's own cwd only: an unknown one gets no route line. Compact shows none.
+function sessionBanner(input, sessions, workspaceState, trackingByKey, ctx) {
+  if (input.source === 'compact') return null;
+  const place = typeof input.cwd === 'string' && input.cwd !== '' ? placeOfDir(input.cwd, ctx) : null;
+  const asking = input.source == null || ASK_SOURCES.indexOf(input.source) !== -1;
+  return buildBanner({ sessions, state: workspaceState, place, trackingByKey, asking });
 }
 
 // whoami reports invalid for any 401/403, which covers an expired token and a permissions
@@ -340,11 +362,6 @@ export async function runSessionStart(input, deps = {}) {
     });
   } catch { /* best-effort */ }
 
-  // The repo's origin: one git shell-out for the machine, then one probe per account, because the
-  // repo→project mapping is a fact about a TENANT and two workspaces answer it differently.
-  let remote = null;
-  try { remote = resolveOriginRemote(gitImpl, input.cwd); } catch { remote = null; }
-
   // Only this session's own rule scopes requests; the row's web-side tenantId never does. One clone
   // per target workspace that tracks live — the tracking state was just refreshed by the whoami
   // above — and none for an account still waiting for the user's answer.
@@ -353,6 +370,13 @@ export async function runSessionStart(input, deps = {}) {
   const trackingByKey = new Map(active.map((session) => [session.key, trackingOf(session.key)]));
   const targetSessions = expandTargets(active, workspaceState)
     .filter((target) => allowsLiveFor(target, trackingByKey.get(target.key)));
+
+  // The repo's origin: one git shell-out for the machine, then one probe per platform target, because
+  // the repo→project mapping is a fact about a TENANT and two workspaces answer it differently.
+  let remote = null;
+  if (targetSessions.some(probesRepo)) {
+    try { remote = resolveOriginRemote(gitImpl, input.cwd); } catch { remote = null; }
+  }
 
   // SERIAL over the accounts: flushQueue takes `shared:queue-<key>`, rank 3, so two drains at once
   // in this one process would be refused as 'lock-order' — an account silently not uploading,
@@ -364,21 +388,33 @@ export async function runSessionStart(input, deps = {}) {
     const targets = targetSessions.filter((target) => target.key === session.key);
     const [, ...lines] = await Promise.all([
       flushQueue(session.key, session, { fetchImpl }),
-      ...targets.map((target) => announceRepo(remote, target, fetchImpl)),
+      ...targets.map((target) => (probesRepo(target) ? announceRepo(remote, target, fetchImpl) : null)),
     ]);
     targets.forEach((target, i) => {
       if (lines[i]) announcements.push(announceLine(target, lines[i], many));
     });
   }
-  const systemMessage = announcements.length ? announcements.join('\n') : null;
   try { pruneStale(); } catch { /* best-effort */ }
 
   // Pre-warm + self-heal the repo-map: discover this session's repo(s) and drop dead roots.
+  // Prune and save are seams: both touch the real filesystem (a root's .git, the map file).
+  const pruneMap = orDefault(deps.pruneRepoMap, pruneRepoMap);
+  const saveMap = orDefault(deps.saveRepoMap, saveRepoMap);
+  let warmed = null;
   try {
     const map = loadRepoMap();
     const { dirty } = discoverRepos(input.cwd, gitImpl, map);
-    const removed = pruneRepoMap(map);
-    if (dirty || removed > 0) saveRepoMap(map);
+    const removed = pruneMap(map);
+    // Before the save: a failed write still lets the banner name a repo found this start.
+    warmed = map;
+    if (dirty || removed > 0) saveMap(map);
+  } catch { /* best-effort */ }
+
+  // Built after the pre-warm, on the map it just warmed, so the banner names the place the checkpoint will route.
+  let banner = null;
+  try {
+    const ctx = createRouteContext({ loadRepoMapImpl: () => (warmed == null ? loadRepoMap() : warmed) });
+    banner = sessionBanner(input, active, workspaceState, trackingByKey, ctx);
   } catch { /* best-effort */ }
 
   // The user may have switched auth method since the last session (exporting a key over a ChatGPT
@@ -520,9 +556,7 @@ export async function runSessionStart(input, deps = {}) {
     } catch { /* best-effort */ }
   }
 
-  let message = warnings.length
-    ? (systemMessage ? `${warnings.join('\n')}\n${systemMessage}` : warnings.join('\n'))
-    : systemMessage;
+  let message = [...warnings, banner, ...announcements].filter(Boolean).join('\n') || null;
   let nudge = null;
   if (billingSource === BillingSource.SUBSCRIPTION && isStale(billingConfig)) {
     // Reached only when the auto-capture above could not name a plan it trusts — so pointing the

@@ -1,14 +1,17 @@
 import { getDefaultKey, listAccounts } from './accounts.mjs';
 import { accountHealth, healHooks } from './me.mjs';
-import { currentSessionWorkspace, describeTenant, isMultiTenant, isSingleTenant, newFoldersOf, tenantById, tenantsOf } from './workspace.mjs';
-import { createRouteContext, routeForDir, routeKeyForDir, rulesOf, rulesTableLines, shortLabel } from './workspace-rules.mjs';
+import { currentSession, describeTenant, isMultiTenant, isSingleTenant, joinTenantNames, newFoldersOf, tenantById, tenantsOf } from './workspace.mjs';
+import { createRouteContext, rulesOf, rulesTableLines } from './workspace-rules.mjs';
+import { kindWords, placeOfDir, routeOfDir, routeTarget, routeText } from './route-describe.mjs';
+import { workspaceCommand } from './workspace-cli.mjs';
 import { readBillingConfig, resolveSource } from './billing-config.mjs';
 import { BillingSource } from './billing.mjs';
 import { isLiveTrackingAllowed } from './tracking.mjs';
 import { crashMode } from './diagnostics.mjs';
 import { UserError, friendlyMessage } from './friendly-error.mjs';
 
-// What the settings skill shows: the screen, the machine-readable `keys`, and one block per section.
+// What the settings skill reads, in one call per view: the screen, the machine-readable `keys`, and
+// every block the next question needs.
 //
 // It lives here rather than in scripts/settings.mjs for the reason lib/accounts-cli.mjs does:
 // tools/hermetic-env.mjs guards child_process, so the output is only testable in-process. Every
@@ -16,6 +19,7 @@ import { UserError, friendlyMessage } from './friendly-error.mjs';
 
 const LABEL_WIDTH = 16;
 const NOT_LINKED = 'Beezi · not linked — use the login skill';
+export const USAGE = 'Usage: settings.mjs [menu | rules | new-folders | account | privacy | all | keys]';
 
 function field(label, value) {
   return `  ${label.padEnd(LABEL_WIDTH)}${value}`;
@@ -34,35 +38,20 @@ function newFoldersLabel(row) {
   return newFolders.mode === 'none' ? 'Don\'t send' : 'Ask me';
 }
 
-// Where this folder's analytics go: its rule, else New folders.
+// "labacus-suite → Acme (default)": where this folder's analytics go, and why.
 function thisFolder(row, dir, ctx) {
-  const key = routeKeyForDir(dir, ctx);
-  if (key == null) return null;
-  const place = shortLabel(key);
-  const route = routeForDir(row, dir, ctx);
-  if (route != null) return `${place} → ${route.tenantIds.length === 0 ? 'not tracked' : names(row, route.tenantIds)}`;
-  const newFolders = newFoldersOf(row);
-  if (newFolders.mode === 'send') return `${place} → ${names(row, newFolders.tenantIds)} (new folder default)`;
-  if (newFolders.mode === 'none') return `${place} → not uploaded (new folders: don't send)`;
-  // Not "asks at the next session start": with the hooks untrusted no session start runs.
-  return `${place} → no rule yet (choose in the settings skill)`;
-}
-
-// This folder's status for a one-workspace account: not tracked (with its rule) or tracked.
-// Skipped entirely when live tracking is off (audit mode or disabled): "→ tracked" would be wrong there.
-function thisFolderSingle(row, dir, ctx) {
-  if (!isLiveTrackingAllowed(row.key)) return null;
-  const key = routeKeyForDir(dir, ctx);
-  if (key == null) return null;
-  const place = shortLabel(key);
-  const route = routeForDir(row, dir, ctx);
-  if (route != null && route.tenantIds.length === 0) return `${place} → not tracked (R${route.index})`;
-  return `${place} → tracked`;
+  const place = placeOfDir(dir, ctx);
+  return place == null ? null : `${place.short} ${routeText(row, routeOfDir(row, dir, ctx))}`;
 }
 
 function rulesCount(n) {
   if (n === 0) return 'none yet';
   return n === 1 ? '1 repo/folder' : `${n} repos/folders`;
+}
+
+// Skipped for a one-workspace account when live tracking is off (audit mode or disabled): "→ Acme" would be wrong there.
+function hereShown(row) {
+  return !isSingleTenant(row) || isLiveTrackingAllowed(row.key);
 }
 
 // accountHealth's lines folded into one: "Beezi: " dropped, sentences joined.
@@ -84,27 +73,24 @@ async function healthByKey(accounts, deps) {
   return health;
 }
 
-function currentDir() {
-  const state = currentSessionWorkspace();
-  return state != null && state.cwd != null ? state.cwd : process.cwd();
-}
-
-function crashLabel(mode) {
-  return mode.charAt(0).toUpperCase() + mode.slice(1);
-}
-
-export async function screenLines(deps = {}) {
-  const machine = [field('Crash reports', crashLabel(crashMode()))];
+// Everything the sections read, loaded once; health checks only when a section shows sign-in.
+async function loadView(withHealth, deps) {
   const accounts = await listAccounts(deps);
-  if (accounts.length === 0) return [NOT_LINKED].concat(machine);
+  const health = withHealth ? await healthByKey(accounts, deps) : {};
   // Health checks refresh each account's workspaces, so the index is read again after.
-  const health = await healthByKey(accounts, deps);
+  const rows = withHealth && accounts.length > 0 ? await listAccounts(deps) : accounts;
+  const cwd = deps.cwd != null ? deps.cwd : process.cwd();
+  const session = currentSession(cwd, deps.env != null ? deps.env : process.env);
+  const dir = session.state != null && session.state.cwd != null ? session.state.cwd : cwd;
+  return { rows, health, def: await getDefaultKey(deps), dir, ctx: createRouteContext(), liveSessionId: session.sessionId, deps };
+}
+
+function screen(view) {
+  const machine = [field('Crash reports', crashMode() === 'off' ? 'Off' : 'On')];
+  const { rows, health, def, dir, ctx } = view;
+  if (rows.length === 0) return [NOT_LINKED].concat(machine);
   // The hook repair the removed `me` skill ran, on linked machines only; a healthy install is left untouched.
-  const healed = accounts.some((a) => health[a.key] != null && health[a.key].ok) ? healHooks(deps) : null;
-  const rows = await listAccounts(deps);
-  const def = await getDefaultKey(deps);
-  const dir = currentDir();
-  const ctx = createRouteContext();
+  const healed = rows.some((a) => health[a.key] != null && health[a.key].ok) ? healHooks(view.deps) : null;
   const several = rows.length > 1;
   const out = [];
   rows.forEach((row, i) => {
@@ -120,7 +106,7 @@ export async function screenLines(deps = {}) {
       return;
     }
     if (!isSingleTenant(row)) return;
-    const here = thisFolderSingle(row, dir, ctx);
+    const here = hereShown(row) ? thisFolder(row, dir, ctx) : null;
     if (here != null) out.push(field('This folder', here));
     const ruleCount = rulesOf(row).length;
     if (ruleCount > 0) out.push(field('Rules', rulesCount(ruleCount)));
@@ -135,20 +121,52 @@ function workspaceCount(row) {
   return tenants == null ? 0 : tenants.length;
 }
 
-// For the skill's routing only; never shown.
-export async function keysLines(deps = {}) {
-  const accounts = await listAccounts(deps);
-  const def = await getDefaultKey(deps);
+// The sections that apply here, in menu order.
+function menuLabels(rows) {
   const menu = [];
-  if (accounts.some((a) => workspaceCount(a) >= 1)) menu.push('Rules');
-  if (accounts.some((a) => isMultiTenant(a))) menu.push('New folders');
+  if (rows.some((a) => workspaceCount(a) >= 1)) menu.push('Rules');
+  if (rows.some((a) => isMultiTenant(a))) menu.push('New folders');
   menu.push('Account', 'Crash reports');
-  const out = [`menu=${menu.join('|')}`];
-  for (const a of accounts) {
+  return menu;
+}
+
+// One menu option label per `menu=` label, in order, each with its current state when one account decides it.
+export function menuLabelLines(view) {
+  const { rows, dir, ctx } = view;
+  return menuLabels(rows).map((label) => {
+    if (label === 'Rules') {
+      const ruled = rows.filter((a) => workspaceCount(a) >= 1);
+      if (ruled.length !== 1 || !hereShown(ruled[0]) || placeOfDir(dir, ctx) == null) return label;
+      return `Rules: here → ${routeTarget(ruled[0], routeOfDir(ruled[0], dir, ctx))}`;
+    }
+    if (label === 'New folders') {
+      const multi = rows.filter((a) => isMultiTenant(a));
+      if (multi.length !== 1) return label;
+      const nf = newFoldersOf(multi[0]);
+      if (nf.mode === 'send') return `New folders: send to ${joinTenantNames(multi[0], nf.tenantIds)}`;
+      return nf.mode === 'none' ? 'New folders: don\'t send' : 'New folders: ask me';
+    }
+    if (label === 'Account') {
+      if (rows.length === 0) return label;
+      return rows.length === 1 ? `Account: ${rows[0].email || rows[0].name || rows[0].key}` : `Account: ${rows.length} linked`;
+    }
+    return `Crash reports ${crashMode() === 'off' ? 'off' : 'on'}`;
+  });
+}
+
+// For the skill's routing only; never shown. The setup wizard parses `keys` too (test/setup-contract.test.mjs).
+function keyLines(view) {
+  const { rows, def } = view;
+  const out = [`menu=${menuLabels(rows).join('|')}`];
+  for (const a of rows) {
     out.push(`account=${a.key} default=${a.key === def ? 'yes' : 'no'} multi=${isMultiTenant(a) ? 'yes' : 'no'} workspaces=${workspaceCount(a)} status=${a.status || 'linked'} email=${a.email || 'unknown'}`);
   }
   out.push(`crash=${crashMode()}`);
   return out;
+}
+
+export async function keysLines(deps = {}) {
+  return keyLines({ rows: await listAccounts(deps), def: await getDefaultKey(deps) });
 }
 
 const PLAN_LABELS = {
@@ -177,20 +195,39 @@ function heading(section, row, several) {
 
 const NEW_FOLDERS_TEXT = {
   ask: 'Ask me — Beezi asks once per repo or folder, when a session starts there',
-  none: 'Don\'t send — nothing from a repo or folder with no rule is uploaded',
+  none: 'Don\'t send — nothing from a repo or folder with no rule is sent',
 };
 
-export async function rulesSection(deps = {}) {
-  const rows = await listAccounts(deps);
-  if (rows.length === 0) return [NOT_LINKED];
-  return rulesTableLines(rows, currentDir(), createRouteContext());
+function rulesSection(view) {
+  if (view.rows.length === 0) return [NOT_LINKED];
+  // The live session is still running, so it is left out of the counts, as `workspace.mjs rules --table` leaves it.
+  const entries = view.deps.listAllRollouts == null ? null : view.deps.listAllRollouts();
+  return rulesTableLines(view.rows, view.dir, view.ctx, { entries, liveSessionId: view.liveSessionId });
 }
 
-export async function newFoldersSection(deps = {}) {
-  const rows = (await listAccounts(deps)).filter((row) => isMultiTenant(row));
+const CARD_FOOTER = {
+  repo: ['The rule follows the repo, so every', 'clone of it stops sending too.'],
+  folder: ['The rule covers this folder and', 'everything inside it.'],
+  outside: ['The rule covers every session in your', 'home folder, / or a temp folder.'],
+};
+
+// The `<here-card>`: where this folder is, where it sends now, and for one workspace what Don't track changes.
+export function hereCardLines(row, dir, ctx) {
+  if (!hereShown(row)) return null;
+  const place = placeOfDir(dir, ctx);
+  if (place == null) return null;
+  const route = routeOfDir(row, dir, ctx);
+  const out = ['● You\'re here', `  ${place.kind === 'outside' ? 'outside a project folder' : `${place.short}, ${kindWords(place)}`}`];
+  if (place.path != null) out.push(`  ${place.path}`);
+  if (place.remote != null) out.push(`  ${place.remote}`);
+  out.push('', `Now     ${routeText(row, route)}`);
+  if (isSingleTenant(row) && route.ids.length > 0) out.push('After   → not tracked (new rule)', '', ...CARD_FOOTER[place.kind]);
+  return out;
+}
+
+function newFoldersSection(view) {
+  const rows = view.rows.filter((row) => isMultiTenant(row));
   if (rows.length === 0) return ['New folders applies only to an account in several workspaces.'];
-  const dir = currentDir();
-  const ctx = createRouteContext();
   const out = [];
   rows.forEach((row, i) => {
     if (i > 0) out.push('');
@@ -198,19 +235,16 @@ export async function newFoldersSection(deps = {}) {
     const nf = newFoldersOf(row);
     out.push(field('Setting', nf.mode === 'send' ? `Send to ${names(row, nf.tenantIds)}` : NEW_FOLDERS_TEXT[nf.mode]));
     out.push(field('Workspaces', workspaceList(row)));
-    const here = thisFolder(row, dir, ctx);
+    const here = thisFolder(row, view.dir, view.ctx);
     if (here != null) out.push(field('This folder', here));
   });
   return out;
 }
 
-export async function accountSection(deps = {}) {
-  const accounts = await listAccounts(deps);
+function accountSection(view) {
+  const { rows, health, def } = view;
   const machine = ['This machine', field('ChatGPT plan', chatgptPlan())];
-  if (accounts.length === 0) return [NOT_LINKED, ''].concat(machine);
-  const health = await healthByKey(accounts, deps);
-  const rows = await listAccounts(deps);
-  const def = await getDefaultKey(deps);
+  if (rows.length === 0) return [NOT_LINKED, ''].concat(machine);
   const several = rows.length > 1;
   const out = [];
   rows.forEach((row) => {
@@ -233,15 +267,15 @@ function crashText(mode) {
   return 'Off';
 }
 
-export function privacySection() {
+function privacySection() {
   return [field('Crash reports', crashText(crashMode()))];
 }
 
-export async function allSections(deps = {}) {
+function allSections(view) {
   const parts = [
-    ['Rules', await rulesSection(deps)],
-    ['New folders', await newFoldersSection(deps)],
-    ['Account', await accountSection(deps)],
+    ['Rules', rulesSection(view)],
+    ['New folders', newFoldersSection(view)],
+    ['Account', accountSection(view)],
     ['Crash reports', privacySection()],
   ];
   const out = [];
@@ -254,18 +288,53 @@ export async function allSections(deps = {}) {
   return out;
 }
 
-const SECTIONS = {
-  keys: keysLines,
-  rules: rulesSection,
-  'new-folders': newFoldersSection,
-  account: accountSection,
-  privacy: privacySection,
-  all: allSections,
+function block(tag, lines) {
+  return [`<${tag}>`].concat(lines, [`</${tag.split(' ')[0]}>`]);
+}
+
+// A workspace.mjs listing run in-process; a failure's ✗ line stays inside the block for the skill to show.
+async function listingBlock(tag, argv, deps) {
+  const result = await workspaceCommand(argv, deps);
+  return block(tag, result.ok ? result.lines : result.lines.concat(result.stderr.map((l) => l.trim())));
+}
+
+// The skill's one read call per view: what to show, the routing keys, and every listing the next question needs.
+// listings: 'rules' and/or 'new-folders' blocks per account; labels: the menu's option labels; hereCards: one card per Rules account.
+const VIEWS = {
+  menu: { show: screen, health: true, listings: ['rules', 'new-folders'], labels: true, hereCards: true },
+  rules: { show: rulesSection, health: false, listings: ['rules'], hereCards: true },
+  'new-folders': { show: newFoldersSection, health: false, listings: ['new-folders'] },
+  account: { show: accountSection, health: true, listings: [] },
+  privacy: { show: privacySection, health: false, listings: [] },
+  all: { show: allSections, health: true, listings: [] },
 };
 
-// `cmd` is the script's first argument; none prints the screen.
+async function viewLines(spec, deps) {
+  const view = await loadView(spec.health, deps);
+  let out = block('show', spec.show(view)).concat(block('keys', keyLines(view)));
+  if (spec.labels) out = out.concat(block('labels', menuLabelLines(view)));
+  const ruled = view.rows.filter((r) => workspaceCount(r) >= 1);
+  if (spec.listings.indexOf('rules') !== -1) {
+    for (const row of ruled) out = out.concat(await listingBlock(`rules account="${row.key}"`, ['rules', '--account', row.key], deps));
+  }
+  if (spec.hereCards) {
+    for (const row of ruled) {
+      const card = hereCardLines(row, view.dir, view.ctx);
+      if (card != null) out = out.concat(block(`here-card account="${row.key}"`, card));
+    }
+  }
+  if (spec.listings.indexOf('new-folders') !== -1) {
+    for (const row of view.rows.filter((r) => isMultiTenant(r))) {
+      out = out.concat(await listingBlock(`new-folders account="${row.key}"`, ['new-folders', '--account', row.key], deps));
+    }
+  }
+  return out;
+}
+
+// `cmd` is the script's first argument; none is the menu. `keys` alone prints bare lines, as the setup wizard parses them.
 export async function settingsLines(cmd, deps = {}) {
-  if (cmd == null) return screenLines(deps);
-  if (Object.prototype.hasOwnProperty.call(SECTIONS, cmd)) return SECTIONS[cmd](deps);
-  throw new UserError('Usage: settings.mjs [keys | rules | new-folders | account | privacy | all]');
+  if (cmd === 'keys') return keysLines(deps);
+  const view = cmd == null ? 'menu' : cmd;
+  if (!Object.prototype.hasOwnProperty.call(VIEWS, view)) throw new UserError(USAGE);
+  return viewLines(VIEWS[view], deps);
 }

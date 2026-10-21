@@ -4,6 +4,7 @@ import {
   addAccount, setDefault, listAccounts, writeIndex,
 } from '../lib/accounts.mjs';
 import { setCredentials, deleteCredentials } from '../lib/credentials.mjs';
+import { initSessionWorkspace } from '../lib/workspace.mjs';
 import { createBridge, LOGIN_TOOL, STATUS_TOOL } from '../lib/mcp-bridge.mjs';
 import {
   makeHome, fakeKeyring, fakeCredMan, credentialBlob,
@@ -337,6 +338,8 @@ function statusBridge(deps, over = {}) {
   const bridge = createBridge({
     // The hook-trust probe would spawn codex app-server; the hermetic gate forbids it.
     probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
+    // The repo map is injected: no real git file is read. The folder comes from the recorded session state.
+    loadRepoMap: () => ({ version: 1, roots: {} }),
     ...deps,
     url: URL_UNDER_TEST,
     ensureHooks: () => NO_REPAIR,
@@ -356,6 +359,16 @@ function statusBridge(deps, over = {}) {
     return out[out.length - 1].result.content[0].text;
   };
   return { bridge, ask };
+}
+
+// The thread id Codex gives the MCP server; the hermetic env scrubs it, so each case sets its own.
+function inThread(t, id) {
+  const previous = process.env.CODEX_THREAD_ID;
+  process.env.CODEX_THREAD_ID = id;
+  t.after(() => {
+    if (previous === undefined) delete process.env.CODEX_THREAD_ID;
+    else process.env.CODEX_THREAD_ID = previous;
+  });
 }
 
 // THE DEFECT. The top-level fields of a linkStatus answer describe the DEFAULT account, so a dead
@@ -398,6 +411,111 @@ test('12. a healthy default reports no discrepancy', async (t) => {
   assert.match(text, /This machine is linked to Beezi/);
   assert.doesNotMatch(text, /cannot report just now/);
   assert.doesNotMatch(text, /linked Beezi accounts can report/);
+});
+
+// The route and plugin lines come from local files only: fetchImpl throws, and the answer still
+// names where this folder goes and the installed version (no update reading cached here).
+test('13. beezi_status names this folder\'s route and the plugin version without the network', async (t) => {
+  makeHome(t);
+  const deps = { run: fakeKeyring().run, platform: 'darwin', checkEnvironment: () => ({ status: 'ok' }) };
+  await setCredentials(KEY_A, credentialBlob({ client_id: `c-${KEY_A}`, access_token: `at-${KEY_A}` }), deps);
+  await addAccount({ key: KEY_A, email: 'dev@acme.io', name: 'Dev', clientId: `c-${KEY_A}`, tenants: [{ id: 'A', name: 'Acme' }] });
+  initSessionWorkspace('thread-outside', { cwd: '/' });   // `/` keys as outside a project before any walk
+  inThread(t, 'thread-outside');
+  const { ask } = statusBridge(deps);
+
+  const text = await ask();
+
+  assert.match(text, /This machine is linked to Beezi/);
+  assert.match(text, /^Here: sessions outside a project → Acme \(default\)$/m);
+  assert.match(text, /^Plugin: \S+ \(could not check for updates\)$/m);
+});
+
+// The repo case, on a fixed path the injected repo map knows: no git walk, no config read.
+test('14. beezi_status names the repo this folder is and where its analytics go', async (t) => {
+  makeHome(t);
+  const repo = '/work/labacus-suite';
+  const deps = { run: fakeKeyring().run, platform: 'darwin', checkEnvironment: () => ({ status: 'ok' }),
+    loadRepoMap: () => ({ version: 1, roots: { [repo]: { origin: 'https://github.com/acme/labacus-suite.git' } } }) };
+  await setCredentials(KEY_A, credentialBlob({ client_id: `c-${KEY_A}`, access_token: `at-${KEY_A}` }), deps);
+  await addAccount({ key: KEY_A, email: 'dev@acme.io', name: 'Dev', clientId: `c-${KEY_A}`, tenants: [{ id: 'A', name: 'Acme' }] });
+  initSessionWorkspace('thread-repo', { cwd: repo });   // the thread's folder, not the MCP server's cwd
+  inThread(t, 'thread-repo');
+  const { ask } = statusBridge(deps);
+
+  assert.match(await ask(), /^This repo: labacus-suite → Acme \(default\)$/m);
+});
+
+// Several linked accounts: each route line names its account.
+test('15. with several accounts each route line names its account', async (t) => {
+  makeHome(t);
+  const repo = '/work/labacus-suite';
+  const deps = { run: fakeKeyring().run, platform: 'darwin', checkEnvironment: () => ({ status: 'ok' }),
+    loadRepoMap: () => ({ version: 1, roots: { [repo]: { origin: 'https://github.com/acme/labacus-suite.git' } } }) };
+  for (const [key, email, tenant] of [[KEY_A, 'dev@acme.io', { id: 'A', name: 'Acme' }], [KEY_B, 'dev@northwind.io', { id: 'N', name: 'Northwind' }]]) {
+    await setCredentials(key, credentialBlob({ client_id: `c-${key}`, access_token: `at-${key}` }), deps);
+    await addAccount({ key, email, name: 'Dev', clientId: `c-${key}`, tenants: [tenant] });
+  }
+  initSessionWorkspace('thread-repo', { cwd: repo });
+  inThread(t, 'thread-repo');
+  const { ask } = statusBridge(deps);
+
+  const text = await ask();
+
+  assert.match(text, /^This repo \(dev@acme\.io\): labacus-suite → Acme \(default\)$/m);
+  assert.match(text, /^This repo \(dev@northwind\.io\): labacus-suite → Northwind \(default\)$/m);
+});
+
+// The MCP server's own cwd is the plugin cache: with no folder recorded for the thread, no route
+// line is printed rather than one naming the process cwd.
+test('16. with no recorded folder beezi_status prints no route line', async (t) => {
+  makeHome(t);
+  const deps = { run: fakeKeyring().run, platform: 'darwin', checkEnvironment: () => ({ status: 'ok' }) };
+  await setCredentials(KEY_A, credentialBlob({ client_id: `c-${KEY_A}`, access_token: `at-${KEY_A}` }), deps);
+  await addAccount({ key: KEY_A, email: 'dev@acme.io', name: 'Dev', clientId: `c-${KEY_A}`, tenants: [{ id: 'A', name: 'Acme' }] });
+  const { ask } = statusBridge(deps);
+
+  const text = await ask();
+
+  assert.doesNotMatch(text, /^(This repo|This folder|Here)\b/m);
+  assert.doesNotMatch(text, /beezi-codex-plugin/);
+  assert.match(text, /^Plugin: /m);
+});
+
+// With no thread id the bridge cannot tell which thread asked: another thread's newest folder is not this one's.
+test('17. with no thread id beezi_status names no other thread\'s folder', async (t) => {
+  makeHome(t);
+  const repo = '/work/labacus-suite';
+  const deps = { run: fakeKeyring().run, platform: 'darwin', checkEnvironment: () => ({ status: 'ok' }),
+    loadRepoMap: () => ({ version: 1, roots: { [repo]: { origin: 'https://github.com/acme/labacus-suite.git' } } }) };
+  await setCredentials(KEY_A, credentialBlob({ client_id: `c-${KEY_A}`, access_token: `at-${KEY_A}` }), deps);
+  await addAccount({ key: KEY_A, email: 'dev@acme.io', name: 'Dev', clientId: `c-${KEY_A}`, tenants: [{ id: 'A', name: 'Acme' }] });
+  initSessionWorkspace('thread-other', { cwd: repo });
+  const { ask } = statusBridge(deps);
+
+  const text = await ask();
+
+  assert.doesNotMatch(text, /^(This repo|This folder|Here)\b/m);
+  assert.doesNotMatch(text, /labacus-suite/);
+  assert.match(text, /^Plugin: /m);
+});
+
+// A thread with no recorded state of its own gets no route line, even when another thread has one.
+test('18. a thread with nothing recorded names no other thread\'s folder', async (t) => {
+  makeHome(t);
+  const repo = '/work/labacus-suite';
+  const deps = { run: fakeKeyring().run, platform: 'darwin', checkEnvironment: () => ({ status: 'ok' }),
+    loadRepoMap: () => ({ version: 1, roots: { [repo]: { origin: 'https://github.com/acme/labacus-suite.git' } } }) };
+  await setCredentials(KEY_A, credentialBlob({ client_id: `c-${KEY_A}`, access_token: `at-${KEY_A}` }), deps);
+  await addAccount({ key: KEY_A, email: 'dev@acme.io', name: 'Dev', clientId: `c-${KEY_A}`, tenants: [{ id: 'A', name: 'Acme' }] });
+  initSessionWorkspace('thread-other', { cwd: repo });
+  inThread(t, 'thread-mine');
+  const { ask } = statusBridge(deps);
+
+  const text = await ask();
+
+  assert.doesNotMatch(text, /^(This repo|This folder|Here)\b/m);
+  assert.match(text, /^Plugin: /m);
 });
 
 // The Windows credential store is keyed by TARGET NAME ALONE — the keyspace a (service, account)

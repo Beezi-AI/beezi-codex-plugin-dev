@@ -95,21 +95,23 @@ node "<plugin-root>/scripts/workspace.mjs" rules --account <key>
 ```
 
 Its lines include one `W. <workspace> account=<key> tenant=<id> role=<role>` per workspace and
-`here: <short> (<label>) → <R<n> | no rule> account=<key> rule=<n|none> kind=<…> match=<…>` (no
-` (<label>)` when `kind=outside`): `<short>` is the text after `here: ` up to ` (` or ` →`, `<label>`
-the text in the parentheses. Only when the `here:` line has `rule=none`, ask:
+`here: <short> (<label>) → <R<n> | no rule> now=<ids|none|pending> path=<path> account=<key> rule=<n|none> kind=<…> match=<…>`
+(no ` (<label>)` and no `path=` when `kind=outside`): `<short>` is the text after `here: ` up to
+` (` or ` →`, `<label>` the text in the parentheses. `now=` is where its analytics go today (`pending`
+while held); `path=`'s value may hold spaces and runs up to ` account=`. Only when the `here:` line
+has `rule=none`, ask:
 
-| `kind=`   | Question                                                            | Last choice               |
-| --------- | ------------------------------------------------------------------- | ------------------------- |
-| `repo`    | "Where should analytics for <short> go?"                            | "Don't track this repo"   |
-| `folder`  | "Where should analytics for <label> (and everything inside it) go?" | "Don't track this folder" |
-| `outside` | "Where should analytics for sessions outside a project folder go?"  | "Don't track these"       |
+| `kind=`   | Question                                                                                   | Last choice           |
+| --------- | ------------------------------------------------------------------------------------------ | --------------------- |
+| `repo`    | "Where should analytics for <short>, the repo you're in, go?"                              | "Don't track <short>" |
+| `folder`  | "Where should analytics for <label>, the folder you're in (and everything inside it), go?" | "Don't track <short>" |
+| `outside` | "Where should analytics for sessions outside a project folder go?"                         | "Don't track these"   |
 
 With more than one `pending=yes` line, add the account after the question: " (<who>)", `<who>` being
 the text before `: ` on the output's first line. Choices: one per `W.` line — the workspace name (the
 text after `W. ` up to ` account=`), described by the line's `role=` value (nothing when it is empty)
-— then the last choice, described "Nothing from <short> is uploaded" ("Nothing from sessions outside
-a project folder is uploaded" for `outside`). Several workspaces may be chosen.
+— then the last choice, described "Not tracked: nothing from <short> is sent" ("Not tracked: nothing
+from sessions outside a project folder is sent" for `outside`). Several workspaces may be chosen.
 
 - **`request_user_input`** only when that tool is listed this turn **and** there are at most 2 `W.`
   lines (3 choices): header "Beezi", the question followed by " Pick one, or name several under
@@ -117,8 +119,8 @@ a project folder is uploaded" for `outside`). Several workspaces may be chosen.
 - **Otherwise one plain sentence** that ends your reply, never a numbered list or a bullet menu: the
   question without its "?", a colon, each workspace as "<name> (<role>)" (just "<name>" with no
   role), then " — one or more — or <last choice, lower-case first letter>?". For example: "Where
-  should analytics for acme-api go: Acme (Owner), Beta (User), Gamma (User) — one or more — or don't
-  track this repo?"
+  should analytics for acme-api, the repo you're in, go: Acme (Owner), Beta (User), Gamma (User) — one
+  or more — or don't track acme-api?"
 
 When the answer arrives, run, with `<ids>` = the chosen workspaces' `tenant=` values joined by commas
 (e.g. `t1,t2`), or `none` when the last choice was picked (it wins over the others):

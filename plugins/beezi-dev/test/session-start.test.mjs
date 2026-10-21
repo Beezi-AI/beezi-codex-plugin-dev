@@ -41,6 +41,9 @@ const unresolved = (getAuthentication) => ({
   linkedSessions: async () => [],
   getAuthentication,
 });
+// What a resolved account says at every start: who it is, its workspace, and where rules change. These
+// rows carry no workspace list, so where the folder's analytics go is not known and no route line shows.
+const banner = (email, workspace = ACCOUNT.tenantName) => `Beezi ✓ ${email}, workspace ${workspace}\n  Change with the settings skill (Rules)`;
 // Nothing in the index at all.
 const NOT_LINKED = { ...store, listAccounts: async () => [], linkedSessions: async () => [] };
 
@@ -90,6 +93,8 @@ const quietBilling = {
 };
 
 const noGit = () => { throw new Error('not a git repository'); };
+// A fixed path that does not exist: the banner walks a real cwd up to its .git and reads its config.
+const WORK = '/work/app';
 
 // Records every account check-in the hook makes: [token, options, deps]. The DEPS are the point —
 // the three seams the hook has to hand over are only assertable on the third argument.
@@ -147,7 +152,7 @@ test('a valid whoami fills an anonymous account row in', async (t) => {
       ...quietBilling,
     },
   );
-  assert.equal(message, null, 'a healthy account still says nothing');
+  assert.equal(message, banner('filled@example.com', 'Acme'), 'a healthy account says only who it is');
   assert.equal(patches.length, 1, 'the row is written exactly once');
   assert.equal(patches[0].key, ACCOUNT.key);
   assert.deepEqual(patches[0].patch, {
@@ -165,7 +170,7 @@ test('a valid whoami refreshes an already-named account and its workspace member
     { ...linked(), updateAccount: async (key, patch) => { patches.push({ key, patch }); },
       fetchImpl, gitImpl: noGit, ...quietBilling },
   );
-  assert.equal(message, null);
+  assert.equal(message, banner('someone@example.com', 'Current workspace'));
   assert.deepEqual(patches, [{ key: ACCOUNT.key, patch: {
     email: 'someone@example.com', name: 'Dev', tenantId: null, tenantName: null, tenants: [{ ...tenants[0], joinedAt: null }],
   } }], 'known identities still refresh membership on every valid answer');
@@ -193,7 +198,7 @@ test('a rejected token is renewed once before the link is called bad', async (t)
     },
   );
   assert.equal(issued, 1, 'the initial bearer rides on the session; only the refresh is a read');
-  assert.equal(message, null, 'a recovered link says nothing');
+  assert.equal(message, banner(ACCOUNT.email), 'a recovered link says nothing more');
 });
 
 test('a token still rejected after renewal reports a rejection, not a revocation', async (t) => {
@@ -237,14 +242,14 @@ test('an unreachable whoami is treated as valid and stays silent', async (t) => 
     { session_id: 's1', cwd: null },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
-  assert.equal(message, null);
+  assert.equal(message, banner(ACCOUNT.email));
 });
 
 test('a connected repo is announced with its project name', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => ok({ connected: true, projectName: 'Apollo' }) });
   const message = await runSessionStart(
-    { session_id: 's1', cwd: process.cwd() },
+    { session_id: 's1', cwd: WORK },
     {
       ...linked(),
       fetchImpl,
@@ -259,7 +264,7 @@ test('a repo with no Beezi project is announced, without claiming it is untracke
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => ok({ connected: false }) });
   const message = await runSessionStart(
-    { session_id: 's1', cwd: process.cwd() },
+    { session_id: 's1', cwd: WORK },
     {
       ...linked(),
       fetchImpl,
@@ -290,21 +295,107 @@ test('a cwd outside any repo is not announced, while crash consent is offered on
     { session_id: 's2', cwd: home },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
-  assert.equal(again, null, 'the same unconnected folder does not re-prompt');
+  assert.equal(again, banner('a@b.c'), 'the same unconnected folder does not re-prompt');
   assert.ok(!calls.some((u) => u.endsWith(ENDPOINTS.reposStatus)), 'no repo probe without an origin');
 });
 
-test('a repo probe that fails leaves session start silent', async (t) => {
+test('a repo probe that fails adds no repo line', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => { throw new Error('offline'); } });
   const message = await runSessionStart(
-    { session_id: 's1', cwd: process.cwd() },
+    { session_id: 's1', cwd: WORK },
     {
       ...linked(),
       fetchImpl,
       gitImpl: () => 'https://host/org/repo.git',
       ...quietBilling,
     },
+  );
+  assert.equal(message, banner('a@b.c'));
+});
+
+// ─── the banner and the repo probe ──────────────────────────────────────────────────────────────
+//
+// An analytics workspace answers "connected" for every repo, so its probe is a wasted round trip
+// inside the hook budget: the banner already says where the analytics go. A platform workspace's
+// repo→project line still means something and keeps its probe.
+
+const workspaceOf = (type) => [{ id: 'A', name: 'Acme', type }];
+
+test('an analytics workspace gets the banner and no /repos/status call', async (t) => {
+  const home = tmpHome(t);
+  const { fetchImpl, calls } = router({
+    whoami: () => ok({ email: 'dev@acme.io', tenants: workspaceOf('analytics') }),
+    repos: () => ok({ connected: true, projectName: 'Apollo' }),
+  });
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: home, source: 'startup' },
+    { ...linked(), fetchImpl, gitImpl: () => 'https://host/org/repo.git', ...quietBilling },
+  );
+  // The hermetic home is a temp dir, which keys as outside a project.
+  assert.equal(message, [
+    'Beezi ✓ dev@acme.io, workspace Acme',
+    '  Sessions outside a project → Acme (default)',
+    '  Change with the settings skill (Rules)',
+  ].join('\n'));
+  assert.ok(!calls.some((u) => u.endsWith(ENDPOINTS.reposStatus)), 'no repo probe for an analytics workspace');
+});
+
+test('a platform workspace keeps its repo probe and line, after the banner', async (t) => {
+  const home = tmpHome(t);
+  const { fetchImpl, calls } = router({
+    whoami: () => ok({ email: 'dev@acme.io', tenants: workspaceOf('platform') }),
+    repos: () => ok({ connected: true, projectName: 'Apollo' }),
+  });
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: home, source: 'startup' },
+    { ...linked(), fetchImpl, gitImpl: () => 'https://host/org/repo.git', ...quietBilling },
+  );
+  assert.equal(message, [
+    'Beezi ✓ dev@acme.io, workspace Acme',
+    '  Sessions outside a project → Acme (default)',
+    '  Change with the settings skill (Rules)',
+    'Beezi: repo connected to "Apollo". Sessions here are tracked.',
+  ].join('\n'));
+  assert.equal(calls.filter((u) => u.endsWith(ENDPOINTS.reposStatus)).length, 1);
+});
+
+// The checkout's folder name differs from its remote's, so only repo routing (the warmed map) prints
+// `labacus-suite`; without it the banner would fall back to the folder, `checkout`. Prune is stubbed
+// because no real .git exists at the fixed path, and the save never lands, so the map on disk stays
+// empty: the banner can only learn the repo from the map this start warmed.
+async function bannerAfterPrewarm(t, saveRepoMap) {
+  tmpHome(t); // empty repo map
+  const checkout = '/work/checkout';
+  const { fetchImpl } = router({ whoami: () => ok({ email: 'dev@acme.io', tenants: workspaceOf('analytics') }) });
+  const gitImpl = (args) => {
+    if (args[0] === 'rev-parse' && args[1] === '--show-toplevel') return checkout;
+    if (args[0] === 'remote') return 'https://github.com/acme/labacus-suite.git';
+    throw new Error('not a git repository');
+  };
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: checkout, source: 'startup' },
+    { ...linked(), fetchImpl, gitImpl, ...quietBilling, pruneRepoMap: () => 0, saveRepoMap },
+  );
+  return message.split('\n')[1];
+}
+
+test('the banner names a repo the pre-warm just discovered', async (t) => {
+  const saved = [];
+  assert.equal(await bannerAfterPrewarm(t, (map) => { saved.push(map); }), '  labacus-suite → Acme (default)');
+  assert.equal(saved.length, 1, 'the discovered root is saved');
+});
+
+test('a repo-map save that fails still lets the banner name the repo', async (t) => {
+  assert.equal(await bannerAfterPrewarm(t, () => { throw new Error('disk full'); }), '  labacus-suite → Acme (default)');
+});
+
+test('compact shows no banner', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router();
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: null, source: 'compact' },
+    { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
   assert.equal(message, null);
 });
@@ -359,7 +450,7 @@ test('a stale plan is captured from auth.json without asking anyone', async (t) 
   assert.ok(captured, 'the plan was captured');
   assert.equal(captured.plan, 'pro_20x', "Codex's bare `pro` is the $200 20× tier");
   assert.equal(captured.source, 'subscription');
-  assert.equal(message, null, 'and no nudge is emitted for a machine we just resolved');
+  assert.equal(message, banner('a@b.c'), 'and no nudge is emitted for a machine we just resolved');
 });
 
 // G-10-1 L1/L3 for this path. runSessionStart resolves the source ONCE and then captures the plan;
@@ -1049,7 +1140,7 @@ test('a check-in that throws does not break session start', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => ok({ connected: true, projectName: 'Apollo' }) });
   const message = await runSessionStart(
-    { session_id: 's1', cwd: process.cwd() },
+    { session_id: 's1', cwd: WORK },
     {
       ...linked(),
       fetchImpl,
@@ -1124,7 +1215,7 @@ test('a machine with no auth.json captures its plan from the app server', async 
   assert.equal(captured.source, 'subscription', 'resolved from what Codex itself said');
   assert.equal(captured.authType, 'chatgpt', 'recorded so the NEXT session resolves the same way');
   assert.equal(captured.accountId, 'eb76c91d-9f94-4807-99aa-ed350b779ecd');
-  assert.equal(message, null, 'and the machine is not nudged about a plan it just captured');
+  assert.equal(message, banner('a@b.c'), 'and the machine is not nudged about a plan it just captured');
 });
 
 test('the plan captured on such a machine survives the next session', async (t) => {
@@ -1158,7 +1249,7 @@ test('the plan captured on such a machine survives the next session', async (t) 
   );
   const reverted = written.find((c) => c.source === 'unknown');
   assert.equal(reverted, undefined, 'syncBillingSource must not overwrite the captured source');
-  assert.equal(message, null, 'and no nudge — the machine knows what it bills');
+  assert.equal(message, banner('a@b.c'), 'and no nudge — the machine knows what it bills');
 });
 
 test('a machine that neither Codex nor auth.json can name is still nudged, not guessed at', async (t) => {
@@ -1242,6 +1333,29 @@ test('one rejected account is named and skipped; the other still reports', async
     'the rejected account is skipped for the session, and the healthy one is not');
   assert.match(message, /W-a1b2c3d4 — Beezi: repo connected to "App"/,
     'each announcement names the workspace it came from');
+});
+
+test('the warnings come first, then the banner, then the repo lines', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router({
+    whoami: (init) => (init.headers.Authorization === 'Bearer tok' ? ok({}) : status(401)),
+    repos: () => ok({ connected: true, projectName: 'App' }),
+  });
+  const message = await runSessionStart(
+    { session_id: 's1', cwd: null },
+    {
+      ...both(),
+      getAuthentication: async () => ({ accessToken: 'tok-b', state: 'ready' }),
+      fetchImpl,
+      gitImpl: () => 'https://host/org/repo.git',
+      ...quietBilling,
+      syncAccount: syncSpy(),
+    },
+  );
+  const lines = message.split('\n');
+  assert.match(lines[0], /W-99887766 is not reporting/);
+  assert.deepEqual(lines.slice(1, 3), banner(ACCOUNT.email).split('\n'));
+  assert.match(lines[3], /^W-a1b2c3d4 — Beezi: repo connected to "App"/);
 });
 
 test('an account that is linked but produced no session is explained, not reported as unlinked', async (t) => {

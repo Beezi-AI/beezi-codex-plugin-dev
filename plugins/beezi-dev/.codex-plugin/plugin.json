@@ -1,6 +1,6 @@
 {
   "name": "beezi-dev",
-  "version": "0.22.10-dev.5838",
+  "version": "0.23.0-dev.5919",
   "description": "Reports Codex session token analytics for Beezi task branches, and drafts tickets to create on your board (Jira / Azure DevOps) or in Beezi. — dev environment build.",
   "author": {
     "name": "Beezi"
