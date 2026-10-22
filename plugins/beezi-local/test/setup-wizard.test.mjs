@@ -122,7 +122,7 @@ test('a multi-workspace account answers New folders, then joined workspaces, the
       'routes=1',
     ].join('\n')),
     [`workspace.mjs rule add --repo github.com/acme/api ${ACCOUNT} t2 --defer-upload`]: ok('✓ api → Beta (rule R1).\nrule=1\n'),
-  }), [2, 0, [1]]);
+  }), [3, 0, [1]]);
   assert.equal(await runSetup(ctx), 0);
   assert.deepEqual(ctx.runs, [
     'accounts.mjs list', 'login.mjs',
@@ -148,7 +148,7 @@ test('a multi-workspace account answers New folders, then joined workspaces, the
   ]);
 });
 
-test('the one New-folders question sends everything to the picked workspace, or leaves it to per-repo questions', async () => {
+test('the one New-folders question sends everything to the picked workspace or several, or leaves it to per-repo questions', async () => {
   const unset = ok([...W, 'history=37 places=4', `new-folders=ask set=no multi=yes account=${KEY}`, ''].join('\n'));
   const SEND = `workspace.mjs new-folders send t1 ${ACCOUNT} --defer-upload`;
   const ASK = `workspace.mjs new-folders ask ${ACCOUNT} --defer-upload`;
@@ -160,14 +160,21 @@ test('the one New-folders question sends everything to the picked workspace, or 
   assert.deepEqual(question.options, [
     { label: 'Acme', description: everything },
     { label: 'Beta', description: everything },
+    { label: 'Several workspaces…', description: 'Pick two or more; everything goes to each of them' },
     { label: 'Let me choose per repo', description: 'Beezi asks about each repo and folder with history next, and new ones when a session starts there' },
   ]);
   assert.deepEqual(picked.runs.slice(2, 5), [NEW_FOLDERS, SEND, CAPTURE]);
   assert.equal(picked.printed[0], '✓ New folders → Acme.');
 
-  const perRepo = fakeCtx(flow({ [NEW_FOLDERS]: unset }), [2]);
+  const perRepo = fakeCtx(flow({ [NEW_FOLDERS]: unset }), [3]);
   await runSetup(perRepo);
   assert.deepEqual(perRepo.runs.slice(2, 5), [NEW_FOLDERS, ASK, CAPTURE]);
+
+  const SEND_BOTH = `workspace.mjs new-folders send t1,t2 ${ACCOUNT} --defer-upload`;
+  const several = fakeCtx(flow({ [NEW_FOLDERS]: unset, [SEND_BOTH]: ok('✓ New folders → Acme and Beta.\nnew-folders=send\n') }), [2, [0, 1]]);
+  await runSetup(several);
+  assert.equal(several.asked[1].question, 'Which workspaces should get analytics from this machine?');
+  assert.deepEqual(several.runs.slice(2, 5), [NEW_FOLDERS, SEND_BOTH, CAPTURE]);
 
   const dismissed = fakeCtx(flow({ [NEW_FOLDERS]: unset }), []);
   await runSetup(dismissed);

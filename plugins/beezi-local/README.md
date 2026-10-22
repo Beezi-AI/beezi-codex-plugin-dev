@@ -37,9 +37,10 @@ token in Codex's store while the analytics hooks read `~/.beezi-codex/credential
 would have to be linked twice.
 
 After the browser sign-in, an account in several workspaces is asked one question, "Where should
-analytics from this machine go?": each workspace (described with how many past sessions go there)
-or "Let me choose per repo", which goes on to a question per repo and folder. With two workspaces
-it is a choice; with more, Codex asks it as one sentence with a numbered list.
+analytics from this machine go?": each workspace (described with how many past sessions go there),
+"Several workspaces…" (pick two or more; everything goes to each), or "Let me choose per repo",
+which goes on to a question per repo and folder. With two workspaces it is a choice, and several
+are named under Other; with more, Codex asks it as one sentence with a numbered list.
 
 Once signed in, every new Codex thread starts with a short banner: the account you're signed in
 as, its workspaces, and where this folder's analytics go (or that it has no rule yet). It needs the
