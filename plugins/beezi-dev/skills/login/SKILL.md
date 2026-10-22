@@ -178,31 +178,45 @@ The `<setup account="<key>">` block is for you only: one `W. <workspace> account
 role=<role>` line per workspace, then `sessions=<N> places=<M>` (the past sessions the history upload
 would send, and the repos and folders they ran in) or a `✗` line when they could not be counted
 (write it verbatim), then the options as `O<i>. <label> — <description>` lines. `O<i>` for `i` up to
-the number of `W.` lines is the `i`-th `W.` line's workspace; the last `O` line is "Let me choose
-per repo".
+the number of `W.` lines is the `i`-th `W.` line's workspace; the next `O` line is "Several
+workspaces…", and the last is "Let me choose per repo".
 
 Ask ONE single-select question, "Where should analytics from this machine go?":
 
 - **`request_user_input`** only when that tool is listed this turn **and** there are at most 2 `W.`
-  lines (3 choices): header "Beezi", one choice per `O` line in order, its text after `O<i>. `
-  split at the last ` — ` into the label and the description, exactly. A typed answer (Other) that
-  names a `W.` line's workspace (ignoring case) is that workspace; one that names none is a dismissal.
+  lines (3 choices): header "Beezi", the question
+  "Where should analytics from this machine go? Pick one, or name several under Other.", one choice
+  per `O` line in order except the "Several workspaces…" line, its text after `O<i>. ` split at the
+  last ` — ` into the label and the description, exactly. A typed answer (Other) that names one or
+  more `W.` lines' workspaces (ignoring case) is those workspaces, and "both" or "all" is every `W.`
+  line; one that names none, or names a workspace together with "per repo", is a dismissal.
 - **Otherwise** — the tool is not listed, or there are 3 or more `W.` lines — one plain sentence
   with the `O` lines as a numbered list, never a 4-option `request_user_input` call: the question
   without its "?", a colon, each `O` line's text after its `O` ("1. Acme — Everything goes here: …"),
-  joined by ", " with "or " before the last, then "?". The user answers with a number or a
-  workspace name; anything else is a dismissal.
+  joined by ", " with "or " before the last, then "?". Every `O` line is numbered, "Several
+  workspaces…" included. The user answers with a number, or with one or more workspace names.
+  Several numbers that all point at workspace lines are those workspaces, and "both" or "all" is
+  every `W.` line. Two or more numbers that include the "Several workspaces…" or the "Let me choose
+  per repo" number are a dismissal, and so is an answer that names a workspace together with "per
+  repo", and anything else.
 
 Then, by the answer:
 
-- a workspace → run, with that `W.` line's `tenant=` value:
+- one or more workspaces → run, with their `W.` lines' `tenant=` values joined by commas as
+  `<tenants>` (one value for one workspace):
 
   ```
-  node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenant> --account <key> --defer-upload
+  node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenants> --account <key> --defer-upload
   ```
 
   write its first line verbatim, then carry on with `--from plan` (this folder now follows New
   folders, so there is no question about it).
+- "Several workspaces…" → ask once more as one plain sentence: "Which workspaces should get
+  analytics from this machine", a colon, each `W.` line as `<name> (<role>)` (just `<name>` when it
+  has no role) joined by ", ", then " — one or more?". For example: "Which workspaces should get
+  analytics from this machine: Acme (Owner), Beta (User), Gamma (User) — one or more?". The
+  workspaces named or numbered in the answer go to the `new-folders send <tenants>` command above;
+  one workspace is fine. Nothing named, or a dismissal, is a dismissal of the first question.
 - "Let me choose per repo" → run
   `node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload`,
   write its first line verbatim, then carry on with `--from here`.
@@ -229,15 +243,17 @@ Its `here:` line is
 Choices: one per `W.` line of this block, as in step 4a, then the last choice, described "Not
 tracked: nothing from <short> is sent" ("Not tracked: nothing from sessions outside a project folder
 is sent" for `outside`); shown the way step 4a shows its question. Then run, with `<ids>` = the
-chosen `tenant=` values joined by commas, or `none` when the last choice was picked (it wins over
-the others):
+chosen `tenant=` values joined by commas, or `none` only when the last choice is the whole answer:
 
 ```
 node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> --defer-upload <ids>
 ```
 
-and write its first line verbatim. Nothing chosen or a skipped question runs nothing. Then carry on
-with `--from plan`.
+and write its first line verbatim. An answer with the last choice together with any workspace runs
+nothing: ask the same question once more, starting with
+`"Don't track" can't be combined with a workspace — pick one or the other.` A second mixed answer
+counts as a skipped question. Nothing chosen or a skipped question runs nothing. Then carry on with
+`--from plan`.
 
 ### Step 2 — capture the ChatGPT plan
 
@@ -393,14 +409,20 @@ Acme" or "Now: no rule yet"). Several repos and folders may be chosen.
   repos and folders should also send analytics to NewCo: 1) acme-api (Now: Acme), 2) notes (Now: no
   rule yet) — reply with the numbers to send, or none — Their past sessions will be sent there too."
 
+An answer with "None of these" (or "none") together with any repo is not an answer: run no
+`J<i>-command=` for it, and ask the same question once more, starting with
+`"None of these" can't be combined with repos — pick one or the other.` A second mixed answer
+counts as a skipped question, so no `done-command` runs.
+
 For each repo and folder the user picked for a workspace, run its `J<i>-command=` text EXACTLY ONCE,
 changing nothing except the final `<tenant>`: that workspace's `tenant=` value (its `W.` line's
 `tenant=`, e.g. `t2`). Map each answered position to the `J` line it listed, then run that line's
 own `J<i>-command=` (J numbers are global across accounts and need not start at 1); never rebuild the
 command or re-quote its path yourself. A repo the
-user did not pick for a workspace runs nothing for that workspace. After the last `new=yes` workspace's
-question has been answered (not skipped or dismissed), run the `done-command=` text EXACTLY ONCE;
-otherwise run no `done-command`, and the next login or sync asks again.
+user did not pick for a workspace runs nothing for that workspace. After every new workspace's
+question has been answered ("None of these" alone is an answer; skipped, dismissed or mixed is
+not), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and the next
+login or sync asks again.
 
 Write each command's first line verbatim, then carry on with `--from routes`.
 
@@ -468,10 +490,13 @@ is sent" for `outside`). Several workspaces may be chosen.
   (User), Gamma (User) — one or more — or don't track this repo?"
 
 Then, for each answered `P` line, run its `P<i>-command=` text EXACTLY ONCE, changing nothing except
-the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` when
-the last choice was picked (it wins over the others). Never rebuild the command or re-quote its path
-yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
-sent this time, and the next login or the `sync` skill asks again.
+the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` only
+when the last choice is the whole answer. Never rebuild the command or re-quote its path yourself.
+An answer with the last choice together with any workspace runs nothing: ask the same question once
+more, starting with `"Don't track" can't be combined with a workspace — pick one or the other.`
+A second mixed answer counts as a skipped question. A `P` line with nothing chosen, or a skipped
+question, runs nothing: its sessions are not sent this time, and the next login or the `sync` skill
+asks again.
 
 Write each command's first line verbatim, then go to step 4b.
 

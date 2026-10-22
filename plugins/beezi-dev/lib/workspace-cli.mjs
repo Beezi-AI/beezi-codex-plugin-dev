@@ -251,11 +251,13 @@ function refValues(refs) {
   return values;
 }
 
-// Ids/names/positions (comma lists too) in row order; `none` anywhere wins and means send nowhere.
+// Ids/names/positions (comma lists too) in row order; `none` alone means send nowhere, and `none` with a workspace is refused.
 function selection(row, refs) {
   const values = refValues(refs);
   if (values.length === 0) throw new UserError(USAGE);
-  if (values.some((v) => v.toLowerCase() === 'none')) return [];
+  const nones = values.filter((v) => v.toLowerCase() === 'none').length;
+  if (nones === values.length) return [];
+  if (nones > 0) throw new UserError('Pick workspaces or none, not both.');
   const picked = values.map((v) => resolveTenantRef(row, v));
   return tenantsOf(row).map((t) => t.id).filter((id) => picked.indexOf(id) !== -1);
 }
@@ -425,10 +427,10 @@ async function ruleAdd(cx, argv) {
   const row = await resolveAccount(account);
   requireKnownWorkspaces(row);
   requireNoneForSingle(row, refs);
+  const tenantIds = selection(row, refs);
   const ctx = createRouteContext();
   const current = await withSessionState(cx, resolveSession(cx, session), ctx);
   const key = ruleKey(cx, target, choiceDir(cx, current.state), ctx);
-  const tenantIds = selection(row, refs);
   const before = routingOf(row);
   const n = (await setWorkspaceRule(row.key, { kind: key.kind, match: key.match, label: key.label, tenantIds })).index;
   const fresh = await resolveAccount(row.key);

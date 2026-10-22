@@ -19,6 +19,8 @@ const TOOL_MAX_WORKSPACES = 2;
 const TOOL_MAX_QUESTIONS = 3;
 // request_user_input headers are at most 12 characters.
 const TOOL_HEADER = 'Beezi';
+// The re-ask lead for an answer that mixes a "Don't track" choice with a workspace.
+const MIXED_LEAD = '"Don\'t track" can\'t be combined with a workspace — pick one or the other.';
 
 // Resolved from this module, not cwd: hooks run with the user's repository as their working directory.
 export function pluginRoot(deps = {}) {
@@ -136,8 +138,9 @@ function promptText(asks) {
     const idsOf = one
       ? 'the chosen workspaces\' ids joined by commas'
       : `the ids of the workspaces chosen for ${emailOf(a.row)} joined by commas`;
-    parts.push(`${lead} \`${a.command}\`. \`<ids>\` is ${idsOf} (${a.ids}), or \`none\` when "${a.dontTrack}" is chosen; it wins over the others.`);
+    parts.push(`${lead} \`${a.command}\`. \`<ids>\` is ${idsOf} (${a.ids}), or \`none\` only when "${a.dontTrack}" is the whole answer.`);
   });
+  parts.push(`If an answer has a "Don't track" choice together with a workspace, run nothing for it and ask that question once more, starting with: \`${MIXED_LEAD}\` A second mixed answer counts as declining that question.`);
   // A hook message carries none of a skill's framing, so the sandbox escalation is spelled out here.
   // Up front, not on refusal: the write lands outside the workspace and the guard reads the OS
   // credential store, which macOS Seatbelt blocks (lib/codex-sandbox.mjs), so a sandboxed run never succeeds.

@@ -197,8 +197,11 @@ workspaces in that rule's `tenants=` (the last choice when `tenants=none`).
   for acme-api go: Acme (Owner), Beta (User, current) — one or more — or don't track this repo?"
   When the last choice is current, append " (current)" to it in this sentence too.
 
-`<ids>` = the chosen workspaces' ids, or `none` when the last choice is among the answers (it wins
-over the others). Nothing chosen → run nothing.
+`<ids>` = the chosen workspaces' ids, or `none` only when the last choice is the whole answer.
+Nothing chosen → run nothing. An answer with the last choice together with any workspace runs
+nothing: ask the same question once more, starting with
+`"Don't track" can't be combined with a workspace — pick one or the other.` A second mixed answer
+runs nothing.
 
 ## Rules
 
