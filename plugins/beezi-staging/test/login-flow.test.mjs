@@ -50,12 +50,13 @@ async function flow(argv, options = {}) {
 const link = (t, over = {}) => linkAccount(makeHome(t), KEY, { tenants: TENANTS, ...over });
 const deps = fakes([]);
 
-test('the setup question lists each workspace and the per-repo choice, with the counts', async (t) => {
+test('the setup question lists each workspace, several, and the per-repo choice, with the counts', async (t) => {
   link(t);
   const out = await capture(() => loginFlow(['--account', KEY, '--from', 'setup'], deps));
   assert.match(out, /^<setup account="a1b2c3d4">\nW\. Acme account=a1b2c3d4 tenant=A role=Owner\nW\. Northwind .*\nsessions=37 places=4\n/m);
   assert.match(out, /^O1\. Acme — Everything goes here: new repos and folders, and 4 with history \(37 past sessions\)$/m);
-  assert.match(out, /^O3\. Let me choose per repo — Beezi asks about each repo and folder with history next, and new ones when a session starts there\n<\/setup>$/m);
+  assert.match(out, /^O3\. Several workspaces… — Pick two or more; everything goes to each of them$/m);
+  assert.match(out, /^O4\. Let me choose per repo — Beezi asks about each repo and folder with history next, and new ones when a session starts there\n<\/setup>$/m);
   assert.doesNotMatch(out, /<preview/);
   assert.match(out, /^next=setup account=a1b2c3d4$/m);
 });
@@ -73,7 +74,7 @@ test('a failing count still asks, with its ✗ line and the options without coun
   link(t);
   const r = await flow(['--account', KEY, '--from', 'setup'], { pastSessions: () => { throw new UserError('rollouts unreadable'); } });
   assert.ok(r.out.includes('role=User\n✗ rollouts unreadable\nO1. Acme — Everything goes here, starting with new repos and folders\n'));
-  assert.ok(r.out.includes('O2. Northwind — Everything goes here, starting with new repos and folders\nO3. Let me choose per repo — '));
+  assert.ok(r.out.includes('O2. Northwind — Everything goes here, starting with new repos and folders\nO3. Several workspaces… — Pick two or more; everything goes to each of them\nO4. Let me choose per repo — '));
   assert.ok(!r.out.includes('sessions='));
   assert.equal(r.next, `next=setup account=${KEY}`);
 });

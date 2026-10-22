@@ -150,14 +150,20 @@ Acme" or "Now: no rule yet"). Several repos and folders may be chosen.
   repos and folders should also send analytics to NewCo: 1) acme-api (Now: Acme), 2) notes (Now: no
   rule yet) — reply with the numbers to send, or none — Their past sessions will be sent there too."
 
+An answer with "None of these" (or "none") together with any repo is not an answer: run no
+`J<i>-command=` for it, and ask the same question once more, starting with
+`"None of these" can't be combined with repos — pick one or the other.` A second mixed answer
+counts as a skipped question, so no `done-command` runs.
+
 For each repo and folder the user picked for a workspace, run its `J<i>-command=` text EXACTLY ONCE,
 changing nothing except the final `<tenant>`: that workspace's `tenant=` value (its `W.` line's
 `tenant=`, e.g. `t2`). Map each answered position to the `J` line it listed, then run that line's
 own `J<i>-command=` (J numbers are global across accounts and need not start at 1); never rebuild the
 command or re-quote its path yourself. A repo the
-user did not pick for a workspace runs nothing for that workspace. After the last `new=yes` workspace's
-question has been answered (not skipped or dismissed), run the `done-command=` text EXACTLY ONCE;
-otherwise run no `done-command`, and the next login or sync asks again.
+user did not pick for a workspace runs nothing for that workspace. After every new workspace's
+question has been answered ("None of these" alone is an answer; skipped, dismissed or mixed is
+not), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and the next
+login or sync asks again.
 
 Write each command's first line verbatim.
 
@@ -242,10 +248,12 @@ outside a project folder is sent" for `outside`). Several workspaces may be chos
   (User), Gamma (User) — one or more — or don't track this repo?"
 
 Then, for each answered `P` line, run its `P<i>-command=` text EXACTLY ONCE, changing nothing except
-the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` when
-the last choice was picked (it wins over the others). Never rebuild the command or re-quote its path
-yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
-sent this time, and the next sync asks again.
+the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` only
+when the last choice is the whole answer. Never rebuild the command or re-quote its path yourself.
+An answer with the last choice together with any workspace runs nothing: ask the same question once
+more, starting with `"Don't track" can't be combined with a workspace — pick one or the other.`
+A second mixed answer counts as a skipped question. A `P` line with nothing chosen, or a skipped
+question, runs nothing: its sessions are not sent this time, and the next sync asks again.
 
 Write each command's first line verbatim.
 

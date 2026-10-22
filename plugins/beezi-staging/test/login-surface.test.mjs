@@ -79,7 +79,7 @@ test('login skill — one script runs the steps, and the beezi_login path resume
   assert.ok(!text.includes('workspace.mjs" new-folders --account <key>'), 'the New folders listing is the script\'s now');
 });
 
-test('login skill — the one setup question uses the tool for at most 2 workspaces, else one numbered sentence', () => {
+test('login skill — the one setup question uses the tool for at most 2 workspaces without "Several workspaces…", else one numbered sentence', () => {
   const text = flat(skill);
   assert.ok(text.includes('"Where should analytics from this machine go?"'));
   assert.ok(!text.includes('<preview'), 'Codex options carry no previews (spec D5)');
@@ -87,9 +87,17 @@ test('login skill — the one setup question uses the tool for at most 2 workspa
   assert.match(text, /\*\*`request_user_input`\*\* only when that tool is listed this turn \*\*and\*\* there are at most 2 `W\.` lines \(3 choices\)/);
   assert.match(text, /split at the last ` — ` into the label and the description/);
   assert.match(text, /3 or more `W\.` lines — one plain sentence with the `O` lines as a numbered list, never a 4-option `request_user_input` call/);
-  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenant> --account <key> --defer-upload'));
+  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenants> --account <key> --defer-upload'));
+  assert.ok(!text.includes('new-folders send <tenant> '));
+  assert.ok(text.includes('one choice per `O` line in order except the "Several workspaces…" line'));
+  assert.ok(text.includes('"Where should analytics from this machine go? Pick one, or name several under Other."'));
+  assert.ok(text.includes('"Which workspaces should get analytics from this machine: Acme (Owner), Beta (User), Gamma (User) — one or more?"'));
   assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload'));
   assert.ok(!text.includes('"Ask me (recommended)"'), 'the old three-way New folders question is gone');
+  assert.ok(text.includes('Every `O` line is numbered, "Several workspaces…" included.'));
+  assert.ok(text.includes('Two or more numbers that include the "Several workspaces…" or the "Let me choose per repo" number are a dismissal'));
+  assert.ok(text.includes('and "both" or "all" is every `W.` line; one that names none, or names a workspace together with "per repo", is a dismissal.'));
+  assert.ok(text.includes('and so is an answer that names a workspace together with "per repo"'));
 });
 
 test('login skill — describes the here: line as workspace.mjs prints it', () => {

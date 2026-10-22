@@ -1,5 +1,14 @@
 # Beezi plugin release notes
 
+## 0.23.1 (2026-10-22) — "Don't track" stands alone, and several workspaces at sign-in
+
+### Fixed
+- **"Don't track" stands alone** — choosing it together with a workspace no longer saves "not tracked" and drops the workspace: the terminal setup clears the other choices, and Codex asks again.
+- **"None of these" stands alone** — after joining a workspace, choosing it together with repos is asked again instead of skipping the repos.
+
+### Improved
+- **Several workspaces at sign-in** — "Where should analytics from this machine go?" now offers "Several workspaces…", so everything can go to more than one workspace.
+
 ## 0.23.0 (2026-10-21) — Clearer settings, a session banner and one-question sign-in
 
 ### New
