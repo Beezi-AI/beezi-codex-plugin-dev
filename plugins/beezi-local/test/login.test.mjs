@@ -16,6 +16,7 @@ const { performLogin, openBrowser } = await import('../lib/login.mjs');
 const { trackingStateFile, auditLedgerFile } = await import('../lib/paths.mjs');
 const { addAccount, listAccounts } = await import('../lib/accounts.mjs');
 const { TEST_KEY, fakeKeyring } = await import('../tools/account-fixtures.mjs');
+const { sessionAnonymization } = await import('../lib/anonymization.mjs');
 
 // Enough of the flow to reach the browser step and past it, with nothing touching the network.
 //
@@ -181,7 +182,6 @@ test('an already-linked login refreshes the tracking cache from the stored sessi
   assert.equal(result.key, KEY);
   const tracking = JSON.parse(fs.readFileSync(trackingStateFile(KEY), 'utf-8'));
   assert.equal(tracking.trackingMode, 'live');
-  assert.equal(tracking.backfillCompleted, true);
   assert.equal(tracking.identity, 'existing-client', 'the stored client keeps the account, so it keeps the state');
 });
 
@@ -376,6 +376,77 @@ test('a check-in that throws does not break the already-linked report either', a
   }));
   assert.equal(result.outcome, 'already-linked');
   assert.equal(result.account.name, 'Dev');
+});
+
+// ─── the sessions used right after whoami carry the block it just answered ───
+//
+// The check-in and the unlink run before any stored row has the fresh anonymization block, so an
+// anonymized workspace would otherwise receive the raw email and host from the sign-in itself.
+
+const ANON_BLOCK = { tenantId: 'T-anon', kinds: { repos: true, branches: true, sessions: true, hosts: true, accounts: true }, key: 'ab'.repeat(32), machineName: 'amber-fox' };
+const anonWhoami = (email) => async () => ({
+  valid: true, name: 'Dev', email, tenantId: 'T-anon', tenants: null, anonymization: ANON_BLOCK,
+});
+
+test('a fresh link checks in with the anonymization block whoami answered', async () => {
+  const sync = syncSpy();
+  const result = await performLogin(loginDeps({ whoami: anonWhoami('anon-new@example.com'), syncAccountIfNeeded: sync }));
+  assert.equal(result.outcome, 'linked');
+  assert.equal(sync.calls.length, 1);
+  assert.equal(sync.calls[0].session.token, 'at');
+  assert.deepEqual(sessionAnonymization(sync.calls[0].session), ANON_BLOCK);
+});
+
+test('an already-linked re-login unlinks and checks in with the fresh block, not the stale row', async () => {
+  const KEY = 'abab0001';
+  await addAccount({ key: KEY, email: 'anon-held@example.com', name: 'Dev', clientId: 'existing-client' });
+  const sync = syncSpy();
+  const unlinked = [];
+
+  const result = await performLogin(loginDeps({
+    whoami: anonWhoami('anon-held@example.com'),
+    getCredentials: storedSession('existing-client', 'already-stored', KEY),
+    unlinkMachine: async (session) => { unlinked.push(session); return true; },
+    syncAccountIfNeeded: sync,
+  }));
+
+  assert.equal(result.outcome, 'already-linked');
+  assert.equal(unlinked.length, 1);
+  assert.equal(unlinked[0].token, 'at', 'the grant handed back is the one just minted');
+  assert.equal(unlinked[0].clientId, 'client-123');
+  assert.deepEqual(sessionAnonymization(unlinked[0]), ANON_BLOCK);
+  assert.equal(sync.calls[0].session.token, 'already-stored');
+  assert.deepEqual(sessionAnonymization(sync.calls[0].session), ANON_BLOCK);
+});
+
+test('a re-armed account checks in with the fresh block', async () => {
+  const KEY = 'abab0002';
+  await addAccount({ key: KEY, email: 'anon-rearm@example.com', name: 'Dev', clientId: 'old-client' });
+  const sync = syncSpy();
+
+  const result = await performLogin(loginDeps({
+    whoami: anonWhoami('anon-rearm@example.com'),
+    getCredentials: async () => { throw new Error('keyring locked'); },
+    syncAccountIfNeeded: sync,
+  }));
+
+  assert.equal(result.outcome, 'relinked');
+  assert.equal(sync.calls[0].session.token, 'at');
+  assert.deepEqual(sessionAnonymization(sync.calls[0].session), ANON_BLOCK);
+});
+
+test('a whoami without a block keeps the block the row already stores', async () => {
+  const KEY = 'abab0003';
+  await addAccount({ key: KEY, email: 'anon-kept@example.com', name: 'Dev', clientId: 'old-client', anonymization: ANON_BLOCK });
+  const sync = syncSpy();
+
+  await performLogin(loginDeps({
+    whoami: async () => ({ valid: true, name: 'Dev', email: 'anon-kept@example.com' }),
+    getCredentials: async () => { throw new Error('keyring locked'); },
+    syncAccountIfNeeded: sync,
+  }));
+
+  assert.deepEqual(sessionAnonymization(sync.calls[0].session), ANON_BLOCK);
 });
 
 test('openBrowser refuses a non-http(s) URL instead of handing it to a shell', async () => {

@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { computeDelta } from '../lib/delta-codex.mjs';
+import { computeDelta, lastUsageLine } from '../lib/delta-codex.mjs';
 
 function writeRollout(records) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-codex-'));
@@ -1166,4 +1166,39 @@ test('a non-limit error carries no resetsAt', () => {
   const [event] = eventsOf(file);
   assert.equal(event.error, 'authentication_failed');
   assert.equal('resetsAt' in event, false);
+});
+
+// ─── lastUsageLine ──────────────────────────────────────────────────────────────────────────
+
+const item = { timestamp: '2026-01-01T00:00:03.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant' } };
+const done = { timestamp: '2026-01-01T00:00:05.000Z', type: 'event_msg', payload: { type: 'task_complete' } };
+
+test('lastUsageLine is the 1-based line of the last token_count that carries totals', () => {
+  const file = writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9), done]);
+  assert.equal(lastUsageLine(file), 4);
+});
+
+test('lastUsageLine is 0 for a rollout with no token_count', () => {
+  assert.equal(lastUsageLine(writeRollout([meta('/r'), item, done])), 0);
+});
+
+test('lastUsageLine passes over a torn final token_count, as computeDelta does', () => {
+  const torn = JSON.stringify(tokens('2026-01-01T00:00:04.000Z', 20, 0, 9)).slice(0, -3);
+  const file = writeRaw(`${jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item])}\n${torn}`);
+  assert.equal(lastUsageLine(file), 2);
+});
+
+test('lastUsageLine counts a parseable final line without a newline, as computeDelta does', () => {
+  const file = writeRaw(jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9)]));
+  assert.equal(lastUsageLine(file), 4);
+});
+
+test('lastUsageLine skips a token_count with no totals', () => {
+  const empty = { timestamp: '2026-01-01T00:00:04.000Z', type: 'event_msg', payload: { type: 'token_count', info: null } };
+  const file = writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, empty]);
+  assert.equal(lastUsageLine(file), 2);
+});
+
+test('lastUsageLine is null for a path it cannot read', () => {
+  assert.equal(lastUsageLine(path.join(os.tmpdir(), 'beezi-codex-missing', 'rollout.jsonl')), null);
 });

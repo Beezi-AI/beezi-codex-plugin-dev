@@ -78,3 +78,14 @@ test('discoverRepos: non-repo parent with no child repos → nothing mapped', (t
   assert.equal(dirty, false);
   assert.deepEqual(map.roots, {});
 });
+
+// Session start may not reach the rollout scan or the coverage request: the offer scan runs in history-worker.mjs.
+test('the session-start offer path imports no scan or coverage module', () => {
+  const banned = ['session-audit.mjs', 'session-coverage.mjs', 'transcript-index-codex.mjs'];
+  for (const file of ['../scripts/session-start.mjs', '../lib/workspace-prompt.mjs', '../lib/history-trigger.mjs']) {
+    const source = fs.readFileSync(new URL(file, import.meta.url), 'utf8');
+    const specifiers = [...source.matchAll(/(?:from\s*|import\s*\(\s*)['"]([^'"]+)['"]/g)].map((m) => path.basename(m[1]));
+    assert.ok(specifiers.length > 0, file);
+    for (const name of banned) assert.ok(!specifiers.includes(name), `${file} imports ${name}`);
+  }
+});

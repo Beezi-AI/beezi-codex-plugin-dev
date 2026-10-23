@@ -7,6 +7,8 @@ import { accountSyncStateFile } from './paths.mjs';
 import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
 import { boundedLabel, orDefault, parseTimestampMs } from './compat.mjs';
+import { ANONYMIZATION_KEY_MISSING, hasKind, kindsOf, sessionAnonymization } from './anonymization.mjs';
+import { Kind, anonymizeAccountSync } from './anonymize.mjs';
 
 // The vendor-generic account check-in (G-2-1).
 //
@@ -141,6 +143,13 @@ export function isEmptyPayload(payload) {
   return payload === null || payload === undefined || Object.keys(payload).length === 0;
 }
 
+// The body `session` may send: the email hashed with accounts on, null when accounts is on and there is no key.
+export function checkInBody(payload, session) {
+  const block = sessionAnonymization(session);
+  if (!hasKind(block, Kind.ACCOUNTS)) return payload;
+  return block.key ? anonymizeAccountSync(payload, block.key, kindsOf(block)) : null;
+}
+
 // Deterministic serialization for the change hash: object keys sorted at every level, so a
 // reordered build can never look like new information. Only the payload is hashed, and no
 // credential is in it.
@@ -224,6 +233,7 @@ function dueForResync(state, nowMs) {
 //                   entirely. Quiet by design — that machine is not ours to talk about.
 //   nothing-known — the payload named nothing; no request was made.
 //   unchanged     — same payload, inside RESYNC_MS; no request was made.
+//   anonymization-key-missing — the workspace hides account emails and no key is cached; no request was made.
 //   rejected      — the server refused. THE MARKER IS LEFT UNTOUCHED, so the next trigger retries.
 //                   Sealing it on a 404 from an older API would freeze the account row for a week
 //                   while looking like a success.
@@ -250,8 +260,10 @@ export async function syncAccountIfNeeded(key, session, options = {}, deps = {})
 
     const payload = buildAccountSyncPayload({ config, account: chatgptAccount, now: now.getTime() });
     if (isEmptyPayload(payload)) return { synced: false, reason: 'nothing-known' };
+    const body = checkInBody(payload, session);
+    if (body === null) return { synced: false, reason: ANONYMIZATION_KEY_MISSING };
 
-    const hash = payloadHash(payload);
+    const hash = payloadHash(body);
     // The same test authHeaders applies, so the marker is scoped exactly as the request was.
     const tenantId = typeof session.tenantId === 'string' && session.tenantId !== '' ? session.tenantId : null;
     const stored = readAccountSyncState(key, deps);
@@ -267,7 +279,7 @@ export async function syncAccountIfNeeded(key, session, options = {}, deps = {})
     const postDeps = { fetchImpl };
     if (deps.timeoutMs !== null && deps.timeoutMs !== undefined) postDeps.timeoutMs = deps.timeoutMs;
 
-    const res = await postJson(`${apiBase()}${accountSyncPath()}`, session, payload, postDeps);
+    const res = await postJson(`${apiBase()}${accountSyncPath()}`, session, body, postDeps);
     const status = res === null || res === undefined ? null : res.status;
     if (typeof status === 'number' && status >= 200 && status < 300) {
       const marker = { lastSyncedHash: hash, lastSyncedAt: now.toISOString() };

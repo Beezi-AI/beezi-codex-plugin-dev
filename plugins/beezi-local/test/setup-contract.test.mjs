@@ -8,10 +8,12 @@ import { CRASH_MODES } from '../lib/diagnostics.mjs';
 import { keysLines } from '../lib/settings-cli.mjs';
 import { lastLine, parseHistory, parsePlaces, parseWorkspaces, token } from '../lib/setup-routing.mjs';
 import {
-  ACCOUNT_LINE, CRASH_CHOICES, FINALIZED, LINKED_AS, PLAN_EXPIRED, STILL_DEFAULT, TIER_CHOICES, TRUST_PENDING, UPLOAD_PROGRESS,
+  ACCOUNT_LINE, CRASH_CHOICES, LINKED_AS, OFFER_COUNT, OFFER_LINE, OFFER_QUESTION, PLAN_EXPIRED, STILL_DEFAULT, TIER_CHOICES,
+  TRUST_PENDING, UPLOAD_PROGRESS,
   crashModeOf, parseLinkedAccounts, planSettled,
 } from '../lib/setup-wizard.mjs';
 import { linkAccount, makeHome } from '../tools/account-fixtures.mjs';
+import { offerToken } from '../lib/history-offer.mjs';
 
 // The terminal setup branches on other scripts' output text. Each row is two-sided: the script still prints the fragment, and the setup still reads a line of that shape.
 
@@ -57,8 +59,6 @@ const LINES = [
   [['scripts', 'billing-capture.mjs'], 'your Codex sign-in expired on ${on}',
     'Beezi: your Codex sign-in expired on 2026-09-30, so its plan info is out of date — sign in to Codex again, or tell Beezi your plan.',
     (line) => PLAN_EXPIRED.test(line)],
-  [['scripts', 'backfill.mjs'], '✓ Beezi: your history pull is finalized.', '✓ Beezi: your history pull is finalized.',
-    (line) => FINALIZED.test(line)],
   [['lib', 'settings-cli.mjs'], 'crash=${crashMode()}', 'crash=anonymous',
     (line) => crashModeOf(line) === 'anonymous'],
   [['lib', 'workspace-cli.mjs'], "new-folders=${newFoldersNow.mode} set=${newFoldersNow.set ? 'yes' : 'no'} multi=yes account=${row.key}",
@@ -80,8 +80,18 @@ const LINES = [
   [['lib', 'workspace-cli.mjs'], 'J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${',
     `J1. api (github.com/acme/api), 1 session, now: Acme account=${KEY} kind=repo match=github.com/acme/api now=t1`,
     (line) => parsePlaces(line, 'J')[0].where === 'Acme' && parsePlaces(line, 'J')[0].match === 'github.com/acme/api'],
-  [['scripts', 'backfill.mjs'], 'Beezi: ${processed}/${total} sessions read…', 'Beezi: 3/12 sessions read…',
+  [['lib', 'history-cli.mjs'], 'Beezi: ${processed}/${total} sessions read…', 'Beezi: 3/12 sessions read…',
     (line) => UPLOAD_PROGRESS.test(line)],
+  [['lib', 'history-cli.mjs'], 'console.log(`Q ${questionText(', 'Q Upload these 3 sessions to Acme?',
+    (line) => OFFER_QUESTION.exec(line)[1] === 'Upload these 3 sessions to Acme?'],
+  [['lib', 'history-cli.mjs'], 'console.log(`offer account=${row.key} tenant=${run.id} sessions=',
+    `offer account=${KEY} tenant=t1 sessions=3 audit=no token=aa54c8e424fb`,
+    (line) => OFFER_LINE.test(line) && token(line, 'tenant') === 't1' && !OFFER_COUNT.test(line)],
+  [['lib', 'history-cli.mjs'], "audit=${summary.audit ? 'yes' : 'no'} token=${offerToken(offeredIds, shownKinds)}`);",
+    `offer account=${KEY} tenant=t1 sessions=1 audit=no token=aa54c8e424fb`,
+    (line) => OFFER_LINE.test(line) && token(line, 'token') === offerToken(['s1'], [])],
+  [['lib', 'history-cli.mjs'], 'console.log(`offers=${offers}`);', 'offers=2',
+    (line) => OFFER_COUNT.test(line) && !OFFER_LINE.test(line)],
 ];
 
 // Shapes setup-routing splits on whose reading its own tests already cover.
@@ -121,6 +131,20 @@ test('workspace.mjs still takes the argv the setup builds', () => {
   assert.ok(cli.includes("if (sub === 'pick') { await joinedPick(cx, after); return; }"), 'joined pick dispatch');
   assert.ok(cli.includes('J${total}-command=${script} joined pick ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenant>'), 'J-command is joined pick');
   assert.ok(cli.includes('done-command=${script} joined done --account ${row.key}${deferText(cx)}'), 'done-command carries the defer flag');
+});
+
+test('sync.mjs still takes the offer, accept and decline argv the setup builds', () => {
+  const sync = read('scripts', 'sync.mjs');
+  for (const fragment of [
+    "const OFFER = '--offer';", "const ACCEPT = '--accept';", "const DECLINE = '--decline';", "const TOKEN = '--token';",
+    "'--past'", "rest.indexOf('--tenant')",
+  ]) assert.ok(sync.includes(fragment), fragment);
+});
+
+test('the wizard answers a yes with the offer line\'s token as the accept argv\'s last pair', () => {
+  const wizard = read('lib', 'setup-wizard.mjs');
+  assert.ok(wizard.includes("['--accept'].concat(target, ['--token', token(line, 'token')])"));
+  assert.ok(wizard.includes('else if (OFFER_LINE.test(line)) await answerOffer(ctx, key, line, question);'));
 });
 
 test('every sign-in failure exits non-zero, so the setup needs no failure text of its own', () => {

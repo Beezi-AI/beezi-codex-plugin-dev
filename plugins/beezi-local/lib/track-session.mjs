@@ -109,7 +109,7 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
   // "Not linked" is only true when nothing IS linked. linkedSessions() also comes back empty when
   // every linked account's token is momentarily unusable at once — a locked keyring, expired
   // refreshes, revoked grants — and telling a user with two accounts in the index that their
-  // machine is not linked is the same falsehood scripts/sync.mjs, scripts/backfill.mjs and the MCP
+  // machine is not linked is the same falsehood lib/history-cli.mjs (sync and backfill) and the MCP
   // bridge stopped printing. The index is the only thing that tells the two apart.
   if (sessions.length === 0) {
     let rows;

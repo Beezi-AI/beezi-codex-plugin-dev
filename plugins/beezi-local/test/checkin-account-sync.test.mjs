@@ -6,11 +6,13 @@ import {
   accountSyncPath,
   accountSyncStateFile,
   buildAccountSyncPayload,
+  checkInBody,
   isEmptyPayload,
   payloadHash,
   syncAccountIfNeeded,
 } from '../lib/account-sync.mjs';
 import { apiBase } from '../lib/config.mjs';
+import { KINDS, anonAccount, anonymizeAccountSync } from '../lib/anonymize.mjs';
 import { beeziCodexHome, queueDir, stateDir } from '../lib/paths.mjs';
 import { recordingFetch, hangingFetch as hangingResponder } from '../tools/suite-fixtures.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
@@ -493,4 +495,51 @@ test('an oversized recorded uuid falls through rather than naming a different ac
     account: { accountId: 'from-auth-json' },
   });
   assert.equal(payload.accountUuid, 'from-auth-json');
+});
+
+// ── anonymization ─────────────────────────────────────────────────────────────────────────────
+
+const ANON_KEY = 'ab'.repeat(32);
+const kindsOn = (on) => Object.fromEntries(KINDS.map((kind) => [kind, on.includes(kind)]));
+const ANON_BLOCK = { tenantId: 'T1', kinds: kindsOn(['accounts']), key: ANON_KEY, machineName: null };
+
+test('anonymized — the check-in body carries a hashed email and the marker hashes that body', async () => {
+  const fetchImpl = recordingFetch(async () => ({ status: 200 }));
+  const writeJsonImpl = spyWrite();
+  const session = { ...SESSION, tenantId: 'T1', tenants: [{ id: 'T1', anonymization: ANON_BLOCK }] };
+  const res = await syncAccountIfNeeded(KEY, session, {}, deps({ fetchImpl, writeJsonImpl }));
+  assert.equal(res.synced, true);
+  const raw = buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT });
+  assert.deepEqual(JSON.parse(fetchImpl.calls[0].opts.body), {
+    accountUuid: 'acct-1234',
+    email: anonAccount(ANON_KEY, 'dev@acme.com'),
+    subscriptionType: 'plus',
+  });
+  const marker = writeJsonImpl.calls[0].obj.byTenant.T1;
+  assert.equal(marker.lastSyncedHash, payloadHash(anonymizeAccountSync(raw, ANON_KEY, ['accounts'])));
+  assert.notEqual(marker.lastSyncedHash, payloadHash(raw), 'the change hash is the anonymized body\'s, not the raw one\'s');
+});
+
+test('anonymized — without its key the check-in sends nothing and seals no marker', async () => {
+  const fetchImpl = recordingFetch(async () => ({ status: 200 }));
+  const writeJsonImpl = spyWrite();
+  const session = { ...SESSION, anonymization: { ...ANON_BLOCK, key: null } };
+  const res = await syncAccountIfNeeded(KEY, session, { force: true }, deps({ fetchImpl, writeJsonImpl }));
+  assert.deepEqual(res, { synced: false, reason: 'anonymization-key-missing' });
+  assert.equal(fetchImpl.calls.length, 0);
+  assert.equal(writeJsonImpl.calls.length, 0);
+});
+
+test('checkInBody hashes the email only with accounts on', () => {
+  const raw = buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT });
+  assert.equal(checkInBody(raw, SESSION), raw);
+  assert.equal(checkInBody(raw, { ...SESSION, anonymization: { ...ANON_BLOCK, kinds: kindsOn([]) } }), raw);
+  assert.equal(checkInBody(raw, { ...SESSION, anonymization: ANON_BLOCK }).email, anonAccount(ANON_KEY, 'dev@acme.com'));
+});
+
+test('checkInBody sends the raw email with only hosts on, with or without a key', () => {
+  const raw = buildAccountSyncPayload({ config: CONFIG, account: ACCOUNT });
+  const hostsOnly = { ...ANON_BLOCK, kinds: kindsOn(['hosts']) };
+  assert.equal(checkInBody(raw, { ...SESSION, anonymization: hostsOnly }), raw);
+  assert.equal(checkInBody(raw, { ...SESSION, anonymization: { ...hostsOnly, key: null } }), raw);
 });

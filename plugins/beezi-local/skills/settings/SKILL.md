@@ -197,13 +197,12 @@ workspaces in that rule's `tenants=` (the last choice when `tenants=none`).
   for acme-api go: Acme (Owner), Beta (User, current) — one or more — or don't track this repo?"
   When the last choice is current, append " (current)" to it in this sentence too.
 
-`<ids>` = the chosen workspaces' ids, or `none` only when the last choice is the whole answer.
-Nothing chosen → run nothing. An answer with the last choice together with any workspace runs
-nothing: ask the same question once more, starting with
-`"Don't track" can't be combined with a workspace — pick one or the other.` A second mixed answer
-runs nothing.
+`<ids>` = the chosen workspaces' ids, or `none` when the last choice is among the answers (it wins
+over the others). Nothing chosen → run nothing.
 
 ## Rules
+
+A rule change never uploads past sessions. When the workspace's past-sessions setting is to offer them, Beezi looks for them in the background and asks at a later session start; under either setting, the sync skill shows them and asks before it uploads anything.
 
 Choose the account. Its lines are the `<rules account="<key>">` block, for you only, and its card is
 the `<here-card account="<key>">` block (none when this folder is not known).
@@ -406,6 +405,8 @@ verbatim and stop: it says what was put back, or why nothing was (`Nothing to
 undo.`, or that the rules changed after that change). Its `undone=` line is for you only.
 
 ## New folders
+
+A rule change never uploads past sessions. When the workspace's past-sessions setting is to offer them, Beezi looks for them in the background and asks at a later session start; under either setting, the sync skill shows them and asks before it uploads anything.
 
 Choose the account. Its lines are the `<new-folders account="<key>">` block, for you only: a summary
 line, `W.` lines as in Rules, and last `new-folders=<ask|send|none> set=<yes|no> multi=yes account=<key>`.

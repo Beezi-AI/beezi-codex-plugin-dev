@@ -15,17 +15,21 @@ const row = (over = {}) => ({
 const deps = (rows, extra = {}) => ({ listAccounts: async () => rows, linkedSessions: async () => rows, pluginRoot: '/p', ...extra });
 
 test('asks on startup while the join is unreviewed, even after the old notice was shown', async () => {
-  const text = await buildJoinedPrompt({ source: 'startup' }, deps([row({ joinNoticedTenantIds: ['B'] })]));
+  const { context: text } = await buildJoinedPrompt({ source: 'startup' }, deps([row({ joinNoticedTenantIds: ['B'] })]));
   assert.match(text, /node "\/p\/scripts\/workspace\.mjs" joined --account k1/);
   assert.match(text, /escalated permissions/);
   assert.match(text, /\/p\/skills\/sync\/SKILL\.md/);
   assert.match(text, /request_user_input/);
   assert.match(text, /end your reply with that question as one plain sentence/);
-  assert.match(text, /run neither routes nor sync\.mjs/);
+  assert.ok(text.includes('do not run routes; then run EXACTLY `node "/p/scripts/sync.mjs" --offer --past --account <key>` with escalated permissions and act on its output.'), text);
+  assert.ok(text.includes('If it prints `offers=0`, say nothing about past sessions.'), text);
+  assert.ok(text.includes('`node "/p/scripts/sync.mjs" --accept --background --account <key> --tenant <id> --token <token>`'), text);
+  assert.ok(text.includes('`node "/p/scripts/sync.mjs" --decline --account <key> --tenant <id>`'), text);
+  assert.doesNotMatch(text, /history question below/);
 });
 
 test('the quoted sync-skill anchors each match exactly once, the stop point only at its paragraph start', async () => {
-  const text = await buildJoinedPrompt({ source: 'startup' }, deps([row()]));
+  const { context: text } = await buildJoinedPrompt({ source: 'startup' }, deps([row()]));
   const skill = fs.readFileSync(new URL('../skills/sync/SKILL.md', import.meta.url), 'utf8');
   const stop = '**Then, repos and folders with no rule.**';
   assert.ok(text.includes(`up to the paragraph that begins "${stop}"`));
@@ -40,12 +44,12 @@ test('the quoted sync-skill anchors each match exactly once, the stop point only
 });
 
 test('request_user_input only where the skill allows it', async () => {
-  const text = await buildJoinedPrompt({ source: 'startup' }, deps([row()]));
+  const { context: text } = await buildJoinedPrompt({ source: 'startup' }, deps([row()]));
   assert.match(text, /where the skill allows request_user_input/);
 });
 
 test('the current-folder question is gated on this session\'s rules after the joined pass', async () => {
-  const text = await buildJoinedPrompt({ source: 'startup', session_id: 'sess-1' }, deps([row()]));
+  const { context: text } = await buildJoinedPrompt({ source: 'startup', session_id: 'sess-1' }, deps([row()]));
   assert.ok(text.includes('`node "/p/scripts/workspace.mjs" rules --session sess-1 --account <key>`'));
   assert.match(text, /Beezi is holding this session's analytics/);
   assert.match(text, /only when the `here:` line shows `no rule`/);
@@ -55,7 +59,7 @@ test('the current-folder question is gated on this session\'s rules after the jo
 });
 
 test('no session id, no rules step', async () => {
-  const text = await buildJoinedPrompt({ source: 'startup' }, deps([row()]));
+  const { context: text } = await buildJoinedPrompt({ source: 'startup' }, deps([row()]));
   assert.ok(!text.includes('rules --session'));
 });
 
@@ -77,9 +81,9 @@ test('history notice: one line per result, prefixed by email with several accoun
   assert.equal(await buildHistoryNotice({ source: 'resume' }, deps(rows, { takeHistoryResults })), null);
 });
 
-test('history notice: a gave-up upload points at the sync skill', async () => {
+test('history notice: a gave-up upload points at the sync command', async () => {
   const gaveUp = [{ tenantId: 'B', status: 'gave-up', sent: 0, skipped: 0 }];
   const rows = [row({ historyResults: gaveUp })];
   const text = await buildHistoryNotice({ source: 'startup' }, deps(rows, { takeHistoryResults: async () => gaveUp }));
-  assert.equal(text, "Beezi: couldn't send history to NewCo. Run the sync skill to try again.");
+  assert.equal(text, "Beezi: couldn't send history to NewCo. Run `$beezi:sync` to try again.");
 });

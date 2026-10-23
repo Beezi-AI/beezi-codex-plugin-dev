@@ -188,7 +188,7 @@ export function electionLock(scope) {
   return descriptor(LOCK_KINDS.ELECTION, `election-${orDefault(scope, 'watcher')}`);
 }
 
-// A one-time or long-running run that must not overlap itself: the backfill's scan and its seal.
+// A long-running run that must not overlap itself, such as the history run.
 export function runLock(name) {
   return descriptor(LOCK_KINDS.RUN, `run-${orDefault(name, 'default')}`);
 }
@@ -357,8 +357,8 @@ function observe(fsImpl, file) {
 }
 
 // The HOLDER'S OWN lease decides when its lock expires, never the contender's stale policy. A
-// Stop hook that wants a 5s lease for itself must still respect the ten-minute lease the backfill
-// wrote, or it would take the run lock away mid-seal. `maxHolderLeaseMs` is a ceiling against a
+// Stop hook that wants a 5s lease for itself must still respect the ten-minute lease the history run
+// wrote, or it would take the run lock away mid-run. `maxHolderLeaseMs` is a ceiling against a
 // malformed record, not a way to overrule a healthy one.
 function holderExpiry(record, policy) {
   const cap = policy.maxHolderLeaseMs;

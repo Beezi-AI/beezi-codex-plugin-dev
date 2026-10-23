@@ -170,7 +170,7 @@ function todaysBatches(groups) {
 }
 
 function makeDeps(over = {}) {
-  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
+  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, updatedAt: null };
   const coverageRecord = { version: 1, identity: null, environment: '', apiBase: null, sessions: {}, updatedAt: null };
   const saved = [];
   const events = over.events || [];
@@ -188,11 +188,10 @@ function makeDeps(over = {}) {
     readTrackingStateImpl: () => null,
     readChatgptAuthImpl: () => null,
     readBillingConfigImpl: () => null,
-    markBackfillCompletedImpl: () => events.push('mark-completed'),
-    completeBackfillImpl: async (session) => {
-      events.push(`complete:${session.token}`);
-      return { completed: true, code: null };
-    },
+    statImpl: () => { throw new Error('ENOENT'); },
+    rolloutStartedAtImpl: () => null,
+    flushQueueImpl: async () => ({ flushed: 0, failed: 0, deferred: 0, unreadable: 0, trackingDisabled: false, lastError: null }),
+    fetchCoverageImpl: async () => new Map(),
     loadLedgerImpl: () => ledger,
     saveLedgerImpl: (_key, l) => saved.push(JSON.parse(JSON.stringify(l))),
     runCheckpointImpl: async (input, _d, options) => {
@@ -212,7 +211,7 @@ function makeDeps(over = {}) {
 
 // ─── lanes ──────────────────────────────────────────────────────────────────
 
-test('two batches fly at once; B may finish first; the last batch goes alone and /complete follows it', async () => {
+test('two batches fly at once; B may finish first; the last batch goes alone', async () => {
   const events = [];
   const flush = deferredFlush(events);
   const h = makeDeps({ events, flush, reports: { s1: 50, s2: 50, s3: 50, s4: 50 } });
@@ -236,19 +235,17 @@ test('two batches fly at once; B may finish first; the last batch goes alone and
   await until(() => flush.calls.length === 4, 'the last batch');
   assert.deepEqual(flush.calls[3].ids, ['s4']);
   assert.equal(flush.calls[3].activeAtStart, 1, 'the last batch is alone');
-  assert.equal(events.some((e) => e.startsWith('complete')), false, '/complete waits for the last batch');
 
   flush.calls[3].settle();
   const result = await run;
 
   assert.equal(flush.peak(), 2);
-  assert.equal(result.finalized, true);
   assert.equal(result.sessionsImported, 4);
-  assert.deepEqual(events, ['settled:s2', 'settled:s1', 'settled:s3', 'settled:s4', 'complete:tok', 'mark-completed']);
+  assert.deepEqual(events, ['settled:s2', 'settled:s1', 'settled:s3', 'settled:s4']);
   for (const id of ['s1', 's2', 's3', 's4']) assert.equal(h.ledger.sessions[id].outcome, BackfillSessionStatus.ACCEPTED);
 });
 
-test('a server halt while the other lane flies launches nothing new, still ledgers that lane, and never seals', async () => {
+test('a server halt while the other lane flies launches nothing new, and still ledgers that lane', async () => {
   const events = [];
   const flush = deferredFlush(events);
   const h = makeDeps({ events, flush, reports: { s1: 50, s2: 50, s3: 50, s4: 50 } });
@@ -271,8 +268,6 @@ test('a server halt while the other lane flies launches nothing new, still ledge
   assert.equal(result.halt, BackfillHalt.FORBIDDEN);
   assert.equal(h.ledger.sessions.s2.outcome, BackfillSessionStatus.ACCEPTED, 'the in-flight lane is still ledgered');
   for (const id of ['s1', 's3', 's4']) assert.equal(h.ledger.sessions[id], undefined);
-  assert.equal(events.some((e) => e.startsWith('complete')), false);
-  assert.equal(result.finalized, false);
 });
 
 test('a lease lost while the other lane flies halts LOCK_LOST, still ledgers that lane, and keeps LOCK_LOST', async () => {
@@ -299,8 +294,6 @@ test('a lease lost while the other lane flies halts LOCK_LOST, still ledgers tha
   assert.equal(h.ledger.sessions.s1.outcome, BackfillSessionStatus.ACCEPTED);
   assert.equal(h.ledger.sessions.s2.outcome, BackfillSessionStatus.ACCEPTED, 'settled after the halt and still ledgered');
   for (const id of ['s3', 's4']) assert.equal(h.ledger.sessions[id], undefined);
-  assert.equal(events.some((e) => e.startsWith('complete')), false);
-  assert.equal(result.finalized, false);
 });
 
 test('a failed flight surfaces once the other lane settles, never as an unhandled rejection', async (t) => {
@@ -324,7 +317,6 @@ test('a failed flight surfaces once the other lane settles, never as an unhandle
 
   assert.match(String(error && error.message), /boom/);
   assert.equal(h.ledger.sessions.s2.outcome, BackfillSessionStatus.ACCEPTED, 'the other lane is still ledgered');
-  assert.equal(events.some((e) => e.startsWith('complete')), false);
   assert.deepEqual(unhandled, []);
 });
 
@@ -359,23 +351,7 @@ test('batches close exactly where they always did: right after the group that re
     flush.calls.flatMap((c) => c.groups.flatMap((g) => g.reports.map((r) => r.segmentId))),
     groups.flatMap((g) => g.reports.map((r) => r.segmentId)),
   );
-  assert.equal(result.finalized, true);
-});
-
-test('a dry run plans the same batches, sends nothing and renews nothing', async () => {
-  const flush = settlingFlush();
-  const lock = fakeLock();
-  const h = makeDeps({ flush, lock, reports: { s1: 50, s2: 50, s3: 50 } });
-
-  const result = await runAudit(h.deps, { dryRun: true });
-
-  assert.equal(flush.calls.length, 0);
-  assert.equal(result.plannedReports, 150);
-  assert.equal(result.plannedChunks, 3);
-  assert.deepEqual(h.saved, []);
-  assert.equal(lock.events.some((e) => e.startsWith('renew:')), false);
-  assert.equal(result.ok, true);
-  assert.equal(result.finalized, false);
+  assert.equal(result.sessionsImported, groups.length);
 });
 
 test('a split session goes out part by part, in order, on one lane while the other lane flies', async () => {
@@ -405,11 +381,11 @@ test('a split session goes out part by part, in order, on one lane while the oth
   assert.deepEqual(forSession('s1').flatMap((r) => r.segmentIds), reportsOf('s1', 120).map((r) => r.segmentId));
   assert.ok(forSession('s1').every((r) => r.overlapping === 0), 'never two parts of one session in flight');
   assert.equal(h.ledger.sessions.s1.outcome, BackfillSessionStatus.ACCEPTED);
-  assert.equal(result.finalized, true);
+  assert.equal(result.sessionsImported, 3);
 });
 
 // Answer 401 only after both lanes are in flight: before Wave 2 a 401 here falls through to the real token store.
-test('a 401 on both lanes renews once; the retries, the last batch and /complete all carry the new token', async () => {
+test('a 401 on both lanes renews once; the retries and the last batch carry the new token', async () => {
   const wire = heldFetch();
   const asks = [];
   let grant;
@@ -445,8 +421,7 @@ test('a 401 on both lanes renews once; the retries, the last batch and /complete
   const result = await run;
 
   assert.deepEqual(asks, [[KEY, true]]);
-  assert.ok(h.events.includes('complete:fresh'));
-  assert.equal(result.finalized, true);
+  assert.equal(result.sessionsImported, 3);
   for (const id of ['s1', 's2', 's3']) assert.equal(h.ledger.sessions[id].outcome, BackfillSessionStatus.ACCEPTED);
 });
 
@@ -495,7 +470,6 @@ test('the run renews once per stale token: lanes share one refresh, and a minted
 
   last.settle();
   await run;
-  assert.ok(events.includes('complete:fresh'));
 });
 
 // Every POST draws a 401: the one refresh is spent, so the later chunks fail without asking again.
@@ -523,9 +497,7 @@ for (const [label, answer] of [
 
     assert.deepEqual(asks, [[KEY, true]], 'one forced refresh for the whole run');
     assert.equal(result.reportsFailed, 101);
-    assert.equal(result.finalized, false);
     for (const id of ['s1', 's2', 's3']) assert.equal(h.ledger.sessions[id], undefined);
-    assert.equal(h.events.some((e) => e.startsWith('complete')), false);
   });
 }
 

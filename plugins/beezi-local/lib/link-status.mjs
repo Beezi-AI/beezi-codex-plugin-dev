@@ -1,7 +1,7 @@
 import { apiBase } from './config.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { getAuthentication as _getAuthentication } from './token.mjs';
-import { listAccounts as _listAccounts, getDefaultKey as _getDefaultKey } from './accounts.mjs';
+import { listAccounts as _listAccounts, getDefaultKey as _getDefaultKey, rowSessionFields } from './accounts.mjs';
 import { whoami as _whoami } from './whoami.mjs';
 import { hooksStatus as _hooksStatus, statusCommand } from './hooks-install.mjs';
 import { orDefault } from './compat.mjs';
@@ -56,9 +56,7 @@ async function accountStatus(row, base, deps) {
     token,
     clientId: orDefault(row.clientId, null),
     tenantId: null,
-    tenants: Array.isArray(row.tenants) ? row.tenants : null,
-    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
-    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+    ...rowSessionFields(row),
   }, { base });
   if (who === null) return { ...identity, state: LinkState.UNREACHABLE, account: null };
   if (!who.valid) return { ...identity, state: LinkState.REVOKED, account: null };
@@ -67,7 +65,7 @@ async function accountStatus(row, base, deps) {
     state: LinkState.LINKED,
     account: who.name || who.email || null,
     // The full whoami verdict rides along so the already-linked login path can refresh the
-    // tracking cache (trackingMode / backfillCompleted) without a second round trip.
+    // tracking cache (trackingMode) without a second round trip.
     who,
   };
 }

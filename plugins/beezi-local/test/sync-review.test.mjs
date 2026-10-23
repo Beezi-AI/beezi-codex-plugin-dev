@@ -112,10 +112,10 @@ function sync(t, args) {
   return { status: res.status, stdout: res.stdout || '', stderr: res.stderr || '' };
 }
 
-test('sync.mjs --review prints both listings and goes on to the sync when nothing needs a question', (t) => {
+test('sync.mjs --review prints both listings and goes on to the offer when nothing needs a question', (t) => {
   const res = sync(t, ['--review']);
-  assert.equal(res.stdout, `${NOTHING.join('\n')}\n`);
-  assert.match(res.stderr, /this machine is not linked/, 'the sync itself ran, as plain sync.mjs does');
+  assert.equal(res.stdout, `${NOTHING.concat(['offers=0']).join('\n')}\n`);
+  assert.match(res.stderr, /this machine is not linked/, 'the offer itself ran, as plain sync.mjs does');
   assert.equal(res.status, 1);
 });
 

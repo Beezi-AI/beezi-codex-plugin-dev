@@ -279,7 +279,7 @@ export function planSessionRoutes(row, entries, ctx, { readState = readSessionWo
   return routes;
 }
 
-// The one "waiting" test, shared by `routes` and the backfill seal hold so a pull is held only for what `routes` asks about: New folders is Ask me, settled, within the 30-day upload window, readable, pending, and in no workspace's ledger nor the account's legacy one.
+// The "waiting" test `routes` asks about: New folders is Ask me, settled, within the 30-day upload window, readable, pending, and in no workspace's ledger nor the account's legacy one.
 // Map<sessionId, key> plus `noDirectory` (waiting with no recorded directory); `routes` option reuses planSessionRoutes results.
 export function waitingRoutes(row, entries, ctx, {
   liveSessionId = null,

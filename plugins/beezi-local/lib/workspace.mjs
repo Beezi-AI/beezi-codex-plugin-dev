@@ -11,6 +11,9 @@ const NEW_FOLDER_MODES = ['ask', 'send', 'none'];
 // How long held reports wait before they expire; checkpoint re-exports it.
 export const QUEUE_HOLD_MS = 3 * 24 * 60 * 60 * 1000;
 
+// The source of a target or read tenant that New folders chose.
+export const NEW_FOLDERS_SOURCE = 'new-folders';
+
 // The account row's workspace list; null means unknown (old server or never probed).
 export function tenantsOf(row) {
   if (row == null || !Array.isArray(row.tenants)) return null;
@@ -282,7 +285,7 @@ export function resolveTargets(row, state) {
   }
   const newFolders = newFoldersOf(row);
   if (newFolders.mode === 'send') {
-    return { tenants, multi: true, targets: newFolders.tenantIds, pendingAsk: false, askTenants: [], rule: null, source: 'new-folders' };
+    return { tenants, multi: true, targets: newFolders.tenantIds, pendingAsk: false, askTenants: [], rule: null, source: NEW_FOLDERS_SOURCE };
   }
   if (newFolders.mode === 'none') {
     return { tenants, multi: true, targets: [], pendingAsk: false, askTenants: [], rule: null, source: 'none' };
@@ -301,7 +304,7 @@ export function resolveReadTenant(row, state) {
   const targets = resolveTargets(row, state).targets;
   if (targets.length > 0) return { tenantId: targets[0], source: 'target' };
   const newFolders = newFoldersOf(row).tenantIds;
-  if (newFolders.length > 0) return { tenantId: newFolders[0], source: 'new-folders' };
+  if (newFolders.length > 0) return { tenantId: newFolders[0], source: NEW_FOLDERS_SOURCE };
   return { tenantId: tenants[0].id, source: 'first' };
 }
 

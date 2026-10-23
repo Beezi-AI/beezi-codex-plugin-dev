@@ -17,6 +17,7 @@ import {
   describeAccount,
   resolveAccountRef,
   parseAccountFlag,
+  rowSessionFields,
 } from '../lib/accounts.mjs';
 import { accountsIndexFile, accountDir } from '../lib/paths.mjs';
 import { makeHome, fakeKeyring } from '../tools/account-fixtures.mjs';
@@ -154,4 +155,25 @@ test('13. a row whose email is not a string reads back as no email, and never th
   assert.equal(await findByEmail('[object Object]'), null);
   await assert.rejects(() => resolveAccountRef('nope'), /No linked account matches/);
   assert.equal(await resolveAccountRef('2'), '99887766');
+});
+
+test('14. rowSessionFields nulls a malformed object field and empties a malformed rule list', () => {
+  assert.deepEqual(
+    rowSessionFields({ anonymization: 'x', newFolders: [], workspaceRules: null, tenants: {} }),
+    { anonymization: null, newFolders: null, workspaceRules: [], tenants: null },
+  );
+});
+
+test('14b. rowSessionFields passes a valid row\'s fields through as the same objects', () => {
+  const row = {
+    tenants: [{ id: 'A' }],
+    anonymization: { tenantId: 'A' },
+    newFolders: { mode: 'ask', tenantIds: [] },
+    workspaceRules: [{ kind: 'repo', match: 'x', tenantIds: ['A'] }],
+  };
+  const fields = rowSessionFields(row);
+  assert.equal(fields.tenants, row.tenants);
+  assert.equal(fields.anonymization, row.anonymization);
+  assert.equal(fields.newFolders, row.newFolders);
+  assert.equal(fields.workspaceRules, row.workspaceRules);
 });

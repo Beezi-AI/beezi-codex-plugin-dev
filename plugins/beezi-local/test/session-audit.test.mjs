@@ -3,9 +3,12 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { parseArgs, runAudit, shouldFinalize, createRunCache } from '../lib/session-audit.mjs';
+import { runAudit, createRunCache, HistoryScope } from '../lib/session-audit.mjs';
+import { workspaceLinkMs } from '../lib/tracking.mjs';
 import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
+import { anonAccount } from '../lib/anonymize.mjs';
+import { kindsOf, sessionAnonymization } from '../lib/anonymization.mjs';
 
 // The audit uploads ONE account's history per run — `options.key` names it, defaulting to the
 // default account — so every seam below is that account's: its session, its ledger, its coverage
@@ -76,7 +79,7 @@ function fakeFlush(statusFor = () => BackfillSessionStatus.ACCEPTED) {
 function makeDeps(overrides = {}) {
   const events = [];
   const saved = [];
-  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
+  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, updatedAt: null };
   const deps = {
     now: () => 10 * 60 * 60 * 1000, // fixed clock, far past every fixture mtime + the 30min window
     linkedSessions: async () => [SESSION],
@@ -91,11 +94,13 @@ function makeDeps(overrides = {}) {
     readBillingConfigImpl: () => null,
     postJsonImpl: async () => ({ ok: true, status: 200, json: async () => ({ accountLinked: true }) }),
     readTrackingStateImpl: () => null,
-    markBackfillCompletedImpl: () => events.push('mark-completed'),
-    completeBackfillImpl: async () => {
-      events.push('complete');
-      return { completed: true, code: null };
-    },
+    statImpl: () => { throw new Error('ENOENT'); },
+    rolloutStartedAtImpl: () => null,
+    // The run drains the queue and asks coverage first: an empty queue, and a server that holds nothing yet.
+    flushQueueImpl: async () => ({ flushed: 0, failed: 0, deferred: 0, unreadable: 0, trackingDisabled: false, lastError: null }),
+    fetchCoverageImpl: async () => new Map(),
+    loadCoverageCheckpointsImpl: () => ({ version: 1, identity: null, environment: '', apiBase: null, sessions: {}, updatedAt: null }),
+    saveCoverageCheckpointsImpl: () => true,
     runCheckpointImpl: async (input, _d, options) => {
       options.sink(report(input.session_id));
       return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: {} };
@@ -151,6 +156,60 @@ test('backfill stamps every historical report with one current subscription acco
   for (const payload of reports) assert.equal(payload.account_uuid, 'current-1');
 });
 
+const ANON_KEY = 'ab'.repeat(32);
+const ANON_BLOCK = { tenantId: null, kinds: { repos: true, branches: true, sessions: true, hosts: true, accounts: true }, key: ANON_KEY, machineName: null };
+
+test('an anonymized account registers with a hashed email through the check-in body', async () => {
+  const registrations = [];
+  const { deps } = makeDeps({
+    linkedSessions: async () => [{ ...SESSION, anonymization: ANON_BLOCK }],
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'current', email: 'dev@example.com', expiresAt: 99_000_000 }),
+    postJsonImpl: async (_url, _session, body) => {
+      registrations.push(body);
+      return { ok: true, status: 200, json: async () => ({ accountLinked: true }) };
+    },
+  });
+  await runAudit(deps);
+  assert.equal(registrations.length, 1);
+  assert.equal(registrations[0].email, anonAccount(ANON_KEY, 'dev@example.com'));
+  assert.equal(registrations[0].accountUuid, 'current');
+});
+
+test('an anonymized account without its key stops before registering or uploading anything', async () => {
+  const events = [];
+  const { deps } = makeDeps({
+    linkedSessions: async () => [{ ...SESSION, anonymization: { ...ANON_BLOCK, key: null } }],
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'current', email: 'dev@example.com', expiresAt: 99_000_000 }),
+    postJsonImpl: async () => { events.push('register'); return { ok: true, status: 200, json: async () => ({ accountLinked: true }) }; },
+    flushBackfillChunksImpl: async () => { events.push('flush'); return flushResult(); },
+  });
+  const result = await runAudit(deps);
+  assert.equal(result.reason, BackfillHalt.ANONYMIZATION_KEY_MISSING);
+  assert.deepEqual(events, []);
+});
+
+test('an accepted upload hides at least the kinds hidden when the developer said yes', async () => {
+  const OFF = { ...ANON_BLOCK, kinds: { repos: false, branches: false, sessions: false, hosts: false, accounts: false } };
+  const registrations = [];
+  const flushed = [];
+  const { deps } = makeDeps({
+    linkedSessions: async () => [{ ...SESSION, anonymization: OFF }],
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'current', email: 'dev@example.com', expiresAt: 99_000_000 }),
+    postJsonImpl: async (_url, _session, body) => {
+      registrations.push(body);
+      return { ok: true, status: 200, json: async () => ({ accountLinked: true }) };
+    },
+    flushBackfillChunksImpl: async (groups, _key, session) => {
+      flushed.push(kindsOf(sessionAnonymization(session)));
+      const bySession = new Map(groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }]));
+      return flushResult({ stored: groups.length, bySession });
+    },
+  });
+  await runAudit(deps, { acceptedKinds: ['accounts', 'repos'] });
+  assert.equal(registrations[0].email, anonAccount(ANON_KEY, 'dev@example.com'));
+  assert.deepEqual(flushed, [['repos', 'accounts']]);
+});
+
 test('account registration failure leaves history untouched and a later run retries it', async () => {
   const events = [];
   let registrationAttempts = 0;
@@ -178,10 +237,6 @@ test('account registration failure leaves history untouched and a later run retr
         bySession: new Map([['s1', { status: BackfillSessionStatus.ACCEPTED, reason: null }]]),
       });
     },
-    completeBackfillImpl: async () => {
-      events.push(['complete']);
-      return { completed: true, code: null };
-    },
   }).deps;
 
   const failed = await runAudit(make());
@@ -190,8 +245,8 @@ test('account registration failure leaves history untouched and a later run retr
   assert.deepEqual(events, [['register', { accountUuid: 'current-account' }]]);
 
   const retried = await runAudit(make());
-  assert.equal(retried.finalized, true);
-  assert.deepEqual(events.slice(1).map(([name]) => name), ['register', 'checkpoint', 'flush', 'complete']);
+  assert.equal(retried.sessionsImported, 1);
+  assert.deepEqual(events.slice(1).map(([name]) => name), ['register', 'checkpoint', 'flush']);
   assert.equal(events[1][1].subscriptionType, undefined); // expired plan is not registered
   assert.equal(events[3][1], 'current-account');
 });
@@ -224,13 +279,9 @@ test('account registration renews a rejected credential and uses the fresh token
         }]]),
       });
     },
-    completeBackfillImpl: async (session) => {
-      calls.push(['complete', session.token]);
-      return { completed: true, code: null };
-    },
   });
   const result = await runAudit(deps);
-  assert.equal(result.finalized, true);
+  assert.equal(result.sessionsImported, 1);
   assert.equal(tokenReads, 1, 'one forced renewal; the first bearer came with the session');
   assert.deepEqual(calls, [
     ['token', false],
@@ -238,22 +289,7 @@ test('account registration renews a rejected credential and uses the fresh token
     ['token', true],
     ['register', 'fresh-token'],
     ['flush', 'fresh-token'],
-    ['complete', 'fresh-token'],
   ]);
-});
-
-test('dry-run annotates planned reports without registering the account', async () => {
-  let registrations = 0;
-  const flush = fakeFlush();
-  const { deps } = makeDeps({
-    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'dry-account' }),
-    postJsonImpl: async () => { registrations += 1; throw new Error('must not post'); },
-    flushBackfillChunksImpl: flush.impl,
-  });
-  const result = await runAudit(deps, { dryRun: true });
-  assert.equal(registrations, 0);
-  assert.equal(result.plannedReports, 1);
-  assert.equal(flush.calls.length, 0);
 });
 
 test('backfill still uploads when subscription identity is unavailable', async () => {
@@ -265,33 +301,6 @@ test('backfill still uploads when subscription identity is unavailable', async (
     assert.equal(flush.calls.length, 1);
     assert.equal(Object.hasOwn(flush.calls[0].groups[0].reports[0], 'account_uuid'), false);
   }
-});
-
-// ─── parseArgs ──────────────────────────────────────────────────────────────
-
-test('1. parses all three flags', () => {
-  const args = parseArgs(['--force', '--dry-run', '--since', '2026-01-31']);
-
-  assert.equal(args.force, true);
-  assert.equal(args.dryRun, true);
-  assert.equal(args.since, '2026-01-31');
-  assert.equal(args.sinceMs, Date.parse('2026-01-31'));
-});
-
-test('2. defaults to no flags', () => {
-  assert.deepEqual(parseArgs([]), {});
-});
-
-test('3. rejects a malformed --since with a user-facing error', () => {
-  assert.throws(() => parseArgs(['--since', 'last tuesday']), (error) => {
-    assert.equal(error.userFacing, true);
-    assert.match(error.message, /--since expects a date/);
-    return true;
-  });
-});
-
-test('4. rejects a well-formatted but impossible --since date', () => {
-  assert.throws(() => parseArgs(['--since', '2026-13-45']), /--since expects a date/);
 });
 
 // ─── candidate selection ────────────────────────────────────────────────────
@@ -334,28 +343,6 @@ test('7. excludes the live session by transcript path when its id is unknown', a
   assert.equal(result.candidates, 1);
 });
 
-test('8. excludes sessions already in the ledger', async () => {
-  const { deps, ledger } = makeDeps({ listRollouts: () => [rollout('s1'), rollout('s2')] });
-  ledger.sessions['s1'] = { outcome: 'accepted' };
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.alreadyImported, 1);
-  assert.equal(result.candidates, 1);
-});
-
-test('9. --force ignores the ledger', async () => {
-  const flush = fakeFlush();
-  const { deps, ledger } = makeDeps({ flushBackfillChunksImpl: flush.impl });
-  ledger.sessions['s1'] = { outcome: 'accepted' };
-
-  const result = await runAudit(deps, { force: true });
-
-  assert.equal(result.alreadyImported, 0);
-  assert.equal(result.candidates, 1);
-  assert.equal(flush.calls.length, 1);
-});
-
 // A rollout touched inside the recency window is probably an OPEN session in another window —
 // backfilling it would re-segment lines its next live checkpoint also reports.
 test('10. skips recently-active rollouts', async () => {
@@ -371,74 +358,6 @@ test('10. skips recently-active rollouts', async () => {
   assert.equal(result.candidates, 1);
   assert.deepEqual(result.recent.map((r) => r.sessionId), ['open']);
   assert.equal(typeof result.recent[0].path, 'string');
-});
-
-// Live-tracking tenants: everything after the machine link was tracked live; re-sending it
-// through the audit would re-segment on different boundaries and double-count.
-test('11. live-mode tenants only upload rollouts predating the machine link', async () => {
-  const { deps } = makeDeps({
-    readTrackingStateImpl: () => ({ trackingMode: 'live', backfillCompleted: false }),
-    statImpl: () => ({ mtimeMs: 5_000 }),
-    listRollouts: () => [rollout('before-link', 1_000), rollout('after-link', 9_000)],
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.liveTracked, 1);
-  assert.equal(result.candidates, 1);
-});
-
-// The stamp is the real signal; the credentials mtime is only a fallback for links made before it
-// existed. On CredMan/Keychain/secret-tool machines that file never exists, so a stat-only cutoff
-// returned null and the guard above silently never fired.
-test('11b. the link cutoff comes from the tracking stamp, not the credentials file', async () => {
-  const { deps } = makeDeps({
-    readTrackingStateImpl: () => ({
-      trackingMode: 'live',
-      backfillCompleted: false,
-      linkedAt: new Date(5_000).toISOString(),
-    }),
-    // No credentials file on this machine — the old implementation gave up here.
-    statImpl: () => { throw new Error('ENOENT'); },
-    listRollouts: () => [rollout('before-link', 1_000), rollout('after-link', 9_000)],
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.liveTracked, 1);
-  assert.equal(result.candidates, 1);
-});
-
-// Keyring machine linked before the stamp existed: no linkedAt, no credentials file. The persisted
-// state cursor is the remaining evidence that live tracking already reported a session.
-test('11i. with no link cutoff at all, a live-mode session with an advanced cursor is skipped', async () => {
-  const { deps } = makeDeps({
-    readTrackingStateImpl: () => ({ trackingMode: 'live', backfillCompleted: false }),
-    statImpl: () => { throw new Error('ENOENT'); },
-    readStateImpl: (id) => (id === 'tracked' ? { cursor: 42 } : null),
-    listRollouts: () => [rollout('tracked'), rollout('untracked')],
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.liveTracked, 1);
-  assert.equal(result.candidates, 1);
-});
-
-// Under dark mode the cursor means the opposite — advanced while every report was 403-dropped —
-// so it must NOT exclude the session there.
-test('11j. a dark-mode tenant imports sessions even when their cursor advanced', async () => {
-  const { deps } = makeDeps({
-    readTrackingStateImpl: () => ({ trackingMode: 'backfill_only', backfillCompleted: false }),
-    statImpl: () => { throw new Error('ENOENT'); },
-    readStateImpl: () => ({ cursor: 42 }),
-    listRollouts: () => [rollout('dark')],
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.liveTracked, 0);
-  assert.equal(result.candidates, 1);
 });
 
 // Every candidate that yields no report used to vanish between `candidates` and
@@ -460,8 +379,6 @@ test('11c. a candidate with no usage data counts as empty, not as a loss', async
   assert.equal(result.empty, 1);
   assert.equal(result.noRemote, 0);
   assert.equal(result.unreadable, 0);
-  // Nothing to upload is not a failure — it must not hold the one-time pull open.
-  assert.equal(result.finalized, true);
 });
 
 test('11d. a candidate with no resolvable repository is reported separately from empty', async () => {
@@ -474,14 +391,9 @@ test('11d. a candidate with no resolvable repository is reported separately from
 
   assert.equal(result.noRemote, 1);
   assert.equal(result.empty, 0);
-  // Deterministic: a rollout with no recorded cwd will have none next run either, so gating
-  // the seal on it would hold the pull open forever.
-  assert.equal(result.finalized, true);
 });
 
-// The seal is one-time per account and tool, and --force skips only the local caches. Sealing
-// over a transcript we merely failed to READ loses that session permanently.
-test('11e. an unreadable transcript is counted and keeps the pull open', async () => {
+test('11e. an unreadable transcript is counted', async () => {
   const { deps } = makeDeps({
     listRollouts: () => [rollout('unreadable')],
     runCheckpointImpl: async () => checkpointResult({ deltaFailed: true }),
@@ -491,10 +403,9 @@ test('11e. an unreadable transcript is counted and keeps the pull open', async (
 
   assert.equal(result.unreadable, 1);
   assert.equal(result.empty, 0);
-  assert.equal(result.finalized, false);
 });
 
-test('11f. a throwing checkpoint counts as unreadable and keeps the pull open', async () => {
+test('11f. a throwing checkpoint counts as unreadable', async () => {
   const { deps } = makeDeps({
     listRollouts: () => [rollout('boom')],
     runCheckpointImpl: async () => { throw new Error('ENOENT'); },
@@ -504,7 +415,6 @@ test('11f. a throwing checkpoint counts as unreadable and keeps the pull open', 
 
   assert.equal(result.unreadable, 1);
   assert.equal(result.sessionsImported, 0);
-  assert.equal(result.finalized, false);
 });
 
 // A session we failed to prepare must never be reported as "held no usage data" — that sentence
@@ -521,10 +431,8 @@ test('11h. a session whose segments all failed to emit is not reported as empty'
   assert.equal(result.empty, 0);
 });
 
-// EACCES reads exactly like transient I/O at the call site. Without a bound, one such file would
-// hold the pull open on every future login and the summary would tell the user to re-run forever.
-test('11g. a transcript that fails twice stops blocking the seal on the second run', async () => {
-  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
+test('11g. a transcript that fails twice is reported as unreadable on both runs', async () => {
+  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, updatedAt: null };
   const make = () =>
     makeDeps({
       listRollouts: () => [rollout('always-broken')],
@@ -535,28 +443,13 @@ test('11g. a transcript that fails twice stops blocking the seal on the second r
 
   const first = await runAudit(make(), {});
   assert.equal(first.unreadable, 1);
-  assert.equal(first.retriableUnreadable, 1);
-  assert.equal(first.finalized, false, 'first failure earns a retry');
 
   const second = await runAudit(make(), {});
   assert.equal(second.unreadable, 1, 'still reported to the user');
-  assert.equal(second.retriableUnreadable, 0, 'but no longer blocking');
-  assert.equal(second.finalized, true, 'the pull can seal');
 });
 
-test('12. --since drops rollouts older than the cutoff', async () => {
-  const { deps } = makeDeps({
-    listRollouts: () => [rollout('old', 1_000), rollout('new', 9_000)],
-  });
-
-  const result = await runAudit(deps, { sinceMs: 5_000 });
-
-  assert.equal(result.candidates, 1);
-});
-
-// The 30-day window (MAX_SESSION_AGE_MS). Unlike --since it is policy, not a flag, so it counts
-// what it dropped and it must NOT turn the run into a scoped one that never seals.
-test('12b. drops rollouts older than the 30-day window and still finalizes', async () => {
+// The 30-day window (MAX_SESSION_AGE_MS) counts what it dropped.
+test('12b. drops rollouts older than the 30-day window', async () => {
   const NOW = 100 * 24 * 60 * 60 * 1000;
   const { deps } = makeDeps({
     now: () => NOW,
@@ -570,7 +463,6 @@ test('12b. drops rollouts older than the 30-day window and still finalizes', asy
 
   assert.equal(result.tooOld, 1);
   assert.equal(result.candidates, 1);
-  assert.equal(result.finalized, true, 'a capped run is not a scoped run');
 });
 
 test('13. skips a rollout too large to parse safely', async () => {
@@ -604,15 +496,14 @@ test('14. an unreadable transcript is skipped without ending the run', async () 
 
 // ─── identity binding ───────────────────────────────────────────────────────
 
-// A ledger recorded under another login must be ignored — replaying it would find zero
-// candidates and seal the NEW tenant's pull empty.
-test('15. a foreign-identity ledger is discarded, never trusted into a seal', async () => {
+// A ledger recorded under another login must be ignored — its deliveries are not the new tenant's.
+test('15. a foreign-identity ledger is discarded', async () => {
   let askedIdentity = 'unset';
   const { deps, events } = makeDeps({
     loadLedgerImpl: (_key, identity) => {
       askedIdentity = identity;
       // loadLedger's contract: a mismatched identity yields a FRESH ledger.
-      return { version: 1, identity, sessions: {}, complete: false, updatedAt: null };
+      return { version: 1, identity, sessions: {}, updatedAt: null };
     },
     listRollouts: () => [rollout('s1')],
   });
@@ -625,51 +516,9 @@ test('15. a foreign-identity ledger is discarded, never trusted into a seal', as
   assert.ok(events.includes('flush'));
 });
 
-// ─── server-side already-used verification ─────────────────────────
+// ─── whoami ─────────────────────────────────────────────────────────────────
 
-// The server is the authority: wiping ~/.beezi-codex (or a fresh reinstall) must not let the
-// pull run again once it was used. Nothing is scanned — the run stops on the whoami verdict.
-test('15a. a server-sealed pull stops before scanning and heals the local cache', async () => {
-  const events = [];
-  const { deps } = makeDeps({
-    whoamiImpl: async () => ({ valid: true, trackingMode: 'backfill_only', backfillCompleted: true }),
-    markBackfillCompletedImpl: () => events.push('mark-completed'),
-    listRollouts: () => { throw new Error('must not scan'); },
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.ok, true);
-  assert.equal(result.reason, 'already-completed');
-  assert.equal(result.upgradeAdvised, true, 'a dark workspace gets the upgrade suggestion');
-  assert.deepEqual(events, ['mark-completed']);
-});
-
-test('15b. --force never bypasses the server verdict', async () => {
-  const { deps } = makeDeps({
-    whoamiImpl: async () => ({ valid: true, trackingMode: 'backfill_only', backfillCompleted: true }),
-    listRollouts: () => { throw new Error('must not scan'); },
-  });
-
-  const result = await runAudit(deps, { force: true });
-
-  assert.equal(result.reason, 'already-completed');
-});
-
-test('15c. a live-tracking tenant with a sealed pull gets no upgrade nag', async () => {
-  const { deps } = makeDeps({
-    whoamiImpl: async () => ({ valid: true, trackingMode: 'live', backfillCompleted: true }),
-    listRollouts: () => { throw new Error('must not scan'); },
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.reason, 'already-completed');
-  assert.equal(result.upgradeAdvised, false);
-});
-
-// Offline or pre-audit server: the check is advisory — the run proceeds and the chunk-level
-// ALREADY_COMPLETED guard remains the backstop.
+// Offline or pre-audit server: the whoami answer is advisory, so the run proceeds without it.
 test('15d. an unreachable whoami never blocks the run', async () => {
   const { deps } = makeDeps({ whoamiImpl: async () => { throw new Error('offline'); } });
 
@@ -677,14 +526,12 @@ test('15d. an unreachable whoami never blocks the run', async () => {
 
   assert.equal(result.ok, true);
   assert.equal(result.sessionsImported, 1);
-  assert.equal(result.finalized, true);
 });
 
 // ─── delivery + follow-ups ──────────────────────────────────────────────────
 
-// Timelines ride IN the chunk payload: the flush sees them attached to their session group,
-// and the run still finalizes off the flush verdicts alone.
-test('16. attaches the computed timeline to its session group, then finalizes', async () => {
+// Timelines ride IN the chunk payload: the flush sees them attached to their session group.
+test('16. attaches the computed timeline to its session group', async () => {
   let seenGroups = null;
   const { deps, events } = makeDeps();
   const base = deps.flushBackfillChunksImpl;
@@ -695,7 +542,7 @@ test('16. attaches the computed timeline to its session group, then finalizes', 
 
   const result = await runAudit(deps, {});
 
-  assert.deepEqual(events, ['flush', 'complete', 'mark-completed']);
+  assert.deepEqual(events, ['flush']);
   assert.equal(seenGroups.length, 1);
   assert.equal(seenGroups[0].timeline.sessionId, 's1');
   assert.deepEqual(seenGroups[0].timeline.periods, [{ state: 'working' }]);
@@ -788,7 +635,6 @@ test('20. a timeline that fails to compute never blocks the upload', async () =>
 
   assert.equal(seenGroups[0].timeline, null);
   assert.equal(result.sessionsImported, 1);
-  assert.equal(result.finalized, true);
 });
 
 // While a batch is in flight the loop keeps parsing (session 52 here; the 51st only launches the full batch).
@@ -817,7 +663,6 @@ test('20b. parsing continues while a dispatched batch is in flight', async () =>
   const result = await runAudit(deps, {});
 
   assert.equal(result.sessionsImported, 52);
-  assert.equal(result.finalized, true);
   const firstStart = order.indexOf('flush-start:50');
   const firstEnd = order.indexOf('flush-end:50');
   assert.ok(firstStart >= 0 && firstEnd > firstStart, 'first batch was dispatched');
@@ -873,155 +718,6 @@ test('23. does NOT ledger a session the server never judged', async () => {
   assert.equal(saved.at(-1)?.sessions['s1'], undefined);
 });
 
-// ─── finalization ───────────────────────────────────────────────────────────
-
-test('24. a fully clean run calls /complete exactly once and marks completion', async () => {
-  const { deps, events, saved } = makeDeps();
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(events.filter((e) => e === 'complete').length, 1);
-  assert.equal(result.finalized, true);
-  assert.equal(saved.at(-1).complete, true);
-});
-
-test('25. a run with a retryable failure does not finalize', async () => {
-  const flush = fakeFlush(() => BackfillSessionStatus.FAILED);
-  const { deps, events } = makeDeps({ flushBackfillChunksImpl: flush.impl });
-
-  const result = await runAudit(deps, {});
-
-  assert.ok(!events.includes('complete'));
-  assert.equal(result.finalized, false);
-});
-
-test('26. per-item rejections (unconnected repo) do NOT block finalization', async () => {
-  const flush = fakeFlush(() => BackfillSessionStatus.REJECTED);
-  const { deps, events } = makeDeps({ flushBackfillChunksImpl: flush.impl });
-
-  const result = await runAudit(deps, {});
-
-  assert.ok(events.includes('complete'));
-  assert.equal(result.finalized, true);
-});
-
-test('27. whole-chunk permanent rejections DO block finalization', async () => {
-  const { deps, events } = makeDeps({
-    flushBackfillChunksImpl: async (groups) => {
-      const bySession = new Map(
-        groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.REJECTED, reason: 'HTTP 413' }]),
-      );
-      return flushResult({ permanentRejections: 1, bySession });
-    },
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.ok(!events.includes('complete'));
-  assert.equal(result.finalized, false);
-});
-
-test('28. an unattributed chunk blocks finalization', async () => {
-  const { deps, events } = makeDeps({
-    flushBackfillChunksImpl: async (groups) => {
-      const bySession = new Map(
-        groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.UNATTRIBUTED, reason: 'unreadable-response' }]),
-      );
-      return flushResult({ unattributed: 1, bySession });
-    },
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.ok(!events.includes('complete'));
-  assert.equal(result.finalized, false);
-});
-
-test('29. --since never finalizes (a scoped run must not seal a partial dataset)', async () => {
-  const { deps, events } = makeDeps({ listRollouts: () => [rollout('new', 9_000)] });
-
-  const result = await runAudit(deps, { sinceMs: 5_000 });
-
-  assert.ok(!events.includes('complete'));
-  assert.equal(result.finalized, false);
-});
-
-// One lost finalize POST must not strand the pull IN_PROGRESS forever.
-test('30. a clean all-ledgered run retries /complete exactly once', async () => {
-  const { deps, events, ledger } = makeDeps();
-  ledger.sessions['s1'] = { outcome: 'accepted' };
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.candidates, 0);
-  assert.deepEqual(events, ['complete', 'mark-completed']);
-  assert.equal(result.finalized, true);
-});
-
-test('31. the fast path exits before scanning once completion is recorded', async () => {
-  const { deps } = makeDeps({
-    readTrackingStateImpl: () => ({ trackingMode: 'backfill_only', backfillCompleted: true }),
-    listRollouts: () => { throw new Error('must not scan'); },
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.reason, 'already-completed');
-  assert.equal(result.ok, true);
-});
-
-test('32. --force bypasses the fast path so the reinstall heal stays reachable', async () => {
-  const flush = fakeFlush();
-  const { deps } = makeDeps({
-    readTrackingStateImpl: () => ({ trackingMode: 'live', backfillCompleted: true }),
-    flushBackfillChunksImpl: flush.impl,
-  });
-
-  const result = await runAudit(deps, { force: true });
-
-  assert.equal(result.reason, null);
-  assert.equal(flush.calls.length, 1);
-});
-
-// The reinstall path: server says the pull is sealed → heal the local ledger and stop.
-test('33. ALREADY_COMPLETED halts, heals the ledger and marks completion', async () => {
-  const { deps, events, saved } = makeDeps({
-    listRollouts: () => [rollout('s1'), rollout('s2')],
-    flushBackfillChunksImpl: async (groups) => {
-      events.push('flush');
-      return flushResult({ halt: BackfillHalt.ALREADY_COMPLETED, bySession: new Map() });
-    },
-  });
-
-  const result = await runAudit(deps, {});
-
-  assert.equal(result.halt, BackfillHalt.ALREADY_COMPLETED);
-  assert.equal(saved.at(-1).complete, true);
-  assert.ok(events.includes('mark-completed'));
-  // Halted — the finalize POST must not fire on top of the server's own seal.
-  assert.ok(!events.includes('complete'));
-});
-
-// ─── dry run ────────────────────────────────────────────────────────────────
-
-test('34. --dry-run sends nothing, writes no ledger, never finalizes', async () => {
-  const flush = fakeFlush();
-  const { deps, saved, events } = makeDeps({
-    flushBackfillChunksImpl: flush.impl,
-    listRollouts: () => [rollout('s1'), rollout('s2')],
-  });
-
-  const result = await runAudit(deps, { dryRun: true });
-
-  assert.equal(flush.calls.length, 0);
-  assert.deepEqual(events, []);
-  assert.deepEqual(saved, []);
-  assert.equal(result.plannedReports, 2);
-  assert.equal(result.plannedChunks, 1);
-  assert.equal(result.ok, true);
-  assert.equal(result.finalized, false);
-});
-
 test('35. a session that yields no reports is not sent', async () => {
   const flush = fakeFlush();
   const { deps } = makeDeps({
@@ -1034,26 +730,6 @@ test('35. a session that yields no reports is not sent', async () => {
   assert.equal(flush.calls.length, 0);
   assert.equal(result.sessionsImported, 0);
   assert.equal(result.ok, true);
-});
-
-// ─── shouldFinalize truth table ─────────────────────────────────────────────
-
-test('36. shouldFinalize truth table', () => {
-  const clean = {
-    ok: true,
-    halt: null,
-    reportsFailed: 0,
-    unattributed: 0,
-    permanentRejections: 0,
-  };
-  assert.equal(shouldFinalize(clean, {}), true);
-  assert.equal(shouldFinalize({ ...clean, ok: false }, {}), false);
-  assert.equal(shouldFinalize({ ...clean, halt: BackfillHalt.NOT_ALLOWED }, {}), false);
-  assert.equal(shouldFinalize({ ...clean, reportsFailed: 1 }, {}), false);
-  assert.equal(shouldFinalize({ ...clean, unattributed: 1 }, {}), false);
-  assert.equal(shouldFinalize({ ...clean, permanentRejections: 1 }, {}), false);
-  assert.equal(shouldFinalize(clean, { sinceMs: 123 }), false);
-  assert.equal(shouldFinalize(clean, { dryRun: true }), false);
 });
 
 // ─── Wave 1: run cache and yield ────────────────────────────────────────────
@@ -1250,4 +926,212 @@ test('gzip 1. runAudit hands one shared compression object to every flush of a r
   const second = await runOnce();
   assert.equal(second[0].enabled, true);
   assert.notStrictEqual(second[0].compression, first[0].compression);
+});
+
+// ─── scope, list-only and the allowlist ─────────────────────────────────────────────────────
+
+const DAY = 24 * 60 * 60 * 1000;
+const SCOPE_NOW = 10 * DAY;
+const L = SCOPE_NOW - 5 * 60 * 60 * 1000;
+const linkedTracking = (trackingMode = 'live') => () => ({ trackingMode, backfillCompleted: false, linkedAt: new Date(L).toISOString() });
+const BOUNDARY = [rollout('before', L - 1), rollout('at', L), rollout('after', L + 1)];
+
+function scopeDeps(overrides = {}) {
+  return makeDeps({
+    now: () => SCOPE_NOW,
+    readTrackingStateImpl: linkedTracking(),
+    listRollouts: () => BOUNDARY,
+    ...overrides,
+  });
+}
+
+const listedIds = (result) => result.listed.map((entry) => entry.sessionId);
+const sentIds = (flush) => flush.calls.flatMap((call) => call.groups.map((group) => group.sessionId)).sort();
+
+test('scope 1. PAST lists only what was last written before the link, LIVE uploads the rest, and together they cover all three once', async () => {
+  const past = await runAudit(scopeDeps().deps, { scope: HistoryScope.PAST, listOnly: true });
+  assert.deepEqual(listedIds(past), ['before']);
+
+  const flush = fakeFlush();
+  const live = await runAudit(scopeDeps({ flushBackfillChunksImpl: flush.impl }).deps, { scope: HistoryScope.LIVE });
+  assert.deepEqual(sentIds(flush), ['after', 'at']);
+
+  const pastIds = listedIds(past);
+  assert.equal(sentIds(flush).filter((id) => pastIds.indexOf(id) !== -1).length, 0, 'disjoint');
+  assert.deepEqual([...pastIds, ...sentIds(flush)].sort(), ['after', 'at', 'before']);
+});
+
+test('scope 2. an unknown link time makes every session past: PAST lists all, LIVE lists none', async () => {
+  const unknown = () => scopeDeps({ readTrackingStateImpl: () => ({ trackingMode: 'live', backfillCompleted: false }) }).deps;
+  assert.equal(workspaceLinkMs(SESSION, null, unknown()), null);
+
+  const past = await runAudit(unknown(), { scope: HistoryScope.PAST, listOnly: true });
+  assert.deepEqual(listedIds(past), ['before', 'at', 'after']);
+
+  const live = await runAudit(unknown(), { scope: HistoryScope.LIVE, listOnly: true });
+  assert.deepEqual(listedIds(live), []);
+});
+
+test('scope 3. an Audit workspace (backfill_only) is offered every session, with its tracking mode', async () => {
+  const { deps } = scopeDeps({
+    readTrackingStateImpl: linkedTracking('backfill_only'),
+    whoamiImpl: async () => ({ valid: true, trackingMode: 'backfill_only', backfillCompleted: false }),
+  });
+  const past = await runAudit(deps, { scope: HistoryScope.PAST, listOnly: true });
+  assert.deepEqual(listedIds(past), ['before', 'at', 'after']);
+  assert.equal(past.trackingMode, 'backfill_only');
+});
+
+test('scope 4. a workspace joined after the link cuts its past at its own join time', async () => {
+  // The linkedSessions() shape: no linkedAt on the session, only each workspace's joinedAt.
+  const joined = { ...SESSION, tenants: [{ id: 't1' }, { id: 't2', joinedAt: new Date(L + 100).toISOString() }] };
+  const deps = () => scopeDeps({ linkedSessions: async () => [joined] }).deps;
+  assert.equal(workspaceLinkMs(joined, 't2', deps()), L + 100);
+  assert.equal(workspaceLinkMs(joined, 't1', deps()), L);
+
+  const t2 = await runAudit(deps(), { scope: HistoryScope.PAST, listOnly: true, tenantId: 't2' });
+  assert.deepEqual(listedIds(t2), ['before', 'at', 'after']);
+  const t1 = await runAudit(deps(), { scope: HistoryScope.PAST, listOnly: true, tenantId: 't1' });
+  assert.deepEqual(listedIds(t1), ['before']);
+});
+
+test('scope 5. a rollout older than 30 days is never listed', async () => {
+  const { deps } = scopeDeps({ listRollouts: () => [rollout('ancient', SCOPE_NOW - 31 * DAY), rollout('recent', L - 1)] });
+  const past = await runAudit(deps, { scope: HistoryScope.PAST, listOnly: true });
+  assert.deepEqual(listedIds(past), ['recent']);
+  assert.equal(past.tooOld, 1);
+});
+
+test('scope 6. a session started before the link and resumed after it is live, never past', async () => {
+  const resumed = rollout('resumed', L + 1);
+  const make = (flushImpl) => scopeDeps({
+    listRollouts: () => [resumed],
+    rolloutStartedAtImpl: () => L - 3 * DAY,
+    ...(flushImpl ? { flushBackfillChunksImpl: flushImpl } : {}),
+  }).deps;
+
+  const past = await runAudit(make(), { scope: HistoryScope.PAST, listOnly: true });
+  assert.deepEqual(listedIds(past), []);
+
+  const flush = fakeFlush();
+  await runAudit(make(flush.impl), { scope: HistoryScope.LIVE });
+  assert.deepEqual(sentIds(flush), ['resumed']);
+});
+
+test('listOnly stops after coverage: no registration, no parse, no chunk, and lists the candidates left', async () => {
+  const posts = [];
+  const parsed = [];
+  const flush = fakeFlush();
+  const make = () => scopeDeps({
+    readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'acct', expiresAt: SCOPE_NOW + DAY }),
+    postJsonImpl: async (url) => { posts.push(url); return { ok: true, status: 200, json: async () => ({ accountLinked: true }) }; },
+    runCheckpointImpl: async (input, _d, options) => { parsed.push(input.session_id); options.sink(report(input.session_id)); return checkpointResult(); },
+    flushBackfillChunksImpl: flush.impl,
+    // Our own confirmation runs ahead of an empty server prefix for `at`: coverage defers it as a gap.
+    loadCoverageCheckpointsImpl: () => ({ version: 1, identity: null, environment: '', apiBase: null, sessions: { at: { line: 5 } }, updatedAt: null }),
+    rolloutStartedAtImpl: (p) => { if (p === BOUNDARY[0].transcriptPath) return L - DAY; throw new Error('EACCES'); },
+  }).deps;
+
+  const listed = await runAudit(make(), { listOnly: true });
+  assert.equal(listed.ok, true);
+  assert.equal(listed.trackingMode, 'live');
+  assert.equal(listed.deferredGap, 1);
+  assert.equal(listed.candidates, 2);
+  assert.deepEqual(listed.listed, [
+    { sessionId: 'before', startedMs: L - DAY, mtimeMs: L - 1, cwd: 'C:/work/app' },
+    { sessionId: 'after', startedMs: L + 1, mtimeMs: L + 1, cwd: 'C:/work/app' },
+  ]);
+  assert.deepEqual(posts, []);
+  assert.deepEqual(parsed, []);
+  assert.equal(flush.calls.length, 0);
+
+  // The same run without listOnly registers and uploads, so the silence above is listOnly's.
+  await runAudit(make());
+  assert.equal(posts.length, 1);
+  assert.deepEqual(sentIds(flush), ['after', 'before']);
+});
+
+test('listOnly leaves out a gap-deferred session that split bookkeeping would still parse', async () => {
+  const { deps } = scopeDeps({
+    loadCoverageCheckpointsImpl: () => ({ version: 1, identity: null, environment: '', apiBase: null, sessions: { at: { line: 5 } }, updatedAt: null }),
+  });
+  const listed = await runAudit(deps, { listOnly: true, excludedSessionIds: new Set() });
+  assert.equal(listed.candidates, 3);
+  assert.deepEqual(listedIds(listed), ['before', 'after']);
+});
+
+test('allowlist: only the offered session is sent, and one the server already covers is not re-sent', async () => {
+  const offered = rollout('s1', L - 1);
+  const eligible = rollout('s2', L - 2);
+  // The rollout has 10 lines: a replay from the server's prefix emits only what lies past it.
+  const tenLines = async (input, _d, options) => {
+    if (options.startCursor < 10) options.sink({ ...report(input.session_id), from_line: options.startCursor + 1, to_line: 10 });
+    return checkpointResult();
+  };
+
+  const flush = fakeFlush();
+  const sent = await runAudit(scopeDeps({
+    listRollouts: () => [offered, eligible],
+    runCheckpointImpl: tenLines,
+    flushBackfillChunksImpl: flush.impl,
+  }).deps, { scope: HistoryScope.PAST, onlySessionIds: ['s1'] });
+  assert.equal(flush.calls.length, 1);
+  assert.deepEqual(sentIds(flush), ['s1']);
+
+  const covered = fakeFlush();
+  const again = await runAudit(scopeDeps({
+    listRollouts: () => [offered, eligible],
+    runCheckpointImpl: tenLines,
+    flushBackfillChunksImpl: covered.impl,
+    fetchCoverageImpl: async () => new Map([['s1', 10]]),
+  }).deps, { scope: HistoryScope.PAST, onlySessionIds: new Set(['s1']) });
+  assert.equal(covered.calls.length, 0);
+  assert.equal(again.sessionsImported, 0);
+  assert.equal(again.empty, 1);
+});
+
+test('declinedSessionIds leaves out the listed sessions and counts them', async () => {
+  const past = await runAudit(scopeDeps({ listRollouts: () => [rollout('a', L - 2), rollout('b', L - 1)] }).deps, {
+    scope: HistoryScope.PAST, listOnly: true, declinedSessionIds: ['a'],
+  });
+  assert.deepEqual(listedIds(past), ['b']);
+  assert.equal(past.declined, 1);
+});
+
+test('a stored session whose rollout cannot be read is still listed, never counted covered', async () => {
+  const { deps } = scopeDeps({
+    listRollouts: () => [rollout('s1', L - 1)],
+    fetchCoverageImpl: async () => new Map([['s1', 7]]),
+    lastUsageLineImpl: () => null,
+  });
+  const past = await runAudit(deps, { scope: HistoryScope.PAST, listOnly: true });
+  assert.deepEqual(listedIds(past), ['s1']);
+  assert.equal(past.covered, 0);
+});
+
+test('the scope and allowlist skips keep no counters; declined and covered are the ones read', async () => {
+  const past = await runAudit(scopeDeps().deps, { scope: HistoryScope.PAST, listOnly: true, onlySessionIds: ['before'] });
+  for (const gone of ['liveSide', 'pastSide', 'notOffered']) assert.equal(gone in past, false, gone);
+  assert.equal(past.declined, 0);
+  assert.equal(past.covered, 0);
+});
+
+test('a busy run reaches the caller unsettled, with no list', async () => {
+  const { deps } = scopeDeps({ acquireLockImpl: () => ({ ok: false, reason: 'held' }) });
+  const result = await runAudit(deps, { scope: HistoryScope.PAST, listOnly: true });
+  assert.equal(result.reason, 'run-in-progress');
+  assert.equal(result.listed, null);
+});
+
+test('the one-time import is gone: lib/ and scripts/ name none of its seal, mode or route', () => {
+  const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
+  const gone = ['SYNC_MODE', 'shouldFinalize', 'completeBackfill', 'markBackfillCompleted', 'shouldBackfill', 'sessionsBackfill', '/sessions/backfill'];
+  const hits = [];
+  for (const dir of ['lib', 'scripts']) {
+    for (const name of fs.readdirSync(path.join(root, dir)).filter((n) => n.endsWith('.mjs'))) {
+      const src = fs.readFileSync(path.join(root, dir, name), 'utf-8');
+      for (const token of gone) if (src.includes(token)) hits.push(`${dir}/${name}: ${token}`);
+    }
+  }
+  assert.deepEqual(hits, []);
 });

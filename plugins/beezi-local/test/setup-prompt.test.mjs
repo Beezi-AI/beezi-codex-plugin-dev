@@ -1,7 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { createPrompt, mixedExclusive, openTerminal, parseNumbers, renderOptions, togglePick } from '../lib/setup-prompt.mjs';
+import { createPrompt, openTerminal, parseNumbers, renderOptions } from '../lib/setup-prompt.mjs';
 
 const OPTIONS = [
   { label: 'Ask me (recommended)', description: 'Beezi asks once' },
@@ -93,42 +93,6 @@ test('chooseMany returns every picked index, [] on Enter, and re-asks on bad inp
   await h.type('2');
   assert.deepEqual(await retry, [1]);
   assert.match(h.text(), /Enter numbers from 1 to 3, separated by commas\./);
-  h.prompt.close();
-});
-
-test('togglePick unticks a picked row, ticks an exclusive row alone, and clears exclusive rows for any other', () => {
-  assert.deepEqual(togglePick([0], 0, [2]), []);
-  assert.deepEqual(togglePick([0, 1], 2, [2]), [2]);
-  assert.deepEqual(togglePick([2], 0, [2]), [0]);
-  assert.deepEqual(togglePick([0], 1, [2]), [0, 1]);
-  assert.deepEqual(togglePick([], 1, []), [1]);
-  const before = [0];
-  togglePick(before, 1, [2]);
-  assert.deepEqual(before, [0]);
-});
-
-test('mixedExclusive finds an exclusive row picked with others, else -1', () => {
-  assert.equal(mixedExclusive([0, 2], [2]), 2);
-  assert.equal(mixedExclusive([2, 0], [2]), 2);
-  assert.equal(mixedExclusive([2], [2]), -1);
-  assert.equal(mixedExclusive([0, 1], [2]), -1);
-  assert.equal(mixedExclusive([0, 1], []), -1);
-});
-
-test('typed chooseMany refuses an exclusive option mixed with others and asks again; a repeated number is not a mix', async () => {
-  const h = harness();
-  const mixed = h.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
-  await h.type('1,3');
-  await h.type('3');
-  assert.deepEqual(await mixed, [2]);
-  assert.match(h.text(), /"Don't send" can't be combined with other choices\.\n/);
-  const repeated = h.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
-  await h.type('3, 3');
-  assert.deepEqual(await repeated, [2]);
-  const plain = h.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
-  await h.type('2,1');
-  assert.deepEqual(await plain, [1, 0]);
-  assert.equal(h.text().split("can't be combined").length - 1, 1);
   h.prompt.close();
 });
 

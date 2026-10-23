@@ -8,6 +8,8 @@ import { readBillingConfig, resolveSource } from './billing-config.mjs';
 import { BillingSource } from './billing.mjs';
 import { isLiveTrackingAllowed } from './tracking.mjs';
 import { crashMode } from './diagnostics.mjs';
+import { hasKind } from './anonymization.mjs';
+import { Kind } from './anonymize.mjs';
 import { UserError, friendlyMessage } from './friendly-error.mjs';
 
 // What the settings skill reads, in one call per view: the screen, the machine-readable `keys`, and
@@ -54,6 +56,14 @@ function hereShown(row) {
   return !isSingleTenant(row) || isLiveTrackingAllowed(row.key);
 }
 
+// On several workspaces the value names the top-level block's workspace.
+function appearsAsField(row) {
+  const block = row.anonymization;
+  if (!hasKind(block, Kind.HOSTS) || !block.machineName) return null;
+  const tenant = isMultiTenant(row) ? tenantById(row, block.tenantId) : null;
+  return field('Appears as', tenant != null && tenant.name ? `${block.machineName} in ${tenant.name}` : block.machineName);
+}
+
 // accountHealth's lines folded into one: "Beezi: " dropped, sentences joined.
 function signInField(lines) {
   const text = lines.map((l) => l.trim()).join(' ').replace(/^Beezi: /, '');
@@ -98,6 +108,8 @@ function screen(view) {
     out.push(`Beezi · ${row.email || row.name || 'linked account'}${several && row.key === def ? ' (default)' : ''}`);
     const h = health[row.key];
     if (h != null && !h.ok && h.lines.length > 0) out.push(signInField(h.lines));
+    const appearsAs = appearsAsField(row);
+    if (appearsAs != null) out.push(appearsAs);
     if (isMultiTenant(row)) {
       const here = thisFolder(row, dir, ctx);
       if (here != null) out.push(field('This folder', here));
@@ -254,6 +266,8 @@ function accountSection(view) {
     else out.push(field('Sign-in', 'OK'));
     const tenants = tenantsOf(row) || [];
     if (tenants.length > 0) out.push(field(tenants.length > 1 ? 'Workspaces' : 'Workspace', workspaceList(row)));
+    const appearsAs = appearsAsField(row);
+    if (appearsAs != null) out.push(appearsAs);
     if (several) out.push(field('Analytics reads', row.key === def ? 'yes (default account)' : 'no'));
     out.push('');
   });

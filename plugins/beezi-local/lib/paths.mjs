@@ -253,9 +253,20 @@ export const environment = Object.freeze({
   assertAccountKey,
 });
 
-// Name helpers that return a file-name fragment, not a path — grouped for the sweep reason above.
+// The installed plugin's name, as make-variant.sh names each variant.
+function pluginName() {
+  return BEEZI_ENV ? `beezi-${BEEZI_ENV}` : 'beezi';
+}
+
+function syncCommand() {
+  return `$${pluginName()}:sync`;
+}
+
+// Name helpers that return a name or file-name fragment, not a path — grouped for the sweep reason above.
 export const naming = Object.freeze({
   tenantTag,
+  pluginName,
+  syncCommand,
 });
 
 // This plugin's own data root — deliberately NOT `~/.beezi`, and deliberately not overridable via
@@ -417,7 +428,7 @@ export function credentialsFile(key) {
   return path.join(accountDir(key), 'credentials.json');
 }
 
-// Cached tenant tracking policy (trackingMode / backfillCompleted / linkedAt), per account. It
+// Cached tenant tracking policy (trackingMode / linkedAt), per account. It
 // sits in the account directory rather than under state/ or queue/ for the same prune-survival
 // reason it used to sit at the root: pruneStale() sweeps those two at 14 days, and an expiring
 // gate would silently re-enable a dark-mode tenant.
@@ -425,7 +436,7 @@ export function trackingStateFile(key) {
   return path.join(accountDir(key), 'tracking.json');
 }
 
-// Durable record of which past sessions the one-time history import has delivered TO THIS ACCOUNT.
+// Durable record of which past sessions the history run has delivered TO THIS ACCOUNT.
 // Outside state/ and queue/ for the prune reason above: an expired ledger would make every old
 // session look importable again. A multi-workspace account keeps one ledger per tenant.
 export function auditLedgerFile(key, tenantId = null) {

@@ -5,12 +5,14 @@ description: Upload past Codex sessions to Beezi analytics, skipping anything Be
 
 # Beezi: sync past sessions
 
-Uploads this machine's past Codex sessions to Beezi, resuming each one from exactly the point
-Beezi already has it. It asks the server how far each session reaches before it sends anything, so
-running it twice uploads nothing twice and running it often is safe.
+Shows what an upload of this machine's past Codex sessions would send, asks, and uploads only the
+sessions it showed, and only after the user answers Upload. Running this skill is not a yes: nothing
+is sent until that answer. The upload resumes each session from exactly the point Beezi already has
+it. It asks the server how far each session reaches before it sends anything, so running it twice
+uploads nothing twice and running it often is safe.
 
 **It reaches back 30 days and no further.** Sessions that ran longer ago are never uploaded, by
-this command or by the `login` skill's one-time import — the window is the same for both. If the
+this command or by the `login` skill — the window is the same for both. If the
 run reports sessions skipped for age, tell the user plainly that a later run will not pick them up.
 
 ## Why a Codex user needs this
@@ -24,15 +26,15 @@ a gap.)
 It repairs the symptom. Point the user at the `analytics-hooks` skill as well, so the hooks are
 installed and trusted and the gap stops reopening.
 
-## This is NOT the one-time import, and must never be used as a way around it
+## Running sync is not a yes
 
-The `login` skill's one-time history import is once per account and tool, and it refuses to run
-again once it has been used. **That refusal is not something sync bypasses.** Sync uploads only what
-Beezi is missing above what it already holds; it does not consume, reopen, re-run or stand in for
-the one-time import, and it does not change whether that import has been used.
+Running this skill, or showing its summary, uploads nothing. Past sessions go up only after the user
+answers Upload to a question this skill showed, and only the sessions that question counted. Never
+run `--accept` for a question the user did not answer with Upload, and never to get round a "Not now"
+the user gave before: run sync again so the user is asked again.
 
-If the user asks you to get around the "already been used" refusal, decline as that skill says, and
-offer sync only for what it actually is: filling in sessions Beezi never received.
+Each upload resumes every session from exactly the point Beezi already has it, so nothing Beezi holds
+is sent twice.
 
 ## Running it
 
@@ -70,7 +72,7 @@ numbered list or a bullet menu — that ends your reply; when the answer arrives
 carry on from the next question, then step 2. Ask one question at a time. A skipped question runs
 nothing.
 
-### Step 1 — new workspaces, then repos and folders with no rule, then the sync
+### Step 1 — new workspaces, then repos and folders with no rule, then the summary
 
 Run this one command, adding `--account <account>` when the user named an account (and step 2's
 `--tenant` override when the user asked for it):
@@ -107,17 +109,17 @@ machine, it lists every repo and folder with where its analytics go now. Its lin
   the user did not pick sending where it sends now;
 - `joined=<total>` — the number of `J` lines, always last.
 
-Run the printed commands unchanged; whatever they route gets its history uploaded.
+Run the printed commands unchanged. They only set where analytics go and upload nothing: step 2
+asks about past sessions.
 
 `joined=0` → nothing to ask: the same call already printed the `<routes>` block; go to "Then, repos
 and folders with no rule" below.
 
-For each account with `J` lines (with several accounts, put " (<email>)" right before every
-question's closing " Their past sessions will be sent there too."), using that account's `W.` lines
-and commands:
+For each account with `J` lines (with several accounts, end every question with " (<email>)"), using
+that account's `W.` lines and commands:
 
 More than 4 `J` lines → first ask "You joined <names>. Where should analytics for these <N> repos and
-folders go? Their past sessions will be sent there too." (`<N>` = that account's number of `J` lines)
+folders go?" (`<N>` = that account's number of `J` lines)
 with the choices "Add <names> to all <N>" (described "Repos you don't track, and ones with no rule
 yet, stay as they are"), "Choose repos" ("Pick which repos and folders go to each new workspace") and
 "Leave them as they are" ("Nothing changes, and you're not asked about <names> again").
@@ -134,36 +136,29 @@ turn. Each question offers that account's `J` lines as its choices and asks whic
 should also send analytics to that one workspace. `<short>` is the `J` line's text after `J<i>. ` up to
 ` (` or `,`, and `<where>` the text after `now: ` up to ` account=`. The question:
 
-"Which repos and folders should also send analytics to <workspace>? Their past sessions will be sent
-there too." — `<workspace>` is the `new=yes` line's name (the text after `W. ` up to ` account=`).
+"Which repos and folders should also send analytics to <workspace>?" — `<workspace>` is the `new=yes`
+line's name (the text after `W. ` up to ` account=`).
 
 Choices: one per `J` line — its `<short>`, described by its `<where>` ("Now: <where>", e.g. "Now:
 Acme" or "Now: no rule yet"). Several repos and folders may be chosen.
 
 - `request_user_input` only with at most 2 `J` lines and at most 3 `new=yes` `W.` lines (so at most 3
-  choices and 3 questions): header "Beezi", the question with " Pick one, or name several under Other."
-  put before its last sentence, a last choice "None of these" (described "This workspace gets none of
-  them"), the labels exactly as above.
-- Otherwise the plain sentence: the question up to "<workspace>" (without the sentence after it), a
-  colon, the `J` lines as a numbered list "1) <short> (Now: <where>), 2) …", then " — reply with the
-  numbers to send, or none —" and " Their past sessions will be sent there too.". For example: "Which
-  repos and folders should also send analytics to NewCo: 1) acme-api (Now: Acme), 2) notes (Now: no
-  rule yet) — reply with the numbers to send, or none — Their past sessions will be sent there too."
-
-An answer with "None of these" (or "none") together with any repo is not an answer: run no
-`J<i>-command=` for it, and ask the same question once more, starting with
-`"None of these" can't be combined with repos — pick one or the other.` A second mixed answer
-counts as a skipped question, so no `done-command` runs.
+  choices and 3 questions): header "Beezi", the question followed by " Pick one, or name several under
+  Other.", a last choice "None of these" (described "This workspace gets none of them"), the labels
+  exactly as above.
+- Otherwise the plain sentence: the question without its "?", a colon, the `J` lines as a numbered
+  list "1) <short> (Now: <where>), 2) …", then " — reply with the numbers to send, or none?". For
+  example: "Which repos and folders should also send analytics to NewCo: 1) acme-api (Now: Acme),
+  2) notes (Now: no rule yet) — reply with the numbers to send, or none?"
 
 For each repo and folder the user picked for a workspace, run its `J<i>-command=` text EXACTLY ONCE,
 changing nothing except the final `<tenant>`: that workspace's `tenant=` value (its `W.` line's
 `tenant=`, e.g. `t2`). Map each answered position to the `J` line it listed, then run that line's
 own `J<i>-command=` (J numbers are global across accounts and need not start at 1); never rebuild the
 command or re-quote its path yourself. A repo the
-user did not pick for a workspace runs nothing for that workspace. After every new workspace's
-question has been answered ("None of these" alone is an answer; skipped, dismissed or mixed is
-not), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and the next
-login or sync asks again.
+user did not pick for a workspace runs nothing for that workspace. After the last `new=yes` workspace's
+question has been answered (not skipped or dismissed), run the `done-command=` text EXACTLY ONCE;
+otherwise run no `done-command`, and the next login or sync asks again.
 
 Write each command's first line verbatim.
 
@@ -177,8 +172,8 @@ and `--tenant` as step 1's command:
 node "<plugin-root>/scripts/sync.mjs" --review-routes
 ```
 
-It prints the `<routes>` block and `review=<n>`, and on `review=0` goes straight on to the sync as
-step 1's command does.
+It prints the `<routes>` block and `review=<n>`, and on `review=0` goes straight on to the summary
+as step 1's command does.
 
 The `<routes>` block is what `workspace.mjs routes` prints. It is for you only, except the one line
 named below. It lists, per account in several workspaces whose New folders setting is Ask me, the
@@ -199,8 +194,8 @@ repos and folders whose past sessions have no rule yet. Its lines:
   about it;
 - `routes=<total>` — the number of `P` lines, always last.
 
-Not linked, or `routes=0` → nothing to ask: the sync already ran in the same call; go to step 2 for
-its output.
+Not linked, or `routes=0` → nothing to ask: the summary already ran in the same call; go to step 2
+for its output.
 
 For each account with `P` lines (with several accounts, end every question with " (<email>)"):
 
@@ -248,24 +243,58 @@ outside a project folder is sent" for `outside`). Several workspaces may be chos
   (User), Gamma (User) — one or more — or don't track this repo?"
 
 Then, for each answered `P` line, run its `P<i>-command=` text EXACTLY ONCE, changing nothing except
-the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` only
-when the last choice is the whole answer. Never rebuild the command or re-quote its path yourself.
-An answer with the last choice together with any workspace runs nothing: ask the same question once
-more, starting with `"Don't track" can't be combined with a workspace — pick one or the other.`
-A second mixed answer counts as a skipped question. A `P` line with nothing chosen, or a skipped
-question, runs nothing: its sessions are not sent this time, and the next sync asks again.
+the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` when
+the last choice was picked (it wins over the others). Never rebuild the command or re-quote its path
+yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
+sent this time, and the next sync asks again.
 
 Write each command's first line verbatim.
 
-### Step 2 — sync
+### Step 2 — the summary, then the question
 
-When the last listing printed `review=0`, the sync already ran: its output is everything after that
-`review=0` line. Run nothing more. Only after the `P` questions (answered or skipped) and their
+When the last listing printed `review=0`, the summary already ran: its output is everything after
+that `review=0` line. Do not run it again. Only after the `P` questions (answered or skipped) and their
 commands, run, with the same `--account` and `--tenant` as step 1's command:
 
 ```
 node "<plugin-root>/scripts/sync.mjs"
 ```
+
+Either way, its output is what an upload would send, per workspace, then that workspace's question.
+Nothing has been uploaded. Its lines:
+
+- `Q <question>` — one per workspace: the question to ask;
+- `offer account=<key> tenant=<id> sessions=<n> audit=<yes|no> token=<token>` — right after its `Q` line, for you
+  only;
+- `offers=<n>` — the number of questions, always last, for you only;
+- every other line (the summary, a heading, an outcome below) — write it verbatim, in order.
+
+`offers=0` → nothing to ask. Otherwise ask exactly as the `login` skill's step 4b does, whatever the
+workspace's past-sessions setting is and even when the user said not now before: each `Q` line's
+question (its text after `Q `), with the choices "Upload" (described "Send these sessions now") and
+"Not now" (described "Nothing is sent"):
+
+- **`request_user_input`** only when that tool is listed this turn and there are at most 3 `Q` lines:
+  one call, header "Beezi", one question per `Q` line. A typed answer (Other) counts as a dismissal.
+- **Otherwise**, end your reply with one plain sentence per `Q` line: the question, then
+  ` Reply upload or not now.` This is the one place this skill asks several questions at once. An
+  answer that does not clearly say upload for a question is not now for it.
+
+Then, for each question, with `<key>`, `<id>` and `<token>` the `account=`, `tenant=` and `token=` values
+of its `offer` line:
+
+- "Upload" → run
+
+  ```
+  node "<plugin-root>/scripts/sync.mjs" --accept --account <key> --tenant <id> --token <token>
+  ```
+
+  with a long timeout (10 minutes) when your shell tool takes one: the upload prints progress lines
+  as it goes. Relay its output verbatim.
+- "Not now", a dismissal, or anything else → run
+  `node "<plugin-root>/scripts/sync.mjs" --decline --account <key> --tenant <id>` and relay its line.
+
+No answer means no upload.
 
 **Run it with no flags unless the user names an account.** With none, it runs for every linked
 account in turn; with more than one linked it prints a `── Account: … ──` heading before each, and
@@ -283,10 +312,12 @@ not sent this time). Add `--tenant <workspace>[,<workspace>…]` only when the u
 specific workspaces instead: that is an override that sends every past session to those workspaces,
 ignoring rules, and with several accounts linked it needs `--account <account>` too.
 
-**It takes no other flags** than `--account`, `--tenant` and step 1's `--review` or `--review-routes`. Not `--since`, not `--force` — the
+**It takes no other flags** than `--account`, `--tenant`, step 1's `--review` or `--review-routes`,
+the answer commands' `--accept` (with its `--token`) and `--decline`, and `--dry-run` when the user
+asks for a preview only. Not `--since`, not `--force` — the
 script rejects both with an explanation, and neither exists to be worked around. `--since` filters on
 when a session last ran, which would skip exactly the old half-uploaded sessions this command is for;
-`--force` has no seal to force past on this path. If the user pushes for either, say the command
+`--force` has nothing to force past. If the user pushes for either, say the command
 takes neither.
 
 The scan reads every rollout under `~/.codex/sessions/`, so it can take a few minutes on a machine
@@ -316,6 +347,26 @@ Never echo a token.
   as that account. Do not report it as the machine being unlinked; it is not.
 - **everything is already uploaded** — a **success**, not a failure. Beezi has everything this
   machine can offer right now. Say so and stop; do not re-run hoping for a different answer.
+- **these past sessions changed after the question was shown, so nothing was uploaded** — from an
+  Upload answer: the sessions that question counted are no longer the ones waiting (another sync
+  showed a newer question, or that question was already answered). Nothing was sent. Relay it, then
+  run step 2's command again so the user is asked about what is there now. Never retry `--accept`
+  with that token or any other.
+- **Codex is still saving analytics on this machine, so nothing was listed this time** — a Codex
+  session is writing right now, so the run stopped before listing or uploading anything. Not a
+  failure and nothing was lost. Relay it and suggest running sync again in a minute; do not retry in a
+  loop.
+- **could not read Codex’s pending analytics on this machine** — a `✗` line, with the error in
+  brackets: Beezi could not read the folder where Codex keeps its unfinished analytics, so nothing was
+  listed or uploaded. This is a fault on this machine (for example its permissions), not a busy
+  writer, so running sync again soon gives the same answer. Relay it with the error. After an Upload
+  answer the yes stays saved and Beezi retries it on its own. Do not retry in a loop.
+- **your yes is saved, but this machine is busy, so nothing was uploaded yet** — from an Upload
+  answer: Codex was saving analytics or another Beezi history run held the machine, so the upload
+  waits. Beezi retries it on its own. Relay it; do not run sync or `--accept` again for it.
+- **this workspace does not accept history uploads on demand** — a `✗` line: the workspace has
+  tracking off (or does not take uploads on demand), so nothing was listed or sent for it and there
+  is no question to ask. Relay it; the workspace admin decides this, and no flag changes it.
 - **uploaded `<n>` sessions** — the repair worked. The counts are sessions and reports, not tokens.
 - **nothing new was uploaded — `<n>` sessions were left for a later run** — not the same as
   "everything is already uploaded", and the difference matters. Nothing went wrong and nothing was
@@ -342,15 +393,13 @@ Never echo a token.
   these were skipped on purpose: live tracking is still delivering them (it will finish on its own),
   or they ran before 11 September 2026, when sub-agent ids changed, and re-sending them could
   double-count. The main sessions were still checked. Report it and move on.
-- **(dry run): sync would send N reports** — only when the user asked for `--dry-run`: a preview.
-  Nothing was sent; relay the number and say so.
+- **`--dry-run`** — only when the user asked for a preview: the summary step 2 shows, without its
+  question, ending `offers=0`; nothing is recorded or sent. Relay it and ask nothing; to upload, run
+  sync again without `--dry-run` so the user is asked.
 - **some already-saved analytics have not reached Beezi yet** — there is a delivery backlog on disk.
   Nothing was synced this time because the check would have been answered with stale information.
   The backlog retries itself; suggest running sync again afterwards.
 - **not linked** — run the `login` skill first.
-- **Your one-time history upload stays open until those repos and folders have a rule — run the
-  login skill or the sync skill to choose.** — printed by the login skill's one-time upload, not by
-  this command; step 1 above is what gives those repos and folders a rule.
 - **the server does not support history sync yet** — the workspace's Beezi server needs updating.
   No history was lost; it can be run again after the portal update.
 

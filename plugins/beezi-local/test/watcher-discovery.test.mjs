@@ -62,7 +62,8 @@ function passDeps(overrides) {
     fetchCoverage: async () => new Map(),
     loadCoverageCheckpoints: () => ({ version: 1, sessions: {} }),
     loadLedger: () => ({ sessions: {}, unreadable: {} }),
-    readTrackingState: () => null,
+    // Linked at the epoch, so every rollout here is written after link (Path B's live cutoff).
+    readTrackingState: () => ({ linkedAt: '1970-01-01T00:00:00.000Z' }),
     isLiveTrackingAllowed: () => true,
     yieldControl: async () => { calls.yields += 1; },
     ...overrides,

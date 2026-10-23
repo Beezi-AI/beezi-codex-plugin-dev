@@ -14,6 +14,7 @@ import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson, POST_TIMEOUT_MS } from './http.mjs';
 import { HOOK_TIMEOUT_SEC } from './hooks-install.mjs';
 import { postSessionError } from './session-error-report.mjs';
+import { ANONYMIZATION_KEY_MISSING, hidesSessions, markPrivate, privateKinds, reportForWire } from './anonymization.mjs';
 import { computeSessionTimeline, postSessionTimeline } from './session-timeline-codex.mjs';
 import { recordRateLimitObservations } from './rate-limits-codex.mjs';
 import { readChatgptIdentity } from './chatgpt-identity.mjs';
@@ -29,7 +30,7 @@ import {
 import { resolveSessionName as _resolveSessionName, sanitizeSessionName } from './session-name-codex.mjs';
 import { readJson, readJsonSalvaged, writeJsonDurable, safeFileName } from './fs-store.mjs';
 import {
-  isLiveTrackingAllowed, markTrackingDisabled, readTrackingState, allowsLiveFor, isTenantDark, markTenantDark,
+  isLiveTrackingAllowed, markTrackingDisabled, readTrackingState, allowsLiveFor, isTenantDark, markTenantDark, workspaceLinkMs,
 } from './tracking.mjs';
 import { readSessionWorkspace, resolveTargets, tenantsOf, isMultiTenant, QUEUE_HOLD_MS } from './workspace.mjs';
 import { recordCoverageAttempts, ensureAttemptStores } from './session-coverage.mjs';
@@ -81,7 +82,7 @@ export function enqueue(keys, payload, tenantId = null, opts = {}) {
 // kept, tokenless: its copies wait in its queue and only its network work is skipped, so the
 // cursor never moves past data it did not receive. listAccountsSync, because linkedSessions has
 // already run readIndex's migration, and a second readIndex would probe the keyring again.
-async function listRecipients(sessions, deps) {
+export async function listRecipients(sessions, deps) {
   let rows = [];
   try { rows = orDefault(await orDefault(deps.listAccounts, listAccountsSync)(deps), []); } catch { rows = []; }
   const byKey = new Map(sessions.map((session) => [session.key, session]));
@@ -101,14 +102,31 @@ function sessionRouteOf(session, workspaceState, cwd, routeCtx) {
   return cwd ? routeForDir(session, cwd, routeCtx) : null;
 }
 
+// True for a workspace whose max(linkedAt, joinedAt) is at or before `writtenAtMs`, memoized per tenant; always true without a number.
+function linkedBy(session, tracking, writtenAtMs) {
+  if (typeof writtenAtMs !== 'number') return () => true;
+  const deps = { readTrackingStateImpl: () => tracking };
+  const cutoffs = new Map();
+  return (tenantId) => {
+    if (!cutoffs.has(tenantId)) {
+      let cutoff = null;
+      try { cutoff = workspaceLinkMs({ ...session, tenantId }, tenantId, deps); } catch { cutoff = null; }
+      cutoffs.set(tenantId, cutoff);
+    }
+    const cutoff = cutoffs.get(tenantId);
+    return cutoff != null && cutoff <= writtenAtMs;
+  };
+}
+
 // Per account, where this session's payloads go: `targets` (live workspaces; [null] = no header)
 // and `hold` (the workspaces an unanswered Ask may still pick). A `routed` account re-answers per
 // segment in segmentPlan, so one with rules stays a recipient even when the session itself sends
 // nowhere: a segment in a ruled repo may still go somewhere. A preset tenantId (a backfill run's
 // own workspace) counts on an account in several workspaces only. An account whose tracking policy
 // is dark gets nothing enqueued at all, which keeps a dark tenant's queue from growing for three
-// days only to expire (see QUEUE_HOLD_MS).
-function planRecipients(recipients, { workspaceState, cwd, skipGate, unrouted, routeCtx }) {
+// days only to expire (see QUEUE_HOLD_MS). A `writtenAtMs` drops every workspace linked or joined
+// after the session's last write, held copies included.
+function planRecipients(recipients, { workspaceState, cwd, skipGate, unrouted, routeCtx, writtenAtMs }) {
   const plans = [];
   let policyGated = false;
   let darkGated = false;
@@ -117,11 +135,13 @@ function planRecipients(recipients, { workspaceState, cwd, skipGate, unrouted, r
     let tracking = null;
     try { tracking = readTrackingState(session.key); } catch { tracking = null; }
     const multi = isMultiTenant(session);
-    const live = (tenantId) => skipGate || allowsLiveFor({ ...session, tenantId }, tracking);
+    const linked = linkedBy(session, tracking, writtenAtMs);
+    const live = (tenantId) => (skipGate || allowsLiveFor({ ...session, tenantId }, tracking)) && linked(tenantId);
+    const holdable = (tenantId) => !isTenantDark(tracking, tenantId) && linked(tenantId);
     const preset = multi && typeof session.tenantId === 'string' && session.tenantId !== '' ? session.tenantId : null;
     const r = resolveTargets(session, workspaceState);
     const targets = (preset == null ? r.targets : [preset]).filter((t) => live(t));
-    const hold = preset == null && r.pendingAsk ? r.askTenants.filter((t) => !isTenantDark(tracking, t)) : [];
+    const hold = preset == null && r.pendingAsk ? r.askTenants.filter(holdable) : [];
     // `unrouted` only means something for a preset workspace, and only multi-workspace runs have
     // one: a one-workspace history run (sync, backfill, the watcher's repair pass) never passes
     // sessionRoutes, so it must still route per segment (I-1) rather than fall back to the
@@ -142,7 +162,7 @@ function planRecipients(recipients, { workspaceState, cwd, skipGate, unrouted, r
       ? routePastSession(session, { state: workspaceState, readCwd: () => orDefault(cwd, null) }, routeCtx)
       : null;
     const sessionRoute = routed && preset == null ? sessionRouteOf(session, workspaceState, cwd, routeCtx) : null;
-    plans.push({ session, multi, tracking, live, preset, targets, hold, routed, sessionRoute, pastRoute });
+    plans.push({ session, multi, live, holdable, preset, targets, hold, routed, sessionRoute, pastRoute });
   }
   return { plans, policyGated, darkGated };
 }
@@ -169,17 +189,28 @@ function segmentPlan(plan, dir, routeCtx) {
   const r = resolveTargets(plan.session, { route: { [plan.session.key]: route } });
   const targets = r.targets.filter((t) => plan.live(t));
   if (plan.preset != null) return { targets: targets.indexOf(plan.preset) === -1 ? [] : [plan.preset], hold: [] };
-  return { targets, hold: r.pendingAsk ? r.askTenants.filter((t) => !isTenantDark(plan.tracking, t)) : [] };
+  return { targets, hold: r.pendingAsk ? r.askTenants.filter(plan.holdable) : [] };
+}
+
+// Each plan's destinations for one segment.
+function routeSegment(plans, dir, routeCtx) {
+  return plans.map((plan) => ({ ...segmentPlan(plan, dir, routeCtx), session: plan.session, multi: plan.multi }));
+}
+
+// The payload with each workspace it reaches added to its marker, under the kinds on there now.
+function markForSegment(payload, routes) {
+  return markPrivate(payload, privateKinds(routes));
 }
 
 // A copy per target workspace, plus one held copy while an Ask is unanswered. `dir` is the
-// segment's directory (null = the session's own route).
+// segment's directory (null = the session's own route); `routes` is its routeSegment answer, computed here when absent.
 function emitToPlans(plans, routeCtx) {
-  const emit = (payload, dir) => {
-    for (const plan of plans) {
-      const { targets, hold } = segmentPlan(plan, dir, routeCtx);
-      for (const tenantId of targets) { enqueueCopy(plan.session.key, payload, tenantId, { multi: plan.multi }); emit.copies += 1; }
-      if (hold.length > 0) enqueueHeld(plan.session.key, payload, hold, { version: 1, dir });
+  const emit = (payload, dir, routes) => {
+    const segmentRoutes = routes != null ? routes : routeSegment(plans, dir, routeCtx);
+    const marked = markForSegment(payload, segmentRoutes);
+    for (const { session, multi, targets, hold } of segmentRoutes) {
+      for (const tenantId of targets) { enqueueCopy(session.key, marked, tenantId, { multi }); emit.copies += 1; }
+      if (hold.length > 0) enqueueHeld(session.key, marked, hold, { version: 1, dir });
     }
   };
   // Copies actually written to a queue, for `track` (M-1): `enqueued` counts built payloads, not
@@ -204,12 +235,13 @@ function readTransaction(id) {
   return tx;
 }
 
-function commitTransaction(tx, lock, emit, deps, durable) {
+// `routes` (in memory only, never on `tx`) carries each payload's routes when this run computed them.
+function commitTransaction(tx, lock, emit, deps, durable, routes = []) {
   const own = () => { if (!stillOwnsSession(lock)) throw new Error('Checkpoint ownership lost'); };
   own();
   // Each payload's segment directory, so a replay routes it afresh; absent in older transactions.
   const dirs = Array.isArray(tx.dirs) ? tx.dirs : [];
-  for (const [i, payload] of tx.payloads.entries()) { own(); emit(payload, orDefault(dirs[i], null)); }
+  for (const [i, payload] of tx.payloads.entries()) { own(); emit(payload, orDefault(dirs[i], null), routes[i]); }
   if (durable) {
     for (const child of tx.children) {
       own();
@@ -410,6 +442,12 @@ function ingestSubagents({
 // budget is unrecoverable once the cursor advances, so it is parked rather than dropped — but a
 // machine that can never reach the server must not grow its state file forever. Newest wins.
 const MAX_PENDING_ERRORS = 20;
+
+// A parked error keeps no free text once a target hides sessions.
+function withoutErrorText(event) {
+  const { text, details, ...rest } = event;
+  return rest;
+}
 
 // `deps` holds substitutable implementations (test seams); `options` holds caller-driven execution
 // modes. Keeping them separate stops a behavior flag from masquerading as an injectable.
@@ -616,6 +654,8 @@ async function runLockedCheckpoint(lock, ctx) {
   const payloads = [];
   // Each payload's segment directory, index-aligned with `payloads`; it routes, never travels.
   const dirs = [];
+  // Each payload's routes, index-aligned with `payloads` (null = emit computes them); never written to disk.
+  const routes = [];
   const children = [];
 
   // Every account this machine can currently produce a token for, plus (listRecipients) every
@@ -628,7 +668,7 @@ async function runLockedCheckpoint(lock, ctx) {
   if (recipients.length === 0) return emptyResult();
 
   // One route context (repo map load, directory keys) for the whole run.
-  const routeCtx = createRouteContext();
+  const routeCtx = deps.routeCtx == null ? createRouteContext() : deps.routeCtx;
   let workspaceState = null;
   try { workspaceState = readSessionWorkspace(sessionId); } catch { /* unreadable = unanswered */ }
   // A live session no SessionStart bound (the rollout watcher, track, a login mid-session) is bound
@@ -660,6 +700,7 @@ async function runLockedCheckpoint(lock, ctx) {
   // from the sink seam — and `unrouted` when its preset workspace takes every segment.
   const { plans, policyGated, darkGated } = planRecipients(recipients, {
     workspaceState, cwd, skipGate: options.skipLiveTrackingGate === true, unrouted: options.unrouted === true, routeCtx,
+    writtenAtMs: options.writtenAtMs,
   });
   if (plans.length === 0) {
     if (policyGated) return { ...emptyResult(), gated: true, reason: darkGated ? 'no-targets-or-dark' : 'no-targets' };
@@ -903,7 +944,7 @@ async function runLockedCheckpoint(lock, ctx) {
       const segStats = isSubagent ? statsSansContext : seg.stats;
       // Build the complete immutable transaction before publishing any payload.
       try {
-        const payload = {
+        const built = {
           segmentId: `${segmentScope}:${seg.fromLine}-${seg.toLine}`,
           sessionId,
           remote,
@@ -926,8 +967,12 @@ async function runLockedCheckpoint(lock, ctx) {
           // After the spread, deliberately: seg.stats carries the un-deduped scalar.
           duration_sec: durationSec,
         };
+        // Marked here so the transaction, the anchor and every queued copy carry the same marker.
+        const segmentRoutes = options.sink ? null : routeSegment(plans, segDir, routeCtx);
+        const payload = options.sink ? built : markForSegment(built, segmentRoutes);
         payloads.push(payload);
         dirs.push(segDir);
+        routes.push(segmentRoutes);
         lastPayload = payload;
         lastDir = segDir;
         enqueued += 1;
@@ -1027,7 +1072,8 @@ async function runLockedCheckpoint(lock, ctx) {
       if (!deliveredEverywhere) undelivered.push({ ...event, deliveredTo });
     }
     // Bounded: a session that cannot reach the server must not grow its state file without limit.
-    const next = undelivered.slice(-MAX_PENDING_ERRORS);
+    const parked = hidesSessions(plans) ? undelivered.map(withoutErrorText) : undelivered;
+    const next = parked.slice(-MAX_PENDING_ERRORS);
     const before = Array.isArray(state.pendingErrors) ? state.pendingErrors : [];
     if (next.length !== before.length || JSON.stringify(next) !== JSON.stringify(before)) {
       state.pendingErrors = next;
@@ -1138,6 +1184,7 @@ async function runLockedCheckpoint(lock, ctx) {
     try {
       payloads.push({ ...state.anchor, session_name: sessionName });
       dirs.push(orDefault(state.anchorDir, null));
+      routes.push(null);
       state.sentSessionName = sessionName;
       stateDirty = true;
     } catch { /* best-effort; retry next checkpoint */ }
@@ -1180,7 +1227,7 @@ async function runLockedCheckpoint(lock, ctx) {
     if (!stillOwnsSession(lock)) return { ...emptyResult(), reason: 'ownership-lost' };
     const tx = { version: 1, sessionId, payloads, dirs, children, state };
     if (durable) writeJsonDurable(transactionFile(sessionId), tx);
-    committedBoundaries = commitTransaction(tx, lock, emit, deps, durable);
+    committedBoundaries = commitTransaction(tx, lock, emit, deps, durable, routes);
   } catch {
     skipped.emitFailed += 1;
     return { ...emptyResult(), outcome: 'failed', reason: 'transaction-commit-failed' };
@@ -1574,6 +1621,14 @@ async function drainQueue(key, session, deps, result, verdict, queueHandle) {
       continue;
     }
 
+    const wire = reportForWire(payload, session, tenantId);
+    // Private with no key to anonymize it: never sent raw, so dropped.
+    if (wire == null) {
+      try { fs.unlinkSync(filePath); result.rejected += 1; } catch { /* best-effort */ }
+      result.lastError = orDefault(result.lastError, ANONYMIZATION_KEY_MISSING);
+      continue;
+    }
+
     // Never hand a request more time than the budget has left, or the last one overruns the kill.
     const perRequest = deadline === null
       ? undefined
@@ -1591,7 +1646,7 @@ async function drainQueue(key, session, deps, result, verdict, queueHandle) {
         result.lastError = 'Could not save workspace replay evidence; report retained.';
         continue;
       }
-      const post = (as) => postJson(reportUrl, { ...as, tenantId }, payload, {
+      const post = (as) => postJson(reportUrl, { ...as, tenantId }, wire, {
         fetchImpl,
         ...(perRequest === undefined ? {} : { timeoutMs: perRequest }),
       });

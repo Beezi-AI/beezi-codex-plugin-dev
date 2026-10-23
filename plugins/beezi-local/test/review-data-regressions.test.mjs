@@ -9,7 +9,7 @@ import * as watcher from '../lib/rollout-watcher.mjs';
 import * as rates from '../lib/rate-limits-codex.mjs';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { drainRateLimitSnapshots } from '../lib/usage-report-codex.mjs';
-import { runAudit, SYNC_MODE } from '../lib/session-audit.mjs';
+import { runAudit } from '../lib/session-audit.mjs';
 import { pruneStale } from '../lib/prune.mjs';
 import { acquireLock, sharedLock, forgetHeldLocks } from '../lib/single-instance-lock.mjs';
 import { linkAccount, accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
@@ -71,7 +71,7 @@ test('F3: a retained observation with a pruned cursor consults coverage before r
   write(file, records);
   let coverageCalls = 0;
   await watcher.runWatchPass({ linkedSessions: async () => [SESSION], pruneStale: () => {}, listRolloutFiles: () => [file], yieldControl: async () => {},
-    fetchCoverage: async () => { coverageCalls++; return new Map([[id, 5]]); }, isLiveTrackingAllowed: () => true, readTrackingState: () => null,
+    fetchCoverage: async () => { coverageCalls++; return new Map([[id, 5]]); }, isLiveTrackingAllowed: () => true, readTrackingState: () => ({ linkedAt: '1970-01-01T00:00:00.000Z' }),
     runCheckpoint: (input, _deps, opts) => runCheckpoint(input, { ...deps, ..._deps }, { ...opts, drainRateLimits: false, emitTimeline: false, skipFlush: true, sink: p => sent.push(p) }),
   }, { sessionsDir: dir, cooldownMs: 0 });
   assert.equal(coverageCalls, 1);
@@ -134,7 +134,9 @@ for (const drain of [{ lockSkipped: true }, { unreadable: 1 }]) {
       readTrackingStateImpl: () => null,
       fetchCoverageImpl: async () => { asked = true; return new Map(); },
       whoamiImpl: async () => { asked = true; return { valid: true }; },
-    }, { mode: SYNC_MODE, dryRun: true });
+      postJsonImpl: async () => { asked = true; throw new Error('must not register'); },
+      flushBackfillChunksImpl: async () => { asked = true; throw new Error('must not upload'); },
+    }, {});
     assert.equal(result.reason, 'pending-not-drained');
     assert.equal(asked, false);
   });

@@ -72,7 +72,7 @@ test('joined pick does not mark the join reviewed', async (t) => {
   assert.equal((row.reviewedTenantIds || []).indexOf('T'), -1);
 });
 
-test('joined pick carries --defer-upload to the worker-start gate', async (t) => {
+test('joined pick never starts an upload, deferred or not', async (t) => {
   link(t);
   await setWorkspaceRule(TEST_KEY, { kind: 'repo', match: MATCH, tenantIds: ['A'] });
   const started = [];
@@ -83,7 +83,7 @@ test('joined pick carries --defer-upload to the worker-start gate', async (t) =>
   assert.deepEqual(ruleFor(await rowNow(), 'repo', MATCH).tenantIds, ['A', 'T']);
   const immediate = await workspaceCommand(['joined', 'pick', '--repo', MATCH, 'B', '--account', TEST_KEY], deps);
   assert.equal(immediate.ok, true, immediate.stderr.join('\n'));
-  assert.deepEqual(started, [TEST_KEY]);
+  assert.deepEqual(started, []);
 });
 
 test('joined done prints kept= after reviewed= and marks the join reviewed', async (t) => {

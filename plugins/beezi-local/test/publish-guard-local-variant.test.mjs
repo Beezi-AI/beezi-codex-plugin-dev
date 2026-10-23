@@ -7,7 +7,7 @@ import url from 'node:url';
 // The non-production-URL guard in scripts/sync-to-github.sh, and the one carve-out that lets the
 // `beezi-local` variant through it.
 //
-// beezi-local is published to the INTERNAL marketplace by the dev step of
+// beezi-local is published to the INTERNAL marketplace by the `local` branch step of
 // azure-pipelines-github-sync.yml, so a developer working on the Beezi API can install a plugin
 // pointed at their own machine without building one. Its env.json therefore carries
 // http://localhost:5001/api by design - the exact shape the guard exists to refuse.
@@ -80,7 +80,7 @@ test('the carve-out exempts the loopback apiBase line and nothing else', () => {
   assert.ok(!allowed.test(LINE('env.json', '"updateManifestUrl": "http://localhost:5001/api",')));
 });
 
-test('the dev step publishes beezi-local without reaching for ALLOW_NON_PROD or FORCE', () => {
+test('the local step publishes beezi-local without reaching for ALLOW_NON_PROD or FORCE', () => {
   const text = pipelineText();
   // Assignment-shaped, not word-shaped: the step's own comments name both variables to explain
   // why neither is set, and a tripwire that fired on the explanation would be useless.
@@ -88,9 +88,9 @@ test('the dev step publishes beezi-local without reaching for ALLOW_NON_PROD or 
     !/(?:^|\s)(?:export\s+)?ALLOW_NON_PROD\s*=/m.test(text),
     'a blanket override would also disable the ngrok and 0.0.0.0 checks for that publish',
   );
-  // Two pushes to one branch in one job. Each sync-to-github.sh run re-fetches the tip, so the
-  // beezi-local push fast-forwards over the beezi-dev push made seconds earlier. FORCE would turn
-  // a stale tip from a loud push rejection into a silent overwrite of that publish.
+  // Each variant publishes from its own branch into one target branch. Each sync-to-github.sh run
+  // re-fetches the tip, so its push fast-forwards over the others. FORCE would turn a stale tip
+  // from a loud push rejection into a silent overwrite of another variant's publish.
   assert.ok(
     !/(?:^|\s)(?:export\s+)?FORCE\s*=/m.test(text),
     'a forced push would let the second publish clobber the first',
@@ -107,6 +107,12 @@ test('the dev step publishes beezi-local without reaching for ALLOW_NON_PROD or 
   assert.match(text, /VARIANT_DIR=dist\/variant bash scripts\/sync-to-github\.sh/);
   assert.match(
     text,
-    /displayName: Publish beezi-dev and beezi-local variants to internal GitHub\n\s+condition: eq\(variables\['Build\.SourceBranchName'\], 'dev'\)/,
+    /displayName: Publish beezi-local variant to internal GitHub\n\s+condition: eq\(variables\['Build\.SourceBranchName'\], 'local'\)/,
   );
+  // dev publishes beezi-dev only: beezi-local ships from the `local` branch alone.
+  assert.match(
+    text,
+    /displayName: Publish beezi-dev variant to internal GitHub\n\s+condition: eq\(variables\['Build\.SourceBranchName'\], 'dev'\)/,
+  );
+  assert.equal(text.match(/make-variant\.sh local /g)?.length, 1, 'beezi-local is built by one step only');
 });

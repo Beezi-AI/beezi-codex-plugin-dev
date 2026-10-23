@@ -37,10 +37,9 @@ token in Codex's store while the analytics hooks read `~/.beezi-codex/credential
 would have to be linked twice.
 
 After the browser sign-in, an account in several workspaces is asked one question, "Where should
-analytics from this machine go?": each workspace (described with how many past sessions go there),
-"Several workspaces…" (pick two or more; everything goes to each), or "Let me choose per repo",
-which goes on to a question per repo and folder. With two workspaces it is a choice, and several
-are named under Other; with more, Codex asks it as one sentence with a numbered list.
+analytics from this machine go?": each workspace (described with how many past sessions go there)
+or "Let me choose per repo", which goes on to a question per repo and folder. With two workspaces
+it is a choice; with more, Codex asks it as one sentence with a numbered list.
 
 Once signed in, every new Codex thread starts with a short banner: the account you're signed in
 as, its workspaces, and where this folder's analytics go (or that it has no rule yet). It needs the
@@ -187,8 +186,8 @@ captured ChatGPT plan.
 **To remove one**, the `logout` skill logs out a named account or every account at once and reports
 the outcome for each. With only one account linked, it logs that one out in a single step.
 
-Each account and workspace has its own history import. Login and sync ask where past sessions with
-no rule should go before uploading them; with nothing to ask, sync goes straight to the upload.
+Each account and workspace has its own history upload. Login and sync ask where past sessions with
+no rule should go, then show what an upload would send and ask before uploading anything.
 Two users of the same workspace can both link the machine; if both send to that workspace, it
 counts the same sessions twice.
 
@@ -263,6 +262,24 @@ endpoint without credentials or machine headers, so authentication failures can 
 The MCP server flushes in the background, with a short attempt at Stop; undelivered reports expire
 after 14 days. Correlation binds a random installation ID using the default linked account when
 usable, otherwise another linked account. Logging out the last account rotates that ID.
+
+## Anonymization
+
+A workspace can hide any of five kinds: **folder and repository names**, **branch names**,
+**computer name**, **account email** and **Session titles**. A hidden name is replaced on this
+machine, before anything is sent, with a made-up value of the form `anon:<kind>:<hex>`: an HMAC-SHA256
+under the key on that workspace's anonymization settings, computed on this machine. Beezi never
+receives the original.
+
+With Session titles on, session titles, error messages and subagent names are not sent at all.
+
+Without the workspace's key on this machine, a hidden kind is never sent raw: live reports for that
+workspace are dropped, and sync stops with a line asking you to sign in again.
+
+Past sessions need a yes. Login, sync and the setup wizard show what an upload would send — which
+kinds are sent as they are and which the workspace hides — and ask; nothing goes up without
+"Upload". The kinds the question showed as hidden stay hidden for that upload, even if the
+workspace turns them off before it runs.
 
 ## Updating
 
@@ -526,8 +543,8 @@ Pro split: the $200 tier kept the name `pro` and became 20×, and the new $100 5
 `prolite`. Anything left unmapped normalizes to `unknown`, which never settles — so the
 "refresh your plan" nudge would fire on every session with no way for the user to end it.
 
-Both history paths — the login skill's one-time import and the repeatable `sync` — reach back
-**30 days** and no further. A rollout older than that is skipped with a visible count and is never
+Both history paths — the login skill's past-sessions step, which asks first, and the repeatable
+`sync` — reach back **30 days** and no further. A rollout older than that is skipped with a visible count and is never
 picked up by a later run; the window is shared deliberately, so a session cannot be in scope for
 one command and out of scope for the other.
 
@@ -543,11 +560,11 @@ sessions that started before 2026-09-11 keep their subagents back, because live 
 agent ids were canonicalized may carry a different `agent_id`. Before 0.16.0 a sync sent no
 subagents at all, so the first sync after upgrading uploads the ones it left behind.
 
-New or unfinished historical backfills register and snapshot the current ChatGPT account before
-upload, then attach its `account_uuid` to every imported report, including subagent reports. This
-attributes history to the account active during the import; it does not reconstruct the plan or
-account that was active when each session ran. If no subscription account ID is available, the
-reports are sent without one.
+Past sessions go up only after a yes to the question login or sync showed. That upload registers
+and snapshots the current ChatGPT account first, then attaches its `account_uuid` to every report it
+sends, including subagent reports. This attributes history to the account active at the upload; it
+does not reconstruct the plan or account that was active when each session ran. If no subscription
+account ID is available, the reports are sent without one.
 
 **Known limitation:** Codex's third-party providers are configured in `~/.codex/config.toml`
 (`model_provider` / `env_key`), invisible to the environment. Parsing it would need a TOML
@@ -557,7 +574,7 @@ machine on a custom provider with a leftover ChatGPT login resolves as `subscrip
 ## Client identity
 
 Every request carries an `X-Beezi-Agent: codex` header, and this machine's OAuth client registers as
-`Beezi Codex plugin — <hostname>`, so the Beezi API attributes Codex machines and analytics
+`Beezi Codex plugin`, with no hostname, so the Beezi API attributes Codex machines and analytics
 distinctly from the Claude Code plugin.
 
 ## Configuration

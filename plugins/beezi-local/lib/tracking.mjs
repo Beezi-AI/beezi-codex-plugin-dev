@@ -1,9 +1,9 @@
 import fs from 'fs';
-import { trackingStateFile } from './paths.mjs';
+import { credentialsFile, trackingStateFile } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { withLock, sharedLock } from './single-instance-lock.mjs';
-import { isMultiTenant } from './workspace.mjs';
+import { isMultiTenant, tenantById } from './workspace.mjs';
 
 const STATE_VERSION = 1;
 
@@ -78,17 +78,6 @@ export function allowsLiveFor(session, state) {
   return liveAllowedIn(state);
 }
 
-// Mirrors the server's derivation: every mode except `disabled` is offered the one-time pull
-// until it completes — paid tenants included, not just audit ones. A null mode means a
-// pre-audit server: it has no backfill routes, so no hint.
-export function shouldBackfill(key, deps = {}) {
-  const state = stateFor(key, deps);
-  if (!state) return false;
-  if (state.trackingMode == null) return false;
-  if (state.backfillCompleted === true) return false;
-  return state.trackingMode !== TrackingMode.DISABLED;
-}
-
 // The state belongs to an account, but the server's pull record is per (tenant, user, tool): a
 // logout→login into another workspace must not inherit the previous one's flags even under the
 // same key. The OAuth client id changes on every login (dynamic registration), so it is the
@@ -146,8 +135,8 @@ function patchTrackingState(key, patch, deps = {}) {
     : { written: false, skipped: true, reason: run.reason };
 }
 
-// When this account was linked on this machine, as an ISO instant. The audit uses it to skip
-// transcripts that live tracking already owns; it used to be approximated by the credentials
+// When this account was linked on this machine, as an ISO instant. The history run uses it to split
+// past sessions from live ones; it used to be approximated by the credentials
 // file's mtime, which is only written by the DPAPI/plaintext fallbacks — on any machine with a
 // real credential store (CredMan, Keychain, secret-tool) that file never exists and the guard
 // silently never fired.
@@ -162,6 +151,30 @@ export function linkedAtMs(key, deps = {}) {
   return Number.isFinite(ms) ? ms : null;
 }
 
+// The machine link instant from tracking.json, stamped by login. The credentials file's mtime stays
+// as the fallback for links made before the stamp existed — but it is only written by the
+// plaintext fallback store, so on a keyring machine (CredMan, Keychain, secret-tool) it does not
+// exist and this returns null.
+function linkOrCredentialsMs(key, deps) {
+  const stamped = linkedAtMs(key, deps);
+  if (stamped != null) return stamped;
+  const statImpl = orDefault(deps.statImpl, (p) => fs.statSync(p));
+  try {
+    return orDefault(statImpl(credentialsFile(key)).mtimeMs, null);
+  } catch {
+    return null;
+  }
+}
+
+// A session last written at or after this is live for the workspace: the account link, or the workspace's later join; null when the link is unknown.
+export function workspaceLinkMs(session, tenantId, deps = {}) {
+  const linkMs = linkOrCredentialsMs(session.key, deps);
+  if (linkMs == null || !isMultiTenant(session)) return linkMs;
+  const tenant = tenantById(session, tenantId);
+  const joinedMs = tenant != null && typeof tenant.joinedAt === 'string' ? Date.parse(tenant.joinedAt) : NaN;
+  return Number.isFinite(joinedMs) && joinedMs > linkMs ? joinedMs : linkMs;
+}
+
 // Persist the whoami verdict. `identity` is the current login's binding key (client id or email).
 export function recordWhoami(key, who, identity, deps = {}) {
   if (!who || who.valid !== true) return { written: false, skipped: false, reason: 'not-valid' };
@@ -170,7 +183,6 @@ export function recordWhoami(key, who, identity, deps = {}) {
     {
       trackingMode: orDefault(who.trackingMode, null),
       tenantTier: orDefault(who.tenantTier, null),
-      backfillCompleted: who.backfillCompleted === true,
       identity: orDefault(identity, null),
       fetchedAt: new Date().toISOString(),
       reason: null,
@@ -202,11 +214,6 @@ export function markTenantDark(key, tenantId, deps = {}) {
     const dark = current.darkTenants != null && typeof current.darkTenants === 'object' ? current.darkTenants : {};
     return { darkTenants: { ...dark, [tenantId]: new Date().toISOString() } };
   }, deps);
-}
-
-// The pull sealed (locally observed or server-confirmed) — the audit fast path keys off this.
-export function markBackfillCompleted(key, deps = {}) {
-  return patchTrackingState(key, { backfillCompleted: true, fetchedAt: new Date().toISOString() }, deps);
 }
 
 export function clearTrackingState(key) {

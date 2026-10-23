@@ -1,5 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
+import os from 'node:os';
 import { discover, registerClient, pkcePair, exchangeCode, refreshTokens } from '../lib/oauth.mjs';
 
 const jsonRes = (body, status = 200) => ({
@@ -43,16 +44,19 @@ test('discover throws a friendly error when the portal has no OAuth metadata', a
   );
 });
 
-test('registerClient POSTs DCR metadata and returns client_id', async () => {
+test('registerClient POSTs DCR metadata and returns client_id', async (t) => {
+  const savedHostname = os.hostname;
+  os.hostname = () => 'my-mac';
+  t.after(() => { os.hostname = savedHostname; });
   let sent;
   const fetchImpl = async (url, init) => {
     sent = JSON.parse(init.body);
     return jsonRes({ client_id: 'cid_123' }, 201);
   };
   const id = await registerClient('https://clerk.example.com/oauth/register',
-    'http://127.0.0.1:49152/callback', { fetchImpl, hostname: 'my-mac' });
+    'http://127.0.0.1:49152/callback', { fetchImpl });
   assert.equal(id, 'cid_123');
-  assert.equal(sent.client_name, 'Beezi Codex plugin — my-mac');
+  assert.equal(sent.client_name, 'Beezi Codex plugin', 'the client name carries no hostname');
   assert.deepEqual(sent.redirect_uris, ['http://127.0.0.1:49152/callback']);
   assert.equal(sent.token_endpoint_auth_method, 'none');
   assert.deepEqual(sent.grant_types, ['authorization_code', 'refresh_token']);
