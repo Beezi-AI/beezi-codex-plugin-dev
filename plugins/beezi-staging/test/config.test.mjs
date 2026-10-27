@@ -7,7 +7,7 @@ import assert from 'node:assert/strict';
 import { apiBase, apiOrigin, AGENT, ENDPOINTS, OAUTH_SCOPES } from '../lib/config.mjs';
 import { ENV_API_BASE, environment } from '../lib/paths.mjs';
 
-const PRODUCTION = 'https://beezi-api-prod.azurewebsites.net/api';
+const PRODUCTION = 'https://api.beezi.ai/api';
 
 // Swap an env var for one test and put it back, whether or not it was set.
 function withEnv(t, name, value) {
@@ -73,7 +73,7 @@ test('an unresolvable environment makes apiBase refuse rather than answer the de
 test('apiOrigin drops the /api path', (t) => {
   // The OAuth discovery documents are mounted at the root, outside the /api prefix.
   withEnv(t, 'BEEZI_API_URL', undefined);
-  assert.equal(apiOrigin(), 'https://beezi-api-prod.azurewebsites.net');
+  assert.equal(apiOrigin(), 'https://api.beezi.ai');
 });
 
 test('apiOrigin follows an overridden base', (t) => {

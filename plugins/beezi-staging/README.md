@@ -564,7 +564,7 @@ distinctly from the Claude Code plugin.
 
 | Env var | Default | Purpose |
 | --- | --- | --- |
-| `BEEZI_API_URL` | `https://beezi-api-prod.azurewebsites.net/api` | Beezi API base |
+| `BEEZI_API_URL` | `https://api.beezi.ai/api` | Beezi API base |
 | `BEEZI_MCP_URL` | `<BEEZI_API_URL>/mcp` | MCP endpoint |
 | `BEEZI_ENV` | unset (production) | `dev`/`staging`/`local` selects the namespace: data root, keyring entry, hook owner |
 | `BEEZI_CODEX_HOME` | `~/.beezi-codex` | Queue / state / credentials, and the hook launcher |

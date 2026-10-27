@@ -53,7 +53,13 @@ const MIGRATION_VERSION = 1;
 // not evidence (R1 forbids inferring an environment from one), and the data itself carries no
 // environment stamp before this release.
 export const STAGING_API_ORIGIN = 'https://beezi-api-staging.azurewebsites.net';
-export const PRODUCTION_API_ORIGIN = 'https://beezi-api-prod.azurewebsites.net';
+export const PRODUCTION_API_ORIGIN = 'https://api.beezi.ai';
+// Production's API before it moved to the beezi.ai domain above. The old host is stopped, but every
+// production root bound before the move holds it in environment.json, and an older production
+// credential may hold a token_endpoint on it. Both hosts name https://clerk.beezi.ai as their
+// authorization server — one tenant, two addresses — so this origin is evidence of production and
+// is accepted wherever a STORED origin is compared. It is never a destination: nothing posts here.
+export const LEGACY_PRODUCTION_API_ORIGIN = 'https://beezi-api-prod.azurewebsites.net';
 // Production's OAuth issuer. A production login is a Clerk login on Beezi's own domain, so the
 // token_endpoint a fresh production credential holds is HERE, not on the API — and naming only the
 // API origin above made every production login read as 'unknown', blocking all uploads with
@@ -123,7 +129,8 @@ export function issuerEnvironment(raw) {
 
   const origin = originOf(obj.token_endpoint);
   const issuer = origin === STAGING_API_ORIGIN || origin === STAGING_OAUTH_ORIGIN ? 'staging'
-    : origin === PRODUCTION_API_ORIGIN || origin === PRODUCTION_OAUTH_ORIGIN ? 'production' : 'unknown';
+    : origin === PRODUCTION_API_ORIGIN || origin === LEGACY_PRODUCTION_API_ORIGIN
+      || origin === PRODUCTION_OAUTH_ORIGIN ? 'production' : 'unknown';
   const stamped = obj.beezi_env;
   if (typeof stamped === 'string') {
     // '' names the unsuffixed NAMESPACE, not an API: every build before the cutover wrote it while
@@ -263,6 +270,9 @@ export function classifyRoot(facts) {
   }
 
   if (binding && typeof binding === 'object' && typeof binding.env === 'string') {
+    // A production root bound before the API moved names the legacy origin; it is the same tenant.
+    const boundApi = env === '' && binding.apiOrigin === LEGACY_PRODUCTION_API_ORIGIN
+      ? PRODUCTION_API_ORIGIN : binding.apiOrigin;
     if (binding.env === env) {
       // The cutover classifier can identify only the two API origins the public plugin has
       // shipped. Dev and local credentials therefore have issuer='unknown', but a named
@@ -270,7 +280,7 @@ export function classifyRoot(facts) {
       // setCredentials(). The token endpoint only has to be PRESENT, not to match the API:
       // OAuth discovery legitimately puts it on an external issuer such as Clerk, so comparing
       // it with the Beezi API origin made a fresh local login block every later operation.
-      // The root's own origin is still verified independently by the `binding.apiOrigin !== api`
+      // The root's own origin is still verified independently by the `boundApi !== api`
       // test below, so the credential is only ever asked for its environment.
       const matchingNamedCredential = env !== ''
         && typeof f.credentialOrigin === 'string'
@@ -279,10 +289,10 @@ export function classifyRoot(facts) {
       // a pre-cutover build — the OS keyring outlives a deleted data root. It cannot be used here
       // and login cannot replace it while the guard blocks, so it is cleared. 'unknown' is not
       // cleared: an issuer this module does not recognise yet may well be production's.
-      if (env === '' && binding.apiOrigin === api && f.issuer === 'staging') {
+      if (env === '' && boundApi === api && f.issuer === 'staging') {
         return { verdict: 'clear-stale' };
       }
-      if (binding.apiOrigin !== api || (f.issuer !== 'unlinked' && f.issuer !== expected
+      if (boundApi !== api || (f.issuer !== 'unlinked' && f.issuer !== expected
         && !matchingNamedCredential)) {
         return { verdict: 'blocked', reason: 'conflicting-evidence' };
       }
