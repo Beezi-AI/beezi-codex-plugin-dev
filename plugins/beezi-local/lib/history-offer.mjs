@@ -13,10 +13,11 @@ export const OfferCheck = Object.freeze({
   SHOW: 'show', SCAN_WAIT: 'scan-wait', SCAN: 'scan',
 });
 
-const MAX_FOLDERS = 5;
+const MAX_FOLDERS = 3;
 const MONTHS = ['Jan', 'Feb', 'Mar', 'Apr', 'May', 'Jun', 'Jul', 'Aug', 'Sep', 'Oct', 'Nov', 'Dec'];
 const TITLE_NOTE = ' (the thread title Codex shows, which is the start of your first message until Codex names the thread)';
 const SUBAGENT_TEXT = 'subagent names';
+const SUBAGENT_SHORT = 'subagent names';
 // L3 / L4 items in K7 order, each with the kind that hides it.
 const FIELD_NAMES = [
   ['repos', 'folder and repository names'],
@@ -103,39 +104,44 @@ function dateRange(firstMs, lastMs) {
   const last = new Date(lastMs);
   const withYear = first.getFullYear() !== last.getFullYear();
   const label = (d) => `${d.getDate()} ${MONTHS[d.getMonth()]}${withYear ? ` ${d.getFullYear()}` : ''}`;
-  return sameDay(first, last) ? `on ${label(first)}` : `from ${label(first)} to ${label(last)}`;
+  return sameDay(first, last) ? label(first) : `${label(first)} – ${label(last)}`;
 }
 
-function folderClause(folders) {
-  const distinct = folders.filter((f, i) => folders.indexOf(f) === i);
-  if (distinct.length === 0) return '';
-  const shown = distinct.slice(0, MAX_FOLDERS);
-  const more = distinct.length - shown.length;
-  const names = more > 0 ? shown.concat([`${more} more`]) : shown;
-  return ` in ${plural(distinct.length, 'folder')}: ${joinList(names)}`;
+function folderLine(distinct) {
+  const more = distinct.length - MAX_FOLDERS;
+  return `  in ${distinct.slice(0, MAX_FOLDERS).join(', ')}${more > 0 ? ` +${more} more` : ''}`;
 }
 
-// The K7 lines L1–L5 for one workspace; `folders` are local base names, `kinds` the workspace's hidden kinds.
+// Hidden items two per line, in K7 order; an odd last item stands alone.
+function hiddenLines(hidden) {
+  const lines = [];
+  for (let i = 0; i < hidden.length; i += 2) lines.push(`    ◆ ${hidden.slice(i, i + 2).join(', ')}`);
+  return lines;
+}
+
+// The K7-C plain lines H1–N1 for one workspace; `folders` are local base names, `kinds` the workspace's hidden kinds.
 export function offerLines({ n, firstMs, lastMs, folders, kinds }) {
   const hidden = FIELD_NAMES.filter(([kind]) => kinds.indexOf(kind) !== -1).map(([, name]) => name);
   const shown = FIELD_NAMES.filter(([kind]) => kinds.indexOf(kind) === -1).map(([, name]) => name);
-  const lines = [
-    `Beezi found ${plural(n, 'past Codex session')} ${dateRange(firstMs, lastMs)}${folderClause(folders)}.`,
-    'Uploading sends dates, duration, models, tokens, cost, and tool, skill and MCP names for each session.',
-  ];
-  if (shown.length > 0) lines.push(`Sent as they are: ${joinList(shown)}.`);
-  if (hidden.length > 0) lines.push(`Hidden by your workspace: ${joinList(hidden)}. Beezi receives made-up names instead.`);
-  lines.push(kinds.indexOf('sessions') !== -1
-    ? `Session titles, error messages and ${SUBAGENT_TEXT} are not sent.`
-    : `Also sent as written: session titles${TITLE_NOTE}, error messages (up to 1,000 characters) and ${SUBAGENT_TEXT}.`);
+  const distinct = folders.filter((f, i) => folders.indexOf(f) === i);
+  const folderPart = distinct.length > 0 ? `, ${plural(distinct.length, 'folder')}` : '';
+  const sessionsHidden = kinds.indexOf('sessions') !== -1;
+  const lines = [`Beezi found ${plural(n, 'past Codex session')} (${dateRange(firstMs, lastMs)}${folderPart})`];
+  if (distinct.length > 0) lines.push(folderLine(distinct));
+  lines.push('  Sent', '    ✓ dates, duration, models, tokens, cost', '    ✓ tool, skill and MCP names');
+  if (shown.length > 0) lines.push(`    ✓ ${joinList(shown)}, as they are`);
+  if (!sessionsHidden) {
+    lines.push(`    ✓ session titles${TITLE_NOTE}, error messages (up to 1,000 characters) and ${SUBAGENT_TEXT}, as written`);
+  }
+  if (hidden.length > 0) lines.push('  Hidden by your workspace — Beezi gets made-up names', ...hiddenLines(hidden));
+  if (sessionsHidden) lines.push('  Never sent', `    ✕ session titles, error messages and ${SUBAGENT_SHORT}`);
   return lines;
 }
 
 export function questionText(n, workspace) {
-  return n === 1 ? `Upload this session to ${workspace}?` : `Upload these ${n} sessions to ${workspace}?`;
+  return n === 1 ? `Upload this session to ${workspace}?` : `Upload ${n} sessions to ${workspace}?`;
 }
 
-// D, or DA for an Audit workspace.
 export function declineLine(audit) {
   const command = `\`${naming.syncCommand()}\``;
   return audit

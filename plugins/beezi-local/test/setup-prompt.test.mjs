@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { createPrompt, openTerminal, parseNumbers, renderOptions } from '../lib/setup-prompt.mjs';
+import { uploadChoices } from '../lib/setup-wizard.mjs';
 
 const OPTIONS = [
   { label: 'Ask me (recommended)', description: 'Beezi asks once' },
@@ -167,4 +168,17 @@ test('openTerminal prefers a TTY stdin, falls back to /dev/tty off Windows, else
   assert.equal(openTerminal({ stdin: piped, platform: 'linux', openTty: () => devTty }), devTty);
   assert.equal(openTerminal({ stdin: piped, platform: 'win32', openTty: () => devTty }), null);
   assert.equal(openTerminal({ stdin: piped, platform: 'linux', openTty: () => { throw new Error('ENXIO'); } }), null);
+});
+
+test('without keys the upload menu falls back to the numbered chooser, Upload now first and the default', async () => {
+  const h = harness();
+  assert.deepEqual(renderOptions(uploadChoices(), 0), ['  1) Upload now (default)', '  2) Not now — run $beezi:sync any time']);
+  const enter = h.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
+  await h.type('');
+  assert.equal(await enter, 0);
+  const notNow = h.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
+  await h.type('2');
+  assert.equal(await notNow, 1);
+  assert.match(h.text(), /Choose 1-2 \[1\]: /);
+  h.prompt.close();
 });

@@ -258,10 +258,10 @@ function offerAnswerSteps(root) {
   const sync = `node "${root}/scripts/sync.mjs"`;
   return [
     'If it prints `offers=0`, say nothing about past sessions.',
-    'Write every line that is not a `Q `, `offer ` or `offers=` line verbatim.',
-    `If a request_user_input tool is available this turn and there are at most ${TOOL_MAX_QUESTIONS} \`offer\` lines, use it in one call, header "${TOOL_HEADER}", one question per \`offer\` line: id "beezi_history_<key>_<i>", the matching \`Q \` line without \`Q \` as its text, and the options "Upload" (description "Send these sessions now") and "Not now" (description "Nothing is sent; run \`${naming.syncCommand()}\` later"). Mark none as recommended.`,
+    'Write every line that is not a `Q `, `offer ` or `offers=` line verbatim, in order, inside one plain fenced code block (```), so their 2- and 4-space indents survive.',
+    `If a request_user_input tool is available this turn and there are at most ${TOOL_MAX_QUESTIONS} \`offer\` lines, use it in one call, header "${TOOL_HEADER}", one question per \`offer\` line: id "beezi_history_<key>_<i>", the matching \`Q \` line without \`Q \` as its text, and the options "Upload now" (description "Send these sessions now") and "Not now" (description "Nothing is sent; run \`${naming.syncCommand()}\` later"). Mark none as recommended.`,
     'Otherwise, after the user\'s request, end your reply with one plain sentence per offer: the question, then " Reply upload or not now."',
-    `On "Upload", run \`${sync} --accept --background --account <key> --tenant <id> --token <token>\`. On "Not now", an Other answer or a dismissed question, run \`${sync} --decline --account <key> --tenant <id>\`.`,
+    `On "Upload now", run \`${sync} --accept --background --account <key> --tenant <id> --token <token>\`. On "Not now", an Other answer or a dismissed question, run \`${sync} --decline --account <key> --tenant <id>\`.`,
     '`<key>` and `<id>` are the `account=` and `tenant=` values of that question\'s `offer` line, `<token>` is the `token=` value of that `offer` line, and `<i>` is that line\'s position, from 1.',
     'Run both commands with escalated permissions too. Show the user only the first line of the accept command\'s output, and nothing from the decline command.',
   ].join(' ');

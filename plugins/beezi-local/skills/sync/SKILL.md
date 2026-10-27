@@ -267,11 +267,12 @@ Nothing has been uploaded. Its lines:
 - `offer account=<key> tenant=<id> sessions=<n> audit=<yes|no> token=<token>` — right after its `Q` line, for you
   only;
 - `offers=<n>` — the number of questions, always last, for you only;
-- every other line (the summary, a heading, an outcome below) — write it verbatim, in order.
+- every other line (the summary, a heading, an outcome below) — write it verbatim, in order, inside one
+  plain fenced code block (```), because Markdown flattens their 2- and 4-space indents.
 
 `offers=0` → nothing to ask. Otherwise ask exactly as the `login` skill's step 4b does, whatever the
 workspace's past-sessions setting is and even when the user said not now before: each `Q` line's
-question (its text after `Q `), with the choices "Upload" (described "Send these sessions now") and
+question (its text after `Q `), with the choices "Upload now" (described "Send these sessions now") and
 "Not now" (described "Nothing is sent"):
 
 - **`request_user_input`** only when that tool is listed this turn and there are at most 3 `Q` lines:
@@ -283,7 +284,7 @@ question (its text after `Q `), with the choices "Upload" (described "Send these
 Then, for each question, with `<key>`, `<id>` and `<token>` the `account=`, `tenant=` and `token=` values
 of its `offer` line:
 
-- "Upload" → run
+- "Upload now" → run
 
   ```
   node "<plugin-root>/scripts/sync.mjs" --accept --account <key> --tenant <id> --token <token>

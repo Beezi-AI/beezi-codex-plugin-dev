@@ -16,9 +16,10 @@ const B = '2026-10-02T00:00:00.000Z';
 const block = (changedAt, choice = 'offer') => parseAnonymization(null, 't1', { choice, changedAt });
 const check = (current, record, extra = {}) => offerCheck({ block: block(current), trackingDisabled: false, record, nowMs: NOW, ...extra });
 const local = (y, m, d) => new Date(y, m - 1, d, 12).getTime();
-const L2 = 'Uploading sends dates, duration, models, tokens, cost, and tool, skill and MCP names for each session.';
-const L5A = 'Also sent as written: session titles (the thread title Codex shows, which is the start of your first message until Codex names the thread), error messages (up to 1,000 characters) and subagent names.';
-const L5B = 'Session titles, error messages and subagent names are not sent.';
+const SENT = ['  Sent', '    ✓ dates, duration, models, tokens, cost', '    ✓ tool, skill and MCP names'];
+const S4 = '    ✓ session titles (the thread title Codex shows, which is the start of your first message until Codex names the thread), error messages (up to 1,000 characters) and subagent names, as written';
+const X0 = '  Hidden by your workspace — Beezi gets made-up names';
+const NEVER = ['  Never sent', '    ✕ session titles, error messages and subagent names'];
 const SUMMARY = { n: 132, firstMs: local(2026, 8, 12), lastMs: local(2026, 10, 21), folders: ['payments-api', 'web', 'infra', 'notes'], workspace: 'Acme' };
 
 test('offerCheck: a skip choice wins over any record', () => {
@@ -57,49 +58,73 @@ test('offerCheck: a scan stamped within the hour waits; an older one or none sca
   assert.equal(offerCheck({ block: null, trackingDisabled: false, record: null, nowMs: NOW }), OfferCheck.SCAN);
 });
 
-test('offerLines: the K7 summary with three kinds hidden', () => {
+test('offerLines: three kinds hidden, sessions off: S3, S4, an odd hidden item alone and no Never sent', () => {
   assert.deepEqual(offerLines({ ...SUMMARY, kinds: ['repos', 'branches', 'hosts'] }), [
-    'Beezi found 132 past Codex sessions from 12 Aug to 21 Oct in 4 folders: payments-api, web, infra and notes.',
-    L2,
-    'Sent as they are: account email.',
-    'Hidden by your workspace: folder and repository names, branch names and computer name. Beezi receives made-up names instead.',
-    L5A,
+    'Beezi found 132 past Codex sessions (12 Aug – 21 Oct, 4 folders)',
+    '  in payments-api, web, infra +1 more',
+    ...SENT,
+    '    ✓ account email, as they are',
+    S4,
+    X0,
+    '    ◆ folder and repository names, branch names',
+    '    ◆ computer name',
   ]);
 });
 
-test('offerLines: every kind on drops L3 and says what is not sent', () => {
-  const lines = offerLines({ ...SUMMARY, kinds: ['repos', 'branches', 'sessions', 'hosts', 'accounts'] });
-  assert.deepEqual(lines.slice(2), [
-    'Hidden by your workspace: folder and repository names, branch names, computer name and account email. Beezi receives made-up names instead.',
-    L5B,
+test('offerLines: every kind on hides all four in pairs, drops S3 and S4, and says what is never sent', () => {
+  assert.deepEqual(offerLines({ ...SUMMARY, kinds: ['repos', 'branches', 'sessions', 'hosts', 'accounts'] }).slice(2), [
+    ...SENT,
+    X0,
+    '    ◆ folder and repository names, branch names',
+    '    ◆ computer name, account email',
+    ...NEVER,
   ]);
 });
 
-test('offerLines: every kind off drops L4', () => {
+test('offerLines: no hidden kinds drops the X block and S3 lists all four', () => {
   assert.deepEqual(offerLines({ ...SUMMARY, kinds: [] }).slice(2), [
-    'Sent as they are: folder and repository names, branch names, computer name and account email.',
-    L5A,
+    ...SENT,
+    '    ✓ folder and repository names, branch names, computer name and account email, as they are',
+    S4,
   ]);
 });
 
-test('offerLines: more than five folders name five, then the rest as a count', () => {
-  const lines = offerLines({ ...SUMMARY, folders: ['a', 'b', 'c', 'b', 'd', 'e', 'f', 'g'], kinds: [] });
-  assert.equal(lines[0], 'Beezi found 132 past Codex sessions from 12 Aug to 21 Oct in 7 folders: a, b, c, d, e and 2 more.');
+test('offerLines: sessions on alone gives N0 and N1, with no S4 and no X block', () => {
+  assert.deepEqual(offerLines({ ...SUMMARY, kinds: ['sessions'] }).slice(2), [
+    ...SENT,
+    '    ✓ folder and repository names, branch names, computer name and account email, as they are',
+    ...NEVER,
+  ]);
+});
+
+test('offerLines: more than three distinct folders name three, then +k more', () => {
+  const lines = offerLines({ ...SUMMARY, folders: ['a', 'b', 'c', 'b', 'd', 'e'], kinds: [] });
+  assert.equal(lines[0], 'Beezi found 132 past Codex sessions (12 Aug – 21 Oct, 5 folders)');
+  assert.equal(lines[1], '  in a, b, c +2 more');
+});
+
+test('offerLines: exactly three folders has no +k more', () => {
+  assert.equal(offerLines({ ...SUMMARY, folders: ['a', 'b', 'c'], kinds: [] })[1], '  in a, b, c');
 });
 
 test('offerLines: a range across a year names both years', () => {
   const lines = offerLines({ ...SUMMARY, firstMs: local(2026, 12, 20), lastMs: local(2027, 1, 3), kinds: [] });
-  assert.equal(lines[0], 'Beezi found 132 past Codex sessions from 20 Dec 2026 to 3 Jan 2027 in 4 folders: payments-api, web, infra and notes.');
+  assert.equal(lines[0], 'Beezi found 132 past Codex sessions (20 Dec 2026 – 3 Jan 2027, 4 folders)');
 });
 
-test('offerLines: one session on one day in one folder', () => {
+test('offerLines: one session on one day in one folder is singular with one date', () => {
   const lines = offerLines({ n: 1, firstMs: local(2026, 9, 3), lastMs: local(2026, 9, 3) + 60 * MIN, folders: ['web'], kinds: [], workspace: 'Acme' });
-  assert.equal(lines[0], 'Beezi found 1 past Codex session on 3 Sep in 1 folder: web.');
+  assert.deepEqual(lines.slice(0, 2), ['Beezi found 1 past Codex session (3 Sep, 1 folder)', '  in web']);
 });
 
-test('offerLines: no folders drops the folder clause', () => {
+test('offerLines: no folder names drops H2 and the folder count', () => {
   const lines = offerLines({ ...SUMMARY, folders: [], kinds: [] });
-  assert.equal(lines[0], 'Beezi found 132 past Codex sessions from 12 Aug to 21 Oct.');
+  assert.deepEqual(lines.slice(0, 2), ['Beezi found 132 past Codex sessions (12 Aug – 21 Oct)', '  Sent']);
+});
+
+test('offerLines: the plain lines carry no ANSI escape', () => {
+  const lines = offerLines({ ...SUMMARY, kinds: ['repos', 'sessions'] });
+  assert.equal(lines.some((line) => line.indexOf('\x1b') !== -1), false);
 });
 
 test('plural adds -s to the singular for any count but one', () => {
@@ -108,7 +133,7 @@ test('plural adds -s to the singular for any count but one', () => {
 });
 
 test('questionText: plural and single', () => {
-  assert.equal(questionText(132, 'Acme'), 'Upload these 132 sessions to Acme?');
+  assert.equal(questionText(132, 'Acme'), 'Upload 132 sessions to Acme?');
   assert.equal(questionText(1, 'Acme'), 'Upload this session to Acme?');
 });
 

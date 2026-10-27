@@ -1,4 +1,5 @@
 import { BillingSource, CHATGPT_PLANS } from './billing.mjs';
+import { naming } from './paths.mjs';
 import {
   askNewFolders, lastLine, outputLines, printable, report, reviewJoined, reviewRoutes, token,
 } from './setup-routing.mjs';
@@ -125,9 +126,13 @@ async function checkHooks(ctx) {
 
 // Yes uploads exactly the sessions the summary showed, named by its `offer` line's token; No or a dismissal keeps them
 // declined and prints the D line.
+export function uploadChoices() {
+  return [{ label: 'Upload now' }, { label: 'Not now', description: `run ${naming.syncCommand()} any time` }];
+}
+
 async function answerOffer(ctx, key, line, question) {
   const target = ['--account', key, '--tenant', token(line, 'tenant')];
-  if (await ctx.ask.confirm(question, false) === true) {
+  if (await ctx.ask.choose(question, uploadChoices(), { defaultIndex: 0, escape: true }) === 0) {
     const accept = ['--accept'].concat(target, ['--token', token(line, 'token')]);
     await ctx.run('sync.mjs', accept, { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
     return;

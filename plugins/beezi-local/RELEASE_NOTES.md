@@ -1,5 +1,10 @@
 # Beezi plugin release notes
 
+## 0.24.1 (2026-10-23) — Past-sessions checklist
+
+### Improved
+- **Past-sessions checklist** — login, sync and the setup wizard show what an upload sends, hides and never sends as a short checklist, and the wizard asks with an Upload now / Not now menu.
+
 ## 0.24.0 (2026-10-21) — Anonymized workspaces
 
 ### New

@@ -103,11 +103,11 @@ test('the sync offer (no --past) still lists and asks under skip', async (t) => 
   assert.equal('mode' in h.audits[0], false);
   assert.equal(h.audits[0].tenantId, null);
   assert.deepEqual(io.out.slice(-3), [
-    'Q Upload these 2 sessions to Acme?',
+    'Q Upload 2 sessions to Acme?',
     offerLine('t1', ['s1', 's2']),
     'offers=1',
   ]);
-  assert.equal(io.out[0], 'Beezi found 2 past Codex sessions from 12 Aug to 21 Oct in 2 folders: web and api.');
+  assert.deepEqual(io.out.slice(0, 2), ['Beezi found 2 past Codex sessions (12 Aug – 21 Oct, 2 folders)', '  in web, api']);
   assert.equal(done.offers, 1);
 });
 
@@ -205,11 +205,11 @@ test('two workspaces get one block each, with their own hidden line', async (t) 
   await offerCommand({ key: TEST_KEY }, deps({ t1: listed([session('s1')]), t2: listed([session('s2'), session('s3')]) }).deps);
   const qs = io.out.map((line, i) => (line.startsWith('Q ') ? i : -1)).filter((i) => i !== -1);
   assert.equal(qs.length, 2);
-  const firstL4 = io.out.indexOf('Hidden by your workspace: folder and repository names. Beezi receives made-up names instead.');
-  const secondL4 = io.out.indexOf('Hidden by your workspace: computer name. Beezi receives made-up names instead.');
+  const firstL4 = io.out.indexOf('    ◆ folder and repository names');
+  const secondL4 = io.out.indexOf('    ◆ computer name');
   assert.ok(firstL4 !== -1 && firstL4 < qs[0]);
   assert.ok(secondL4 > qs[0] && secondL4 < qs[1]);
-  assert.equal(io.out[qs[1]], 'Q Upload these 2 sessions to Beta?');
+  assert.equal(io.out[qs[1]], 'Q Upload 2 sessions to Beta?');
   assert.equal(io.out[io.out.length - 1], 'offers=2');
 });
 

@@ -278,7 +278,7 @@ workspace are dropped, and sync stops with a line asking you to sign in again.
 
 Past sessions need a yes. Login, sync and the setup wizard show what an upload would send — which
 kinds are sent as they are and which the workspace hides — and ask; nothing goes up without
-"Upload". The kinds the question showed as hidden stay hidden for that upload, even if the
+"Upload now". The kinds the question showed as hidden stay hidden for that upload, even if the
 workspace turns them off before it runs.
 
 ## Updating

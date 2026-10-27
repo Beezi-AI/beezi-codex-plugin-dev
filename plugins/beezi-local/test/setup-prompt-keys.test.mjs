@@ -3,6 +3,7 @@ import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { createPrompt } from '../lib/setup-prompt.mjs';
 import { createStyle } from '../lib/setup-style.mjs';
+import { uploadChoices } from '../lib/setup-wizard.mjs';
 
 const OPTIONS = [
   { label: 'Ask me (recommended)', description: 'Beezi asks once' },
@@ -272,6 +273,29 @@ test('Esc is ignored when the choice has a default', async () => {
   assert.equal(count(t.text(), '✓'), 0);
   await t.press('\r');
   assert.equal(await answer, 2);
+  t.prompt.close();
+});
+
+test('the upload menu starts on Upload now, Enter picks it, and with escape on Esc returns null despite the default', async () => {
+  const t = terminal();
+  const picked = t.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
+  await t.press('\r');
+  assert.equal(await picked, 0);
+  assert.ok(t.text().includes('? Upload 3 sessions to Acme?\n❯ Upload now\n  Not now — run $beezi:sync any time\n  ↑/↓ move · Enter select\n'));
+  assert.match(t.text(), /✓ Upload 3 sessions to Acme\? Upload now\n/);
+  const skipped = t.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
+  await t.press(ESC);
+  assert.equal(await skipped, null);
+  assert.match(t.text(), /✓ Upload 3 sessions to Acme\? skipped\n/);
+  t.prompt.close();
+});
+
+test('the upload menu with colour on draws ? bold cyan, the question bold and the active row cyan', async () => {
+  const t = terminal({ style: COLOR });
+  const picked = t.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
+  await t.press(DOWN, '\r');
+  assert.equal(await picked, 1);
+  assert.ok(t.text().includes('\x1b[1;36m?\x1b[0m \x1b[1mUpload 3 sessions to Acme?\x1b[0m\n\x1b[36m❯\x1b[0m \x1b[36mUpload now\x1b[0m\n'));
   t.prompt.close();
 });
 

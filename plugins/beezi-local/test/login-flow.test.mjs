@@ -196,7 +196,7 @@ test('a listing that fails shows its ✗ line in its block and the later steps s
 
 test('a past-sessions offer to ask stops at history, with the offer\'s block', async (t) => {
   link(t, { tenants: SOLO });
-  const history = 'Beezi found 2 past Codex sessions on 12 Aug in 1 folder: api.\nQ Upload these 2 sessions to Solo?\n'
+  const history = 'Beezi found 2 past Codex sessions (12 Aug, 1 folder)\n  in api\n  Sent\n    ✓ dates, duration, models, tokens, cost\nQ Upload 2 sessions to Solo?\n'
     + `offer account=${KEY} tenant=S sessions=2 audit=no token=2a7d000b5e34\noffers=1\n`;
   const r = await flow(['--account', KEY, '--from', 'routes'], { workspace: async () => listed(['routes=0']), history });
   assert.deepEqual(r.calls, [OFFER]);

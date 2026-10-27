@@ -485,11 +485,12 @@ prints what an upload would send, then its question. Nothing has been uploaded. 
 - `offer account=<key> tenant=<id> sessions=<n> audit=<yes|no> token=<token>` — right after its `Q` line, for you
   only;
 - `offers=<n>` — the number of questions, always last, for you only;
-- every other line (the summary, a heading, a `✗` line) — write it verbatim, in order.
+- every other line (the summary, a heading, a `✗` line) — write it verbatim, in order, inside one
+  plain fenced code block (```), because Markdown flattens their 2- and 4-space indents.
 
 With `next=default` the block has no question: write its other lines and go to step 5.
 
-With `next=history`, ask each `Q` line's question (its text after `Q `), with the choices "Upload"
+With `next=history`, ask each `Q` line's question (its text after `Q `), with the choices "Upload now"
 (described "Send these sessions now") and "Not now" (described "Nothing is sent"):
 
 - **`request_user_input`** only when that tool is listed this turn and there are at most 3 `Q` lines:
@@ -501,7 +502,7 @@ With `next=history`, ask each `Q` line's question (its text after `Q `), with th
 Then, for each question, with `<key>`, `<id>` and `<token>` the `account=`, `tenant=` and `token=` values
 of its `offer` line:
 
-- "Upload" → run
+- "Upload now" → run
 
   ```
   node "<plugin-root>/scripts/sync.mjs" --accept --account <key> --tenant <id> --token <token>
