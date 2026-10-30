@@ -31,13 +31,28 @@ const TRUSTED_MAX_AGE_MS = 24 * 60 * 60 * 1000;
 // positional and shifts whenever another tool's hook lands before ours.
 export function expectedHookCommands(options = {}) {
   const entries = buildHookEntries(options);
+  return commandsFor(entries, Object.keys(entries));
+}
+
+// The `command` of every handler buildHookEntries wrote for `events`, in event order.
+function commandsFor(entries, events) {
   const commands = [];
-  Object.keys(entries).forEach((event) => {
-    entries[event].forEach((group) => {
+  events.forEach((event) => {
+    (entries[event] || []).forEach((group) => {
       group.hooks.forEach((hook) => commands.push(hook.command));
     });
   });
   return commands;
+}
+
+// Events an older Codex build may not know at all. Such a build never registers the entry, so
+// "absent from hooks/list" says nothing about trust there; it must not hold the verdict at UNKNOWN
+// forever. Registered-but-untrusted still counts: only total absence is forgiven.
+export const OPTIONAL_EVENTS = Object.freeze(['PermissionRequest']);
+
+// The subset of expectedHookCommands whose event is optional.
+export function optionalHookCommands(options = {}) {
+  return commandsFor(buildHookEntries(options), OPTIONAL_EVENTS);
 }
 
 // This server's key in `.mcp.json`: `beezi`, or `beezi_<env>` on a variant — the key
@@ -51,8 +66,11 @@ function eventOf(hook) {
   return typeof hook.eventName === 'string' ? hook.eventName : 'unknown';
 }
 
-// Pure: `hooks` is the flattened hooks/list answer, `expected` this owner's commands.
-export function classifyHooks(hooks, expected) {
+// Pure: `hooks` is the flattened hooks/list answer, `expected` this owner's commands, `optional`
+// the commands of OPTIONAL_EVENTS (dropped from `expected` when Codex did not register them at all).
+export function classifyHooks(hooks, expected, optional = []) {
+  const known = (command) => hooks.some((hook) => hook && hook.command === command);
+  expected = expected.filter((command) => optional.indexOf(command) === -1 || known(command));
   const mine = hooks.filter((hook) => hook && expected.indexOf(hook.command) !== -1);
   const untrusted = [];
   const disabled = [];
@@ -157,7 +175,8 @@ export function probeHookTrust(deps = {}) {
   return pending.then((answer) => {
     if (!answer || !answer.ok) return unknown(answer ? answer.reason : 'error');
     const expected = deps.expected || expectedHookCommands();
-    const result = { ...classifyHooks(answer.hooks, expected), reason: 'ok' };
+    const optional = deps.optional || (deps.expected ? [] : optionalHookCommands());
+    const result = { ...classifyHooks(answer.hooks, expected, optional), reason: 'ok' };
     writeCachedVerdict(result, deps);
     return result;
   }, () => unknown('error'));

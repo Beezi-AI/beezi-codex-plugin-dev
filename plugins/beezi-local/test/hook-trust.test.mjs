@@ -7,7 +7,9 @@ import {
   TrustVerdict,
   classifyHooks,
   expectedHookCommands,
+  OPTIONAL_EVENTS,
   mcpServerKey,
+  optionalHookCommands,
   probeHookTrust,
   readCachedVerdict,
   writeCachedVerdict,
@@ -88,6 +90,35 @@ test('classifyHooks — another owner\'s untrusted entries are ignored', () => {
   const staging = expectedHookCommands({ launcherDir: LAUNCHER_DIR, owner: 'beezi-staging' });
   const rows = allRows().concat(staging.map((command) => row(command, 'untrusted')));
   assert.equal(classifyHooks(rows, EXPECTED).verdict, TrustVerdict.TRUSTED);
+});
+
+const OPTIONAL = optionalHookCommands({ launcherDir: LAUNCHER_DIR, owner: 'beezi' });
+
+test('optionalHookCommands — exactly the PermissionRequest command', () => {
+  assert.deepEqual(OPTIONAL_EVENTS.slice(), ['PermissionRequest']);
+  assert.equal(OPTIONAL.length, 1);
+  assert.ok(OPTIONAL[0].indexOf('permission-request.mjs') !== -1);
+  assert.ok(EXPECTED.indexOf(OPTIONAL[0]) !== -1);
+});
+
+test('classifyHooks — all registered and trusted, optional included, is TRUSTED', () => {
+  assert.equal(classifyHooks(allRows(), EXPECTED, OPTIONAL).verdict, TrustVerdict.TRUSTED);
+});
+
+test('classifyHooks — PermissionRequest absent from hooks/list (older Codex) is still TRUSTED', () => {
+  const rows = allRows().filter((r) => r.command !== OPTIONAL[0]);
+  assert.equal(classifyHooks(rows, EXPECTED, OPTIONAL).verdict, TrustVerdict.TRUSTED);
+  // without the optional set the same answer stays UNKNOWN: the rule is opt-in per command
+  assert.equal(classifyHooks(rows, EXPECTED).verdict, TrustVerdict.UNKNOWN);
+});
+
+test('classifyHooks — PermissionRequest registered but untrusted is UNTRUSTED', () => {
+  const rows = allRows().map((r) => (r.command === OPTIONAL[0] ? { ...r, trustStatus: 'untrusted' } : r));
+  assert.equal(classifyHooks(rows, EXPECTED, OPTIONAL).verdict, TrustVerdict.UNTRUSTED);
+});
+
+test('classifyHooks — a non-optional entry absent stays UNKNOWN even with the optional set', () => {
+  assert.equal(classifyHooks(allRows().slice(1), EXPECTED, OPTIONAL).verdict, TrustVerdict.UNKNOWN);
 });
 
 // ── the cache ────────────────────────────────────────────────────────────────────────────────

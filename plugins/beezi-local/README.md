@@ -2,7 +2,7 @@
 
 A Codex plugin that (1) drafts and creates tickets on your board (Jira / Azure DevOps) or in Beezi
 via the Beezi MCP server, and (2) hooks into Codex session lifecycle events (`SessionStart`,
-`PostToolUse`, `SubagentStart`, `SubagentStop`, `Stop`) to report per-branch token-usage analytics
+`PostToolUse`, `PermissionRequest`, `SubagentStart`, `SubagentStop`, `Stop`) to report per-branch token-usage analytics
 to every Beezi account linked on this machine.
 
 This is the Codex port of the Claude Code `beezi` plugin. The auth, MCP stdio bridge, and reporting
@@ -102,7 +102,9 @@ the launcher, which changes the entries.
 
 An untrusted hook simply does not run, and Codex itself reports nothing. Skipping `SubagentStart` /
 `SubagentStop`, for example, still bills subagent tokens (the parent's checkpoint does that) but
-loses every spawned agent's name and its span on the timeline.
+loses every spawned agent's name and its span on the timeline. Skipping `PermissionRequest` loses
+only the approval waits: no `waiting_user` / `command_approval` period is recorded, and the time
+shows as ordinary work or idle instead. Nothing reports that either.
 
 #### The trust reminder
 
@@ -349,7 +351,11 @@ menus (↑/↓, then Enter), with typed numbers as the fallback where keys canno
 ## How analytics work
 
 Codex writes one rollout transcript per session at
-`~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<sessionId>.jsonl`. Each line is
+`~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<sessionId>.jsonl`. Codex compresses rollouts older
+than 7 days (by mtime) to `rollout-*.jsonl.zst` and deletes the plain file; resuming a session
+decompresses it back. The plugin reads both. Reading `.zst` needs `zlib.zstdDecompressSync`
+(Node 22.15+ or 23.8+; Node 23.0-23.7 have none); on an older Node those sessions are skipped, and
+sync and backfill print how many. Each line is
 `{ timestamp, type, payload }` with types `session_meta`, `turn_context`, `response_item`, and
 `event_msg`.
 
@@ -439,6 +445,18 @@ Codex writes one rollout transcript per session at
   - `duration_sec` is a **union** of wall-clock intervals, not a sum: the parent blocks in
     `wait_agent` while its agents run, so they describe the same seconds. Summing them turned 431s of
     real time into 1117s.
+- **Approval waits and plans.** The `PermissionRequest` hook (5 s timeout) records one marker per
+  approval prompt in `~/.beezi-codex/state/<sessionId>.perm.jsonl`; the timeline turns each into a
+  `waiting_user` / `command_approval` period that ends when execution starts (exec), the patch
+  completes (apply_patch), the turn aborts ("No") or the main thread next does real work, whichever
+  comes first. A period under 1 s is not counted. Nothing is counted when
+  `approval_policy` is `never`, in bypass mode, when an automatic reviewer rather than you handles
+  approvals, or for subagent threads.
+  Markers are local and kept 35 days (longer than the 30-day sync window); a backfill after they
+  are pruned, or on another machine, has no approval periods. A plan accepted with "Yes, clear
+  context" starts a new Codex thread; the plugin matches it to the plan session (same cwd, plan
+  text, within 6 hours), appends the `plan_approval` wait to the old session's timeline and
+  re-posts it once from the new session. `docs/timeline-statuses.md` has the evidence rules.
 
 The report fields and idempotency contract are shared with the Claude plugin, so the server upserts
 are identical. Subagent segments scope the id by agent —

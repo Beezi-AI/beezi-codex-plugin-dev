@@ -13,8 +13,8 @@ import { removeTrustNotice } from '../lib/agents-notice.mjs';
 // orphan is usually not the owner that can remove it. `install` sweeps them itself.
 //
 // Collapsed BY TARGET, because every event of an install now points at that install's one launcher:
-// an abandoned variant produces five rows naming one path, and printing that path five times reads
-// as five separate faults.
+// an abandoned variant produces one row per event naming one path, and printing that path once per event reads
+// as separate faults.
 function reportBroken(status) {
   if (!status.broken || !status.broken.length) return;
 
@@ -32,7 +32,7 @@ function reportBroken(status) {
 
 // What the sweep cleared, named rather than counted: the paths are the only way a user can tell
 // this was their stale variant and not something of their own. Collapsed by target for the same
-// reason reportBroken is — one abandoned install is one path, five times over.
+// reason reportBroken is — one abandoned install is one path, once per event.
 function collapseByTarget(entries) {
   const out = [];
   for (const entry of entries) {
@@ -128,8 +128,8 @@ async function reportStatus() {
 
 // `install` goes through ensureHooks, so a healthy install is left untouched.
 //
-// That is not a saved write. Codex records trust against each entry's HASH, so rewriting five
-// identical entries revokes the trust the user has already granted and sends them back to `/hooks`
+// That is not a saved write. Codex records trust against each entry's HASH, so rewriting identical
+// entries revokes the trust the user has already granted and sends them back to `/hooks`
 // for nothing. `--force` exists for the one case the no-op cannot serve: a registry that reads as
 // installed but that the user wants rewritten anyway.
 function runInstall(force) {

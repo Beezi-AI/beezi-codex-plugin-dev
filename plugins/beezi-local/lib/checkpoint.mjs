@@ -11,11 +11,14 @@ import { git, currentBranch, resolveOriginRemote } from './git.mjs';
 import { readCheckoutEvents, buildBranchTimeline, branchAt as branchAtReflog } from './reflog.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
 import { resolveCodexTranscript, isUsableSessionId } from './transcript-codex.mjs';
+import { resolveRolloutPath } from './rollout-file.mjs';
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { postJson, POST_TIMEOUT_MS } from './http.mjs';
 import { HOOK_TIMEOUT_SEC } from './hooks-install.mjs';
 import { postSessionError } from './session-error-report.mjs';
-import { computeSessionTimeline, postSessionTimeline } from './session-timeline-codex.mjs';
+import { computeSessionTimeline, postSessionTimeline, parseTranscript } from './session-timeline-codex.mjs';
+import { handoffPlanText, findPlanPredecessor as _findPlanPredecessor } from './plan-handoff-codex.mjs';
+import { isTimelineUserPrompt } from './timeline-waits-codex.mjs';
 import { recordRateLimitObservations } from './rate-limits-codex.mjs';
 import { readChatgptIdentity } from './chatgpt-identity.mjs';
 import { drainRateLimitSnapshots as _drainRateLimitSnapshots } from './usage-report-codex.mjs';
@@ -326,6 +329,14 @@ function ingestSubagents({
 
   let agents;
   try { agents = readAgents(sessionId); } catch { agents = {}; }
+  // A sidecar path recorded while the rollout was plain (or compressed) goes stale when Codex
+  // compresses or resumes it; follow the file to its current name, else keep the recorded value.
+  for (const agentId of Object.keys(agents)) {
+    const record = agents[agentId];
+    if (record && typeof record.transcriptPath === 'string') {
+      record.transcriptPath = orDefault(resolveRolloutPath(record.transcriptPath), record.transcriptPath);
+    }
+  }
 
   if (sweep) {
     try {
@@ -1044,6 +1055,24 @@ async function runLockedCheckpoint(lock, ctx) {
   // we don't re-upsert the same growing jsonb every turn. Best-effort: a failure must never break the
   // checkpoint.
   if (options.emitTimeline) {
+    // Posts one timeline to every live sender within the remaining budget. True only when every
+    // sender confirmed it: a tokenless sender, a budget that ran out or a failed post makes it false.
+    // A throw propagates to the caller's own best-effort catch.
+    const postToEverySender = async (payload) => {
+      let reportedEverywhere = liveSenders.length === senders.length;
+      for (const session of liveSenders) {
+        const remaining = timeLeft();
+        if (remaining !== null && remaining <= 0) { reportedEverywhere = false; break; }
+        const { reported } = await postSessionTimeline(
+          payload,
+          session,
+          { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
+        );
+        if (!reported) reportedEverywhere = false;
+      }
+      return reportedEverywhere;
+    };
+
     try {
       // The agent map is handed over rather than re-read: ingestSubagents just built it, and its
       // sweep entries are ones a fresh readAgents would not see.
@@ -1061,25 +1090,49 @@ async function runLockedCheckpoint(lock, ctx) {
           // The signature is machine-level, so it may only be remembered once every sender has
           // the timeline: sealing it after a partial round would leave the workspaces that missed
           // out with no timeline until the derived content changed again. A tokenless sender is one.
-          let reportedEverywhere = liveSenders.length === senders.length;
-          for (const session of liveSenders) {
-            const remaining = timeLeft();
-            if (remaining !== null && remaining <= 0) { reportedEverywhere = false; break; }
-            const { reported } = await postSessionTimeline(
-              { sessionId, ...timeline },
-              session,
-              { fetchImpl, ...(remaining === null ? {} : { timeoutMs: Math.min(POST_TIMEOUT_MS, remaining) }) },
-            );
-            if (!reported) reportedEverywhere = false;
-          }
           // Only remember the signature on a confirmed send, so a failed post retries next turn.
-          if (reportedEverywhere) {
+          if (await postToEverySender({ sessionId, ...timeline })) {
             state.sentTimelineSig = sig;
             stateDirty = true;
           }
         }
       }
     } catch { /* best-effort */ }
+
+    // A session started by accepting a plan with "Yes, clear context" re-posts its PREDECESSOR's
+    // timeline once: Codex writes nothing to the old rollout, so only this session's first prompt
+    // can close the old one's plan-approval wait (computeSessionTimeline appends it). Separate try,
+    // so a failed own-timeline post above does not skip this. The predecessor's lock and state are
+    // never touched: its sentTimelineSig stays stale, and a later recompute re-posting the same
+    // content is harmless. The flag is set once there is nothing (more) to do — a first prompt that is
+    // not a handoff, no predecessor (it finished before this session began, so a miss now is a miss
+    // forever), no timeline — or once every sender confirmed the post; a failed or partial post
+    // retries next turn. No prompt yet decides nothing: the handoff prompt may still be on its way.
+    if (!state.planHandoffPosted && (timeLeft() === null || timeLeft() > 0)) {
+      try {
+        const records = parseTranscript(transcript_path, transcriptMemo.readLines);
+        let settled = records.some((r) => r && isTimelineUserPrompt(r));
+        if (settled && handoffPlanText(records) !== null) {
+          const findPredecessor = orDefault(deps.findPlanPredecessor, _findPlanPredecessor);
+          const pred = findPredecessor(transcript_path, records);
+          // The successor is this session, so the predecessor's successor lookup is pointed at this
+          // transcript alone instead of walking the whole sessions directory again.
+          // The id came from a session_meta on disk and keys a timeline post: it must be usable.
+          const predTimeline = pred && isUsableSessionId(pred.sessionId)
+            ? computeSessionTimeline(pred.transcriptPath, pred.sessionId, {
+              // Its own hook sidecars, read-only; an empty map once pruned.
+              readAgents: _readAgents,
+              planHandoff: { listRollouts: () => [transcript_path] },
+            })
+            : null;
+          if (predTimeline) settled = await postToEverySender({ sessionId: pred.sessionId, ...predTimeline });
+        }
+        if (settled) {
+          state.planHandoffPosted = true;
+          stateDirty = true;
+        }
+      } catch { /* best-effort */ }
+    }
   }
 
   // Rate-limit rows the rollout scan queued. Same turn-end gate as the timeline — these are

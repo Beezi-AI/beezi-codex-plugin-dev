@@ -138,3 +138,98 @@ test('non-rollout files and an empty file are skipped', (t) => {
 
   assert.deepEqual(listAllRollouts({ sessionsDir: root }), []);
 });
+
+// ── compressed rollouts (.jsonl.zst) ────────────────────────────────────────────────────────
+
+import zlib from 'node:zlib';
+import { readRolloutText } from '../lib/rollout-file.mjs';
+
+const zstd = typeof zlib.zstdCompressSync === 'function' ? zlib.zstdCompressSync : null;
+const zstOpts = { skip: zstd ? false : 'zlib.zstdCompressSync unavailable' };
+
+// The default head read is subagent-codex's byte reader; this seam reads a head through the shared
+// rollout reader so these cases hold whichever reader that module currently ships.
+const readHead = (file) => {
+  const text = readRolloutText(file);
+  return text ? [JSON.parse(text.split('\n')[0])] : [];
+};
+
+function writeZst(root, datePath, name, records, mtimeMs = null) {
+  const dir = path.join(root, ...datePath.split('/'));
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, zstd(Buffer.from(records.map((r) => JSON.stringify(r)).join('\n') + '\n')));
+  if (mtimeMs != null) fs.utimesSync(file, mtimeMs / 1000, mtimeMs / 1000);
+  return file;
+}
+
+test('a .zst rollout is listed with its id, cwd and DECOMPRESSED size', zstOpts, (t) => {
+  const root = makeTree(t);
+  const records = [meta(UUID_A), { type: 'event_msg', payload: { pad: 'x'.repeat(5000) } }];
+  const file = writeZst(root, '2026/07/01', `rollout-2026-07-01T00-00-00-${UUID_A}.jsonl.zst`, records);
+  const plainLen = Buffer.byteLength(records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+  const entries = listAllRollouts({ sessionsDir: root, readHead });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].sessionId, UUID_A);
+  assert.equal(entries[0].transcriptPath, file);
+  assert.equal(entries[0].cwd, 'C:\\repo');
+  assert.equal(entries[0].size, plainLen);
+  assert.ok(fs.statSync(file).size < plainLen, 'precondition: the file on disk is smaller');
+});
+
+test('plain and .zst of one id collapse to the plain path even when the .zst is newer', zstOpts, (t) => {
+  const root = makeTree(t);
+  const plain = writeRollout(root, '2026/07/01', `rollout-2026-07-01T00-00-00-${UUID_A}.jsonl`, [meta(UUID_A)], 1_000_000);
+  writeZst(root, '2026/07/01', `rollout-2026-07-01T00-00-00-${UUID_A}.jsonl.zst`, [meta(UUID_A)], 9_000_000);
+
+  const entries = listAllRollouts({ sessionsDir: root, readHead });
+
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].transcriptPath, plain);
+});
+
+test('a .zst is listed from its filename, flagged, when zstd cannot be read here', { skip: zstd ? 'zstd is available' : false }, (t) => {
+  const root = makeTree(t);
+  writeRollout(root, '2026/07/01', `rollout-2026-07-01T00-00-00-${UUID_A}.jsonl.zst`, [meta(UUID_A)]);
+  const entries = listAllRollouts({ sessionsDir: root });
+  assert.equal(entries.length, 1);
+  assert.equal(entries[0].sessionId, UUID_A);
+  assert.equal(entries[0].compressed, true);
+});
+
+// ── blind compressed entries (no zstd on this Node) ─────────────────────────────────────────
+
+import { planSessionRoutes, waitingRoutes } from '../lib/workspace-rules.mjs';
+import { countPastSessions } from '../lib/past-sessions.mjs';
+
+function blindTree(t) {
+  const root = makeTree(t);
+  writeRollout(root, '2026/07/01', `rollout-2026-07-01T00-00-00-${UUID_A}.jsonl.zst`, [meta(UUID_A)], Date.now() - 12 * 86_400_000);
+  writeRollout(root, '2026/07/02', `rollout-2026-07-02T00-00-00-${UUID_B}.jsonl`, [meta(UUID_B)], Date.now() - 12 * 86_400_000);
+  return root;
+}
+
+test('blind compressed entries (no zstd) are hidden unless includeBlind asks for them', (t) => {
+  const root = blindTree(t);
+
+  const normal = listAllRollouts({ sessionsDir: root, decompress: null });
+  assert.deepEqual(normal.map((e) => e.sessionId), [UUID_B]);
+
+  const audit = listAllRollouts({ sessionsDir: root, decompress: null, includeBlind: true });
+  assert.deepEqual(audit.map((e) => [e.sessionId, e.compressed === true]).sort(), [[UUID_A, true], [UUID_B, false]].sort());
+});
+
+test('blind compressed entries are not counted by pastSessions nor routed by planSessionRoutes/waitingRoutes', (t) => {
+  const entries = listAllRollouts({ sessionsDir: blindTree(t), decompress: null });
+  const row = { key: 'abcdef01', clientId: null, tenants: [] };
+
+  const counts = countPastSessions(entries, { imported: () => false, readCwd: (e) => e.cwd, keyOf: () => ({ kind: 'folder', match: '/' }) });
+  assert.equal(counts.sessions, 1);
+
+  const routes = planSessionRoutes(row, entries, null);
+  assert.deepEqual([...routes.keys()], [UUID_B]);
+  const waiting = waitingRoutes(row, entries, null, { routes, loadLedgerImpl: () => ({ sessions: {}, unreadable: {} }) });
+  assert.ok(!waiting.has(UUID_A));
+});

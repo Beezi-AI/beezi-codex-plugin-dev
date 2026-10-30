@@ -2,7 +2,8 @@ import fs from 'fs';
 import path from 'path';
 import { codexSessionsDir } from './paths.mjs';
 import { scanNumberedRecords } from './session-name-codex.mjs';
-import { ROLLOUT_HEAD_BYTES, ROLLOUT_RE } from './transcript-codex.mjs';
+import { ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
+import { ROLLOUT_RE } from './rollout-file.mjs';
 import { orDefault } from './compat.mjs';
 
 // Codex writes a subagent to its OWN top-level rollout under ~/.codex/sessions, not nested under the
@@ -232,7 +233,7 @@ function belongsTo(identity, sessionId) {
 }
 
 function foundEntry(identity, full, name) {
-  return { agentId: orDefault(identity.ownThreadId, name.replace(/\.jsonl$/, '')), path: full };
+  return { agentId: orDefault(identity.ownThreadId, name.replace(/\.jsonl(\.zst)?$/, '')), path: full };
 }
 
 export function findSubagentRollouts(sessionId, { sinceMs = null, sessionsDir = null, maxReads = 500 } = {}) {

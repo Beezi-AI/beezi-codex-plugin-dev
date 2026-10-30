@@ -2,6 +2,7 @@ import fs from 'fs';
 import path from 'path';
 import { codexSessionIndexFile } from './paths.mjs';
 import { orDefault } from './compat.mjs';
+import { isZstdBuffer, readRolloutHeadBuffer } from './rollout-file.mjs';
 
 const MAX = 200;
 
@@ -132,6 +133,20 @@ const CHUNK_BYTES = 256 * 1024;
 // must not turn a bounded read into a bounded read plus unbounded memory.
 const MAX_LINE_BYTES = 1024 * 1024;
 
+// Lines of an already-decompressed rollout, cut at maxBytes exactly as the streaming path cuts: a
+// record the ceiling splits does not parse and is dropped. Every line, blank or malformed, takes a
+// number, so `line` is the physical line computeDelta counts, as on the streaming path.
+function* scanDecompressed(buf, maxBytes) {
+  const lines = buf.slice(0, maxBytes).toString('utf-8').split('\n');
+  for (let i = 0; i < lines.length; i += 1) {
+    const line = lines[i];
+    if (!line.trim()) continue;
+    let rec;
+    try { rec = JSON.parse(line); } catch { continue; }
+    yield { rec, line: i };
+  }
+}
+
 export function* scanRecords(transcriptPath, options) {
   for (const { rec } of scanNumberedRecords(transcriptPath, options)) yield rec;
 }
@@ -141,6 +156,15 @@ export function* scanNumberedRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES
   let fd;
   try { fd = fs.openSync(transcriptPath, 'r'); } catch { return; }
   try {
+    const magic = Buffer.alloc(4);
+    let got = 0;
+    try { got = fs.readSync(fd, magic, 0, 4, 0); } catch { return; }
+    if (got === 4 && isZstdBuffer(magic)) {
+      let whole = null;
+      try { whole = readRolloutHeadBuffer(transcriptPath, maxBytes); } catch { return; }
+      if (whole !== null) yield* scanDecompressed(whole, maxBytes);
+      return;
+    }
     const buf = Buffer.alloc(CHUNK_BYTES);
     // Streaming decode, not buf.toString(): a multi-byte UTF-8 sequence straddling a chunk boundary
     // would otherwise decode to U+FFFD, and a mangled character in a name we POST is a visible bug

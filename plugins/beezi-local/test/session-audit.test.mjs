@@ -1271,3 +1271,96 @@ test('gzip 1. runAudit hands one shared compression object to every flush of a r
   assert.equal(second[0].enabled, true);
   assert.notStrictEqual(second[0].compression, first[0].compression);
 });
+
+// ── compressed rollouts (.jsonl.zst) ────────────────────────────────────────────────────────
+
+const zstRollout = (sessionId, size = 1024) => ({
+  ...rollout(sessionId),
+  transcriptPath: `C:/sessions/2026/01/01/rollout-2026-01-01T00-00-00-${sessionId}.jsonl.zst`,
+  size,
+});
+
+test('with zstd unavailable, .zst rollouts are skipped and counted as compressedUnsupported', async () => {
+  const checkpointed = [];
+  const { deps } = makeDeps({
+    decompress: null, // the key present with null is "no zstd on this Node" (lib/rollout-file.mjs)
+    listRollouts: () => [rollout('s1'), zstRollout('z1'), zstRollout('z2')],
+    runCheckpointImpl: async (input, _d, options) => {
+      checkpointed.push(input.session_id);
+      options.sink(report(input.session_id));
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: {} };
+    },
+  });
+
+  const result = await runAudit(deps, { key: KEY });
+
+  assert.equal(result.compressedUnsupported, 2);
+  assert.equal(result.scanned, 3);
+  assert.deepEqual(checkpointed, ['s1']);
+});
+
+test('with zstd available, .zst rollouts are processed like any other', async () => {
+  const checkpointed = [];
+  const { deps } = makeDeps({
+    decompress: () => Buffer.alloc(0),
+    listRollouts: () => [zstRollout('z1')],
+    runCheckpointImpl: async (input, _d, options) => {
+      checkpointed.push(input.session_id);
+      options.sink(report(input.session_id));
+      return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], agents: {} };
+    },
+  });
+
+  const result = await runAudit(deps, { key: KEY });
+
+  assert.equal(result.compressedUnsupported, 0);
+  assert.deepEqual(checkpointed, ['z1']);
+});
+
+// 0.24.0 streams rollouts and dropped the 64 MiB cap; a large .zst uploads like a large plain one.
+test('a .zst larger than 64 MiB decompressed is still a candidate', async () => {
+  const { deps } = makeDeps({
+    decompress: () => Buffer.alloc(0),
+    listRollouts: () => [zstRollout('big', 65 * 1024 * 1024)],
+  });
+  const result = await runAudit(deps, { key: KEY });
+  assert.equal(result.candidates, 1);
+});
+
+test('an excluded (Don\'t-track) .zst session is not counted as compressedUnsupported', async () => {
+  const { deps } = makeDeps({
+    decompress: null,
+    listRollouts: () => [zstRollout('z1'), zstRollout('z2')],
+  });
+  const result = await runAudit(deps, { key: KEY, excludedSessionIds: new Set(['z1']) });
+  assert.equal(result.excluded, 1);
+  assert.equal(result.compressedUnsupported, 1);
+});
+
+// ── multi-workspace runs and unreadable compressed rollouts ─────────────────────────────────
+
+import { planWorkspaceRuns } from '../lib/session-audit.mjs';
+
+const blindRollout = (sessionId, mtimeMs = Date.now() - 3_600_000) => ({
+  ...zstRollout(sessionId), cwd: null, compressed: true, mtimeMs,
+});
+
+test('planWorkspaceRuns counts unreadable compressed rollouts once and routes none of them', () => {
+  const old = Date.now() - 40 * 24 * 60 * 60 * 1000;
+  const listed = [rollout('s1', Date.now() - 3_600_000), blindRollout('z1'), blindRollout('z2'), blindRollout('zold', old)];
+  const plan = planWorkspaceRuns({ key: KEY, clientId: null, tenants: [] }, { listRollouts: () => listed });
+  assert.equal(plan.compressedUnsupported, 2); // the 40-day-old one never uploads anyway
+  assert.equal(plan.scanned, 4); // blind entries count in scanned here AND in runAudit's scanned
+  assert.deepEqual([...plan.routes.keys()], ['s1']);
+});
+
+test('a routed run neither routes-elsewhere nor counts a blind compressed rollout', async () => {
+  const { deps } = makeDeps({
+    decompress: null,
+    listRollouts: () => [rollout('s1'), blindRollout('z1')],
+  });
+  const result = await runAudit(deps, { key: KEY, sessionRoutes: new Map() });
+  assert.equal(result.scanned, 2);
+  assert.equal(result.routedElsewhere, 1); // s1 only
+  assert.equal(result.compressedUnsupported, 0); // counted once by planWorkspaceRuns, not per workspace
+});

@@ -3,6 +3,12 @@
 // spans, including intervening bookkeeping, only while the main thread is actually blocked.
 // Names and waiting subtypes match the Claude timeline contract.
 import { toolNamesFromProgram } from './exec-program.mjs';
+import { ASKING_POLICIES, approvalLabel } from './codex-permissions.mjs';
+
+// Like Claude permission markers, an approval resolved faster than this was not a human reading a
+// prompt. One threshold for both sources of command_approval: request_permissions calls and
+// PermissionRequest markers.
+const MIN_APPROVAL_WAIT_MS = 1000;
 
 function argsOf(raw) {
   if (raw && typeof raw === 'object') return raw;
@@ -60,7 +66,7 @@ function callWait(p) {
   return null;
 }
 
-function isBookkeeping(rec) {
+export function isBookkeeping(rec) {
   const p = rec.payload || {};
   // Completion echoes are observations of tools finishing, not fresh main-thread work.
   const completion = rec.type === 'event_msg' && p.type === 'item_completed' && p.item
@@ -76,28 +82,120 @@ function isBookkeeping(rec) {
       || p.type === 'thread_settings_applied'));
 }
 
-// First index whose time is after `ms` (or at/after it when `inclusive`); `times` is ascending.
-function firstIndex(times, ms, inclusive) {
-  let lo = 0;
-  let hi = times.length;
-  while (lo < hi) {
-    const mid = (lo + hi) >>> 1;
-    if (inclusive ? times[mid] < ms : times[mid] <= ms) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo;
-}
-
-export function timelineWaits(records) {
-  // Parse each timestamp once; the stable sort keeps equal timestamps in input order.
+// Records with a usable timestamp, oldest first, and their times. Each timestamp is parsed once;
+// the stable sort keeps equal timestamps in input order.
+function timedRecords(records) {
   const entries = [];
   for (const rec of records) {
     const ms = Date.parse(rec.timestamp);
     if (Number.isFinite(ms)) entries.push({ rec, ms });
   }
   entries.sort((a, b) => a.ms - b.ms);
-  const timed = entries.map((e) => e.rec);
-  const times = entries.map((e) => e.ms);
+  return { timed: entries.map((e) => e.rec), times: entries.map((e) => e.ms) };
+}
+
+// Index of the first element of an ascending array strictly greater than `ms`.
+export function firstIndexAfter(sorted, ms) {
+  let lo = 0;
+  let hi = sorted.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >> 1;
+    if (sorted[mid] <= ms) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
+// Every instant at which a human approval wait can be seen to end, ascending. Codex persists neither
+// the prompt nor the decision, so the end is read off what the decision caused:
+//   - a "No" interrupts the turn: `event_msg/turn_aborted`;
+//   - an approved command starts only after the prompt closes: CommandExecution `started_at_ms`
+//     (the completion record's own timestamp is when the command finished, far too late);
+//   - an approved patch is applied inside its FileChange span: `completed_at_ms`;
+//   - otherwise, the next main-thread record that is not bookkeeping. The completion echoes above
+//     ARE bookkeeping, which is why their start/finish fields are read separately.
+// Taking the earliest candidate after a marker, rather than the first record of each kind, keeps
+// the answer independent of the file order of records that share a millisecond.
+function approvalEnds(timed) {
+  const out = [];
+  for (const rec of timed) {
+    const ms = Date.parse(rec.timestamp);
+    const p = rec.payload || {};
+    const completed = rec.type === 'event_msg' && p.type === 'item_completed' && p.item ? p.item.type : null;
+    if (rec.type === 'event_msg' && p.type === 'turn_aborted') out.push(ms);
+    else if (!isBookkeeping(rec)) out.push(ms);
+    if (completed === 'CommandExecution' && Number.isFinite(p.started_at_ms)) out.push(p.started_at_ms);
+    if (completed === 'FileChange' && Number.isFinite(p.completed_at_ms)) out.push(p.completed_at_ms);
+  }
+  return out.sort((a, b) => a - b);
+}
+
+// Could a human have been looking at this prompt? The hook fires for every approval Codex is about
+// to route, including ones nobody sees, so the marker alone is not proof.
+function humanWasAsked(marker, ctx) {
+  // Approvals bypassed: nothing was put on screen.
+  if (marker.permissionMode === 'bypassPermissions') return false;
+  // A subagent's prompt: the main thread's own records cannot place its end.
+  if (marker.agentId) return false;
+  // The rollout's request_permissions call/output pair already yields this exact wait.
+  if (marker.toolName === 'request_permissions') return false;
+  // No turn_context yet: the policy is unknown, and unknown never charges the human.
+  if (!ctx) return false;
+  const label = approvalLabel(ctx.approval_policy);
+  if (label !== 'granular' && ASKING_POLICIES.indexOf(label) === -1) return false;
+  // The hook fires BEFORE the automatic reviewer: under `auto_review` (or a guardian) a machine may
+  // settle the request with no human ever seeing it. A turn_context with no `approvals_reviewer` at
+  // all comes from a build that predates the field, when only a human could review — so 'user'.
+  const reviewer = ctx.approvals_reviewer == null ? 'user' : ctx.approvals_reviewer;
+  return reviewer === 'user';
+}
+
+function markerSpansOf(timed, markers) {
+  if (!Array.isArray(markers) || markers.length === 0 || timed.length === 0) return [];
+  const firstMs = Date.parse(timed[0].timestamp);
+  const lastMs = Date.parse(timed[timed.length - 1].timestamp);
+  const ends = approvalEnds(timed);
+  const sorted = markers.filter((m) => m && Number.isFinite(m.ts)).slice().sort((a, b) => a.ts - b.ts);
+  const spans = [];
+  let ctx = null;
+  let next = 0;
+  let acceptedEnd = -Infinity;
+  for (const marker of sorted) {
+    // The turn_context in force at the marker: the latest one at or before it, replaced wholesale.
+    while (next < timed.length && Date.parse(timed[next].timestamp) <= marker.ts) {
+      if (timed[next].type === 'turn_context') ctx = timed[next].payload || {};
+      next += 1;
+    }
+    if (!humanWasAsked(marker, ctx)) continue;
+    // Outside the charted span: a stale marker from before a resume, or one past the last record.
+    if (marker.ts < firstMs || marker.ts >= lastMs) continue;
+    // A parallel batch prompts several times inside one continuous wait; the earliest opens it.
+    if (marker.ts < acceptedEnd) continue;
+    const i = firstIndexAfter(ends, marker.ts);
+    // No observed end: never extend a wait to wall-clock now.
+    if (i === ends.length) continue;
+    const end = ends[i];
+    if (end - marker.ts < MIN_APPROVAL_WAIT_MS) continue;
+    spans.push({ start: marker.ts, end, state: 'waiting_user', subtype: 'command_approval' });
+    acceptedEnd = end;
+  }
+  return spans;
+}
+
+// PermissionRequest markers (lib/permission-markers-codex.mjs) as command_approval waits. A marker
+// is the START of a human approval wait; the rollout says where it ended. Rollout timing alone
+// cannot detect an approval — measured gaps up to 29 s happen without one — so command_approval is
+// never inferred without a marker.
+export function markerSpans(records, markers) {
+  // Most sessions have no markers; skip sorting the whole rollout for them.
+  if (!Array.isArray(markers) || markers.length === 0) return [];
+  return markerSpansOf(timedRecords(records).timed, markers);
+}
+
+// `marked` is markerSpans(records, markers), computed once by buildPeriods, which anchors on the
+// same spans.
+export function timelineWaits(records, marked = []) {
+  const { timed, times } = timedRecords(records);
   const calls = new Map();
   const asyncQuestions = new Set();
   const spans = [];
@@ -149,11 +247,21 @@ export function timelineWaits(records) {
         const answered = call.subtype !== 'question_answer' || (output && output.answers
           && typeof output.answers === 'object' && Object.keys(output.answers).length > 0);
         // Like Claude permission markers, suppress near-instant auto-resolved approvals.
-        const human = call.subtype !== 'command_approval' || ms - call.start >= 1000;
+        const human = call.subtype !== 'command_approval' || ms - call.start >= MIN_APPROVAL_WAIT_MS;
         if (answered && human && !(output && output.error)) spans.push({ ...call, end: ms });
       }
     }
   }
+
+  for (const span of marked) spans.push(span);
+
+  const recordMs = times;
+  // The times buildPeriods will look up: every record, plus the synthetic anchors it adds at each
+  // marker span's start and end (neither is a record timestamp when the end is a started_at_ms or
+  // completed_at_ms).
+  const keys = recordMs.slice();
+  for (const span of marked) keys.push(span.start, span.end);
+  keys.sort((a, b) => a - b);
 
   const waits = new Map();
   // Only classify complete observed waits, never extend an unanswered call to wall-clock now.
@@ -162,16 +270,13 @@ export function timelineWaits(records) {
   // Records are sorted by time, so each span scans only the records inside it.
   for (const span of spans) {
     let start = span.start;
-    const innerEnd = firstIndex(times, span.end, true);
-    for (let i = firstIndex(times, span.start, false); i < innerEnd; i++) {
-      if (!isBookkeeping(timed[i])) start = times[i];
+    for (let i = firstIndexAfter(recordMs, span.start); i < recordMs.length && recordMs[i] < span.end; i++) {
+      if (!isBookkeeping(timed[i])) start = recordMs[i];
     }
-    const end = firstIndex(times, span.end, false);
-    for (let i = firstIndex(times, start, false); i < end; i++) {
-      const ms = times[i];
-      const existing = waits.get(ms);
+    for (let i = firstIndexAfter(keys, start); i < keys.length && keys[i] <= span.end; i++) {
+      const existing = waits.get(keys[i]);
       // Human decisions have a more specific cause than a concurrent machine wait.
-      if (!existing || span.state === 'waiting_user') waits.set(ms, { state: span.state, subtype: span.subtype });
+      if (!existing || span.state === 'waiting_user') waits.set(keys[i], { state: span.state, subtype: span.subtype });
     }
   }
   return waits;

@@ -1188,3 +1188,40 @@ test('a non-limit error carries no resetsAt', () => {
   assert.equal(event.error, 'authentication_failed');
   assert.equal('resetsAt' in event, false);
 });
+
+// --- zstd-compressed rollouts ---
+import zlib from 'node:zlib';
+const zstdOk = typeof zlib.zstdCompressSync === 'function';
+const zstdCopy = (file) => {
+  const out = file + '.zst';
+  fs.writeFileSync(out, zlib.zstdCompressSync(fs.readFileSync(file)));
+  return out;
+};
+const zstdRollout = () => writeRollout([
+  meta('/repoA'),
+  turn('/repoA', 'gpt-5.2-codex', '2026-01-01T00:00:01.000Z'),
+  tokens('2026-01-01T00:00:02.000Z', 100, 40, 10),
+  tokens('2026-01-01T00:00:03.000Z', 150, 60, 30),
+]);
+
+test('computeDelta on a .zst rollout equals the plain result', { skip: !zstdOk }, () => {
+  const plain = zstdRollout();
+  const zst = zstdCopy(plain);
+  assert.deepEqual(computeDelta(zst, 0, identityResolvers), computeDelta(plain, 0, identityResolvers));
+});
+
+test('a cursor saved on the plain file resumes on its compressed copy', { skip: !zstdOk }, () => {
+  const plain = zstdRollout();
+  const { nextCursor } = computeDelta(plain, 0, identityResolvers);
+  const zst = zstdCopy(plain);
+  const resumed = computeDelta(zst, nextCursor, identityResolvers);
+  assert.equal(resumed.segments.length, 0);
+  assert.equal(resumed.nextCursor, nextCursor);
+});
+
+test('a corrupt .zst frame throws ROLLOUT_UNREADABLE instead of yielding a junk cursor', () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-codex-'));
+  const bad = path.join(dir, 'rollout.jsonl.zst');
+  fs.writeFileSync(bad, Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), Buffer.from('not a real frame, just garbage\n'.repeat(5))]));
+  assert.throws(() => computeDelta(bad, 0, identityResolvers), (e) => e.code === 'ROLLOUT_UNREADABLE');
+});

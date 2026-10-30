@@ -3,6 +3,7 @@ import path from 'path';
 import { beeziCodexHome, codexSessionsDir, stateDir } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
+import { rolloutIdFromName, zstdSupported, isCompressedRolloutName, rolloutSupersedes } from './rollout-file.mjs';
 import { acquireLock as _acquireLock, electionLock, withLock, sharedLock } from './single-instance-lock.mjs';
 import { hookMayProceed, shouldCheckEnvironment } from './env-guard.mjs';
 import { isUsableSessionId, listRolloutFiles as _listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
@@ -254,10 +255,8 @@ export function pruneObservations(record, max = MAX_OBSERVATIONS) {
 
 // ── Classification (a deliberate mirror of listAllRollouts) ─────────────────────────────────
 
-// rollout-<ISO-with-dashes>-<uuid>.jsonl — the trailing UUID is the session id. Same regex as
-// lib/transcript-index-codex.mjs and lib/transcript-codex.mjs; the internal dashes make a greedy
-// suffix capture wrong.
-const TRAILING_UUID_RE = /-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$/;
+// rollout-<ISO-with-dashes>-<uuid>.jsonl[.zst] — the trailing UUID is the session id, read by
+// rolloutIdFromName (lib/rollout-file.mjs), the same definition listAllRollouts uses.
 
 function str(v) {
   return typeof v === 'string' && v.trim() ? v.trim() : null;
@@ -297,7 +296,7 @@ function classifyRollout(file, deps) {
   const meta = first.type === 'session_meta' ? first.payload : null;
   // `id`, never `session_id` — on a subagent rollout the latter holds the PARENT's thread id.
   const metaId = str((meta || {}).id);
-  const nameId = orDefault((TRAILING_UUID_RE.exec(path.basename(file)) || [])[1], null);
+  const nameId = rolloutIdFromName(path.basename(file));
   const sessionId = isUsableSessionId(metaId)
     ? metaId
     : (isUsableSessionId(nameId) ? nameId : null);
@@ -339,6 +338,10 @@ export async function scanPass(options = {}, deps = {}) {
     : options.sessionsDir;
   const maxHeadReads = orDefault(options.maxHeadReads, MAX_HEAD_READS_PER_PASS);
   const chunk = Math.max(1, orDefault(options.chunkSize, SCAN_CHUNK));
+  // A Node without zstd cannot read a compressed rollout: computeDelta would throw
+  // ROLLOUT_UNREADABLE, the run would record no observation, and the session would be retried on
+  // every pass. Such files are skipped before the stat; sync and backfill count them instead.
+  const readsZstd = zstdSupported(deps);
 
   let files;
   try {
@@ -368,6 +371,7 @@ export async function scanPass(options = {}, deps = {}) {
     }
     const index = (start + step) % total;
     const full = files[index];
+    if (!readsZstd && isCompressedRolloutName(full)) continue;
     let stat;
     try {
       stat = fsImpl.statSync(full);
@@ -411,8 +415,12 @@ export async function scanPass(options = {}, deps = {}) {
       size: stat.size,
     };
     // Codex resume can leave two files carrying one session id; the newest supersedes.
+    // A plain file beats a compressed one of the same id whatever the mtimes (a resume decompresses
+    // back to `.jsonl`, leaving any `.zst` as the stale copy), exactly as listAllRollouts rules.
     const existing = tops.get(kind.sessionId);
-    if (!existing || entry.mtimeMs > existing.mtimeMs) tops.set(kind.sessionId, entry);
+    if (!existing || rolloutSupersedes(full, entry.mtimeMs, existing.transcriptPath, existing.mtimeMs)) {
+      tops.set(kind.sessionId, entry);
+    }
   }
   if (!truncated) nextIndex = start;
 
