@@ -16,6 +16,7 @@ import {
   STAGING_API_ORIGIN,
   STAGING_OAUTH_ORIGIN,
   PRODUCTION_API_ORIGIN,
+  LEGACY_PRODUCTION_API_ORIGIN,
   PRODUCTION_OAUTH_ORIGIN,
 } from '../lib/env-migration.mjs';
 import { readRawCredential, deleteRawCredential } from '../lib/credentials.mjs';
@@ -206,6 +207,27 @@ test('classify — a production root linked through Clerk is not blocked', () =>
   assert.equal(classifyRoot(facts).verdict, 'ok');
   // An unbound root holding a production Clerk sign-in is production data: adopted, never moved.
   assert.equal(classifyRoot({ ...facts, binding: null }).verdict, 'adopt');
+});
+
+test('classify — a production root bound to the pre-move API origin is still production', () => {
+  // Every production root bound before the API moved holds the legacy origin in environment.json.
+  // Reading it as conflicting evidence would block every existing production install at once.
+  const bound = { env: '', apiOrigin: LEGACY_PRODUCTION_API_ORIGIN };
+  const facts = { env: '', apiOrigin: PRODUCTION_API_ORIGIN, binding: bound, hasData: true, issuer: 'production' };
+  assert.equal(classifyRoot(facts).verdict, 'ok');
+  assert.equal(classifyRoot({ ...facts, issuer: 'unlinked' }).verdict, 'ok');
+  // The pre-cutover staging leftover is still cleared, whichever production origin the root names.
+  assert.equal(classifyRoot({ ...facts, issuer: 'staging' }).verdict, 'clear-stale');
+  // The alias is production's only: a staging root bound to it is not staging's.
+  assert.equal(classifyRoot({ env: 'staging', apiOrigin: STAGING_API_ORIGIN,
+    binding: { env: 'staging', apiOrigin: LEGACY_PRODUCTION_API_ORIGIN }, hasData: true, issuer: 'unlinked' }).verdict, 'blocked');
+  // And it is never a live API: a build resolving to it is not production.
+  assert.equal(classifyRoot({ ...facts, apiOrigin: LEGACY_PRODUCTION_API_ORIGIN }).reason, 'api-mismatch');
+});
+
+test('issuer — a token endpoint on the pre-move API origin reads as production', () => {
+  assert.equal(issuerEnvironment(JSON.stringify({ token_endpoint: `${LEGACY_PRODUCTION_API_ORIGIN}/oauth/token`, beezi_env: '' })), 'production');
+  assert.equal(issuerEnvironment(JSON.stringify({ token_endpoint: `${LEGACY_PRODUCTION_API_ORIGIN}/oauth/token`, beezi_env: 'staging' })), 'unknown');
 });
 
 test('issuer — a conflicting stamp blocks the endpoint, and an unknown stamp is unknown', () => {

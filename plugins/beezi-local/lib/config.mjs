@@ -14,7 +14,7 @@ import { ENV_API_BASE, environment } from "./paths.mjs";
 // staging holds cursors pointing into rollouts whose earlier lines are already delivered, and a
 // queue of segments addressed to a staging tenant. Without the guard this constant alone would
 // post both to production. If the guard is ever removed, this default must go back with it.
-const RELEASE_DEFAULT = 'https://beezi-api-prod.azurewebsites.net/api';
+const RELEASE_DEFAULT = 'https://api.beezi.ai/api';
 
 // Explicit override → the variant's baked apiBase → the release default (G-1-2).
 //
