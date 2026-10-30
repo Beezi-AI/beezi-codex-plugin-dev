@@ -6,18 +6,16 @@ import path from 'node:path';
 import { spawnSync } from 'node:child_process';
 import { fileURLToPath } from 'node:url';
 import { withoutGuard } from '../tools/hermetic-env.mjs';
-import { runAudit } from '../lib/session-audit.mjs';
-import { BackfillHalt, isKeyMissing, KEY_MISSING_MESSAGE } from '../lib/audit-flush.mjs';
+import { runAudit, SYNC_MODE } from '../lib/session-audit.mjs';
 import { makeHome, accountSession } from '../tools/account-fixtures.mjs';
-import { CHANGED_LINE } from '../lib/history-offer.mjs';
-import { WRITER_BUSY_LINE, ACCEPT_BUSY_LINE, PENDING_UNREADABLE_TEXT } from '../lib/history-cli.mjs';
 
-// G-9-3: the repeatable sync surface: the script's flag policy and the skill that drives it.
+// G-9-3: the repeatable sync surface. Two halves — the script's flag policy, which is the
+// MECHANICAL enforcement of "sync is not a way around the one-time import", and the skill that
+// drives it, whose two boundary paragraphs are the reason a model does not reach for sync the
+// moment backfill refuses.
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const syncScript = path.join(pluginRoot, 'scripts', 'sync.mjs');
-// The run printer and the offer, accept and decline commands sync.mjs dispatches to.
-const historyCli = path.join(pluginRoot, 'lib', 'history-cli.mjs');
 const skillFile = path.join(pluginRoot, 'skills', 'sync', 'SKILL.md');
 const skill = fs.readFileSync(skillFile, 'utf-8');
 
@@ -71,65 +69,39 @@ test('sync — --via is not accepted as a quiet alias for anything', (t) => {
   assert.match(res.stderr, /takes no --force/);
 });
 
-test('sync — --accept without the question\'s --token uploads nothing and says the sessions changed', (t) => {
-  const res = runSync(t, ['--accept', '--account', 'a1b2c3d4', '--tenant', 't1']);
-  assert.equal(res.status, 1);
-  assert.ok(res.stderr.includes(CHANGED_LINE), res.stderr);
-  assert.equal(res.stdout, '');
-});
+// ── the one-time import's surface must not misread a lock refusal ───────────────────────────
 
-test('sync — --dry-run with an answer, or --background or --token without --accept, is refused naming the pair', (t) => {
-  for (const [args, message] of [
-    [['--dry-run', '--accept'], /--dry-run previews the offer only; it does not go with --accept\./],
-    [['--dry-run', '--decline'], /--dry-run previews the offer only; it does not go with --decline\./],
-    [['--background', '--decline'], /--background goes only with --accept, not with --decline\./],
-    [['--background'], /--background goes only with --accept, not with --offer\./],
-    [['--decline', '--token', 'abc'], /--token goes only with --accept, not with --decline\./],
-    [['--offer', '--token', 'abc'], /--token goes only with --accept, not with --offer\./],
-  ]) {
-    const res = runSync(t, args);
-    assert.equal(res.status, 1, args.join(' '));
-    assert.match(res.stderr, message, args.join(' '));
-    assert.equal(res.stdout, '', args.join(' '));
+test('backfill — a busy run lock is never reported as "no past sessions found"', () => {
+  const script = fs.readFileSync(path.join(pluginRoot, 'scripts', 'backfill.mjs'), 'utf-8');
+  // Every lock outcome comes back with scanned === 0, so each one must be handled BEFORE the
+  // scanned-zero summary or the login flow tells the user a false thing about their machine.
+  const scannedZero = script.indexOf('result.scanned === 0');
+  for (const branch of ["result.reason === 'run-in-progress'", "result.reason === 'lock-order'", 'BackfillHalt.LOCK_LOST']) {
+    const at = script.indexOf(branch);
+    assert.ok(at > -1, `scripts/backfill.mjs must handle ${branch}`);
+    assert.ok(at < scannedZero, `${branch} must be handled before the scanned-zero summary`);
   }
+  assert.match(script, /already running on this machine/);
 });
 
-// ── the one-time import script is gone ───────────────────────────────────────────────────────
-
-test('backfill — scripts/backfill.mjs no longer exists', () => {
-  assert.equal(fs.existsSync(path.join(pluginRoot, 'scripts', 'backfill.mjs')), false);
+// The one-time import is spent per account and cannot be given back, so there is no default to
+// fall back to: a run with no --account would burn whichever account the fallback landed on.
+test('backfill — a run with no --account is refused before anything is uploaded', (t) => {
+  const res = runScript(t, path.join(pluginRoot, 'scripts', 'backfill.mjs'), []);
+  assert.notEqual(res.status, 0);
+  assert.match(res.stderr, /backfill needs --account/);
+  assert.equal(res.stdout, '', 'nothing is read or sent before the refusal');
 });
 
-// ── an anonymized workspace with no key is named, never summarised as an empty upload ─────────
-
-test('isKeyMissing reads the stop from the check-in reason and from the upload halt', () => {
-  assert.equal(isKeyMissing({ reason: BackfillHalt.ANONYMIZATION_KEY_MISSING, halt: null }), true);
-  assert.equal(isKeyMissing({ reason: null, halt: BackfillHalt.ANONYMIZATION_KEY_MISSING }), true);
-  assert.equal(isKeyMissing({ reason: null, halt: null }), false);
-  assert.equal(isKeyMissing({ reason: 'no-token', halt: BackfillHalt.FORBIDDEN }), false);
-});
-
-test('the missing-key line sends the user to sign in again, then to their admin', () => {
-  assert.equal(
-    KEY_MISSING_MESSAGE,
-    'Beezi: this workspace is anonymized but this machine has no key yet. '
-      + 'Sign in to Beezi again (login skill); if this repeats, contact your workspace admin.',
-  );
-});
-
-test('sync — a missing key gets its own line before the coverage and upload summaries', () => {
-  const script = fs.readFileSync(historyCli, 'utf-8');
-  const at = script.indexOf('if (isKeyMissing(result)) {\n    return refusal(KEY_MISSING_MESSAGE);\n  }');
-  assert.ok(at > -1);
-  assert.ok(at < script.indexOf('result.coverageKnown === false'));
-  assert.ok(at < script.indexOf('result.scanned === 0'));
-});
-
-test('login — the past-sessions answers pass the --account and --tenant sync requires', () => {
+// Two-sided: backfill now REQUIRES the flag, and the login skill is the caller that always passes
+// it. Either half alone passes happily while the login flow is broken at step 4.
+test('backfill — the login skill passes the --account the script requires', () => {
   const skill = fs.readFileSync(path.join(pluginRoot, 'skills', 'login', 'SKILL.md'), 'utf-8');
-  assert.match(skill, /scripts\/sync\.mjs" --accept --account <key> --tenant <id> --token <token>/);
-  assert.match(skill, /scripts\/sync\.mjs" --decline --account <key> --tenant <id>/);
-  assert.match(skill, /`offer account=<key> tenant=<id> sessions=<n> audit=<yes\|no> token=<token>`/);
+  assert.match(skill, /scripts\/backfill\.mjs" --via login --account <key>/);
+  assert.match(
+    fs.readFileSync(path.join(pluginRoot, 'scripts', 'backfill.mjs'), 'utf-8'),
+    /parseAccountFlag/,
+  );
 });
 
 // THE ASSERTION ABOVE IS NOT ENOUGH, and shipping it as if it were is how this broke: it greps for
@@ -154,19 +126,19 @@ test('login — the past-sessions answers pass the --account and --tenant sync r
 //     the safe direction, and a one-word edit clears it.
 const SKIPS_ACCOUNT_FLAG = /(without|skip|omit|drop|leave off|leave out|no)\b[^.\n]{0,20}`?--account/i;
 
-test('login — every sync invocation carries --account, and no enumerated phrasing tells a path to skip it', () => {
+test('backfill — every login-skill invocation carries --account, and no enumerated phrasing tells a path to skip it', () => {
   const skill = fs.readFileSync(path.join(pluginRoot, 'skills', 'login', 'SKILL.md'), 'utf-8');
 
-  const invocations = skill.split('\n').filter((line) => line.includes('scripts/sync.mjs"'));
-  assert.ok(invocations.length > 0, 'the skill still answers the past-sessions question');
+  const invocations = skill.split('\n').filter((line) => line.includes('scripts/backfill.mjs'));
+  assert.ok(invocations.length > 0, 'the skill still runs the one-time import');
   for (const line of invocations) {
-    assert.match(line, /--account/, `sync is invoked without --account: ${line}`);
+    assert.match(line, /--account/, `backfill is invoked without --account: ${line}`);
   }
 
   const skipped = skill.match(SKIPS_ACCOUNT_FLAG);
   assert.equal(
     skipped, null,
-    `the skill tells a path to run without --account, where sync's answers refuse: ${skipped && skipped[0]}`,
+    `the skill tells a path to run without --account, where the one-time import refuses: ${skipped && skipped[0]}`,
   );
 
   assert.match(skill, /get a key before continuing/);
@@ -191,7 +163,7 @@ test('skill — routes history before syncing, with scripts derived from its own
   // One call when nothing needs an answer: the skill reads the sync's output after review=0 and runs nothing more.
   assert.match(skill, /`review=<n>`/);
   assert.match(skill, /On `review=0` it goes straight on to the sync/);
-  assert.match(skill, /its output is everything after\s+that `review=0` line\. Do not run it again\./);
+  assert.match(skill, /its output is everything after that\s+`review=0` line\. Run nothing more\./);
   assert.match(skill, /Run nothing for them after `joined=0`/);
   assert.match(skill, /counts as nothing to ask/);
   assert.match(skill, /J<i>-command=/);
@@ -218,8 +190,8 @@ test('skill — states the flag policy in the same terms the script enforces', (
 });
 
 test('skill — documents the per-account fan-out the script prints headings for', () => {
-  const script = fs.readFileSync(historyCli, 'utf-8');
-  assert.ok(script.includes('── Account: '), 'lib/history-cli.mjs should still print the heading');
+  const script = fs.readFileSync(syncScript, 'utf-8');
+  assert.ok(script.includes('── Account: '), 'scripts/sync.mjs should still print the heading');
   assert.match(skill, /── Account: /, 'skills/sync/SKILL.md should explain the heading');
   assert.match(skill, /every linked\s+account in turn/);
 });
@@ -234,58 +206,36 @@ test('a run scoped to an account that cannot produce a token answers no-token', 
   makeHome(t);
   const result = await runAudit(
     { linkedSessions: async () => [accountSession('99887766', 'tok-b')] },
-    { key: 'a1b2c3d4' },
+    { mode: SYNC_MODE, key: 'a1b2c3d4' },
   );
   assert.equal(result.reason, 'no-token');
   assert.equal(result.scanned, 0, 'nothing was read — the account was the whole problem');
 });
 
-test('sync words that as the account’s problem, from one definition', () => {
-  const sync = fs.readFileSync(historyCli, 'utf-8');
-  // One definition: a second spelling leaves the skill relaying a sentence sync
-  // no longer prints — the same rule test/account-surfaces.test.mjs case 15 enforces.
+test('sync and backfill word that as the account’s problem, from one definition', () => {
+  const sync = fs.readFileSync(syncScript, 'utf-8');
+  const backfill = fs.readFileSync(path.join(pluginRoot, 'scripts', 'backfill.mjs'), 'utf-8');
+  // One definition, two callers: a second spelling leaves the skill relaying a sentence one of
+  // them no longer prints — the same rule test/account-surfaces.test.mjs case 15 enforces.
   assert.match(
     fs.readFileSync(path.join(pluginRoot, 'lib', 'session-audit.mjs'), 'utf-8'),
     /export const ACCOUNT_TOKEN_UNUSABLE/,
   );
-  assert.match(sync, /ACCOUNT_TOKEN_UNUSABLE/, 'lib/history-cli.mjs should import the one definition');
+  for (const [name, script] of [['sync', sync], ['backfill', backfill]]) {
+    assert.match(script, /ACCOUNT_TOKEN_UNUSABLE/, `scripts/${name}.mjs should import the one definition`);
+  }
+  // backfill REQUIRES --account, so every no-token it can reach is an account it already resolved.
+  assert.doesNotMatch(backfill, /this machine is not linked/, 'backfill can no longer reach that state');
   // sync keeps it for the UNSCOPED run, which is the only one where it is still true.
   assert.match(sync, /key === null\s*\n?\s*\? 'Beezi: this machine is not linked/);
   assert.match(skill, /could not use the saved credentials for that account/);
   assert.match(skill, /Do not report it as the machine being unlinked/);
 });
 
-test('skill — running sync is not a yes: uploads follow only an Upload answer to a shown question', () => {
-  assert.match(skill, /## Running sync is not a yes/);
-  assert.match(skill, /go up only after the user\s+answers Upload to a question this skill showed/);
-  assert.match(skill, /Never\s+run `--accept` for a question the user did not answer with Upload/);
-  assert.doesNotMatch(skill, /one-time import/);
-});
-
-test('README — names no one-time import and no hostname in the OAuth client name', () => {
-  const readme = fs.readFileSync(path.join(pluginRoot, 'README.md'), 'utf-8');
-  assert.doesNotMatch(readme, /one-time import/);
-  assert.ok(!readme.includes('<hostname>'));
-  assert.ok(fs.readFileSync(path.join(pluginRoot, 'lib', 'oauth.mjs'), 'utf-8').includes("client_name: 'Beezi Codex plugin',"));
-});
-
-test('skill — explains the changed-offer, busy-writer and tracking-off outcomes the script prints', () => {
-  const script = fs.readFileSync(historyCli, 'utf-8');
-  const flat = skill.replace(/\s+/g, ' ');
-  assert.ok(CHANGED_LINE.includes('these past sessions changed after the question was shown, so nothing was uploaded'));
-  assert.ok(flat.includes('these past sessions changed after the question was shown, so nothing was uploaded'));
-  assert.ok(flat.includes('Never retry `--accept` with that token or any other.'));
-  assert.ok(WRITER_BUSY_LINE.includes('Codex is still saving analytics on this machine, so nothing was listed this time'));
-  assert.ok(flat.includes('Codex is still saving analytics on this machine, so nothing was listed this time'));
-  for (const [line, fragment] of [
-    [PENDING_UNREADABLE_TEXT, 'could not read Codex’s pending analytics on this machine'],
-    [ACCEPT_BUSY_LINE, 'your yes is saved, but this machine is busy, so nothing was uploaded yet'],
-  ]) {
-    assert.ok(line.includes(fragment), fragment);
-    assert.ok(flat.includes(fragment), fragment);
-  }
-  assert.ok(script.includes("'Beezi: this workspace does not accept history uploads on demand.'"));
-  assert.ok(flat.includes('this workspace does not accept history uploads on demand'));
+test('skill — carries the hard boundary against the one-time import', () => {
+  assert.match(skill, /NOT the one-time import/);
+  assert.match(skill, /does not consume, reopen, re-run or stand in for/);
+  assert.match(skill, /decline/);
 });
 
 test('skill — carries the trust-gap framing and points at the cause, not just the symptom', () => {
@@ -305,15 +255,14 @@ test('skill — the coverage-unknown notice is relayed, not treated as an error'
 });
 
 test('sync — a deferred run never claims "everything is already uploaded"', () => {
-  const script = fs.readFileSync(historyCli, 'utf-8');
+  const script = fs.readFileSync(syncScript, 'utf-8');
   // The success phrase and the deferral count must be mutually exclusive branches: the skill
   // teaches the model that the phrase means "stop", so printing it over deferred history is the
   // one way this surface can tell a user to give up on work that is still recoverable.
   // The deferral branch is tested first, and the success phrase sits in the `else if` behind it,
   // so the two can never both print.
   assert.match(script, /if \(result\.sessionsImported === 0 && result\.deferred > 0\) \{/);
-  assert.match(script, /\} else if \(result\.sessionsImported === 0\) \{\n\s*console\.log\(nothingLeftLine\(result\)\);/);
-  assert.match(script, /function nothingLeftLine\(result\) \{[\s\S]{0,200}everything is already uploaded/);
+  assert.match(script, /\} else if \(result\.sessionsImported === 0\) \{[\s\S]{0,400}everything is already uploaded/);
   // And the success line's parenthetical must not mention deferred history at all.
   assert.doesNotMatch(script, /bits\.push\([^)]*deferred/);
 });
@@ -324,7 +273,7 @@ test('skill — the deferred-gap outcome is documented as final, with no overrid
 });
 
 test('skill — every outcome the script can print is documented', () => {
-  const script = fs.readFileSync(historyCli, 'utf-8');
+  const script = fs.readFileSync(syncScript, 'utf-8');
   // Distinctive fragments of each user-visible line, paired with the phrase the skill must carry.
   const outcomes = [
     ['everything is already uploaded', /everything is already uploaded/],
@@ -333,22 +282,24 @@ test('skill — every outcome the script can print is documented', () => {
     ['does not line up', /does not line up/],
     ['does not prove a safe resume point', /does not prove a safe resume point/],
     ['left alone: live tracking is still delivering', /sub-agents left alone/],
+    ['(dry run): sync would send', /dry run/],
     ['not linked', /not linked/],
     ['does not support history sync yet', /does not support history sync yet/],
     ['already-saved analytics have not reached Beezi', /already-saved analytics have not reached Beezi/],
   ];
   for (const [fragment, inSkill] of outcomes) {
-    assert.ok(script.includes(fragment), `lib/history-cli.mjs should still print "${fragment}"`);
+    assert.ok(script.includes(fragment), `scripts/sync.mjs should still print "${fragment}"`);
     assert.match(skill, inSkill, `skills/sync/SKILL.md should explain "${fragment}"`);
   }
 });
 
-test('sync never asks for liveOnly, so audit workspaces are offered their history too', () => {
-  for (const file of [syncScript, historyCli]) {
-    const script = fs.readFileSync(file, 'utf-8');
-    assert.ok(!script.includes('liveOnly'), 'sync uploads to audit workspaces too');
-    assert.ok(!script.includes("'audit-only'"), 'sync never receives the audit-only refusal');
-  }
+test('sync never asks for liveOnly; only login\'s joined-workspace upload does, falling back to the one-time import', () => {
+  const script = fs.readFileSync(syncScript, 'utf-8');
+  assert.ok(!script.includes('liveOnly'), 'sync uploads to audit workspaces too');
+  assert.ok(!script.includes("'audit-only'"), 'sync no longer receives the audit-only refusal');
+  const backfill = fs.readFileSync(path.join(pluginRoot, 'scripts', 'backfill.mjs'), 'utf-8');
+  assert.ok(backfill.includes('{ ...options, mode: SYNC_MODE, liveOnly: true }'), 'backfillJoinedOne asks for liveOnly');
+  assert.ok(backfill.includes("result.reason === 'audit-only'"), 'and takes the one-time import on that refusal');
 });
 
 test('skill — track points at sync for history it cannot repair', () => {
@@ -364,17 +315,4 @@ test('skill — a place\'s Don\'t track choice is described as nothing sent', ()
   assert.ok(flat.includes('"Not tracked: nothing from sessions outside a project folder is sent"'));
   assert.ok(!flat.includes('Nothing from <short> is uploaded'));
   assert.ok(!flat.includes('outside a project folder is uploaded'));
-});
-
-test('skill — step 2 shows the summary and asks each Q line under both choices; running it is not a yes', () => {
-  const flat = skill.replace(/\s+/g, ' ');
-  assert.ok(flat.includes('node "<plugin-root>/scripts/sync.mjs" --accept --account <key> --tenant <id> --token <token>'));
-  assert.ok(flat.includes('node "<plugin-root>/scripts/sync.mjs" --decline --account <key> --tenant <id>'));
-  assert.ok(flat.includes('`offer account=<key> tenant=<id> sessions=<n> audit=<yes|no> token=<token>`'));
-  assert.ok(flat.includes('whatever the workspace\'s past-sessions setting is'));
-  assert.ok(flat.includes('Running this skill is not a yes'));
-  assert.ok(flat.includes('` Reply upload or not now.`'));
-  assert.ok(flat.includes('No answer means no upload.'));
-  assert.ok(flat.includes('the summary step 2 shows, without its question, ending `offers=0`; nothing is recorded or sent'));
-  assert.doesNotMatch(skill, /past sessions will be sent there too|gets its history uploaded|sync would send/);
 });

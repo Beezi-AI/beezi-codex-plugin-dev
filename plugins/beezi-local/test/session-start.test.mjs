@@ -11,12 +11,7 @@ import { stateDir } from '../lib/paths.mjs';
 import { CONSENT_VERSION, diagnosticsConsentFile, readConsent, isTelemetryGranted } from '../lib/diagnostics.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
-import { accountSession, fakeKeyring, TEST_KEY, makeHome, linkAccount } from '../tools/account-fixtures.mjs';
-import { KINDS } from '../lib/anonymize.mjs';
-import { buildHistoryOffer, buildJoinedPrompt, buildWorkspacePrompt, usableRows } from '../lib/workspace-prompt.mjs';
-import { startOfferScans } from '../lib/history-trigger.mjs';
-import { listAccounts } from '../lib/accounts.mjs';
-import { workspaceCommand } from '../lib/workspace-cli.mjs';
+import { accountSession, fakeKeyring, TEST_KEY } from '../tools/account-fixtures.mjs';
 
 // The credential store is NOT sandboxed by BEEZI_CODEX_HOME. A test that reaches the real
 // getAuthentication — the forced-refresh retry does, unless it stubs it — spawns `security` against
@@ -161,7 +156,7 @@ test('a valid whoami fills an anonymous account row in', async (t) => {
   assert.equal(patches.length, 1, 'the row is written exactly once');
   assert.equal(patches[0].key, ACCOUNT.key);
   assert.deepEqual(patches[0].patch, {
-    email: 'filled@example.com', name: 'Dev', tenantId: 't-9', tenantName: 'Acme', tenants: null, anonymization: null,
+    email: 'filled@example.com', name: 'Dev', tenantId: 't-9', tenantName: 'Acme', tenants: null,
   });
 });
 
@@ -177,8 +172,7 @@ test('a valid whoami refreshes an already-named account and its workspace member
   );
   assert.equal(message, banner('someone@example.com', 'Current workspace'));
   assert.deepEqual(patches, [{ key: ACCOUNT.key, patch: {
-    email: 'someone@example.com', name: 'Dev', tenantId: null, tenantName: null, tenants: [{ ...tenants[0], joinedAt: null, anonymization: null }],
-    anonymization: null,
+    email: 'someone@example.com', name: 'Dev', tenantId: null, tenantName: null, tenants: [{ ...tenants[0], joinedAt: null }],
   } }], 'known identities still refresh membership on every valid answer');
 });
 
@@ -364,52 +358,6 @@ test('a platform workspace keeps its repo probe and line, after the banner', asy
     'Beezi: repo connected to "Apollo". Sessions here are tracked.',
   ].join('\n'));
   assert.equal(calls.filter((u) => u.endsWith(ENDPOINTS.reposStatus)).length, 1);
-});
-
-const kindsOn = (on) => Object.fromEntries(KINDS.map((kind) => [kind, on.includes(kind)]));
-const anonymizedWorkspace = (type, on) => [{ id: 'A', name: 'Acme', type, anonymization: { kinds: kindsOn(on), key: 'ab'.repeat(32), machineName: 'Laptop 7' } }];
-
-async function startIn(t, tenants) {
-  const home = tmpHome(t);
-  const { fetchImpl, calls } = router({
-    whoami: () => ok({ email: 'dev@acme.io', tenants }),
-    repos: () => ok({ connected: true, projectName: 'Apollo' }),
-  });
-  const message = await runSessionStart(
-    { session_id: 's1', cwd: home, source: 'startup' },
-    { ...linked(), fetchImpl, gitImpl: () => 'https://host/org/repo.git', ...quietBilling },
-  );
-  return { message, probes: calls.filter((u) => u.endsWith(ENDPOINTS.reposStatus)).length };
-}
-
-const ACME_BANNER = [
-  'Beezi ✓ dev@acme.io, workspace Acme',
-  '  Sessions outside a project → Acme (default)',
-  '  Change with the settings skill (Rules)',
-];
-
-test('a platform workspace hiding repos says so and is never sent the remote', async (t) => {
-  const { message, probes } = await startIn(t, anonymizedWorkspace('platform', ['repos']));
-  assert.equal(message, [...ACME_BANNER, 'Beezi: this workspace is anonymized.'].join('\n'));
-  assert.equal(probes, 0, 'no /repos/status call when repos is on');
-});
-
-test('a platform workspace with only branches on keeps its repo probe and shows the notice', async (t) => {
-  const { message, probes } = await startIn(t, anonymizedWorkspace('platform', ['branches']));
-  assert.equal(message, [...ACME_BANNER, 'Beezi: this workspace is anonymized.'].join('\n'));
-  assert.equal(probes, 1);
-});
-
-test('an anonymized analytics workspace says so too', async (t) => {
-  const { message, probes } = await startIn(t, anonymizedWorkspace('analytics', KINDS));
-  assert.equal(message, [...ACME_BANNER, 'Beezi: this workspace is anonymized.'].join('\n'));
-  assert.equal(probes, 0);
-});
-
-test('a workspace with every kind off gets no notice and keeps its repo probe', async (t) => {
-  const { message, probes } = await startIn(t, anonymizedWorkspace('platform', []));
-  assert.equal(message, [...ACME_BANNER, 'Beezi: repo connected to "Apollo". Sessions here are tracked.'].join('\n'));
-  assert.equal(probes, 1);
 });
 
 // The checkout's folder name differs from its remote's, so only repo routing (the warmed map) prints
@@ -1430,137 +1378,4 @@ test('an account that is linked but produced no session is explained, not report
   assert.match(message, /W-99887766 is temporarily unavailable or refreshing/);
   assert.doesNotMatch(message, /not linked/, 'one account mid-refresh is not an unlinked machine');
   assert.deepEqual(sync.calls.map((c) => c.key), ['a1b2c3d4']);
-});
-
-// ── The session-start history offer ─────────────────────────────────────────────────────────────
-const CHANGED_AT = '2026-10-01T00:00:00.000Z';
-const READY = { state: 'ready', changedAt: CHANGED_AT, offeredIds: ['s1', 's2'], summary: { n: 2 } };
-const pastBlock = (choice) => ({
-  tenantId: 't1',
-  kinds: { repos: true, branches: true, sessions: true, hosts: true, accounts: true },
-  pastSessions: { choice, changedAt: CHANGED_AT },
-});
-function offerHome(t, choice) {
-  linkAccount(makeHome(t), TEST_KEY, {
-    tenants: [{ id: 't1', name: 'Acme', anonymization: pastBlock(choice) }],
-    historyOffers: { t1: READY },
-  });
-  return { pluginRoot: '/plugin', linkedSessions: async () => [{ key: TEST_KEY }] };
-}
-
-test('a ready offer is shown as an instruction to run the offer command, and nothing is recorded', async (t) => {
-  const deps = offerHome(t, 'offer');
-  const offer = await buildHistoryOffer({ source: 'startup' }, deps);
-  assert.deepEqual(Object.keys(offer), ['context', 'keys']);
-  assert.deepEqual(offer.keys, [TEST_KEY]);
-  assert.equal(offer.status, undefined);
-  assert.ok(offer.context.includes(`sync.mjs" --offer --past --account ${TEST_KEY}`), offer.context);
-  assert.ok(offer.context.includes('--accept --background --account <key> --tenant <id> --token <token>'), offer.context);
-  assert.ok(offer.context.includes('`<token>` is the `token=` value of that `offer` line'), offer.context);
-  assert.ok(offer.context.includes('--decline --account <key> --tenant <id>'), offer.context);
-  assert.match(offer.context, /non-interactive run where no user can answer, and run nothing/);
-  const [row] = await listAccounts();
-  assert.deepEqual(row.historyOffers, { t1: READY });
-  assert.deepEqual(await buildHistoryOffer({ source: 'startup' }, deps), offer);
-});
-
-test('a ready offer under skip is not shown, and no scan is spawned', async (t) => {
-  const spawned = [];
-  const deps = { ...offerHome(t, 'skip'), spawnImpl: (exe, args) => { spawned.push(args); return { unref() {} }; } };
-  assert.equal(await buildHistoryOffer({ source: 'startup' }, deps), null);
-  assert.equal(await startOfferScans(await usableRows(deps), deps), 0);
-  assert.deepEqual(spawned, []);
-  assert.deepEqual((await listAccounts())[0].historyOffers, { t1: READY });
-});
-
-test('the offer asks the credential store only when an offer is ready', async (t) => {
-  for (const [choice, expected] of [['skip', 0], ['offer', 1]]) {
-    await t.test(choice, async (tt) => {
-      let asked = 0;
-      const deps = { ...offerHome(tt, choice), linkedSessions: async () => { asked += 1; return [{ key: TEST_KEY }]; } };
-      await buildHistoryOffer({ source: 'startup' }, deps);
-      assert.equal(asked, expected);
-    });
-  }
-});
-
-test('the offer is never built on resume', async (t) => {
-  const deps = offerHome(t, 'offer');
-  assert.equal(await buildHistoryOffer({ source: 'resume' }, deps), null);
-  assert.equal(await buildHistoryOffer({ source: 'compact' }, deps), null);
-});
-
-test('the session-start hook puts the offer only into additionalContext, never into systemMessage', () => {
-  const source = fs.readFileSync(new URL('../scripts/session-start.mjs', import.meta.url), 'utf8');
-  assert.match(source, /\[joinedPrompt, workspacePrompt, offerContext\]/);
-  for (const line of source.split('\n').filter((l) => /systemMessage|const status =/.test(l))) {
-    assert.doesNotMatch(line, /offer/i, line);
-  }
-});
-
-test('the session-start hook shares one check pass and skips accounts already offered to (M-1, M-7, C-8)', () => {
-  const source = fs.readFileSync(new URL('../scripts/session-start.mjs', import.meta.url), 'utf8');
-  assert.match(source, /buildHistoryOffer\(input, deps, \{ checks, skipKeys: joinedKeys \}\)/);
-  assert.match(source, /joinedKeys\.concat\(historyOffer\.keys\)/);
-  assert.match(source, /startOfferScans\(scanRows\(rows, offered\), deps, \{ checks \}\)/);
-});
-
-test('the joined prompt hands the past sessions to the offer command', async (t) => {
-  linkAccount(makeHome(t), TEST_KEY, {
-    linkedAt: '2026-10-01T00:00:00.000Z',
-    tenants: [{ id: 'A', name: 'Acme', joinedAt: '2026-01-01T00:00:00.000Z' }, { id: 'B', name: 'NewCo', joinedAt: '2026-10-10T00:00:00.000Z' }],
-  });
-  const { context: text } = await buildJoinedPrompt({ source: 'startup' }, { pluginRoot: '/plugin', linkedSessions: async () => [{ key: TEST_KEY }] });
-  assert.ok(text.includes('`node "/plugin/scripts/sync.mjs" --offer --past --account <key>`'), text);
-  assert.doesNotMatch(text, /the upload starts by itself/);
-});
-
-test('an account the joined pass offers to gets no second offer instruction; another account still does (M-7)', async (t) => {
-  const home = makeHome(t);
-  const JOINED_KEY = 'aaaa1111';
-  const OTHER_KEY = 'bbbb2222';
-  const block = (tenantId) => ({ ...pastBlock('offer'), tenantId });
-  linkAccount(home, JOINED_KEY, {
-    linkedAt: '2026-10-01T00:00:00.000Z',
-    tenants: [
-      { id: 'A', name: 'Acme', joinedAt: '2026-01-01T00:00:00.000Z', anonymization: block('A') },
-      { id: 'B', name: 'NewCo', joinedAt: '2026-10-10T00:00:00.000Z', anonymization: block('B') },
-    ],
-    historyOffers: { A: READY },
-  });
-  linkAccount(home, OTHER_KEY, { tenants: [{ id: 't1', name: 'Acme', anonymization: pastBlock('offer') }], historyOffers: { t1: READY } });
-  const deps = { pluginRoot: '/plugin', linkedSessions: async () => [{ key: JOINED_KEY }, { key: OTHER_KEY }] };
-  const joined = await buildJoinedPrompt({ source: 'startup' }, deps);
-  assert.deepEqual(joined.keys, [JOINED_KEY]);
-  assert.ok(joined.context.includes('--offer --past'), joined.context);
-  const offer = await buildHistoryOffer({ source: 'startup' }, deps, { skipKeys: joined.keys });
-  assert.deepEqual(offer.keys, [OTHER_KEY]);
-  assert.ok(offer.context.includes(`--offer --past --account ${OTHER_KEY}`), offer.context);
-  assert.ok(!offer.context.includes(JOINED_KEY), offer.context);
-  assert.equal(await buildHistoryOffer({ source: 'startup' }, deps, { skipKeys: [JOINED_KEY, OTHER_KEY] }), null);
-});
-
-test('the folder question writes the rule and owes no history', async (t) => {
-  const home = makeHome(t);
-  linkAccount(home, TEST_KEY, { tenants: [{ id: 't1', name: 'Acme', role: 'owner' }, { id: 't2', name: 'Beta', role: 'admin' }] });
-  const cwd = path.join(home, 'project');
-  fs.mkdirSync(cwd);
-  const text = await buildWorkspacePrompt({ session_id: 'session-1', cwd, source: 'startup' }, {
-    pluginRoot: '/plugin',
-    linkedSessions: async () => [{ key: TEST_KEY }],
-  });
-  const command = /`node "\/plugin\/scripts\/workspace\.mjs" (rule add [^`]*)`/.exec(text);
-  assert.ok(command, text);
-  assert.doesNotMatch(command[1], /--defer-upload/);
-  const argv = command[1].split(' ').map((arg) => (arg === '<ids>' ? 't1' : arg));
-  const out = await workspaceCommand(argv, {
-    cwd,
-    getAuthentication: async () => null,
-    syncAccountIfNeeded: async () => {},
-    startHistoryWorker: async () => false,
-  });
-  assert.equal(out.ok, true, out.stderr.join('\n'));
-  const [row] = await listAccounts();
-  assert.equal(row.workspaceRules.length, 1);
-  assert.equal(row.pendingHistory, undefined);
 });

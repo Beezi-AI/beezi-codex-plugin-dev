@@ -3,8 +3,8 @@ import { runHook, importHookModule } from '../lib/hook-runner.mjs';
 import { DIAGNOSTIC_SOURCES } from '../lib/diagnostics.mjs';
 import { hookMayProceed, environmentNotice } from '../lib/env-guard.mjs';
 import { linkedSessions } from '../lib/accounts.mjs';
-import { markPendingWorkspace, buildWorkspacePrompt, buildJoinedPrompt, buildHistoryNotice, buildHistoryOffer, usableRows } from '../lib/workspace-prompt.mjs';
-import { maybeStartPendingHistory, startOfferScans, offerChecksByRow, scanRows } from '../lib/history-trigger.mjs';
+import { markPendingWorkspace, buildWorkspacePrompt, buildJoinedPrompt, buildHistoryNotice } from '../lib/workspace-prompt.mjs';
+import { maybeStartPendingHistory } from '../lib/history-trigger.mjs';
 
 const input = readHookInput();
 if (!input) process.exit(0);
@@ -59,35 +59,21 @@ async function main() {
   }
   // Re-binds with the workspaces runSessionStart just refreshed; asks only on startup or clear.
   // A refused re-bind asks from the first bind's answer rather than dropping the question.
-  let joined = null;
+  let joinedPrompt = null;
   let workspacePrompt = null;
-  try { joined = await buildJoinedPrompt(input, deps); } catch { /* best-effort */ }
-  const joinedPrompt = joined == null ? null : joined.context;
-  const joinedKeys = joined == null ? [] : joined.keys;
+  try { joinedPrompt = await buildJoinedPrompt(input, deps); } catch { /* best-effort */ }
   try { workspacePrompt = await buildWorkspacePrompt(input, deps, marked); } catch { /* best-effort */ }
+  // The joined re-pick comes first, so the current-folder question sees its answers.
+  const additionalContext = [joinedPrompt, workspacePrompt].filter(Boolean).join('\n\n') || null;
   let historyNotice = null;
-  let historyOffer = null;
   if (source !== 'compact') {
     // Built only when the status line will be written, since building it takes the results.
     if (failure == null) {
       try { historyNotice = await buildHistoryNotice(input, deps); } catch { /* best-effort */ }
-      // One offer instruction per account: the joined pass's item (5), else the history offer; neither races a scan worker.
-      let rows = [];
-      let checks = null;
-      try {
-        rows = await usableRows(deps);
-        checks = offerChecksByRow(rows, Date.now(), deps);
-        historyOffer = await buildHistoryOffer(input, deps, { checks, skipKeys: joinedKeys });
-      } catch { /* best-effort */ }
       // Awaited: the hook exits once main resolves. Never throws.
       await maybeStartPendingHistory();
-      const offered = historyOffer == null ? joinedKeys : joinedKeys.concat(historyOffer.keys);
-      await startOfferScans(scanRows(rows, offered), deps, { checks });
     }
   }
-  // The joined re-pick comes first, so the current-folder question sees its answers; the history offer runs last.
-  const offerContext = historyOffer == null ? null : historyOffer.context;
-  const additionalContext = [joinedPrompt, workspacePrompt, offerContext].filter(Boolean).join('\n\n') || null;
   if (failure != null) {
     write({ systemMessage: notice, additionalContext });
     throw failure;

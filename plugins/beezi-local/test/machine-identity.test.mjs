@@ -98,11 +98,6 @@ test('2. X-Beezi-Agent is exactly "codex"', () => {
   assert.strictEqual(machineHeaders(null)['X-Beezi-Agent'], AGENT);
 });
 
-test('2b. machineHeaders says the plugin asks before uploading past sessions', () => {
-  assert.strictEqual(machineHeaders(null)['x-beezi-history-consent'], 'ask-first');
-  assert.strictEqual(machineHeaders('client-a', { token: 't', clientId: 'client-a' })['x-beezi-history-consent'], 'ask-first');
-});
-
 // ── 3. the host header ──────────────────────────────────────────────────────────────────────────
 
 test('3. X-Beezi-Host is truncated at 255 characters', (t) => {

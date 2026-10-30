@@ -20,14 +20,12 @@ test('joined --defer-upload prints pick commands that carry the flag before <ten
   assert.match(out.lines.find((l) => l.startsWith('done-command=')), new RegExp(`joined done --account ${TEST_KEY} --defer-upload$`));
 });
 
-test('a rule write never starts an upload, deferred or not', async (t) => {
-  const home = makeHome(t);
-  linkAccount(home, TEST_KEY, { tenants: TENANTS, linkedAt: '2026-10-01T00:00:00.000Z' });
+test('rule add starts the worker unless deferred', async (t) => {
+  linkAccount(makeHome(t), TEST_KEY, { tenants: TENANTS, linkedAt: '2026-10-01T00:00:00.000Z' });
   const started = [];
-  const deps = { startHistoryWorker: async (key) => { started.push(key); }, getAuthentication: async () => null, listAllRollouts: () => [], cwd: home };
-  for (const argv of [['rule', 'add', '--current', '--account', TEST_KEY, 'B'], ['rule', 'add', '--repo', 'github.com/acme/web', '--account', TEST_KEY, 'B', '--defer-upload']]) {
-    const out = await workspaceCommand(argv, deps);
-    assert.equal(out.ok, true, out.stderr.join('\n'));
-  }
+  const deps = { startHistoryWorker: async (key) => { started.push(key); } };
+  await workspaceCommand(['rule', 'add', '--repo', 'github.com/acme/api', '--account', TEST_KEY, 'B', '--defer-upload'], deps);
   assert.deepEqual(started, []);
+  await workspaceCommand(['rule', 'add', '--repo', 'github.com/acme/web', '--account', TEST_KEY, 'B'], deps);
+  assert.deepEqual(started, [TEST_KEY]);
 });

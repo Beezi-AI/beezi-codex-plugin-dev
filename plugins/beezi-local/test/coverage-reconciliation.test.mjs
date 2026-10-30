@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { runAudit, HISTORY_RUN_LOCK, RUN_LEASE_MS } from '../lib/session-audit.mjs';
+import { runAudit, SYNC_MODE, HISTORY_RUN_LOCK, RUN_LEASE_MS } from '../lib/session-audit.mjs';
 import { BackfillSessionStatus, BackfillHalt } from '../lib/audit-flush.mjs';
 import { ReplayDecision } from '../lib/session-coverage.mjs';
 import { TrackingMode } from '../lib/tracking.mjs';
@@ -117,7 +117,7 @@ function fakeFlush(statusFor = () => BackfillSessionStatus.ACCEPTED) {
 }
 
 function makeDeps(over = {}) {
-  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, updatedAt: null };
+  const ledger = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
   const coverageRecord = { version: 1, identity: null, environment: '', apiBase: null, sessions: {}, updatedAt: null };
   const saved = [];
   const lock = over.lock || fakeLock();
@@ -133,7 +133,8 @@ function makeDeps(over = {}) {
     resolveTranscriptByCwdImpl: () => null,
     readStateImpl: () => null,
     readTrackingStateImpl: () => null,
-    statImpl: () => { throw new Error('ENOENT'); },
+    markBackfillCompletedImpl: () => {},
+    completeBackfillImpl: async () => ({ completed: true, code: null }),
     loadLedgerImpl: () => ledger,
     saveLedgerImpl: (_key, l) => saved.push(l),
     runCheckpointImpl: checkpoint.impl,
@@ -152,9 +153,10 @@ function makeDeps(over = {}) {
   return { deps, ledger, coverageRecord, saved, lock, checkpoint, flush };
 }
 
-const sync = (h, options = {}) => runAudit(h.deps, options);
+const sync = (h, options = {}) => runAudit(h.deps, { mode: SYNC_MODE, ...options });
 
-// The 30-day window is policy: an older session is counted and never reconciled.
+// The 30-day window is shared policy, not a backfill-only rule: a session out of scope for the
+// one-time import must be out of scope here too, or the two commands disagree about the same file.
 test('the 30-day window applies to sync as well, and is never reconciled', async () => {
   const NOW = 100 * 24 * 60 * 60 * 1000;
   const asked = [];
@@ -214,12 +216,21 @@ test('R2/no hooks trusted — a session the server has never seen replays from l
 test('R2/imported session append — a ledgered session is NOT skipped in sync; coverage picks the cursor', async () => {
   const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 260)] });
   const h = makeDeps({ checkpoint, deps: { fetchCoverageImpl: async () => new Map([['s1', 200]]) } });
-  // Delivered by an earlier run at line 200, then the session resumed and grew.
+  // Delivered by the one-time import at line 200, then the session resumed and grew.
   h.ledger.sessions.s1 = { at: 'x', outcome: BackfillSessionStatus.ACCEPTED, reports: 3 };
   const result = await sync(h);
+  assert.equal(result.alreadyImported, 0, 'the ledger skip must not fire in sync mode');
   assert.equal(result.candidates, 1);
   assert.equal(checkpoint.calls[0].startCursor, 200);
   assert.equal(result.sessionsImported, 1);
+});
+
+test('R2/imported session append — the SAME session is still skipped by the ledger in backfill mode', async () => {
+  const h = makeDeps();
+  h.ledger.sessions.s1 = { at: 'x', outcome: BackfillSessionStatus.ACCEPTED, reports: 3 };
+  const result = await runAudit(h.deps, {});
+  assert.equal(result.alreadyImported, 1);
+  assert.equal(result.candidates, 0);
 });
 
 test('R2/rejected then connected repo — a REJECTED ledger entry is not delivery, so it replays in full', async () => {
@@ -391,6 +402,14 @@ test('fill — children the engine left to live capture are counted, not silentl
   const h = makeDeps({ checkpoint: { impl, calls: checkpoint.calls } });
   const result = await sync(h);
   assert.equal(result.childrenDeferred, 2);
+});
+
+test('the one-time import records every child it delivered, so a later sync does not repeat it', async () => {
+  const checkpoint = fakeCheckpoint({ s1: () => [seg('s1', 1, 40), childSeg('s1', 'a1', 1, 20)] });
+  const h = makeDeps({ checkpoint });
+  await runAudit(h.deps, {});
+  assert.deepEqual(h.ledger.subagents.s1, { a1: 20 });
+  assert.equal(checkpoint.calls[0].childFill, null, 'the import keeps its own child rules');
 });
 
 test('R2/child-only append — a child segment below the parent boundary is not an overlap', async () => {
@@ -591,6 +610,7 @@ test('R2/audit-only tenant — liveOnly refuses locally on a dark cache before a
   });
   const result = await sync(h, { liveOnly: true });
   assert.equal(result.reason, 'audit-only');
+  assert.equal(result.upgradeAdvised, true);
   assert.equal(result.candidates, 0);
   assert.equal(h.flush.calls.length, 0);
 });
@@ -697,16 +717,69 @@ test('R2/audit-only tenant — liveOnly stops on a dark queue drain', async () =
   assert.equal(h.flush.calls.length, 0);
 });
 
-// ─── route ──────────────────────────────────────────────────────────────────────────────────
+// ─── the one-time seal is neither honoured nor touched by sync ───────────────────────────────
 
-test('route — the historical replay uses the sync route', async () => {
+test('seal — sync runs against a sealed local cache instead of early-returning', async () => {
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)] });
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      readTrackingStateImpl: () => ({ identity: null, trackingMode: TrackingMode.LIVE, backfillCompleted: true }),
+      whoamiImpl: async () => ({ valid: true, trackingMode: TrackingMode.LIVE, backfillCompleted: true }),
+      fetchCoverageImpl: async () => new Map(),
+    },
+  });
+  h.ledger.complete = true;
+  const result = await sync(h);
+  assert.notEqual(result.reason, 'already-completed');
+  assert.equal(result.sessionsImported, 1);
+});
+
+test('seal — sync never seals, and never calls completeBackfill', async () => {
+  let sealCalls = 0;
+  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)] });
+  const h = makeDeps({
+    checkpoint,
+    deps: {
+      completeBackfillImpl: async () => { sealCalls += 1; return { completed: true, code: null }; },
+      fetchCoverageImpl: async () => new Map(),
+    },
+  });
+  const result = await sync(h);
+  assert.equal(result.finalized, false);
+  assert.equal(sealCalls, 0);
+  assert.equal(h.ledger.complete, false);
+});
+
+test('seal — an empty sync run still does not seal', async () => {
+  let sealCalls = 0;
+  const h = makeDeps({
+    deps: {
+      listRollouts: () => [],
+      completeBackfillImpl: async () => { sealCalls += 1; return { completed: true, code: null }; },
+    },
+  });
+  const result = await sync(h);
+  assert.equal(sealCalls, 0);
+  assert.equal(result.finalized, false);
+});
+
+test('seal — the historical replay uses the sync route, not the sealed backfill route', async () => {
   const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 40)] });
   const h = makeDeps({ checkpoint, deps: { fetchCoverageImpl: async () => new Map() } });
   await sync(h);
   assert.equal(h.flush.calls[0].options.endpoint, '/sessions/sync');
 });
 
-// ─── the history run lock ────────────────────────────────────────────────────────────────────
+test('seal — the one-time import still uses the backfill route and still seals', async () => {
+  const checkpoint = fakeCheckpoint({ s1: () => [seg('s1', 1, 40)] });
+  const h = makeDeps({ checkpoint });
+  const result = await runAudit(h.deps, {});
+  assert.equal(h.flush.calls[0].options.endpoint, undefined, 'the default route is read from ENDPOINTS');
+  assert.equal(result.finalized, true);
+});
+
+// ─── the backfill run lock ───────────────────────────────────────────────────────────────────
 
 test('lock — the run takes a RUN-rank lock with a lease longer than one chunk timeout', async () => {
   const lock = fakeLock();
@@ -715,6 +788,15 @@ test('lock — the run takes a RUN-rank lock with a lease longer than one chunk 
   assert.equal(lock.events[0], `acquire:${LOCK_KINDS.RUN}:run-${HISTORY_RUN_LOCK}:${RUN_LEASE_MS}`);
   assert.ok(RUN_LEASE_MS > 60_000, 'per-batch renewal cannot rescue a lease shorter than one request');
   assert.equal(lock.events[lock.events.length - 1], 'release');
+});
+
+test('lock — sync and backfill contend for the SAME run lock', async () => {
+  const names = [];
+  const lock = fakeLock();
+  const record = (target, options) => { names.push(target.name); return lock.acquire(target, options); };
+  await runAudit(makeDeps({ deps: { acquireLockImpl: record } }).deps, {});
+  await runAudit(makeDeps({ deps: { acquireLockImpl: record } }).deps, { mode: SYNC_MODE });
+  assert.equal(names[0], names[1]);
 });
 
 test('lock — a busy lock is a benign skip, not an error', async () => {
@@ -747,6 +829,39 @@ test('lock — it is renewed once per dispatched batch, before the request', asy
   assert.equal(lock.events.filter((e) => e === 'renew:' + RUN_LEASE_MS).length, 1);
 });
 
+test('lock — ownership is verified immediately before the seal', async () => {
+  const lock = fakeLock();
+  const order = [];
+  const h = makeDeps({
+    lock,
+    deps: {
+      listRollouts: () => [],
+      completeBackfillImpl: async () => { order.push('seal'); return { completed: true, code: null }; },
+    },
+  });
+  const originalVerify = lock.handle.verify;
+  lock.handle.verify = () => { order.push('verify'); return originalVerify(); };
+  await runAudit(h.deps, {});
+  assert.deepEqual(order, ['verify', 'seal']);
+});
+
+test('lock — lost ownership aborts the seal cleanly', async () => {
+  const lock = fakeLock({ verify: () => ({ ok: false, reason: 'lost', holder: { pid: 4 } }) });
+  let sealCalls = 0;
+  const h = makeDeps({
+    lock,
+    deps: {
+      listRollouts: () => [],
+      completeBackfillImpl: async () => { sealCalls += 1; return { completed: true, code: null }; },
+    },
+  });
+  const result = await runAudit(h.deps, {});
+  assert.equal(sealCalls, 0, 'a run that no longer owns the machine must not close the one-time pull');
+  assert.equal(result.finalized, false);
+  assert.match(result.lastError, /lock lost/);
+  assert.equal(lock.events[lock.events.length - 1], 'release');
+});
+
 test('lock — a lost renewal abandons the batch unsent and halts', async () => {
   const lock = fakeLock({ renew: () => ({ ok: false, reason: 'lost' }) });
   const checkpoint = fakeCheckpoint({ s1: () => [seg('s1', 1, 10)] });
@@ -754,6 +869,7 @@ test('lock — a lost renewal abandons the batch unsent and halts', async () => 
   const result = await runAudit(h.deps, {});
   assert.equal(result.halt, BackfillHalt.LOCK_LOST);
   assert.equal(h.flush.calls.length, 0, 'nothing may be sent under a lock we no longer hold');
+  assert.equal(result.finalized, false);
   assert.equal(h.ledger.sessions.s1, undefined, 'the session stays unledgered and eligible');
 });
 
@@ -776,6 +892,13 @@ test('lock — a throwing acquire is reported, not swallowed', async () => {
 
 // ─── result shape ───────────────────────────────────────────────────────────────────────────
 
+test('shape — coverageKnown stays null for a backfill run', async () => {
+  const h = makeDeps();
+  const result = await runAudit(h.deps, {});
+  assert.equal(result.coverageKnown, null, 'never consulted is not the same as could not ask');
+  assert.equal(result.mode, 'backfill');
+});
+
 test('shape — a lock refusal answers the same field set as a real run', async () => {
   const real = await runAudit(makeDeps().deps, {});
   const refused = await runAudit(
@@ -792,7 +915,7 @@ test('shape — ReplayDecision is the vocabulary the audit routes on', () => {
 
 test('ledger — per-agent child records merge by maximum and survive a concurrent save', async () => {
   const { recordSubagentLines, mergeLedger } = await import('../lib/audit-ledger.mjs');
-  const mine = { version: 1, identity: null, sessions: {}, unreadable: {}, updatedAt: null };
+  const mine = { version: 1, identity: null, sessions: {}, unreadable: {}, complete: false, updatedAt: null };
   recordSubagentLines(mine, 's1', { a1: 30, a2: 5 });
   recordSubagentLines(mine, 's1', { a1: 10 });
   assert.deepEqual(mine.subagents.s1, { a1: 30, a2: 5 }, 'a record never moves backwards');
@@ -855,62 +978,4 @@ test('a history run walks the subagent tree once and answers every session from 
   await sync(h);
   assert.equal(builds.length, 1, 'one walk for the whole run');
   assert.deepEqual(finders, [[{ agentId: 'a1', path: 'C:/x/a1.jsonl' }], []]);
-});
-
-// ─── fully covered (I-1, Review Focus 3) ────────────────────────────────────────────────────
-
-// The server's prefix for s1 against a rollout whose last usage line is 7; `held` makes it a multi-workspace answer.
-const coveredTo = (stored, held = false) => async () => {
-  const coverage = new Map([['s1', stored]]);
-  return held ? Object.assign(coverage, { held: new Map([['s1', stored]]) }) : coverage;
-};
-const listedOf = (result) => result.listed.map((entry) => entry.sessionId);
-
-test('covered — one workspace: a prefix reaching the last usage line is not listed; one line short, it is', async () => {
-  const full = await sync(makeDeps({ deps: { fetchCoverageImpl: coveredTo(7), lastUsageLineImpl: () => 7 } }), { listOnly: true });
-  assert.deepEqual(listedOf(full), []);
-  assert.equal(full.covered, 1);
-  assert.equal(full.candidates, 0);
-
-  const short = await sync(makeDeps({ deps: { fetchCoverageImpl: coveredTo(6), lastUsageLineImpl: () => 7 } }), { listOnly: true });
-  assert.deepEqual(listedOf(short), ['s1']);
-  assert.equal(short.covered, 0);
-});
-
-test('covered — split bookkeeping: a held prefix reaching the last usage line is not listed; one line short, it is', async () => {
-  const run = (stored) => sync(
-    makeDeps({ deps: { linkedSessions: async () => [MULTI], fetchCoverageImpl: coveredTo(stored, true), lastUsageLineImpl: () => 7 } }),
-    { key: KEY, tenantId: 'A', listOnly: true },
-  );
-  const full = await run(7);
-  assert.deepEqual(listedOf(full), []);
-  assert.equal(full.covered, 1);
-
-  const short = await run(6);
-  assert.deepEqual(listedOf(short), ['s1']);
-  assert.equal(short.covered, 0);
-});
-
-test('covered — an upload run skips a session held in full without parsing it', async () => {
-  const checkpoint = fakeCheckpoint({ s1: (from) => [seg('s1', from + 1, 7)] });
-  const h = makeDeps({ checkpoint, deps: { fetchCoverageImpl: coveredTo(7), lastUsageLineImpl: () => 7 } });
-  const result = await sync(h);
-  assert.equal(result.covered, 1);
-  assert.equal(checkpoint.calls.length, 0);
-  assert.equal(h.flush.calls.length, 0);
-});
-
-test('covered — nothing stored never reads the rollout, and a gap is deferred, not covered', async () => {
-  const reads = [];
-  const lastUsageLineImpl = (p) => { reads.push(p); return 0; };
-  const none = await sync(makeDeps({ deps: { lastUsageLineImpl } }), { listOnly: true });
-  assert.deepEqual(listedOf(none), ['s1']);
-  assert.deepEqual(reads, []);
-
-  // Our own confirmation runs past the server's prefix: decideReplay defers it as a gap.
-  const ahead = { version: 1, identity: null, environment: '', apiBase: null, sessions: { s1: { line: 9 } }, updatedAt: null };
-  const gap = await sync(makeDeps({ deps: { fetchCoverageImpl: coveredTo(7), lastUsageLineImpl, loadCoverageCheckpointsImpl: () => ahead } }));
-  assert.equal(gap.covered, 0);
-  assert.equal(gap.deferredGap, 1);
-  assert.deepEqual(reads, []);
 });

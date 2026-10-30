@@ -6,7 +6,6 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { drainRateLimitSnapshots } from '../lib/usage-report-codex.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
-import { KINDS, anonAccount } from '../lib/anonymize.mjs';
 
 // The drain is per account: it reads that account's queue, posts under that account's bearer and
 // client id, and clears only what that account's server confirmed.
@@ -438,41 +437,4 @@ test('step 4 of the ladder is answered from the account already read, not a seco
     env: {},
   });
   assert.equal('subscription_plan' in keyed, false, 'a stored key means no subscription to state');
-});
-
-// ── anonymization ─────────────────────────────────────────────────────────────────────────────
-
-const ANON_KEY = 'ab'.repeat(32);
-const kindsOn = (on) => Object.fromEntries(KINDS.map((kind) => [kind, on.includes(kind)]));
-const ANON_SESSION = { ...SESSION, anonymization: { tenantId: 'T1', kinds: kindsOn(['accounts']), key: ANON_KEY, machineName: null } };
-
-test('an anonymized target is sent a hashed email, and the queued rows stay raw', async () => {
-  const h = harness([ROW(1), { ...ROW(2), account_uuid: 'acct-row', account_email: 'Row@Example.com' }], [200, 200]);
-  h.deps.usageIdentityFields = () => ({ account_uuid: 'acct-1', account_email: 'dev@example.com' });
-  const res = await drainRateLimitSnapshots(KEY, ANON_SESSION, h.deps);
-  assert.equal(res.posted, 2);
-  assert.equal(h.calls[0].body.account_email, anonAccount(ANON_KEY, 'dev@example.com'));
-  assert.equal(h.calls[0].body.account_uuid, 'acct-1', 'the opaque account id is unchanged');
-  assert.equal(h.calls[1].body.account_email, anonAccount(ANON_KEY, 'Row@Example.com'));
-  assert.deepEqual(h.cleared(), [ROW(1), { ...ROW(2), account_uuid: 'acct-row', account_email: 'Row@Example.com' }]);
-});
-
-test('an anonymized target without its key is sent nothing and keeps every row queued', async () => {
-  const h = harness([ROW(1), ROW(2)], [200, 200]);
-  const session = { ...ANON_SESSION, anonymization: { ...ANON_SESSION.anonymization, key: null } };
-  const res = await drainRateLimitSnapshots(KEY, session, h.deps);
-  assert.deepEqual(res, { posted: 0, deferred: 2, reason: 'anonymization-key-missing' });
-  assert.equal(h.calls.length, 0);
-  assert.equal(h.cleared(), null);
-});
-
-test('a target with only hosts on is sent the raw email, even without its key', async () => {
-  for (const key of [ANON_KEY, null]) {
-    const h = harness([ROW(1)], [200]);
-    h.deps.usageIdentityFields = () => ({ account_email: 'dev@example.com' });
-    const session = { ...ANON_SESSION, anonymization: { ...ANON_SESSION.anonymization, kinds: kindsOn(['hosts']), key } };
-    const res = await drainRateLimitSnapshots(KEY, session, h.deps);
-    assert.equal(res.posted, 1);
-    assert.equal(h.calls[0].body.account_email, 'dev@example.com');
-  }
 });

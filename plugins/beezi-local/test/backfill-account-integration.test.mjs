@@ -119,13 +119,6 @@ const deps = (fetchImpl) => ({
   recordWhoamiImpl: () => {},
   resolveTranscriptByCwdImpl: () => null,
   computeSessionTimelineImpl: () => null,
-  statImpl: () => { throw new Error('ENOENT'); },
-  rolloutStartedAtImpl: () => null,
-  // The run drains the queue and asks coverage first: an empty queue, and a server that holds nothing yet.
-  flushQueueImpl: async () => ({ flushed: 0, failed: 0, deferred: 0, unreadable: 0, trackingDisabled: false, lastError: null }),
-  fetchCoverageImpl: async () => new Map(),
-  loadCoverageCheckpointsImpl: () => ({ version: 1, identity: null, environment: '', apiBase: null, sessions: {}, updatedAt: null }),
-  saveCoverageCheckpointsImpl: () => true,
   fetchImpl,
 });
 
@@ -138,18 +131,19 @@ test('real backfill pipeline registers the account before parent and child repor
     if (url.endsWith('/me/cli-agent/account')) {
       return response(200, { status: 'stored', accountLinked: true, keysLinked: 0 });
     }
-    if (url.endsWith('/sessions/sync')) {
+    if (url.endsWith('/sessions/backfill')) {
       return response(200, {
         stored: body.sessions.length, skipped: 0, errors: [], timelines: 0,
       });
     }
+    if (url.endsWith('/sessions/backfill/complete')) return response(200, {});
     throw new Error(`unexpected request: ${url}`);
   };
 
   const result = await runAudit(deps(fetchImpl));
-  assert.equal(result.ok, true);
+  assert.equal(result.finalized, true);
   assert.deepEqual(wire.map(({ url }) => new URL(url).pathname), [
-    '/api/me/cli-agent/account', '/api/sessions/sync',
+    '/api/me/cli-agent/account', '/api/sessions/backfill', '/api/sessions/backfill/complete',
   ]);
   assert.deepEqual(wire[0].body, { accountUuid: ACCOUNT, subscriptionType: 'plus' });
   assert.equal(wire[0].headers['X-Beezi-Agent'], 'codex');
@@ -165,7 +159,7 @@ for (const [name, failure] of [
   ['HTTP 503', () => response(503, { message: 'later' })],
   ['malformed 2xx', () => response(200, null, { malformed: true })],
 ]) {
-  test(`account registration ${name} sends no history`, async (t) => {
+  test(`account registration ${name} sends no history and does not finalize`, async (t) => {
     isolatedHistory(t);
     const urls = [];
     const fetchImpl = async (url) => {
@@ -175,6 +169,7 @@ for (const [name, failure] of [
     };
     const result = await runAudit(deps(fetchImpl));
     assert.equal(result.reason, 'account-registration-failed');
+    assert.equal(result.finalized, false);
     assert.equal(result.plannedReports, 0, 'transcripts were not parsed');
     assert.equal(urls.length, 1);
   });

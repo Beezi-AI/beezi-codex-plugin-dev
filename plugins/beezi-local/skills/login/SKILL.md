@@ -42,13 +42,13 @@ ran escalated and still fails is not retried: show its line and stop.
 
 Logging in is these steps, in order. Step 1 links an account; step 1w says where its analytics go
 when it is in several workspaces; steps 2 and 3 record which ChatGPT plan pays for this machine;
-step 4 asks about new workspaces and repos and folders with no rule, and then whether to upload the machine's past Codex sessions;
+step 4 asks about new workspaces and repos and folders with no rule, and then uploads the machine's past Codex sessions;
 step 5 asks about the analytics default. **Do not stop after step 1** — a linked machine with no
 plan reports its usage with no plan attached, which is the single most common thing users report as
-"my analytics look wrong". **Step 4 comes only after the plan is
+"my analytics look wrong". **Step 4 comes last of the uploading steps and only after the plan is
 settled**: settled means step 2 named a real plan or an API-key/third-party billing source, or the user answered step 3's question (or
 explicitly dismissed it). Jumping to step 4 with the plan question still open is the other way
-machines end up with no plan — the past-sessions question reads like the end of a login, so nothing ever
+machines end up with no plan — the backfill output reads like a finished login, so nothing ever
 comes back to ask.
 
 **Asking.** A question below uses `request_user_input` only when that tool is listed this turn and
@@ -62,14 +62,14 @@ choice was saved.
 
 **Several Beezi accounts can be linked at once**, and every step after the first is about ONE of
 them. Step 1 names which, on its last line, as `account=<key>` — an 8-character key. Carry that key
-through steps 1w to 5 as `--account <key>`. Pass `--tenant` only to step 4b's answer commands, which
-take it from the offer line: every other step picks its workspaces itself. If step 1 printed
+through steps 1w to 5 as `--account <key>`. Pass no `--tenant` anywhere: each step picks its
+workspaces itself, and step 4 routes each past session by its own repo or folder. If step 1 printed
 no such line, match its output against the outcome list below before doing anything else: two of
 those outcomes mean the sign-in is still running, not that it failed.
 
 ### How the steps run
 
-Steps 1 to 4b come from ONE script, which runs them in order and stops at the first one that needs a
+Steps 1 to 4a come from ONE script, which runs them in order and stops at the first one that needs a
 question. Start at step 1: when a `beezi_login` tool is available, call it first and run the script
 with `--from setup`; run it bare, as below, only without that tool.
 
@@ -82,16 +82,15 @@ browser. Each step's output is a block: a `<name …>` line, the output, then a 
 LAST line says what to do now: `next=<step> account=<key>`, or just `next=stop` when the sign-in
 linked nothing. `<key>` is the account just linked.
 
-| `next=`   | Go to                                                 |
-| --------- | ----------------------------------------------------- |
-| `stop`    | Step 1: relay the `<sign-in>` block, run nothing else |
-| `setup`   | Step 1w, where analytics from this machine go         |
-| `here`    | Step 1w, this session's own folder                    |
-| `tier`    | Step 3                                                |
-| `joined`  | Step 4a, new workspaces                               |
-| `routes`  | Step 4a, repos and folders with no rule               |
-| `history` | Step 4b, past sessions                                |
-| `default` | Step 5                                                |
+| `next=`    | Go to                                                  |
+| ---------- | ------------------------------------------------------ |
+| `stop`     | Step 1: relay the `<sign-in>` block, run nothing else  |
+| `setup`    | Step 1w, where analytics from this machine go          |
+| `here`     | Step 1w, this session's own folder                     |
+| `tier`     | Step 3                                                 |
+| `joined`   | Step 4a, new workspaces                                |
+| `routes`   | Step 4a, repos and folders with no rule                |
+| `backfill` | Step 4b                                                |
 
 After a question's answers (or its dismissal) and the commands they call for, carry on with
 EXACTLY this, where the step names `<step>`:
@@ -105,9 +104,9 @@ a `✗` line inside its block and the script goes on: write that line verbatim. 
 without any `next=` line means the script itself failed or refused to run: show what it printed
 verbatim and stop (running this login skill again resumes safely). Never run the commands behind the blocks yourself
 (`login.mjs`, `billing-capture.mjs --from-codex`, the `workspace.mjs` `rules`, `joined` and `routes`
-listings, `sync.mjs --offer`): the blocks hold their output. Before doing what `next=` says, write
-out what each block printed this time calls for, in order, as its step below says (step 1's sign-in
-output, step 2's capture line, the no-folder line in step 4a, step 4b's summary lines).
+listings): the blocks hold their output. Before doing what `next=` says, write out what each block
+printed this time calls for, in order, as its step below says (step 1's sign-in output, step 2's
+capture line, the no-folder line in step 4a).
 
 ### Step 1 — sign in
 
@@ -176,34 +175,48 @@ The script stops with `next=setup` only for an account in several workspaces tha
 folders. Without a `<setup>` block, say nothing about it.
 
 The `<setup account="<key>">` block is for you only: one `W. <workspace> account=<key> tenant=<id>
-role=<role>` line per workspace, then `sessions=<N> places=<M>` (the past sessions on this machine,
-and the repos and folders they ran in) or a `✗` line when they could not be counted
+role=<role>` line per workspace, then `sessions=<N> places=<M>` (the past sessions the history upload
+would send, and the repos and folders they ran in) or a `✗` line when they could not be counted
 (write it verbatim), then the options as `O<i>. <label> — <description>` lines. `O<i>` for `i` up to
-the number of `W.` lines is the `i`-th `W.` line's workspace; the last `O` line is "Let me choose
-per repo".
+the number of `W.` lines is the `i`-th `W.` line's workspace; the next `O` line is "Several
+workspaces…", and the last is "Let me choose per repo".
 
 Ask ONE single-select question, "Where should analytics from this machine go?":
 
 - **`request_user_input`** only when that tool is listed this turn **and** there are at most 2 `W.`
-  lines (3 choices): header "Beezi", one choice per `O` line in order, its text after `O<i>. `
-  split at the last ` — ` into the label and the description, exactly. A typed answer (Other) that
-  names a `W.` line's workspace (ignoring case) is that workspace; one that names none is a dismissal.
+  lines (3 choices): header "Beezi", the question
+  "Where should analytics from this machine go? Pick one, or name several under Other.", one choice
+  per `O` line in order except the "Several workspaces…" line, its text after `O<i>. ` split at the
+  last ` — ` into the label and the description, exactly. A typed answer (Other) that names one or
+  more `W.` lines' workspaces (ignoring case) is those workspaces, and "both" or "all" is every `W.`
+  line; one that names none, or names a workspace together with "per repo", is a dismissal.
 - **Otherwise** — the tool is not listed, or there are 3 or more `W.` lines — one plain sentence
   with the `O` lines as a numbered list, never a 4-option `request_user_input` call: the question
   without its "?", a colon, each `O` line's text after its `O` ("1. Acme — Everything goes here: …"),
-  joined by ", " with "or " before the last, then "?". The user answers with a number or a
-  workspace name; anything else is a dismissal.
+  joined by ", " with "or " before the last, then "?". Every `O` line is numbered, "Several
+  workspaces…" included. The user answers with a number, or with one or more workspace names.
+  Several numbers that all point at workspace lines are those workspaces, and "both" or "all" is
+  every `W.` line. Two or more numbers that include the "Several workspaces…" or the "Let me choose
+  per repo" number are a dismissal, and so is an answer that names a workspace together with "per
+  repo", and anything else.
 
 Then, by the answer:
 
-- a workspace → run, with that `W.` line's `tenant=` value:
+- one or more workspaces → run, with their `W.` lines' `tenant=` values joined by commas as
+  `<tenants>` (one value for one workspace):
 
   ```
-  node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenant> --account <key> --defer-upload
+  node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenants> --account <key> --defer-upload
   ```
 
   write its first line verbatim, then carry on with `--from plan` (this folder now follows New
   folders, so there is no question about it).
+- "Several workspaces…" → ask once more as one plain sentence: "Which workspaces should get
+  analytics from this machine", a colon, each `W.` line as `<name> (<role>)` (just `<name>` when it
+  has no role) joined by ", ", then " — one or more?". For example: "Which workspaces should get
+  analytics from this machine: Acme (Owner), Beta (User), Gamma (User) — one or more?". The
+  workspaces named or numbered in the answer go to the `new-folders send <tenants>` command above;
+  one workspace is fine. Nothing named, or a dismissal, is a dismissal of the first question.
 - "Let me choose per repo" → run
   `node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload`,
   write its first line verbatim, then carry on with `--from here`.
@@ -230,15 +243,17 @@ Its `here:` line is
 Choices: one per `W.` line of this block, as in step 4a, then the last choice, described "Not
 tracked: nothing from <short> is sent" ("Not tracked: nothing from sessions outside a project folder
 is sent" for `outside`); shown the way step 4a shows its question. Then run, with `<ids>` = the
-chosen `tenant=` values joined by commas, or `none` when the last choice was picked (it wins over
-the others):
+chosen `tenant=` values joined by commas, or `none` only when the last choice is the whole answer:
 
 ```
 node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> --defer-upload <ids>
 ```
 
-and write its first line verbatim. Nothing chosen or a skipped question runs nothing. Then carry on
-with `--from plan`.
+and write its first line verbatim. An answer with the last choice together with any workspace runs
+nothing: ask the same question once more, starting with
+`"Don't track" can't be combined with a workspace — pick one or the other.` A second mixed answer
+counts as a skipped question. Nothing chosen or a skipped question runs nothing. Then carry on with
+`--from plan`.
 
 ### Step 2 — capture the ChatGPT plan
 
@@ -280,7 +295,7 @@ name the plan now; when they would not, carry on with `--from joined`.
 The tier question has ten choices, so it is always this one plain sentence — never a numbered
 list. Ask it as the last thing in your reply and then **stop and wait for the user's reply**. Do not
 guess a tier, do not run the capture command in the same turn, and **do not carry on to step 4 in the
-same turn either** — an unanswered question followed by step 4's output is how this step gets
+same turn either** — an unanswered question followed by backfill output is how this step gets
 silently skipped. Both the capture and step 4 happen on the next turn, once the user has answered.
 
 > How does this machine pay for Codex: ChatGPT Free, ChatGPT Plus, ChatGPT Pro — $100/mo (5× Plus
@@ -321,15 +336,15 @@ Report its one-line output. If the user dismisses the question or answers someth
 table, skip the capture — the link itself already succeeded, say that. Either way, then carry on with
 `--from joined`.
 
-### Step 4 — routing, then past sessions
+### Step 4 — upload past sessions
 
 Run this only once the plan is settled (step 2 named a real plan or an API-key/third-party billing
 source, or step 3 was answered or dismissed) —
 never while step 3's question is still waiting for a reply. That holds for both parts, 4a and then
 4b. With that condition met, it runs on every login outcome: fresh links, accounts that were already
-linked, **and when step 1 used the `beezi_login` MCP tool** — that tool links the account without
-uploading anything, and step 4b is where the user is asked whether to upload past sessions. The
-script prints step 4a's listings and step 4b's summary itself; the questions are yours.
+linked, **and when step 1 used the `beezi_login` MCP tool** — that tool links the account but never
+uploads history, so this step is still yours to run. The script prints step 4a's listings itself;
+step 4b is yours.
 
 #### Step 4a — new workspaces, then repos and folders with no rule
 
@@ -359,7 +374,7 @@ machine, it lists every repo and folder with where its analytics go now. Its lin
 `joined=0` → nothing to ask; the script went on to "Then, repos and folders with no rule" below.
 
 More than 4 `J` lines → first ask "You joined <names>. Where should analytics for these <N> repos and
-folders go?" (`<N>` = the number of `J` lines)
+folders go? Their past sessions will be sent there too." (`<N>` = the number of `J` lines)
 with the choices "Add <names> to all <N>" (described "Repos you don't track, and ones with no rule
 yet, stay as they are"), "Choose repos" ("Pick which repos and folders go to each new workspace") and
 "Leave them as they are" ("Nothing changes, and you're not asked about <names> again").
@@ -378,29 +393,36 @@ turn. Each question offers the `J` lines as its choices and asks which repos and
 should also send analytics to that one workspace. `<short>` is the `J` line's text after `J<i>. ` up to
 ` (` or `,`, and `<where>` the text after `now: ` up to ` account=`. The question:
 
-"Which repos and folders should also send analytics to <workspace>?" — `<workspace>` is the `new=yes`
-line's name (the text after `W. ` up to ` account=`).
+"Which repos and folders should also send analytics to <workspace>? Their past sessions will be sent
+there too." — `<workspace>` is the `new=yes` line's name (the text after `W. ` up to ` account=`).
 
 Choices: one per `J` line — its `<short>`, described by its `<where>` ("Now: <where>", e.g. "Now:
 Acme" or "Now: no rule yet"). Several repos and folders may be chosen.
 
 - `request_user_input` only with at most 2 `J` lines and at most 3 `new=yes` `W.` lines (so at most 3
-  choices and 3 questions): header "Beezi", the question followed by " Pick one, or name several under
-  Other.", a last choice "None of these" (described "This workspace gets none of them"), the labels
-  exactly as above.
-- Otherwise the plain sentence: the question without its "?", a colon, the `J` lines as a numbered
-  list "1) <short> (Now: <where>), 2) …", then " — reply with the numbers to send, or none?". For
-  example: "Which repos and folders should also send analytics to NewCo: 1) acme-api (Now: Acme),
-  2) notes (Now: no rule yet) — reply with the numbers to send, or none?"
+  choices and 3 questions): header "Beezi", the question with " Pick one, or name several under Other."
+  put before its last sentence, a last choice "None of these" (described "This workspace gets none of
+  them"), the labels exactly as above.
+- Otherwise the plain sentence: the question up to "<workspace>" (without the sentence after it), a
+  colon, the `J` lines as a numbered list "1) <short> (Now: <where>), 2) …", then " — reply with the
+  numbers to send, or none —" and " Their past sessions will be sent there too.". For example: "Which
+  repos and folders should also send analytics to NewCo: 1) acme-api (Now: Acme), 2) notes (Now: no
+  rule yet) — reply with the numbers to send, or none — Their past sessions will be sent there too."
+
+An answer with "None of these" (or "none") together with any repo is not an answer: run no
+`J<i>-command=` for it, and ask the same question once more, starting with
+`"None of these" can't be combined with repos — pick one or the other.` A second mixed answer
+counts as a skipped question, so no `done-command` runs.
 
 For each repo and folder the user picked for a workspace, run its `J<i>-command=` text EXACTLY ONCE,
 changing nothing except the final `<tenant>`: that workspace's `tenant=` value (its `W.` line's
 `tenant=`, e.g. `t2`). Map each answered position to the `J` line it listed, then run that line's
 own `J<i>-command=` (J numbers are global across accounts and need not start at 1); never rebuild the
 command or re-quote its path yourself. A repo the
-user did not pick for a workspace runs nothing for that workspace. After the last `new=yes` workspace's
-question has been answered (not skipped or dismissed), run the `done-command=` text EXACTLY ONCE;
-otherwise run no `done-command`, and the next login or sync asks again.
+user did not pick for a workspace runs nothing for that workspace. After every new workspace's
+question has been answered ("None of these" alone is an answer; skipped, dismissed or mixed is
+not), run the `done-command=` text EXACTLY ONCE; otherwise run no `done-command`, and the next
+login or sync asks again.
 
 Write each command's first line verbatim, then carry on with `--from routes`.
 
@@ -426,7 +448,7 @@ Ask me. Its lines:
   about it;
 - `routes=<total>` — the number of `P` lines, always last.
 
-`routes=0` → nothing to ask; the script went on to step 4b's `<history>` block.
+`routes=0` → nothing to ask; the script ended with `next=backfill`: go to step 4b.
 
 More than 4 `P` lines → first ask "Where should analytics for these <N> repos and folders go?"
 (`<N>` = the number of `P` lines) with the choices "Send all <N> to the same workspaces…" (described
@@ -440,7 +462,7 @@ and "Skip" ("Nothing from them is sent this time; you're asked again next time")
   nothing. Otherwise run the `all-command=` text EXACTLY ONCE, changing nothing except the final
   `<tenants>`, which becomes the chosen `tenant=` values joined by commas.
 - "Choose per repo" → the per-repo questions below.
-- "Skip" or a skipped question → nothing more; carry on with `--from history`.
+- "Skip" or a skipped question → nothing more; go to step 4b.
 
 4 or fewer `P` lines → the per-repo questions.
 
@@ -468,69 +490,69 @@ is sent" for `outside`). Several workspaces may be chosen.
   (User), Gamma (User) — one or more — or don't track this repo?"
 
 Then, for each answered `P` line, run its `P<i>-command=` text EXACTLY ONCE, changing nothing except
-the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` when
-the last choice was picked (it wins over the others). Never rebuild the command or re-quote its path
-yourself. A `P` line with nothing chosen, or a skipped question, runs nothing: its sessions are not
-sent this time, and the next login or the `sync` skill asks again.
+the final `<tenants>`: the chosen `tenant=` values joined by commas (e.g. `t1,t2`), or `none` only
+when the last choice is the whole answer. Never rebuild the command or re-quote its path yourself.
+An answer with the last choice together with any workspace runs nothing: ask the same question once
+more, starting with `"Don't track" can't be combined with a workspace — pick one or the other.`
+A second mixed answer counts as a skipped question. A `P` line with nothing chosen, or a skipped
+question, runs nothing: its sessions are not sent this time, and the next login or the `sync` skill
+asks again.
 
-Write each command's first line verbatim, then carry on with `--from history`.
+Write each command's first line verbatim, then go to step 4b.
 
-#### Step 4b — past sessions
+#### Step 4b — the one-time upload
 
-The `<history>` block is `node "<plugin-root>/scripts/sync.mjs" --offer --past --account <key>`'s
-output. For each workspace with past sessions Beezi does not have yet (the last 30 days only), it
-prints what an upload would send, then its question. Nothing has been uploaded. Its lines:
+```
+node "<plugin-root>/scripts/backfill.mjs" --via login --account <key>
+```
 
-- `Q <question>` — one per workspace: the question to ask;
-- `offer account=<key> tenant=<id> sessions=<n> audit=<yes|no> token=<token>` — right after its `Q` line, for you
-  only;
-- `offers=<n>` — the number of questions, always last, for you only;
-- every other line (the summary, a heading, a `✗` line) — write it verbatim, in order, inside one
-  plain fenced code block (```), because Markdown flattens their 2- and 4-space indents.
+It is the one-time upload of this machine's past Codex sessions into Beezi and can take several
+minutes; it prints progress lines as it goes. It covers the **last 30 days only** — older sessions
+are out of scope for this import and for the `sync` skill alike, and no later run reaches them. Report its output verbatim — progress and final
+summary, or the error line. It is safe on every login: already-uploaded sessions are skipped, and
+if it says nothing new to upload, tell the user their history is up to date. If some sessions could
+not be delivered, tell the user that running this login skill again later resumes the upload where
+it left off. Never echo any token.
 
-With `next=default` the block has no question: write its other lines and go to step 5.
+If it reports the one-time import **has already been used**, that is final for THAT account — the
+import is once per Beezi account and tool and cannot be re-run. Do NOT retry, do NOT run the script
+again with different flags, and refuse politely if the user asks you to bypass it; relay the
+script's message (including the upgrade suggestion when it prints one), then continue to step 5
+without retrying the import. A different Beezi
+account linked on this machine has its own untouched import, so this message is never a reason to
+skip step 4 for an account that has just been linked.
 
-With `next=history`, ask each `Q` line's question (its text after `Q `), with the choices "Upload now"
-(described "Send these sessions now") and "Not now" (described "Nothing is sent"):
+Only when it reports the pull *finalized*, tell the user: the pull is one-time per Beezi account and
+tool — if they have Codex history on other machines, they should sign in to Beezi there BEFORE it
+finalizes; a finalized pull cannot be re-opened.
 
-- **`request_user_input`** only when that tool is listed this turn and there are at most 3 `Q` lines:
-  one call, header "Beezi", one question per `Q` line. A typed answer (Other) counts as a dismissal.
-- **Otherwise**, end your reply with one plain sentence per `Q` line: the question, then
-  ` Reply upload or not now.` This is the one place this skill asks several questions at once. An
-  answer that does not clearly say upload for a question is not now for it.
+For an account in several workspaces the output has a few more lines; relay each verbatim:
 
-Then, for each question, with `<key>`, `<id>` and `<token>` the `account=`, `tenant=` and `token=` values
-of its `offer` line:
-
-- "Upload now" → run
-
-  ```
-  node "<plugin-root>/scripts/sync.mjs" --accept --account <key> --tenant <id> --token <token>
-  ```
-
-  with a long timeout (10 minutes) when your shell tool takes one: the upload prints progress lines
-  as it goes. Relay its output verbatim.
-- "Not now", a dismissal, or anything else → run
-  `node "<plugin-root>/scripts/sync.mjs" --decline --account <key> --tenant <id>` and relay its line.
-
-No answer means no upload. Then go to step 5.
-
-What these lines mean, so you relay them right:
-
-- **no new past sessions to offer** — in the `<history>` block: nothing is waiting that the user has
-  not already answered. Nothing to ask; the sync skill shows every past session again.
-- **Codex is still saving analytics on this machine, so nothing was listed this time** — a Codex
-  session is writing right now, so nothing was listed or sent. Not a failure; the sync skill can ask
-  again in a minute.
-- **could not read Codex’s pending analytics on this machine** — a `✗` line, with the error in
-  brackets: a fault on this machine (for example its permissions), not a busy writer, so nothing was
-  listed or sent and asking again soon gives the same answer. Relay it with the error. After an Upload
-  answer the yes stays saved and Beezi retries it on its own.
-- **your yes is saved, but this machine is busy, so nothing was uploaded yet** — from the Upload
-  answer: the upload waits and Beezi retries it on its own. Relay it; do not run `--accept` again.
-- **these past sessions changed after the question was shown, so nothing was uploaded** — from the
-  Upload answer: the sessions changed since the question was printed, so nothing was sent. Relay it
-  and point the user at the sync skill, which asks again. Never retry `--accept`.
+- **`Beezi (<account>): <R> past sessions follow your rules; …`** — where that account's past
+  sessions go: by their rules, then by the New folders setting. "… not sent this time" is expected
+  after a skipped step 4a question: the next login or the `sync` skill asks again, and the settings
+  skill's Rules adds a rule from inside that repo or folder. When it is the only line, the run
+  succeeded with nothing to send.
+- **`— <account> · <workspace> —`** — a heading: the upload runs once per workspace those sessions go
+  to, and the lines below it are that workspace's outcome. Report each under its own heading; one
+  workspace's failure does not stop the others.
+- **`Your one-time history upload stays open until those repos and folders have a rule — run the
+  login skill or the sync skill to choose.`** — not a failure: the upload is not finalized while
+  some repos or folders still wait for a rule, so their history is not lost.
+- **`this account belongs to several workspaces and none was picked for this run`** — nothing was
+  uploaded; say where analytics go is checked in the settings skill (Rules and New folders), then
+  this login skill runs the upload again.
+- **`Nothing on this machine goes to this workspace yet, so its one-time history upload stays open.`**
+  — not a failure: no past session on this machine goes to that workspace, so its one-time upload
+  stays open for this machine's later sessions and for other machines. Nothing was lost.
+- **`could not check this workspace with Beezi (…), so nothing was uploaded to it`** — that
+  workspace's one-time upload did not run, because Beezi could not confirm which of its sessions
+  were already tracked live. The other workspaces under their own headings are unaffected; running
+  this login skill again retries it.
+- **`… to this workspace you joined`**, **`this workspace already has this machine's history`**,
+  **`Some history did not reach this workspace this time…`** — the upload for a workspace joined after
+  this machine was linked: it resumes from what that workspace already has, like the `sync` skill.
+  Relay it; when it says some history did not arrive, offer to run the `sync` skill.
 
 ### Step 5 — offer to make this the analytics default
 

@@ -211,6 +211,35 @@ test('the boundary is exactly the cursor computeDelta needs to drop the replay',
   assert.equal(sum(own), (65624 - 51165) + (1571 - 895));
 });
 
+// ── The boundary is a physical-line cursor, the way computeDelta numbers lines ───────────────────
+
+const userPrompt = (ms, text) => ({
+  timestamp: at(ms), type: 'response_item',
+  payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+});
+
+// Own meta, replayed parent meta, an optional raw prefix line, the replayed prompt, then own work.
+function forkWithPrefixLine(rawLine) {
+  const lines = [subMeta(), parentMeta(3)].map((r) => JSON.stringify(r));
+  if (rawLine !== undefined) lines.push(rawLine);
+  lines.push(JSON.stringify(userPrompt(10, 'REPLAYED PARENT PROMPT')), JSON.stringify(userPrompt(2000, 'CHILD OWN PROMPT')));
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-sub-')), 'rollout.jsonl');
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  return file;
+}
+
+test('fork boundary counts physical lines past a blank prefix line', () => {
+  assert.equal(inspectSubagentRollout(forkWithPrefixLine('')).forkBoundaryLine, 4);
+});
+
+test('fork boundary counts physical lines past a malformed prefix line', () => {
+  assert.equal(inspectSubagentRollout(forkWithPrefixLine('{"torn')).forkBoundaryLine, 4);
+});
+
+test('fork boundary with no skipped lines equals the record index', () => {
+  assert.equal(inspectSubagentRollout(forkWithPrefixLine()).forkBoundaryLine, 3);
+});
+
 // ── findSubagentRollouts: which rollouts a session claims, and what bounds the walk ──────────────
 //
 // Every case here passes an explicit `sessionsDir`, so codexSessionsDir() is never called and the

@@ -11,19 +11,21 @@ const LEDGER_VERSION = 1;
 // anybody's critical section.
 const LEDGER_LOCK_LEASE_MS = 5_000;
 
-// Which past sessions the history sync has already handed to the server, and what the server said.
+// Which past sessions the history backfill (the last step of the Beezi login skill) has already
+// handed to the server, and what the server said.
 //
 // This has to be durable in a way ~/.beezi-codex/state/<id>.json is not: pruneStale() deletes
 // anything in state/ and queue/ older than 14 days, so a marker there expires and every old
 // session looks importable again on the next run. auditLedgerFile(key) sits in the account
 // directory, outside the dirs pruneStale walks.
 //
-// The ledger belongs to ONE ACCOUNT, and the server's record is per (tenant, user, tool), so it
-// binds to the login that wrote it as well: a ledger recorded under another identity is discarded,
-// or a logout→login into a different workspace would read its deliveries as the new tenant's.
+// The ledger belongs to ONE ACCOUNT, and the server's pull record is per (tenant, user, tool), so
+// it binds to the login that wrote it as well: a ledger recorded under another identity is
+// discarded, or a logout→login into a different workspace would replay it, find zero candidates,
+// and seal the new tenant's pull EMPTY (there is no reopen).
 //
-// A multi-workspace account keeps one ledger per workspace (tenantId), because each workspace holds
-// its own history; a null tenantId is the account's single-workspace ledger, the file it always was.
+// A multi-workspace account keeps one ledger per workspace (tenantId), because each workspace has
+// its own pull; a null tenantId is the account's single-workspace ledger, the file it always was.
 export function loadLedger(key, identity = null, tenantId = null) {
   const raw = readJson(auditLedgerFile(key, tenantId), null);
   // A ledger from a future/foreign shape is discarded rather than merged: re-sending is
@@ -35,8 +37,9 @@ export function loadLedger(key, identity = null, tenantId = null) {
   // check rather than failing it: runAuditLocked in session-audit.mjs reads getMachineClientId() on
   // the assumption that a login primed it, and when nothing did (no credentials, an injected
   // getAccessToken, or a credentials file with no client_id) the previous login's ledger was merged
-  // and its imported-session set trusted under the current one. An unidentified caller now
-  // re-offers every session instead, which is the safe direction: re-sending is idempotent server-side.
+  // and its imported-session set trusted under the current one — sealing the new tenant's pull
+  // empty, with no reopen. An unidentified caller now re-offers every session instead, which is the
+  // safe direction: emptyLedger sets complete:false and re-sending is idempotent server-side.
   if (raw.identity && raw.identity !== identity) {
     return emptyLedger(identity);
   }
@@ -55,12 +58,25 @@ function emptyLedger(identity) {
     sessions: {},
     unreadable: {},
     subagents: {},
+    complete: false,
     updatedAt: null,
   };
 }
 
+// The pull was sealed server-side (we finalized it, or a chunk answered ALREADY_COMPLETED).
+export function markComplete(ledger, { at = new Date() } = {}) {
+  ledger.complete = true;
+  ledger.updatedAt = at.toISOString();
+  return ledger;
+}
+
+export function isComplete(ledger) {
+  return (ledger || {}).complete === true;
+}
+
 // Rejected sessions count as imported. A repository that was never connected to Beezi rejects
-// every one of its reports and always will.
+// every one of its reports and always will, so resending it each run is pure waste; --force is the
+// escape hatch when the repo has since been connected.
 export function isImported(ledger, sessionId) {
   return Object.prototype.hasOwnProperty.call((ledger && ledger.sessions) || {}, sessionId);
 }
@@ -73,10 +89,10 @@ export function isImported(ledger, sessionId) {
 //
 // A REJECTED entry is deliberately NOT delivery: a repository that was never connected to Beezi
 // rejects every report it sends, and must replay IN FULL the moment it is connected (R2). That is
-// the opposite of isImported() above, which counts REJECTED as imported — two different questions
-// about the same row, which is why both live here rather than being re-derived at a call site.
-// lib/session-audit.mjs and lib/rollout-watcher.mjs each once carried their own private copy;
-// this is the one.
+// the opposite of isImported() above, which counts REJECTED as imported so a run does not resend
+// it — two different questions about the same row, which is why both live here rather than being
+// re-derived at a call site. lib/session-audit.mjs and lib/rollout-watcher.mjs each once carried
+// their own private copy; this is the one.
 export function ledgerDelivered(ledger, sessionId) {
   const sessions = (ledger || {}).sessions;
   if (!sessions || typeof sessions !== 'object') return false;
@@ -126,7 +142,9 @@ export function subagentLinesFor(ledger, sessionId) {
 }
 
 // A transcript that could not be read. Deliberately NOT in `sessions`: the session stays eligible,
-// so the next run parses it again. It records when the read failed.
+// so the next run parses it again. It only records that we already gave it one chance, which is
+// what lets the pull seal on the second attempt instead of blocking forever on a file that fails
+// deterministically (a permission error reads exactly like a transient one).
 export function markUnreadable(ledger, sessionId, { at = new Date() } = {}) {
   ledger.unreadable[sessionId] = { at: at.toISOString() };
   ledger.updatedAt = at.toISOString();
@@ -153,17 +171,19 @@ function laterOf(a, b) {
 }
 
 // Fold whatever is on disk into `ledger`. Both sides are the same shape and describe the same
-// question — which sessions history runs have already handed over — so every field has an answer that
+// question — which sessions the pull has already handed over — so every field has an answer that
 // cannot lose information:
 //
 //   identity  a truthy on-disk identity that DIFFERS from ours belongs to another login. It is
 //             discarded whole rather than merged, exactly as loadLedger discards it: merging across
-//             identities would replay one tenant's imported set under another.
+//             identities is what would replay one tenant's imported set under another and seal the
+//             new tenant's one-time pull empty, with no reopen.
 //   sessions  union; ours wins a collision, because a markImported we are holding is newer than
 //             the row that was on disk when we loaded.
 //   unreadable  union, then MINUS every key present in the merged sessions — markImported's own
 //             invariant. A naive union would resurrect an `unreadable` marker for a session that
 //             has since imported, and wasUnreadable() would answer yes forever.
+//   complete  logical OR. The seal is one-time and irreversible; a save must never un-seal one.
 //   updatedAt the later of the two.
 export function mergeLedger(ledger, disk) {
   if (!disk) return ledger;
@@ -200,6 +220,7 @@ export function mergeLedger(ledger, disk) {
   ledger.sessions = sessions;
   ledger.unreadable = unreadable;
   ledger.subagents = subagents;
+  ledger.complete = ledger.complete === true || disk.complete === true;
   ledger.updatedAt = laterOf(ledger.updatedAt, disk.updatedAt);
   return ledger;
 }
@@ -214,9 +235,11 @@ export function mergeLedger(ledger, disk) {
 // fan-out caller loops accounts and workspaces in turn.
 //
 // the last-writer-wins hazard G-8-3 opens with. writeJsonSecure already makes each write atomic,
-// so the file is never TORN; what it is not is safe against two history runs that each loaded the
+// so the file is never TORN; what it is not is safe against two backfill runs that each loaded the
 // ledger minutes ago and now save their own in-memory copy over the top. Run A's markImported
-// entries vanish, and already-uploaded sessions lose the delivery evidence decideReplay reads.
+// entries vanish, already-uploaded sessions look importable again, and in the worst case both runs
+// reach finalize() and both POST /sessions/backfill/complete — sealing a one-time pull that has no
+// reopen while the other run still holds unledgered candidates.
 //
 // The re-read is what closes it, and it has to be INSIDE the lock or it is the same race one step
 // smaller. The lock deliberately does NOT span the caller's `loadLedger` at the top of its run:
@@ -234,7 +257,7 @@ export function saveLedger(key, ledger, tenantId = null) {
     () => writeJsonSecure(auditLedgerFile(key, tenantId), mergeLedger(ledger, readLedgerRaw(key, tenantId))),
   );
   // 'held'/'contended' is another run mid-save; this one's rows are still in memory and its next
-  // save (the caller saves after every dispatched batch) carries them.
+  // save (there is always one — the caller saves per chunk and again at finalize) carries them.
   // 'lock-order' is a caller bug that will fail identically forever, so it is reported, not folded
   // into the same "we'll get it next time" bucket.
   return run.ok

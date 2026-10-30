@@ -4,7 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
-import { writeTrackingState } from '../lib/tracking.mjs';
+import { writeAgent } from '../lib/subagent-state.mjs';
+import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
+import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
+import { createTranscriptMemo } from '../lib/transcript-memo-codex.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 
@@ -320,6 +323,43 @@ test('a turn-end checkpoint drains alongside the timeline post', async (t) => {
     { emitTimeline: true },
   );
   assert.equal(drains, 1);
+});
+
+test('a live checkpoint reads the rollout once', async (t) => {
+  const home = tmpHome(t);
+  const writeRollout = (name, records) => {
+    const file = path.join(home, name);
+    fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    return file;
+  };
+  const meta = (payload) => ({ timestamp: '2026-01-01T00:00:00.000Z', type: 'session_meta', payload: { cwd: home, ...payload } });
+  const turn = { timestamp: '2026-01-01T00:00:05.000Z', type: 'turn_context', payload: { cwd: home, model: 'gpt-5.4-mini' } };
+  const tokens = { timestamp: '2026-01-01T00:00:10.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5 } } } };
+  const parent = writeRollout('rollout.jsonl', [meta({ id: 's1', session_id: 's1', thread_source: 'user' }), turn, tokens]);
+  const child = writeRollout('agent-a.jsonl', [
+    meta({ id: 'agent-a', session_id: 's1', parent_thread_id: 's1', thread_source: 'subagent',
+      source: { subagent: { thread_spawn: { parent_thread_id: 's1', depth: 1 } } } }),
+    turn, tokens,
+  ]);
+  writeAgent('s1', 'agent-a', { started_at: '2026-01-01T00:00:00.000Z', transcriptPath: child });
+
+  const reads = new Map();
+  const countingRead = (p) => { reads.set(p, (reads.get(p) || 0) + 1); return readRolloutLines(p); };
+  const memo = createTranscriptMemo({ readLines: countingRead });
+  const parentLookups = [];
+  const transcriptMemo = { readLines: (p) => { if (p === parent) parentLookups.push(p); return memo.readLines(p); } };
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [], {
+    resolveTranscript: () => ({ transcriptPath: parent, sessionId: 's1' }),
+    resolveSessionName: () => 'a session',
+    // A child read without the memo goes through the counting reader too.
+    computeDelta: (p, from, resolvers) => realComputeDelta(p, from, resolvers.readLines ? resolvers : { ...resolvers, readLines: countingRead }),
+    transcriptMemo,
+  }), { emitTimeline: true });
+
+  assert.equal(parentLookups.length, 2, 'the parent delta and the timeline both ask the memo');
+  assert.equal(reads.get(parent), 1);
+  assert.equal(reads.get(child), 1);
 });
 
 // `/beezi:track` is a turn end in every sense that matters. Without its own opt-in it queued rows
@@ -733,70 +773,3 @@ for (const failure of ['queue', 'state']) {
     assert.equal([...delivered.values()].reduce((sum, payload) => sum + payload.token_total, 0), 30);
   });
 }
-
-// ─── writtenAtMs: the watcher's established path cuts each workspace at its own link time ───────
-
-const LINK = Date.parse('2026-10-01T00:00:00.000Z');
-const MINUTE = 60 * 1000;
-const iso = (ms) => new Date(ms).toISOString();
-const KEY_B = 'b2c3d4e5';
-
-const envelopes = (key = KEY) => {
-  let names = [];
-  try { names = fs.readdirSync(queueDir(key)); } catch { names = []; }
-  return names.map((f) => JSON.parse(fs.readFileSync(path.join(queueDir(key), f), 'utf-8')));
-};
-
-// One account in t1 and t2, linked at LINK; t2 was joined ten minutes later.
-const joined = (newFolders) => ({
-  ...SESSION,
-  tenants: [{ id: 't1' }, { id: 't2', joinedAt: iso(LINK + 10 * MINUTE) }],
-  newFolders,
-});
-
-test('writtenAtMs: a workspace joined after the last write gets no copy', async (t) => {
-  const home = tmpHome(t);
-  writeTrackingState(KEY, { linkedAt: iso(LINK) });
-  const session = joined({ mode: 'send', tenantIds: ['t1', 't2'] });
-
-  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg()], { linkedSessions: async () => [session] }),
-    { writtenAtMs: LINK + 5 * MINUTE });
-
-  assert.deepEqual(envelopes().map((e) => e.tenantId), ['t1']);
-});
-
-test('writtenAtMs: an Ask hold leaves out a workspace joined after the last write', async (t) => {
-  const home = tmpHome(t);
-  writeTrackingState(KEY, { linkedAt: iso(LINK) });
-  const session = joined({ mode: 'ask' });
-
-  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg()], { linkedSessions: async () => [session] }),
-    { writtenAtMs: LINK + 5 * MINUTE });
-
-  const held = envelopes();
-  assert.equal(held.length, 1);
-  assert.equal(held[0].hold, 'ask');
-  assert.deepEqual(held[0].askTenants, ['t1']);
-});
-
-test('writtenAtMs: an unknown link time queues nothing for that account', async (t) => {
-  const home = tmpHome(t);
-  // Written a day from now: a link known at any time up to now (a credentials-file fallback included) would be sent to.
-  const result = await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg()]),
-    { writtenAtMs: Date.now() + 24 * 60 * MINUTE });
-
-  assert.equal(result.gated, true);
-  assert.deepEqual(envelopes(), []);
-});
-
-test('without writtenAtMs, an account linked after the last write is still sent to (the hooks are unchanged)', async (t) => {
-  const home = tmpHome(t);
-  writeTrackingState(KEY, { linkedAt: iso(LINK) });
-  writeTrackingState(KEY_B, { linkedAt: iso(LINK + 10 * MINUTE) });
-  const both = async () => [SESSION, accountSession(KEY_B, 'tok-b')];
-
-  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg()], { linkedSessions: both }));
-
-  assert.equal(envelopes(KEY).length, 1);
-  assert.equal(envelopes(KEY_B).length, 1);
-});

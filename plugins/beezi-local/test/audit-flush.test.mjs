@@ -6,6 +6,7 @@ import path from 'node:path';
 import { apiBase, ENDPOINTS } from '../lib/config.mjs';
 import {
   flushBackfillChunks,
+  completeBackfill,
   planChunks,
   BackfillSessionStatus,
   BackfillHalt,
@@ -251,12 +252,12 @@ test('30. an old server that 400s the timelines field gets the chunk again witho
 
 // ─── flushBackfillChunks ─────────────────────────────────────────────────────
 
-test('8. POSTs { sessions } to the sync route with the raised timeout', async () => {
+test('8. POSTs { sessions } to the backfill route with the raised timeout', async () => {
   const post = fakePost([{ status: 200, body: okBody() }]);
 
   await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
-  assert.ok(post.calls[0].url.endsWith('/sessions/sync'));
+  assert.ok(post.calls[0].url.endsWith('/sessions/backfill'));
   assert.ok(Array.isArray(post.calls[0].body.sessions));
   assert.equal(post.calls[0].body.skipExisting, undefined);
   assert.equal(post.calls[0].deps.timeoutMs, 60_000);
@@ -498,24 +499,39 @@ test('25. no groups means no request at all', async () => {
   assert.equal(result.chunks, 0);
 });
 
+// ─── completeBackfill ───────────────────────────────────────────────────────
+
+test('26. completeBackfill POSTs the seal route and reports the coded refusals', async () => {
+  const ok = fakePost([{ status: 200, body: { stored: 0, skipped: 0, completed: true, errors: [] } }]);
+  const sealed = await completeBackfill(SESSION, { postJsonImpl: ok.impl });
+  assert.ok(ok.calls[0].url.endsWith('/sessions/backfill/complete'));
+  assert.equal(sealed.completed, true);
+
+  const refused = fakePost([
+    { status: 403, body: { statusCode: 403, code: 'BACKFILL_NOT_ALLOWED', message: 'audit ended' } },
+  ]);
+  const denial = await completeBackfill(SESSION, { postJsonImpl: refused.impl });
+  assert.equal(denial.completed, false);
+  assert.equal(denial.code, 'BACKFILL_NOT_ALLOWED');
+});
+
 // ─── G-8-6: the endpoint is a parameter, not a literal ───────────────────────
 
-test('27. with no endpoint it posts to the sync route, read from ENDPOINTS', async () => {
+test('27. defaults to ENDPOINTS.sessionsBackfill — no route is spelled out in the module', async () => {
   const post = fakePost([{ status: 200, body: okBody() }]);
 
   await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl });
 
-  assert.equal(post.calls[0].url, `${apiBase()}/sessions/sync`);
-  assert.equal(ENDPOINTS.sessionsSync, '/sessions/sync');
+  assert.equal(post.calls[0].url.endsWith(ENDPOINTS.sessionsBackfill), true);
 });
 
 test('28. options.endpoint reuses the whole chunk/bisect/renewal machinery on another route', async () => {
   const post = fakePost([{ status: 200, body: okBody() }]);
 
-  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl }, { endpoint: '/sessions/other' });
+  await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl }, { endpoint: '/sessions/sync' });
 
   assert.equal(post.calls.length, 1);
-  assert.equal(post.calls[0].url.endsWith('/sessions/other'), true);
+  assert.equal(post.calls[0].url.endsWith('/sessions/sync'), true);
   // Still absolute against the configured API base, never a bare path.
   assert.equal(post.calls[0].url.startsWith(apiBase()), true);
 });
@@ -975,104 +991,4 @@ test('gzip 19. a 429 on a compressed chunk is not resent plain', async () => {
   assert.deepEqual(gzipFlags(post.calls), [true]);
   assert.equal(compression.enabled, true);
   assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.REJECTED);
-});
-
-// ─── anonymization ──────────────────────────────────────────────────────────
-
-const VECTORS = JSON.parse(fs.readFileSync(new URL('./fixtures/anonymization-vectors.json', import.meta.url), 'utf8'));
-const vector = (match) => VECTORS.cases.find((c) => Object.keys(match).every((k) => c[k] === match[k])).expected;
-const VECTOR_SESSION = '0b6f2c1e-3c1a-4f7e-9a51-2d9c1f0e7a11';
-const kindsBlock = (on, key = VECTORS.keyHex) => ({
-  tenantId: 'T1',
-  kinds: Object.fromEntries(['repos', 'branches', 'sessions', 'hosts', 'accounts'].map((kind) => [kind, on.includes(kind)])),
-  key,
-  machineName: null,
-  pastSessions: { choice: 'offer', changedAt: null },
-});
-const ANON_BLOCK = kindsBlock(['repos', 'branches', 'sessions', 'hosts', 'accounts']);
-
-function rawGroup() {
-  return {
-    sessionId: VECTOR_SESSION,
-    reports: [{
-      ...report(VECTOR_SESSION, `${VECTOR_SESSION}:0-5`),
-      remote: 'git@github.com:Acme/Payments.git',
-      branch: 'feature/ABC-123',
-      session_name: 'Fix the payments retry loop',
-      account_uuid: 'acct-uuid-1',
-      account_email: ' Dev@example.com ',
-      agent_name: 'Scout',
-      beeziPrivate: { T1: ['repos'] },
-    }],
-  };
-}
-
-test('anonymization — an anonymized run sends the vector values and no marker', async () => {
-  const post = fakePost([{ status: 200, body: okBody() }]);
-  const session = { ...SESSION, tenants: [{ id: 'T1', anonymization: ANON_BLOCK }] };
-  const groups = [rawGroup()];
-
-  const result = await flushBackfillChunks(groups, KEY, session, { postJsonImpl: post.impl });
-
-  assert.equal(post.calls.length, 1);
-  const [sent] = post.calls[0].body.sessions;
-  assert.equal(sent.remote, vector({ fn: 'remote', input: 'git@github.com:Acme/Payments.git' }));
-  assert.equal(sent.branch, vector({ fn: 'branch', remote: 'git@github.com:Acme/Payments.git', branch: 'feature/ABC-123' }));
-  assert.equal(sent.session_name, vector({ fn: 'session', input: VECTOR_SESSION }));
-  assert.equal(sent.account_email, vector({ fn: 'account', input: ' Dev@example.com ' }));
-  assert.equal(sent.account_uuid, 'acct-uuid-1');
-  assert.equal(sent.sessionId, VECTOR_SESSION, 'the session id stays raw so verdicts attribute');
-  assert.equal('agent_name' in sent, false);
-  assert.equal(JSON.stringify(post.calls[0].body).includes('beeziPrivate'), false);
-  assert.equal(result.bySession.get(VECTOR_SESSION).status, BackfillSessionStatus.ACCEPTED);
-  assert.equal(groups[0].reports[0].remote, 'git@github.com:Acme/Payments.git', "the caller's reports are not rewritten");
-});
-
-test('anonymization — an anonymized run without its key halts and posts nothing', async () => {
-  const post = fakePost([{ status: 200, body: okBody() }]);
-  const session = { ...SESSION, anonymization: { ...ANON_BLOCK, key: null } };
-
-  const result = await flushBackfillChunks([rawGroup()], KEY, session, { postJsonImpl: post.impl });
-
-  assert.equal(post.calls.length, 0);
-  assert.equal(result.halt, BackfillHalt.ANONYMIZATION_KEY_MISSING);
-  assert.equal(result.halt, 'anonymization-key-missing');
-  assert.equal(result.bySession.size, 0, 'nothing is ledgered off a run that sent nothing');
-});
-
-test('anonymization — a run that is not anonymized sends the reports as they are, without another workspace\'s marker', async () => {
-  const post = fakePost([{ status: 200, body: okBody() }]);
-  const session = { ...SESSION, anonymization: kindsBlock([]) };
-  const reports = rawGroup().reports.map((r) => ({ ...r, beeziPrivate: { T2: ['repos'] } }));
-
-  await flushBackfillChunks([{ sessionId: VECTOR_SESSION, reports }], KEY, session, { postJsonImpl: post.impl });
-
-  assert.deepEqual(post.calls[0].body.sessions, reports.map(({ beeziPrivate, ...rest }) => rest));
-  assert.equal(JSON.stringify(post.calls[0].body).includes('beeziPrivate'), false);
-  assert.deepEqual(reports[0].beeziPrivate, { T2: ['repos'] }, "the caller's reports are not rewritten");
-});
-
-test('anonymization — a run with only accounts on hashes the email and leaves the remote raw', async () => {
-  const post = fakePost([{ status: 200, body: okBody() }]);
-  const session = { ...SESSION, tenants: [{ id: 'T1', anonymization: kindsBlock(['accounts']) }] };
-
-  await flushBackfillChunks([rawGroup()], KEY, session, { postJsonImpl: post.impl });
-
-  const [sent] = post.calls[0].body.sessions;
-  assert.equal(sent.account_email, vector({ fn: 'account', input: ' Dev@example.com ' }));
-  assert.equal(sent.remote, 'git@github.com:Acme/Payments.git');
-  assert.equal(sent.branch, 'feature/ABC-123');
-  assert.equal(sent.session_name, 'Fix the payments retry loop');
-  assert.equal(sent.agent_name, 'Scout');
-  assert.equal(JSON.stringify(post.calls[0].body).includes('beeziPrivate'), false);
-});
-
-test('anonymization — a run with repos on and no key halts and posts nothing', async () => {
-  const post = fakePost([{ status: 200, body: okBody() }]);
-  const session = { ...SESSION, anonymization: kindsBlock(['repos'], null) };
-
-  const result = await flushBackfillChunks([rawGroup()], KEY, session, { postJsonImpl: post.impl });
-
-  assert.equal(post.calls.length, 0);
-  assert.equal(result.halt, 'anonymization-key-missing');
 });

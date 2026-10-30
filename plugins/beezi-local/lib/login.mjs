@@ -19,7 +19,7 @@ import { machineHeaders } from './machine-identity.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import {
   AccountStatus, addAccount, findByEmail, getAccount,
-  getDefaultKey, listAccounts, newAccountKey, rowSessionFields, updateAccount,
+  getDefaultKey, listAccounts, newAccountKey, updateAccount,
 } from './accounts.mjs';
 
 // The browser PKCE flow that links a Beezi account to this machine. It lives in lib because two
@@ -157,7 +157,7 @@ export async function unlinkMachine(session) {
   try {
     const res = await fetchCompat(`${apiBase()}${ENDPOINTS.machine}`, {
       method: 'DELETE',
-      headers: { Authorization: `Bearer ${session.token}`, ...machineHeaders(session.clientId, session) },
+      headers: { Authorization: `Bearer ${session.token}`, ...machineHeaders(session.clientId) },
       signal: controller.signal,
     });
     return res.ok || res.status === 401 || res.status === 403;
@@ -235,7 +235,9 @@ async function sessionFor(row, deps) {
   return {
     token: auth.accessToken,
     clientId: auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId,
-    ...rowSessionFields(row),
+    tenants: Array.isArray(row.tenants) ? row.tenants : null,
+    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
     // Only a per-workspace clone sets it; the row's web-side tenantId never scopes a request.
     tenantId: null,
   };
@@ -298,21 +300,9 @@ async function resolveAnonymousRows(d, base) {
       await updateAccount(row.key, {
         email: probe.who.email, name: probe.who.name,
         tenantId: probe.who.tenantId, tenantName: probe.who.tenantName, tenants: probe.who.tenants,
-        anonymization: probe.who.anonymization,
       }, d);
     } catch { /* best-effort: the branch table still runs, it just cannot match this row */ }
   }
-}
-
-// `session` carrying the workspace list and anonymization block whoami answered, else the ones `row` stored.
-function withIdentity(session, row, who) {
-  const answer = orDefault(who, {});
-  const stored = orDefault(row, {});
-  return {
-    ...session,
-    tenants: orDefault(answer.tenants, orDefault(stored.tenants, null)),
-    anonymization: orDefault(answer.anonymization, orDefault(stored.anonymization, null)),
-  };
 }
 
 // S's rule: one check-in per current target. A whoami without tenants keeps the stored list, so an
@@ -419,9 +409,9 @@ async function performGuardedLogin(deps) {
     // state could not produce a token at all — and still falls through to be re-armed.
     const stillValid = probe.state === 'valid' ? probe.who : null;
     if (probe.state === 'valid' || (probe.state === 'unknown' && existing !== null)) {
-      try { await d.unlinkMachine(withIdentity(newSession, existingByEmail, who)); } catch { /* best-effort */ }
-      // Same-identity re-login: refresh the cached tracking policy (trackingMode) so the steps
-      // that follow act on current facts. The identity
+      try { await d.unlinkMachine(newSession); } catch { /* best-effort */ }
+      // Same-identity re-login: refresh the cached tracking policy (trackingMode /
+      // backfillCompleted) so the backfill step that follows acts on current facts. The identity
       // stays the STORED client's — nothing about this account's link changed. recordWhoami is a
       // no-op on a null answer, so an unreachable portal leaves the cached policy alone.
       try { recordWhoami(existingByEmail.key, stillValid, existing.clientId); } catch { /* best-effort */ }
@@ -431,14 +421,13 @@ async function performGuardedLogin(deps) {
           await updateAccount(existingByEmail.key, {
             email: stillValid.email, name: stillValid.name,
             tenantId: stillValid.tenantId, tenantName: stillValid.tenantName, tenants: stillValid.tenants,
-            anonymization: stillValid.anonymization,
           }, d);
         } catch { /* best-effort */ }
       }
       // Check the account in, UNFORCED (G-2-1). A re-login on an unchanged machine is not news:
       // the payload hash still gates it, so this only refreshes last_seen_at once a week rather
       // than posting on every login a user runs to read their status back.
-      await checkInTargets(d, existingByEmail.key, existingByEmail, answer.tenants, withIdentity(existing, existingByEmail, who), {});
+      await checkInTargets(d, existingByEmail.key, existingByEmail, answer.tenants, existing, {});
       return finish('already-linked', existingByEmail.key, existingByEmail, null);
     }
   }
@@ -451,14 +440,14 @@ async function performGuardedLogin(deps) {
     await updateAccount(existingByEmail.key, {
       status: AccountStatus.LINKED, clientId: fresh.client_id,
       name: answer.name, tenantId: answer.tenantId, tenantName: answer.tenantName,
-      tenants: answer.tenants, anonymization: answer.anonymization,
+      tenants: answer.tenants,
     }, d);
     // The new client id is what the account's reports will carry from here, so the tracking state
     // has to bind to it — a state still naming the dead client reads as another login's.
     try { recordWhoami(existingByEmail.key, who, fresh.client_id); } catch { /* best-effort */ }
     // FORCED: this account has been unable to report for as long as its grant was dead, so its
     // marker describes a check-in the server may never have seen.
-    await checkInTargets(d, existingByEmail.key, existingByEmail, answer.tenants, withIdentity(newSession, existingByEmail, who), { force: true });
+    await checkInTargets(d, existingByEmail.key, existingByEmail, answer.tenants, newSession, { force: true });
     return finish('relinked', existingByEmail.key, await getAccount(existingByEmail.key, d), relinkedIn);
   }
 
@@ -474,10 +463,10 @@ async function performGuardedLogin(deps) {
   await addAccount({
     key, email, name: answer.name,
     tenantId: answer.tenantId, tenantName: answer.tenantName, tenants: answer.tenants,
-    anonymization: answer.anonymization, clientId: fresh.client_id,
+    clientId: fresh.client_id,
   }, d);
-  // markLinked stamps linkedAt BEFORE anything can be tracked under this account — the history run
-  // uses that instant to split past sessions from live ones. Nothing is cleared first:
+  // markLinked stamps linkedAt BEFORE anything can be tracked under this account — the backfill
+  // uses that instant to skip transcripts live tracking already owns. Nothing is cleared first:
   // the key was minted three lines up, so the account directory the keyed layout gives it is
   // empty by construction and no previous login's ledger or policy can be in it.
   try { markLinked(key); } catch { /* best-effort */ }
@@ -491,7 +480,7 @@ async function performGuardedLogin(deps) {
   //
   // It lives in performLogin rather than in scripts/login.mjs because this function is the shared
   // entry for both the CLI script and the `beezi_login` MCP tool.
-  await checkInTargets(d, key, null, answer.tenants, withIdentity(newSession, null, who), { force: true });
+  await checkInTargets(d, key, null, answer.tenants, newSession, { force: true });
   // apiBase travels with every outcome: a machine signed in against the wrong BEEZI_API_URL is
   // exactly the case this field exists to make visible.
   return finish('linked', key, await getAccount(key, d), storedIn);

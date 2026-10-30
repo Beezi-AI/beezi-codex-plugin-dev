@@ -10,7 +10,6 @@ import { initSessionWorkspace, readSessionWorkspace } from '../lib/workspace.mjs
 import { enqueueHeld } from '../lib/workspace-queue.mjs';
 import { queueDir } from '../lib/paths.mjs';
 import { hereLine, pickerLines, pickerPlaces, workspaceCommand } from '../lib/workspace-cli.mjs';
-import { sessionAnonymization } from '../lib/anonymization.mjs';
 
 const TENANTS = [{ id: 'A', name: 'Acme' }, { id: 'B', name: 'Beta' }];
 const SOLO = 'e5f6a7b8';
@@ -141,18 +140,6 @@ test('a removal names the rule and what applies now, on both account kinds', asy
     [`✓ Removed rule R1 (sessions outside a project). It's tracked again unless another rule covers it.${UNDO}`, 'removed=1']);
 });
 
-test('removing a rule and undoing it re-open no offer and owe no history', async (t) => {
-  const settled = { state: 'settled', changedAt: null, places: [] };
-  const rule = { ...REPO_B, createdAt: '2026-01-01T00:00:00.000Z' };
-  linkAccount(makeHome(t), TEST_KEY, { tenants: TENANTS, workspaceRules: [rule], historyOffers: { B: settled } });
-  await run(['rule', 'remove', 'R1', '--account', TEST_KEY]);
-  await run(['undo']);
-  const row = await getAccount(TEST_KEY);
-  assert.deepEqual(row.workspaceRules, [rule]);
-  assert.deepEqual(row.historyOffers, { B: settled });
-  assert.equal(row.pendingHistory, undefined);
-});
-
 test('add-all confirms with the joined workspace names, and undo takes the rules back', async (t) => {
   linkAccount(makeHome(t), TEST_KEY, { tenants: TENANTS, newFolders: { mode: 'ask', tenantIds: [] } });
   const listAllRollouts = () => [entry('s1', NOTES, 2 * 24 * HOUR)];
@@ -213,25 +200,6 @@ test('a removal re-routes every session bound to the rule, releases each one\'s 
   assert.ok(!files.some((f) => f.endsWith('__ask.qjson')), files.join('\n'));
   const copies = files.map((f) => JSON.parse(fs.readFileSync(path.join(queueDir(TEST_KEY), f), 'utf-8')));
   assert.deepEqual(copies.map((c) => [c.payload.sessionId, c.tenantId]).sort(), [['sess-one', 'B'], ['sess-two', 'B']]);
-});
-
-test('the workspace check-in carries the row\'s anonymization, so an anonymized workspace is checked in anonymized', async (t) => {
-  const block = { tenantId: 'B', kinds: { repos: true, branches: true, sessions: true, hosts: true, accounts: true }, key: 'ab'.repeat(32), machineName: null };
-  linkAccount(makeHome(t), TEST_KEY, {
-    tenants: [TENANTS[0], { ...TENANTS[1], anonymization: block }],
-    newFolders: { mode: 'send', tenantIds: ['B'] },
-    workspaceRules: [OUTSIDE_A],
-  });
-  initSessionWorkspace('sess-anon', { cwd: os.homedir(), routes: { [TEST_KEY]: OUTSIDE_A } });
-  enqueueHeld(TEST_KEY, { segmentId: 'sess-anon-seg', sessionId: 'sess-anon', remote: null }, ['A', 'B']);
-  const synced = [];
-  await run(['rule', 'remove', '1', '--account', TEST_KEY, '--defer-upload'], {
-    getAuthentication: async () => ({ state: 'ready', accessToken: 'tok', clientId: 'c' }),
-    syncAccountIfNeeded: async (key, session) => { synced.push(session); },
-  });
-  assert.equal(synced.length, 1);
-  assert.equal(synced[0].tenantId, 'B');
-  assert.deepEqual(sessionAnonymization(synced[0]), block);
 });
 
 test('undo of a rule add on a multi-workspace account unbinds sessions bound to it', async (t) => {

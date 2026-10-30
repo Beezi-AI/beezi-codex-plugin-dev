@@ -132,7 +132,12 @@ const CHUNK_BYTES = 256 * 1024;
 // must not turn a bounded read into a bounded read plus unbounded memory.
 const MAX_LINE_BYTES = 1024 * 1024;
 
-export function* scanRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES } = {}) {
+export function* scanRecords(transcriptPath, options) {
+  for (const { rec } of scanNumberedRecords(transcriptPath, options)) yield rec;
+}
+
+// scanRecords with each record's 0-based physical line, counted as computeDelta counts it.
+export function* scanNumberedRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES } = {}) {
   let fd;
   try { fd = fs.openSync(transcriptPath, 'r'); } catch { return; }
   try {
@@ -143,6 +148,7 @@ export function* scanRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES } = {})
     const decoder = new TextDecoder('utf-8');
     let carry = '';
     let read = 0;
+    let lineNo = 0;
     while (read < maxBytes) {
       let n;
       try { n = fs.readSync(fd, buf, 0, Math.min(CHUNK_BYTES, maxBytes - read), read); } catch { return; }
@@ -154,16 +160,19 @@ export function* scanRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES } = {})
       carry = orDefault(lines.pop(), '');
       if (carry.length > MAX_LINE_BYTES) carry = '';
       for (const line of lines) {
+        const line0 = lineNo++;
         if (!line.trim()) continue;
         let rec;
         try { rec = JSON.parse(line); } catch { continue; }
-        yield rec;
+        yield { rec, line: line0 };
       }
     }
     // A file with no trailing newline ends on a complete record; a file cut off by maxBytes ends on
     // a partial one. JSON.parse separates the two.
     if (carry.trim()) {
-      try { yield JSON.parse(carry); } catch { /* truncated at the ceiling — drop it */ }
+      let rec;
+      try { rec = JSON.parse(carry); } catch { return; /* truncated at the ceiling — drop it */ }
+      yield { rec, line: lineNo };
     }
   } finally {
     if (fd !== undefined) fs.closeSync(fd);

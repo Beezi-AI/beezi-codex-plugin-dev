@@ -43,7 +43,7 @@ export function sessionOf(session) {
 // clone; a single-workspace or unknown account (tenantId null) sends exactly the headers it always has.
 export function authHeaders(session) {
   const { token, clientId, tenantId } = sessionOf(session);
-  const headers = { 'Authorization': `Bearer ${token}`, ...machineHeaders(clientId, session) };
+  const headers = { 'Authorization': `Bearer ${token}`, ...machineHeaders(clientId) };
   if (typeof tenantId === 'string' && tenantId !== '') headers['X-Beezi-Tenant'] = tenantId;
   return headers;
 }

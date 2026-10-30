@@ -1,20 +1,19 @@
 # Beezi plugin release notes
 
-## 0.24.1 (2026-10-23) — Past-sessions checklist
+## 0.24.0 (2026-10-29) — Large sessions upload
+
+### Fixed
+- **Large sessions upload** — rollouts over 64 MB are no longer skipped by the history upload or sync, and each turn reads a session once.
+- **Subagent forks bill only their own work** — even when the replayed prefix holds a blank or unreadable line.
+
+## 0.23.1 (2026-10-22) — "Don't track" stands alone, and several workspaces at sign-in
+
+### Fixed
+- **"Don't track" stands alone** — choosing it together with a workspace no longer saves "not tracked" and drops the workspace: the terminal setup clears the other choices, and Codex asks again.
+- **"None of these" stands alone** — after joining a workspace, choosing it together with repos is asked again instead of skipping the repos.
 
 ### Improved
-- **Past-sessions checklist** — login, sync and the setup wizard show what an upload sends, hides and never sends as a short checklist, and the wizard asks with an Upload now / Not now menu.
-
-## 0.24.0 (2026-10-21) — Anonymized workspaces
-
-### New
-- **Past sessions only after a yes** — Past sessions are uploaded only after you say yes; login, sync and the setup wizard now show what would be sent and ask.
-- **Anonymized workspaces** — when a workspace has anonymization on, repo, folder, branch, machine, account and session names are replaced with made-up values on this machine before anything is sent, and error text and agent names stay here.
-- **Notice at start** — a new Codex thread says "Beezi: this workspace is anonymized." for each workspace that has it on, and the repo check is no longer sent when the workspace hides folder and repository names.
-- **Appears as** — the settings skill shows the name an anonymized workspace sees this machine as.
-
-### Improved
-- **Clear stop for a missing key** — sync and the history upload say when an anonymized workspace has no key on this machine yet, instead of reporting nothing uploaded.
+- **Several workspaces at sign-in** — "Where should analytics from this machine go?" now offers "Several workspaces…", so everything can go to more than one workspace.
 
 ## 0.23.0 (2026-10-21) — Clearer settings, a session banner and one-question sign-in
 

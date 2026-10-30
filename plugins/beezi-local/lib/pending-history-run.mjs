@@ -1,19 +1,17 @@
-import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, createRunCache as _createRunCache, dontTrackSessionIds } from './session-audit.mjs';
+import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, createRunCache as _createRunCache, dontTrackSessionIds, SYNC_MODE } from './session-audit.mjs';
 import { BackfillHalt } from './audit-flush.mjs';
 import { isMultiTenant } from './workspace.mjs';
 import { usesRules } from './workspace-rules.mjs';
 import { rolloutStartedAt as _rolloutStartedAt } from './subagent-codex.mjs';
-import { pendingHistoryOf, historyDue, waitingOnRecent, acceptedKindsOf, RunOutcome, SettleState } from './pending-history.mjs';
+import { pendingHistoryOf, historyDue, waitingOnRecent, RunOutcome, SettleState } from './pending-history.mjs';
 
 // A live checkpoint transaction or a run that took the lock over is busy, not a failure.
 const BUSY_REASONS = ['run-in-progress', 'active-writer', 'pending-transaction'];
 const BUSY_HALTS = [BackfillHalt.LOCK_LOST];
 const REFUSED_REASONS = ['workspace-required', 'audit-only'];
 const REFUSED_HALTS = [BackfillHalt.NOT_ALLOWED, BackfillHalt.FORBIDDEN, BackfillHalt.UNSUPPORTED_SERVER];
-const BUSY_WAIT_MS = 30_000;
-const BUSY_RETRIES = 6;
 
-// One history run's meaning for the marker; `waiting` = a recent session predates the request.
+// One sync-mode run's meaning for the marker; `waiting` = a recent session predates the request.
 export function classifyRun(result, waiting) {
   if (result == null) return RunOutcome.FAILED;
   if (BUSY_REASONS.indexOf(result.reason) !== -1 || BUSY_HALTS.indexOf(result.halt) !== -1) return RunOutcome.BUSY;
@@ -33,29 +31,22 @@ function startedAtMs(recent, startedAt) {
   }
 }
 
-// Each pending workspace's runAudit options, limited to the sessions the developer accepted and the kinds hidden at
-// that yes: a --tenant override runs unrouted, the rest as sync plans them; null when no route reaches it.
+// Each pending workspace's runAudit options, as sync plans them; null when no route reaches it.
 function plannedRuns(row, entries, planRuns) {
-  const accepted = (entry) => ({ onlySessionIds: entry.sessionIds, acceptedKinds: acceptedKindsOf(entry) });
   if (!isMultiTenant(row)) {
     const options = { tenantId: null };
     if (usesRules(row)) options.excludedSessionIds = dontTrackSessionIds(planRuns(row));
-    return entries.slice(0, 1).map((entry) => ({ entry, options: { ...options, ...accepted(entry) } }));
+    return entries.slice(0, 1).map((entry) => ({ entry, options }));
   }
   const plan = planRuns(row);
-  return entries.map((entry) => {
-    if (entry.override === true) return { entry, options: { tenantId: entry.tenantId, ...accepted(entry) } };
-    return {
-      entry,
-      options: plan.tenantIds.indexOf(entry.tenantId) === -1
-        ? null
-        : { tenantId: entry.tenantId, sessionRoutes: plan.routes, ...accepted(entry) },
-    };
-  });
+  return entries.map((entry) => ({
+    entry,
+    options: plan.tenantIds.indexOf(entry.tenantId) === -1 ? null : { tenantId: entry.tenantId, sessionRoutes: plan.routes },
+  }));
 }
 
-// Runs every pending workspace of one account (or only `tenantIds`) once, reports each run to `onResult` and settles each entry.
-export async function runPendingHistory(key, deps = {}, { tenantIds = null, onResult = null } = {}) {
+// Runs every pending workspace of one account once and settles each entry.
+export async function runPendingHistory(key, deps = {}) {
   const accounts = deps.accounts == null ? await import('./accounts.mjs') : deps.accounts;
   const runAudit = deps.runAudit == null ? _runAudit : deps.runAudit;
   const planRuns = deps.planWorkspaceRuns == null ? _planWorkspaceRuns : deps.planWorkspaceRuns;
@@ -65,7 +56,7 @@ export async function runPendingHistory(key, deps = {}, { tenantIds = null, onRe
   const plannedAtMs = now();
   const row = (await accounts.listAccounts()).find((a) => a.key === key && a.status === accounts.AccountStatus.LINKED);
   if (row == null) return [];
-  const entries = pendingHistoryOf(row).filter((e) => tenantIds == null || tenantIds.indexOf(e.tenantId) !== -1);
+  const entries = pendingHistoryOf(row);
   if (entries.length === 0) return [];
   await accounts.notePendingAttempt(key, entries.map((e) => e.tenantId), new Date(plannedAtMs).toISOString());
   const done = [];
@@ -76,8 +67,7 @@ export async function runPendingHistory(key, deps = {}, { tenantIds = null, onRe
     let run = { outcome: busy ? RunOutcome.BUSY : RunOutcome.CLEAN, sent: 0, skipped: 0 };
     if (!busy && options != null) {
       // A throwing run settles as failed (classifyRun(null)) rather than leaving later entries unsettled.
-      const result = await runAudit({ runCache }, { ...options, key }).catch(() => null);
-      if (onResult != null) onResult(entry, result);
+      const result = await runAudit({ runCache }, { ...options, key, mode: SYNC_MODE }).catch(() => null);
       const ran = result == null ? {} : result;
       const recent = Array.isArray(ran.recent) ? ran.recent.map((r) => startedAtMs(r, startedAt)) : [];
       run = {
@@ -90,23 +80,6 @@ export async function runPendingHistory(key, deps = {}, { tenantIds = null, onRe
     // A busy index lock leaves this entry for the next pass instead of abandoning the rest.
     const state = await accounts.settlePendingHistory(key, entry.tenantId, run, { plannedAtMs, nowMs: now() }).catch(() => SettleState.MISSING);
     done.push({ tenantId: entry.tenantId, outcome: run.outcome, state });
-  }
-  return done;
-}
-
-const busyIds = (done) => done.filter((d) => d.outcome === RunOutcome.BUSY).map((d) => d.tenantId);
-
-// Reruns only the busy workspaces while another writer holds the lock: up to `retries` more passes, `waitMs` apart,
-// each pass's results replacing the earlier ones for its workspaces.
-export async function runPendingHistoryPatiently(key, deps = {}, { waitMs = BUSY_WAIT_MS, retries = BUSY_RETRIES } = {}) {
-  const sleep = deps.sleep == null ? (ms) => new Promise((resolve) => setTimeout(resolve, ms)) : deps.sleep;
-  let done = await runPendingHistory(key, deps);
-  let busy = busyIds(done);
-  for (let left = retries; left > 0 && busy.length > 0; left -= 1) {
-    await sleep(waitMs);
-    const again = await runPendingHistory(key, deps, { tenantIds: busy });
-    done = done.filter((d) => busy.indexOf(d.tenantId) === -1).concat(again);
-    busy = busyIds(again);
   }
   return done;
 }

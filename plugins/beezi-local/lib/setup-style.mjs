@@ -29,7 +29,6 @@ export function createStyle(options) {
     boldGreen: wrap('1;32'),
     yellow: wrap('33'),
     red: wrap('31'),
-    magenta: wrap('35'),
     violet: (level, text) => (enabled ? `\x1b[38;5;${VIOLETS[level]}m${text}${RESET}` : text),
   };
 }
@@ -90,64 +89,6 @@ export function paintRows(style, rows) {
 }
 
 // One printed line wrapped to the terminal and painted; each \n-separated part wraps on its own.
-// The K7-C past-sessions lines by exact shape: one tone per capture group, the groups spelling the whole line.
-const OFFER_SHAPES = [
-  [/^(Beezi found \d+ past [A-Za-z ]+ sessions?)( )(\([^()]+\))$/, ['bold', null, 'dim']],
-  [/^( {2})(in)( .+?)( \+\d+ more)?$/, [null, 'dim', null, 'dim']],
-  [/^( {2})(Sent)$/, [null, 'green']],
-  [/^( {4})(✓)( .+)$/, [null, 'green', null]],
-  [/^( {2})(Hidden by your workspace)( — Beezi gets made-up names)$/, [null, 'magenta', 'dim']],
-  [/^( {4})(◆)( .+)$/, [null, 'magenta', null]],
-  [/^( {2})(Never sent)$/, [null, 'dim']],
-  [/^( {4})(✕ .+)$/, [null, 'dim']],
-];
-
-// One tone per UTF-16 unit of an offer line, or null when the line has none of the shapes.
-function offerTones(line) {
-  for (const [shape, tones] of OFFER_SHAPES) {
-    const found = shape.exec(line);
-    if (found === null) continue;
-    const perUnit = [];
-    tones.forEach((tone, i) => {
-      const part = found[i + 1] === undefined ? '' : found[i + 1];
-      for (let k = 0; k < part.length; k += 1) perUnit.push(tone);
-    });
-    return perUnit;
-  }
-  return null;
-}
-
-// Wraps line[from, to) run by run in each unit's tone.
-function paintSpan(style, line, tones, from, to) {
-  let out = '';
-  let start = from;
-  for (let i = from + 1; i <= to; i += 1) {
-    if (i < to && tones[i] === tones[start]) continue;
-    const text = line.slice(start, i);
-    out += tones[start] === null ? text : style[tones[start]](text);
-    start = i;
-  }
-  return out;
-}
-
-// Wrapped rows are contiguous slices of the line after their hang, so each row keeps the tones of the units it shows.
-export function paintOffer(style, line, columns) {
-  const tones = offerTones(line);
-  if (tones === null) return null;
-  const hang = line.length - line.replace(/^\s+/, '').length + 2;
-  let at = 0;
-  return wrapLines(line, columns).map((row, i) => {
-    const prefix = i === 0 ? '' : row.slice(0, hang);
-    const shown = row.length - prefix.length;
-    const painted = prefix + paintSpan(style, line, tones, at, at + shown);
-    at += shown + 1;
-    return painted;
-  }).join('\n');
-}
-
 export function formatLine(style, line, columns) {
-  return String(line).split('\n').map((part) => {
-    const offer = paintOffer(style, part, columns);
-    return offer === null ? paintRows(style, wrapLines(part, columns)) : offer;
-  }).join('\n');
+  return String(line).split('\n').map((part) => paintRows(style, wrapLines(part, columns))).join('\n');
 }

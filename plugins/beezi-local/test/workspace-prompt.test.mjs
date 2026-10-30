@@ -41,7 +41,7 @@ test('the workspace ask tells the model to run its command escalated from the st
 // The inverted join re-pick asks per new workspace which repos send to it, mapped to `joined pick`;
 // past request_user_input's caps the fallback is a numbered list of that one workspace's repos.
 test('the joined prompt instructs joined pick and a per-workspace numbered repo list past the caps', async () => {
-  const { context: text } = await buildJoinedPrompt({ session_id: 'session-1', source: 'startup' }, {
+  const text = await buildJoinedPrompt({ session_id: 'session-1', source: 'startup' }, {
     pluginRoot: '/plugin',
     listAccounts: async () => [JOINED_ROW],
     linkedSessions: async () => [{ key: KEY }],
@@ -64,4 +64,20 @@ test('the workspace question names the repo you are in and what not tracking it 
   assert.ok(text.includes('"Where should analytics for labacus-suite, the repo you\'re in, go? Pick one, or name several under Other."'), text);
   assert.ok(text.includes('"Don\'t track labacus-suite" (description "Not tracked: nothing from labacus-suite is sent")'), text);
   assert.ok(text.includes('— one or more — or don\'t track labacus-suite?'), text);
+});
+
+// A mixed answer (through Other or the plain sentence) is re-asked once, not resolved as none.
+test('a Don\'t track answer mixed with a workspace is asked again, never resolved as none', async (t) => {
+  tmpHome(t, 'workspace-prompt-');
+  const repo = '/work/labacus-suite';
+  saveRepoMap(upsertRoot(loadRepoMap(), repo, 'https://github.com/acme/labacus-suite.git'));
+  const text = await buildWorkspacePrompt({ session_id: 'session-1', cwd: repo, source: 'startup' }, {
+    pluginRoot: '/plugin',
+    listAccounts: async () => [ROW],
+    linkedSessions: async () => [{ key: KEY }],
+  });
+  assert.ok(text.includes('or `none` only when "Don\'t track labacus-suite" is the whole answer.'), text);
+  assert.ok(text.includes('starting with: `"Don\'t track" can\'t be combined with a workspace — pick one or the other.` A second'), text);
+  assert.ok(text.includes('A second mixed answer counts as declining that question.'), text);
+  assert.doesNotMatch(text, /wins over the others/);
 });

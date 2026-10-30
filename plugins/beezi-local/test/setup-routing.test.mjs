@@ -42,8 +42,8 @@ function fakeCtx(outputs, answers) {
   const asked = [];
   const printed = [];
   const queue = answers.slice();
-  const next = (kind, question, options) => {
-    asked.push({ kind, question, options });
+  const next = (kind, question, options, opts) => {
+    asked.push({ kind, question, options, opts });
     return Promise.resolve(queue.length ? queue.shift() : null);
   };
   return {
@@ -56,7 +56,7 @@ function fakeCtx(outputs, answers) {
     },
     ask: {
       choose: (q, o) => next('choose', q, o),
-      chooseMany: (q, o) => next('chooseMany', q, o),
+      chooseMany: (q, o, opts) => next('chooseMany', q, o, opts),
       confirm: (q) => next('confirm', q),
       text: (q) => next('text', q),
     },
@@ -122,11 +122,13 @@ test('a folder label with unbalanced parentheses is asked about by its path, nev
   assert.deepEqual(ruleArgv(place, 'k1', 't1'), ['rule', 'add', '--folder', '/Users/dev/notes :)', '--account', 'k1', 't1', '--defer-upload']);
 });
 
-test('tenantsArg joins picked tenants; the Don\'t track option wins', () => {
+test('tenantsArg joins picked tenants in pick order; Don\'t track alone is none, and a mix throws', () => {
   const workspaces = parseWorkspaces(ROUTES);
   assert.equal(tenantsArg([0, 1], workspaces), 't1,t2');
+  assert.equal(tenantsArg([1, 0], workspaces), 't2,t1');
   assert.equal(tenantsArg([1], workspaces), 't2');
-  assert.equal(tenantsArg([0, 2], workspaces), 'none');
+  assert.equal(tenantsArg([2], workspaces), 'none');
+  assert.throws(() => tenantsArg([0, 2], workspaces), { message: "Don't track was combined with a workspace" });
 });
 
 test('ruleArgv builds argv without shell quoting', () => {
@@ -160,6 +162,7 @@ test('report never prints machine lines from stdout when a failing step has no s
 const LISTING = 'new-folders --history --account k1';
 const SETUP_QUESTION = 'Where should analytics from this machine go?';
 const PER_REPO = { label: 'Let me choose per repo', description: 'Beezi asks about each repo and folder with history next, and new ones when a session starts there' };
+const SEVERAL_OPTION = { label: 'Several workspaces…', description: 'Pick two or more; everything goes to each of them' };
 const unset = (history) => ok(`${W_LINES.join('\n')}\n${history}new-folders=ask set=no multi=yes account=k1\n`);
 
 test('askNewFolders asks only when set=no on a multi-workspace account', async () => {
@@ -173,7 +176,7 @@ test('askNewFolders asks only when set=no on a multi-workspace account', async (
   assert.equal(single.asked.length, 0);
 });
 
-test('askNewFolders asks one question: a workspace each, then per repo', async () => {
+test('askNewFolders asks one question: a workspace each, several, then per repo', async () => {
   const ctx = fakeCtx({ [LISTING]: unset('history=143 places=12\n') }, [1]);
   await askNewFolders(ctx, 'k1');
   assert.equal(ctx.asked[0].question, SETUP_QUESTION);
@@ -181,12 +184,13 @@ test('askNewFolders asks one question: a workspace each, then per repo', async (
   assert.deepEqual(ctx.asked[0].options, [
     { label: 'Acme', description: everything },
     { label: 'Beta Team', description: everything },
+    SEVERAL_OPTION,
     PER_REPO,
   ]);
   assert.deepEqual(ctx.runs, ['workspace.mjs new-folders --history --account k1', 'workspace.mjs new-folders send t2 --account k1 --defer-upload']);
   assert.deepEqual(ctx.printed, ['✓ done']);
 
-  const perRepo = fakeCtx({ [LISTING]: unset('history=143 places=12\n') }, [2]);
+  const perRepo = fakeCtx({ [LISTING]: unset('history=143 places=12\n') }, [3]);
   await askNewFolders(perRepo, 'k1');
   assert.equal(perRepo.runs[1], 'workspace.mjs new-folders ask --account k1 --defer-upload');
 
@@ -200,9 +204,31 @@ test('askNewFolders asks one question: a workspace each, then per repo', async (
   assert.deepEqual(dismissed.printed, []);
 });
 
-test('one question, one option per workspace plus per repo, with history in the descriptions', () => {
+test('askNewFolders Several workspaces… asks which ones and sends everything to each, in pick order', async () => {
+  const ctx = fakeCtx({ [LISTING]: unset('history=143 places=12\n') }, [2, [1, 0]]);
+  await askNewFolders(ctx, 'k1');
+  assert.deepEqual(ctx.asked[1], {
+    kind: 'chooseMany', question: 'Which workspaces should get analytics from this machine?',
+    options: [{ label: 'Acme', description: 'Owner' }, { label: 'Beta Team', description: 'Beezi workspace' }], opts: undefined,
+  });
+  assert.equal(ctx.runs[1], 'workspace.mjs new-folders send t2,t1 --account k1 --defer-upload');
+
+  const one = fakeCtx({ [LISTING]: unset('') }, [2, [1]]);
+  await askNewFolders(one, 'k1');
+  assert.equal(one.runs[1], 'workspace.mjs new-folders send t2 --account k1 --defer-upload');
+
+  for (const answer of [null, []]) {
+    const dismissed = fakeCtx({ [LISTING]: unset('') }, [2, answer]);
+    await askNewFolders(dismissed, 'k1');
+    assert.equal(dismissed.runs.length, 1);
+    assert.deepEqual(dismissed.printed, []);
+  }
+});
+
+test('one question, one option per workspace, several, then per repo, with history in the descriptions', () => {
   const options = setupOptions([{ name: 'Acme', tenant: 'A' }, { name: 'Beta', tenant: 'B' }], { sessions: 37, places: 4 });
-  assert.deepEqual(options.map((o) => o.label), ['Acme', 'Beta', 'Let me choose per repo']);
+  assert.deepEqual(options.map((o) => o.label), ['Acme', 'Beta', 'Several workspaces…', 'Let me choose per repo']);
+  assert.deepEqual(options[2], SEVERAL_OPTION);
   assert.equal(options[0].description, 'Everything goes here: new repos and folders, and 4 with history (37 past sessions)');
   assert.equal(setupOptions([{ name: 'Acme' }], { sessions: 1, places: 0 })[0].description, 'Everything goes here: new repos and folders, and 1 past session');
   assert.equal(setupOptions([{ name: 'Acme' }], null)[0].description, 'Everything goes here, starting with new repos and folders');
@@ -230,7 +256,7 @@ test('askNewFolders reports a failing listing and asks nothing', async () => {
 });
 
 test('reviewRoutes with 4 or fewer places asks per place and prints the no-folder line once', async () => {
-  const ctx = fakeCtx({ 'routes --account k1': ok(ROUTES) }, [[0], [], [1, 2]]);
+  const ctx = fakeCtx({ 'routes --account k1': ok(ROUTES) }, [[0], [], [2]]);
   await reviewRoutes(ctx, 'k1');
   assert.deepEqual(ctx.asked.map((a) => a.question), [
     '(1 of 3) Where should analytics for api go?',
@@ -243,6 +269,12 @@ test('reviewRoutes with 4 or fewer places asks per place and prints the no-folde
     'workspace.mjs rule add --outside --account k1 none --defer-upload',
   ]);
   assert.equal(ctx.printed[0], '2 other past sessions have no recorded folder and are not sent.');
+});
+
+test('askPerPlace passes Don\'t track as the exclusive choice', async () => {
+  const ctx = fakeCtx({ 'routes --account k1': ok(ROUTES) }, [[0], [], [2]]);
+  await reviewRoutes(ctx, 'k1');
+  assert.deepEqual(ctx.asked.map((a) => a.opts), [{ exclusive: [2] }, { exclusive: [2] }, { exclusive: [2] }]);
 });
 
 test('reviewRoutes with routes=0 asks nothing', async () => {
@@ -322,7 +354,7 @@ function manyJoined(n) {
 test('reviewJoined with more than 4 places offers add-all, choose repos or leave', async () => {
   const add = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [0]);
   await reviewJoined(add, 'k1');
-  assert.equal(add.asked[0].question, 'You joined Beta Team. Where should analytics for these 5 repos and folders go?');
+  assert.equal(add.asked[0].question, 'You joined Beta Team. Where should analytics for these 5 repos and folders go? Their past sessions will be sent there too.');
   assert.deepEqual(add.asked[0].options.map((o) => o.label), ['Add Beta Team to all 5', 'Choose repos', 'Leave them as they are']);
   assert.equal(add.runs[1], 'workspace.mjs joined add-all --account k1 --defer-upload');
 
@@ -360,7 +392,7 @@ test('reviewJoined asks one repo picker per new tenant', async () => {
   await reviewJoined(ctx, 'k1');
   const screens = ctx.asked.filter((a) => a.kind === 'chooseMany');
   assert.equal(screens.length, 2);
-  assert.equal(screens[0].question, 'Which repos and folders should also send analytics to Acme?');
+  assert.match(screens[0].question, /send analytics to Acme/);
   assert.match(screens[1].question, /send analytics to Beta/);
   assert.deepEqual(ctx.runs, [
     'workspace.mjs joined --account k1',

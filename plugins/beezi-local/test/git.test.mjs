@@ -1,6 +1,6 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { taskFromBranch, sanitizeRemote, canonicalRemote, TASK_BRANCH_RE } from '../lib/git.mjs';
+import { taskFromBranch, sanitizeRemote, TASK_BRANCH_RE } from '../lib/git.mjs';
 
 test('taskFromBranch — extracts task token from a task branch', () => {
   assert.equal(taskFromBranch('feature/task-abc-123'), 'task-abc-123');
@@ -54,25 +54,4 @@ const REMOTE_CASES = [
 ];
 test('sanitizeRemote — table', () => {
   for (const [input, want] of REMOTE_CASES) assert.equal(sanitizeRemote(input), want, input);
-});
-
-// The `hashed` values of the repo rows in test/fixtures/anonymization-vectors.json.
-const CANONICAL_REMOTE_CASES = [
-  ['git@github.com:Acme/Payments.git', 'github.com/acme/payments'],
-  ['https://github.com/acme/payments', 'github.com/acme/payments'],
-  ['https://user:tok@github.com/acme/payments.git/', 'github.com/acme/payments'],
-  ['HTTPS://GitHub.com/Acme/Payments', 'github.com/acme/payments'],
-  ['https://www.github.com/acme/payments', 'github.com/acme/payments'],
-  ['ssh://git@ssh.github.com:443/acme/payments.git', 'github.com/acme/payments'],
-  ['ssh://git@altssh.gitlab.com:443/group/sub/proj.git', 'gitlab.com/group/sub/proj'],
-  ['git@ssh.dev.azure.com:v3/org/proj/repo', 'dev.azure.com/org/proj/repo'],
-  ['org@vs-ssh.visualstudio.com:v3/org/proj/repo', 'dev.azure.com/org/proj/repo'],
-  ['https://org@dev.azure.com/org/proj/_git/repo', 'dev.azure.com/org/proj/repo'],
-  ['https://org.visualstudio.com/DefaultCollection/proj/_git/repo', 'dev.azure.com/org/proj/repo'],
-  ['https://dev.azure.com/org/_git/repo', 'dev.azure.com/org/repo/repo'],
-  ['https://gitlab.example.com:8443/team/app.git?x=1#frag', 'gitlab.example.com/team/app'],
-  ['github.com/Acme/Payments.git', 'github.com/acme/payments.git'],
-];
-test('canonicalRemote — table', () => {
-  for (const [input, want] of CANONICAL_REMOTE_CASES) assert.equal(canonicalRemote(input), want, input);
 });

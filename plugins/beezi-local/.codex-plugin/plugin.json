@@ -1,6 +1,6 @@
 {
   "name": "beezi-local",
-  "version": "0.24.1-local.6002",
+  "version": "0.24.0-local.6085",
   "description": "Reports Codex session token analytics for Beezi task branches, and drafts tickets to create on your board (Jira / Azure DevOps) or in Beezi. — local environment build.",
   "author": {
     "name": "Beezi"

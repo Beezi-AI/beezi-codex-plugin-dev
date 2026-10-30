@@ -3,8 +3,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { NO_NEW_LINE, WRITER_BUSY_LINE, ACCEPT_BUSY_LINE, PENDING_UNREADABLE_TEXT } from '../lib/history-cli.mjs';
-import { CHANGED_LINE } from '../lib/history-offer.mjs';
 
 // The login surface's cross-file contract, in the shape test/sync-surface.test.mjs uses.
 //
@@ -74,15 +72,14 @@ test('login skill — one script runs the steps, and the beezi_login path resume
   assert.ok(text.includes('node "<plugin-root>/scripts/login-flow.mjs" --account <key> --from <step>'));
   // Every stop the script can print has a row in the skill's table, and the script still prints it.
   const flow = read('scripts', 'login-flow.mjs');
-  for (const step of ['stop', 'setup', 'here', 'tier', 'joined', 'routes', 'history', 'default']) {
+  for (const step of ['stop', 'setup', 'here', 'tier', 'joined', 'routes', 'backfill']) {
     assert.ok(flow.includes(`'${step}'`), `login-flow.mjs no longer prints next=${step}`);
     assert.match(skill, new RegExp(`^\\| \`${step}\` +\\|`, 'm'), `the skill has no row for next=${step}`);
   }
-  assert.doesNotMatch(skill, /^\| `backfill` +\|/m, 'login no longer runs a one-time import');
   assert.ok(!text.includes('workspace.mjs" new-folders --account <key>'), 'the New folders listing is the script\'s now');
 });
 
-test('login skill — the one setup question uses the tool for at most 2 workspaces, else one numbered sentence', () => {
+test('login skill — the one setup question uses the tool for at most 2 workspaces without "Several workspaces…", else one numbered sentence', () => {
   const text = flat(skill);
   assert.ok(text.includes('"Where should analytics from this machine go?"'));
   assert.ok(!text.includes('<preview'), 'Codex options carry no previews (spec D5)');
@@ -90,9 +87,17 @@ test('login skill — the one setup question uses the tool for at most 2 workspa
   assert.match(text, /\*\*`request_user_input`\*\* only when that tool is listed this turn \*\*and\*\* there are at most 2 `W\.` lines \(3 choices\)/);
   assert.match(text, /split at the last ` — ` into the label and the description/);
   assert.match(text, /3 or more `W\.` lines — one plain sentence with the `O` lines as a numbered list, never a 4-option `request_user_input` call/);
-  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenant> --account <key> --defer-upload'));
+  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenants> --account <key> --defer-upload'));
+  assert.ok(!text.includes('new-folders send <tenant> '));
+  assert.ok(text.includes('one choice per `O` line in order except the "Several workspaces…" line'));
+  assert.ok(text.includes('"Where should analytics from this machine go? Pick one, or name several under Other."'));
+  assert.ok(text.includes('"Which workspaces should get analytics from this machine: Acme (Owner), Beta (User), Gamma (User) — one or more?"'));
   assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload'));
   assert.ok(!text.includes('"Ask me (recommended)"'), 'the old three-way New folders question is gone');
+  assert.ok(text.includes('Every `O` line is numbered, "Several workspaces…" included.'));
+  assert.ok(text.includes('Two or more numbers that include the "Several workspaces…" or the "Let me choose per repo" number are a dismissal'));
+  assert.ok(text.includes('and "both" or "all" is every `W.` line; one that names none, or names a workspace together with "per repo", is a dismissal.'));
+  assert.ok(text.includes('and so is an answer that names a workspace together with "per repo"'));
 });
 
 test('login skill — describes the here: line as workspace.mjs prints it', () => {
@@ -117,33 +122,4 @@ test('login — the here question names the folder you\'re in, and the last choi
   assert.ok(!flat.includes('without the "(i of N) " prefix'), 'the here question has its own wording, not step 4a\'s');
   assert.ok(!flat.includes('Nothing from <short> is uploaded'));
   assert.ok(!flat.includes('outside a project folder is uploaded'));
-});
-
-test('login skill — step 4b asks each Q line and answers with accept or decline; no routing question uploads', () => {
-  const text = flat(skill);
-  assert.ok(text.includes('node "<plugin-root>/scripts/sync.mjs" --accept --account <key> --tenant <id> --token <token>'));
-  assert.ok(text.includes('`offer account=<key> tenant=<id> sessions=<n> audit=<yes|no> token=<token>`'));
-  assert.ok(text.includes('node "<plugin-root>/scripts/sync.mjs" --decline --account <key> --tenant <id>'));
-  assert.ok(text.includes('` Reply upload or not now.`'));
-  assert.ok(text.includes('No answer means no upload.'));
-  assert.ok(read('scripts', 'login-flow.mjs').includes("['--offer', '--past', '--account', key]"));
-  for (const name of ['login', 'sync']) {
-    assert.doesNotMatch(read('skills', name, 'SKILL.md'), /past sessions will be sent there too/, name);
-  }
-  assert.doesNotMatch(skill, /scripts\/backfill\.mjs|finalized/);
-});
-
-test('login skill — step 4b explains the no-new, busy-writer and changed-offer lines the scripts print', () => {
-  const text = flat(skill);
-  for (const [line, fragment] of [
-    [NO_NEW_LINE, 'no new past sessions to offer'],
-    [WRITER_BUSY_LINE, 'Codex is still saving analytics on this machine, so nothing was listed this time'],
-    [PENDING_UNREADABLE_TEXT, 'could not read Codex’s pending analytics on this machine'],
-    [ACCEPT_BUSY_LINE, 'your yes is saved, but this machine is busy, so nothing was uploaded yet'],
-    [CHANGED_LINE, 'these past sessions changed after the question was shown, so nothing was uploaded'],
-  ]) {
-    assert.ok(line.includes(fragment), fragment);
-    assert.ok(text.includes(fragment), `skills/login/SKILL.md should explain "${fragment}"`);
-  }
-  assert.ok(text.includes('Never retry `--accept`.'));
 });

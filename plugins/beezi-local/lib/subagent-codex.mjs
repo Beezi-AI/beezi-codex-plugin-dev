@@ -1,7 +1,7 @@
 import fs from 'fs';
 import path from 'path';
 import { codexSessionsDir } from './paths.mjs';
-import { scanRecords } from './session-name-codex.mjs';
+import { scanNumberedRecords } from './session-name-codex.mjs';
 import { ROLLOUT_HEAD_BYTES, ROLLOUT_RE } from './transcript-codex.mjs';
 import { orDefault } from './compat.mjs';
 
@@ -144,14 +144,19 @@ function str(v) {
 // Parse a bounded head of a rollout into records. Only the prefix matters here, and the prefix does
 // not scale with the session, so this never reads the whole file.
 //
-// Built on scanRecords rather than repeating it: that generator stops at the first record the caller
+// Built on scanNumberedRecords rather than repeating it: that generator stops at the first record the caller
 // stops asking for, and decodes through a streaming TextDecoder so a multi-byte UTF-8 sequence
 // straddling a chunk boundary does not become U+FFFD. A local `buf.toString()` here had exactly that
 // bug, and read the whole byte window before honouring maxRecords.
-export function readRolloutHead(transcriptPath, { maxBytes = HEAD_BYTES, maxRecords = HEAD_RECORDS } = {}) {
+export function readRolloutHead(transcriptPath, options) {
+  return readNumberedHead(transcriptPath, options).map((entry) => entry.rec);
+}
+
+// readRolloutHead with each record's physical line, as [{ rec, line }].
+function readNumberedHead(transcriptPath, { maxBytes = HEAD_BYTES, maxRecords = HEAD_RECORDS } = {}) {
   const out = [];
-  for (const rec of scanRecords(transcriptPath, { maxBytes })) {
-    out.push(rec);
+  for (const entry of scanNumberedRecords(transcriptPath, { maxBytes })) {
+    out.push(entry);
     if (out.length >= maxRecords) break;
   }
   return out;
@@ -273,15 +278,18 @@ export function rolloutStartedAt(transcriptPath) {
 // billed as one — unreadable, not a subagent, or a fork whose replayed prefix could not be
 // delimited. The caller treats all three the same way (skip), so they are one return value.
 export function inspectSubagentRollout(transcriptPath) {
-  const records = readRolloutHead(transcriptPath);
+  const entries = readNumberedHead(transcriptPath);
+  const records = entries.map((entry) => entry.rec);
   if (records.length === 0) return null;
 
   const identity = subagentIdentityFrom(records);
   if (!identity) return null;
 
-  const forkBoundaryLine = forkPrefixBoundary(records);
-  if (forkBoundaryLine === null) return null;
+  const boundary = forkPrefixBoundary(records);
+  if (boundary === null) return null;
 
+  // computeDelta's cursor counts physical lines, so blank and malformed prefix lines count too.
+  const forkBoundaryLine = boundary === 0 ? 0 : entries[boundary].line;
   return { forkBoundaryLine, ...identity };
 }
 

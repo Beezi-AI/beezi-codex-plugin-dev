@@ -11,9 +11,6 @@ import {
 } from './workspace.mjs';
 import { bindSessionRoutes, createRouteContext, routeKeyForDir, shortLabel, usesRules } from './workspace-rules.mjs';
 import { resultLine } from './pending-history.mjs';
-import { OfferCheck } from './history-offer.mjs';
-import { offerChecksFor } from './history-trigger.mjs';
-import { naming } from './paths.mjs';
 
 // Only a new session or a clear asks; resume and compact never do.
 export const ASK_SOURCES = ['startup', 'clear'];
@@ -22,6 +19,8 @@ const TOOL_MAX_WORKSPACES = 2;
 const TOOL_MAX_QUESTIONS = 3;
 // request_user_input headers are at most 12 characters.
 const TOOL_HEADER = 'Beezi';
+// The re-ask lead for an answer that mixes a "Don't track" choice with a workspace.
+const MIXED_LEAD = '"Don\'t track" can\'t be combined with a workspace — pick one or the other.';
 
 // Resolved from this module, not cwd: hooks run with the user's repository as their working directory.
 export function pluginRoot(deps = {}) {
@@ -31,7 +30,7 @@ export function pluginRoot(deps = {}) {
   return root.replace(/\\/g, '/');
 }
 
-async function promptRows(deps) {
+async function linkedRows(deps) {
   const accounts = await import('./accounts.mjs');
   const listAccounts = deps.listAccounts == null ? accounts.listAccounts : deps.listAccounts;
   const rows = await listAccounts(deps);
@@ -139,8 +138,9 @@ function promptText(asks) {
     const idsOf = one
       ? 'the chosen workspaces\' ids joined by commas'
       : `the ids of the workspaces chosen for ${emailOf(a.row)} joined by commas`;
-    parts.push(`${lead} \`${a.command}\`. \`<ids>\` is ${idsOf} (${a.ids}), or \`none\` when "${a.dontTrack}" is chosen; it wins over the others.`);
+    parts.push(`${lead} \`${a.command}\`. \`<ids>\` is ${idsOf} (${a.ids}), or \`none\` only when "${a.dontTrack}" is the whole answer.`);
   });
+  parts.push(`If an answer has a "Don't track" choice together with a workspace, run nothing for it and ask that question once more, starting with: \`${MIXED_LEAD}\` A second mixed answer counts as declining that question.`);
   // A hook message carries none of a skill's framing, so the sandbox escalation is spelled out here.
   // Up front, not on refusal: the write lands outside the workspace and the guard reads the OS
   // credential store, which macOS Seatbelt blocks (lib/codex-sandbox.mjs), so a sandboxed run never succeeds.
@@ -156,7 +156,7 @@ export async function markPendingWorkspace(input, deps = {}) {
   if (input == null || typeof input.session_id !== 'string' || input.session_id === '') return null;
   const sessionId = input.session_id;
   const cwd = inputCwd(input);
-  const rows = await promptRows(deps);
+  const rows = await linkedRows(deps);
   const bound = rows.filter(usesRules);
   if (bound.length === 0) return null;
   const ctx = createRouteContext();
@@ -208,7 +208,7 @@ function joinedPromptText(rows, root, sessionId) {
     '(2) leave out the "Add … to all" choice when every J line ends in now=pending or now=none;',
     '(3) each repo-pick question asks which of one new workspace\'s repos and folders should also send analytics to it, and its answer runs a `joined pick` command (the `J<i>-command=` printed for that repo or folder, run unchanged except its final `<tenant>`, which becomes that workspace\'s `tenant=` id); ask with request_user_input (header "Beezi") where the skill allows request_user_input and that tool is available this turn; otherwise do the user\'s request first and end your reply with that question as one plain sentence (for a repo pick, one that lists that workspace\'s repos and folders as a numbered list), and act on the answer when it arrives;',
     '(4) a skipped or ignored question runs nothing; it is asked again next session;',
-    `(5) stop after that part: do not run routes; then run EXACTLY \`node "${root}/scripts/sync.mjs" --offer --past --account <key>\` with escalated permissions and act on its output. ${offerAnswerSteps(root)}`,
+    '(5) stop after that part: run neither routes nor sync.mjs, because the upload starts by itself.',
   ];
   // The current-folder question below was built before this pass, so it is asked only if the pass left this folder without a rule.
   if (sessionId != null) {
@@ -218,23 +218,22 @@ function joinedPromptText(rows, root, sessionId) {
   return parts.join(' ');
 }
 
-// SessionStart: the joined re-pick, asked on startup or clear until the join is reviewed; null when nothing is new,
-// else its text and the accounts whose offer its item (5) runs.
+// SessionStart: the joined re-pick, asked on startup or clear until the join is reviewed; null when nothing is new.
 export async function buildJoinedPrompt(input, deps = {}) {
   if (input == null) return null;
   if (input.source != null && ASK_SOURCES.indexOf(input.source) === -1) return null;
-  const fresh = (await promptRows(deps)).filter((row) => newTenantsOf(row).length > 0);
+  const fresh = (await linkedRows(deps)).filter((row) => newTenantsOf(row).length > 0);
   if (fresh.length === 0) return null;
   const rows = await withUsableLogin(fresh, deps);
   const sessionId = typeof input.session_id === 'string' && input.session_id !== '' ? input.session_id : null;
-  return rows.length === 0 ? null : { context: joinedPromptText(rows, pluginRoot(deps), sessionId), keys: rows.map((row) => row.key) };
+  return rows.length === 0 ? null : joinedPromptText(rows, pluginRoot(deps), sessionId);
 }
 
 // SessionStart: one user-only line per finished history upload, shown once on startup or clear.
 export async function buildHistoryNotice(input, deps = {}) {
   if (input == null) return null;
   if (input.source != null && ASK_SOURCES.indexOf(input.source) === -1) return null;
-  const rows = await promptRows(deps);
+  const rows = await linkedRows(deps);
   const waiting = rows.filter((row) => Array.isArray(row.historyResults) && row.historyResults.length > 0);
   if (waiting.length === 0) return null;
   const take = deps.takeHistoryResults == null ? (await import('./accounts.mjs')).takeHistoryResults : deps.takeHistoryResults;
@@ -243,50 +242,7 @@ export async function buildHistoryNotice(input, deps = {}) {
     let taken = [];
     try { taken = await take(row.key); } catch { continue; }
     const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
-    for (const result of taken) lines.push(resultLine(result, { prefix, nameOf: (id) => nameOf(row, id), syncName: `\`${naming.syncCommand()}\`` }));
+    for (const result of taken) lines.push(resultLine(result, { prefix, nameOf: (id) => nameOf(row, id), syncName: 'the sync skill' }));
   }
   return lines.length === 0 ? null : lines.join('\n');
-}
-
-// Linked accounts that can produce a token: the ones a session-start offer or offer scan may run for.
-export async function usableRows(deps = {}) {
-  return withUsableLogin(await promptRows(deps), deps);
-}
-
-// How to ask and answer what the offer command prints; shared by the session-start offer and the joined pass.
-function offerAnswerSteps(root) {
-  const sync = `node "${root}/scripts/sync.mjs"`;
-  return [
-    'If it prints `offers=0`, say nothing about past sessions.',
-    'Write every line that is not a `Q `, `offer ` or `offers=` line verbatim, in order, inside one plain fenced code block (```), so their 2- and 4-space indents survive.',
-    `If a request_user_input tool is available this turn and there are at most ${TOOL_MAX_QUESTIONS} \`offer\` lines, use it in one call, header "${TOOL_HEADER}", one question per \`offer\` line: id "beezi_history_<key>_<i>", the matching \`Q \` line without \`Q \` as its text, and the options "Upload now" (description "Send these sessions now") and "Not now" (description "Nothing is sent; run \`${naming.syncCommand()}\` later"). Mark none as recommended.`,
-    'Otherwise, after the user\'s request, end your reply with one plain sentence per offer: the question, then " Reply upload or not now."',
-    `On "Upload now", run \`${sync} --accept --background --account <key> --tenant <id> --token <token>\`. On "Not now", an Other answer or a dismissed question, run \`${sync} --decline --account <key> --tenant <id>\`.`,
-    '`<key>` and `<id>` are the `account=` and `tenant=` values of that question\'s `offer` line, `<token>` is the `token=` value of that `offer` line, and `<i>` is that line\'s position, from 1.',
-    'Run both commands with escalated permissions too. Show the user only the first line of the accept command\'s output, and nothing from the decline command.',
-  ].join(' ');
-}
-
-function historyOfferText(keys, root) {
-  const commands = keys.map((key) => `\`node "${root}/scripts/sync.mjs" --offer --past --account ${key}\``).join(', then ');
-  return [
-    'Beezi has past Codex sessions it can offer to upload.',
-    'Skip this entirely in a non-interactive run where no user can answer, and run nothing.',
-    `Otherwise run EXACTLY ${commands} with escalated permissions from the start: it reads Beezi's sign-in from the system credential store and writes Beezi's settings outside the workspace, so the sandbox cannot run it.`,
-    offerAnswerSteps(root),
-    'Then continue with the user\'s request.',
-  ].join(' ');
-}
-
-// SessionStart: the instruction to run the offer command for every account with an offer ready, except `skipKeys`
-// (another prompt already runs it); the text and those accounts, or null. It records nothing.
-export async function buildHistoryOffer(input, deps = {}, { checks = null, skipKeys = [] } = {}) {
-  if (input == null) return null;
-  if (input.source != null && ASK_SOURCES.indexOf(input.source) === -1) return null;
-  const nowMs = deps.now == null ? Date.now() : deps.now();
-  // Index checks first, so the credential store is asked only when an offer is ready.
-  const ready = (await promptRows(deps)).filter((row) => skipKeys.indexOf(row.key) === -1
-    && offerChecksFor(row, nowMs, deps, checks).some((c) => c.check === OfferCheck.SHOW));
-  const keys = (await withUsableLogin(ready, deps)).map((row) => row.key);
-  return keys.length === 0 ? null : { context: historyOfferText(keys, pluginRoot(deps)), keys };
 }

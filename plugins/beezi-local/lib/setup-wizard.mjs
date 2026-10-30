@@ -1,7 +1,6 @@
 import { BillingSource, CHATGPT_PLANS } from './billing.mjs';
-import { naming } from './paths.mjs';
 import {
-  askNewFolders, lastLine, outputLines, printable, report, reviewJoined, reviewRoutes, token,
+  askNewFolders, lastLine, outputLines, report, reviewJoined, reviewRoutes, token,
 } from './setup-routing.mjs';
 
 // One `accounts.mjs list` row: "  <n>. <description> [<key>]", then "  (default, revoked)" marks when any.
@@ -13,11 +12,8 @@ export const WORKSPACES_LABEL = 'Checking your workspaces…';
 export const PLAN_LABEL = 'Checking your plan…';
 export const SESSIONS_LABEL = 'Looking at your past sessions…';
 export const UPLOAD_LABEL = 'Uploading past sessions…';
-// sync.mjs --accept prints this once per batch; the wizard shows it on the activity line instead.
+// backfill.mjs prints this once per batch; the wizard shows it on the activity line instead.
 export const UPLOAD_PROGRESS = /^Beezi: (\d+)\/(\d+) sessions read…$/;
-export const OFFER_QUESTION = /^Q (.+)$/;
-export const OFFER_LINE = /^offer account=\S+ tenant=\S+ /;
-export const OFFER_COUNT = /^offers=\d+$/;
 export const SETTINGS_LABEL = 'Saving your settings…';
 const CAPTURED = / source=(\S+) plan=([^\s.]+)/;
 export const PLAN_EXPIRED = /Codex sign-in expired/;
@@ -102,10 +98,12 @@ export async function capturePlan(ctx, key) {
   report(ctx, await ctx.run('billing-capture.mjs', ['--plan', TIER_CHOICES[pick].value, '--via', 'login-user', '--account', key]));
 }
 
+export const FINALIZED = /your history pull is finalized/;
 export const STILL_DEFAULT = /still reads from this machine/;
 export const LINKED_AS = /linked as (.+?)\. (?:Nothing changed|Credentials stored)/;
 export const TRUST_PENDING = /run \/hooks in Codex/;
 const HOOK_OUTCOME = /^(?:[✓⚠]|Beezi: another )/;
+const FINALIZE_NOTE = 'History import is now closed for this account: past sessions on other machines can no longer be imported. New sessions are still tracked everywhere Beezi is installed.';
 const DEFAULT_UNCHANGED = 'The default account is unchanged. The settings skill (Account → Default account) switches it later.';
 const TRUST_NOTE = 'One step left in Codex: run /hooks and trust the Beezi entries.';
 const CRASH_QUESTION = 'How should Beezi crash reports work?';
@@ -124,33 +122,9 @@ async function checkHooks(ctx) {
   return result.stdout;
 }
 
-// Yes uploads exactly the sessions the summary showed, named by its `offer` line's token; No or a dismissal keeps them
-// declined and prints the D line.
-export function uploadChoices() {
-  return [{ label: 'Upload now' }, { label: 'Not now', description: `run ${naming.syncCommand()} any time` }];
-}
-
-async function answerOffer(ctx, key, line, question) {
-  const target = ['--account', key, '--tenant', token(line, 'tenant')];
-  if (await ctx.ask.choose(question, uploadChoices(), { defaultIndex: 0, escape: true }) === 0) {
-    const accept = ['--accept'].concat(target, ['--token', token(line, 'token')]);
-    await ctx.run('sync.mjs', accept, { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
-    return;
-  }
-  report(ctx, await ctx.run('sync.mjs', ['--decline'].concat(target)));
-}
-
-// Prints each workspace's summary and asks its question right after it, in the order sync.mjs listed them.
-async function offerHistory(ctx, key) {
-  const listed = await ctx.run('sync.mjs', ['--offer', '--past', '--account', key]);
-  let question = null;
-  for (const line of printable(listed.stdout)) {
-    const asked = OFFER_QUESTION.exec(line);
-    if (asked !== null) question = asked[1];
-    else if (OFFER_LINE.test(line)) await answerOffer(ctx, key, line, question);
-    else if (!OFFER_COUNT.test(line)) ctx.print(line);
-  }
-  if (listed.code !== 0) report(ctx, { code: listed.code, stdout: '', stderr: listed.stderr });
+async function uploadHistory(ctx, key) {
+  const result = await ctx.run('backfill.mjs', ['--via', 'login', '--account', key], { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
+  if (FINALIZED.test(result.stdout)) ctx.print(FINALIZE_NOTE);
 }
 
 // "<name> - <workspace>" from the sign-in's "linked as" sentence becomes "<name> (<workspace>)".
@@ -222,7 +196,7 @@ export async function runSetup(ctx) {
   ctx.progress(SESSIONS_LABEL);
   await reviewJoined(ctx, key);
   await reviewRoutes(ctx, key);
-  await offerHistory(ctx, key);
+  await uploadHistory(ctx, key);
   ctx.progress(SETTINGS_LABEL);
   await offerDefault(ctx, key, signInOutput);
   await chooseCrashMode(ctx);

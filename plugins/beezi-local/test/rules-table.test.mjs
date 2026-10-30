@@ -1,7 +1,6 @@
 import '../tools/hermetic-env.mjs';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
 import { createRouteContext, rulesTableLines } from '../lib/workspace-rules.mjs';
 import { TrackingMode, writeTrackingState } from '../lib/tracking.mjs';
 
@@ -77,15 +76,4 @@ test('with no account\'s workspaces known, the table asks for a new Codex thread
   assert.deepEqual(rulesTableLines([unknown], REPO, ctx(), { entries: [] }), [
     'Rules need the account\'s workspaces, which are not known yet. Start a new Codex thread and try again.',
   ]);
-});
-
-test('the settings skill says a rule change never uploads, under Rules and under New folders', () => {
-  const skill = fs.readFileSync(new URL('../skills/settings/SKILL.md', import.meta.url), 'utf8');
-  const line = 'A rule change never uploads past sessions. When the workspace\'s past-sessions setting is to offer them, Beezi looks for them '
-    + 'in the background and asks at a later session start; under either setting, the sync skill shows them and asks before it uploads anything.';
-  for (const section of ['## Rules\n', '## New folders\n']) {
-    const at = skill.indexOf(section);
-    assert.ok(at > -1, section);
-    assert.ok(skill.slice(at, skill.indexOf('\n## ', at + 1)).includes(line), section);
-  }
 });

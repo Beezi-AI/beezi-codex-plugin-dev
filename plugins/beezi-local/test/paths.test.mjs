@@ -26,7 +26,6 @@ import {
   codexSessionsDir,
   KNOWN_ENVIRONMENTS,
   environment,
-  naming,
   BEEZI_ENV,
   ENV_API_BASE,
 } from '../lib/paths.mjs';
@@ -251,21 +250,6 @@ test('BEEZI_ENV on a build with NO env.json still moves the namespace', () => {
   const r = resolveEnvironment({ envJson: { present: false, value: {} }, env: { BEEZI_ENV: 'staging' } });
   assert.equal(r.suffix, '-staging');
   assert.equal(r.apiBase, null);
-});
-
-// ── the plugin's own name ─────────────────────────────────────────────────────────────────────
-
-test('syncCommand names the production plugin with no variant environment', () => {
-  assert.equal(naming.pluginName(), 'beezi');
-  assert.equal(naming.syncCommand(), '$beezi:sync');
-});
-
-test('syncCommand names the variant plugin, as make-variant.sh names it', async (t) => {
-  // A fresh module instance, because BEEZI_ENV is read once at module load.
-  withEnv(t, 'BEEZI_ENV', 'staging');
-  const fresh = await import('../lib/paths.mjs?sync-command=staging');
-  assert.equal(fresh.naming.pluginName(), 'beezi-staging');
-  assert.equal(fresh.naming.syncCommand(), '$beezi-staging:sync');
 });
 
 test('a malformed baked apiBase is an error, not a silent drop to the default', () => {

@@ -1,7 +1,13 @@
 import { apiBase, ENDPOINTS } from './config.mjs';
 import { getJson, sessionOf } from './http.mjs';
-import { oneLine, orDefault } from './compat.mjs';
-import { parseAnonymization } from './anonymization.mjs';
+import { orDefault } from './compat.mjs';
+
+// Server-supplied names reach model-read lines, so control characters and line breaks collapse to one space.
+function oneLine(value) {
+  if (typeof value !== 'string') return null;
+  const text = value.replace(/[\u0000-\u001f\u007f-\u009f\u2028\u2029]+/g, ' ').trim();
+  return text === '' ? null : text;
+}
 
 // Absent list → null (unknown, old server), never []; entries without a string id are dropped.
 function parseTenants(raw) {
@@ -14,13 +20,14 @@ function parseTenants(raw) {
       role: oneLine(t.role),
       type: oneLine(t.type),
       joinedAt: typeof t.joinedAt === 'string' && Number.isFinite(Date.parse(t.joinedAt)) ? t.joinedAt : null,
-      anonymization: parseAnonymization(t.anonymization, t.id, t.pastSessions),
     }));
 }
 
 // Resolve one session's validity/identity against the portal.
 // Returns { valid: true, email, name, tenantId, tenantName, tenantTier, trackingMode,
-// tenants, anonymization } | { valid: false } | null (offline/unknown). trackingMode gates live reporting.
+// backfillCompleted, tenants } | { valid: false } | null (offline/unknown). The tracking/backfill fields
+// drive the session-history import: trackingMode gates live reporting, backfillCompleted is the
+// server's authority on whether this account+tool's one-time pull is already sealed.
 //
 // `session` is { token, clientId }, not a bare token — getJson demands it, because the client id
 // has to travel with the bearer once a machine can have several accounts linked.
@@ -52,9 +59,9 @@ export async function whoami(session, deps = {}) {
       tenantName: orDefault(body.tenantName, null),
       tenantTier: orDefault(body.tenantTier, null),
       trackingMode: orDefault(body.trackingMode, null),
+      backfillCompleted: body.backfillCompleted === true,
       // Every workspace this user belongs to; null (not []) when the portal predates the list.
       tenants: parseTenants(body.tenants),
-      anonymization: parseAnonymization(body.anonymization, body.tenantId, body.pastSessions),
     };
   } catch {
     return null;

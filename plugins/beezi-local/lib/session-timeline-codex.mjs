@@ -1,5 +1,4 @@
 import { fetchCompat } from './fetch-compat.mjs';
-import fs from 'fs';
 import path from 'path';
 import { timelineWaits, isBackgroundNotification, isTimelineUserPrompt } from './timeline-waits-codex.mjs';
 import { toolNamesFromProgram } from './exec-program.mjs';
@@ -10,6 +9,7 @@ import { postJson } from './http.mjs';
 import { orDefault, parseTimestampMs } from './compat.mjs';
 import { skillInjectionOf, skillReadsOfCall } from './skills-codex.mjs';
 import { editedPathsOf } from './code-changes-codex.mjs';
+import { readRolloutLines } from './transcript-reader-codex.mjs';
 
 // Whole-session activity timeline, derived from a Codex rollout. Same output contract as the Claude
 // engine ({ periods, plan_events, subagents, started_at, ended_at, generated_at }), so the server
@@ -49,16 +49,8 @@ const STATE = {
 // charted `idle` before this.
 const BREAK_GAP_SEC = 6 * 60 * 60;
 
-function parseTranscript(transcriptPath) {
-  const content = fs.readFileSync(transcriptPath, 'utf-8');
-  const trimmed = content.replace(/\n+$/, '');
-  if (trimmed === '') return [];
-  const out = [];
-  for (const raw of trimmed.split('\n')) {
-    if (!raw.trim()) continue;
-    try { out.push(JSON.parse(raw)); } catch { /* skip malformed */ }
-  }
-  return out;
+function parseTranscript(transcriptPath, readLines) {
+  return readLines(transcriptPath).records.filter((record) => record !== null);
 }
 
 function tsOf(rec) {
@@ -438,7 +430,7 @@ function buildSubagents(agents, fallbackEndMs) {
 
 export function computeSessionTimeline(transcriptPath, sessionId = null, deps = {}) {
   let records;
-  try { records = parseTranscript(transcriptPath); } catch { return null; }
+  try { records = parseTranscript(transcriptPath, orDefault(deps.readLines, readRolloutLines)); } catch { return null; }
 
   const skillPlan = buildSkillPlanCycles(records);
   const periods = buildPeriods(records, skillPlan.intervals);

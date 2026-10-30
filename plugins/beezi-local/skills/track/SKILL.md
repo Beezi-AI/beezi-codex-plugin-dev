@@ -123,16 +123,18 @@ from sessions outside a project folder is sent" for `outside`). Several workspac
   or more — or don't track acme-api?"
 
 When the answer arrives, run, with `<ids>` = the chosen workspaces' `tenant=` values joined by commas
-(e.g. `t1,t2`), or `none` when the last choice was picked (it wins over the others):
+(e.g. `t1,t2`), or `none` only when the last choice is the whole answer:
 
 ```
 node "<plugin-root>/scripts/workspace.mjs" rule add --current --account <key> <ids>
 ```
 
 Show the user only its first line (a `✗` line too). The held analytics then go where the answer
-says with the next checkpoint — the next `track` run, while the hooks are not trusted. A skipped or declined
-question runs nothing and changes nothing: the analytics stay held, and the next `track` run asks
-again.
+says with the next checkpoint — the next `track` run, while the hooks are not trusted. An answer with
+the last choice together with any workspace runs nothing: ask the same question once more, starting
+with `"Don't track" can't be combined with a workspace — pick one or the other.` A second mixed
+answer counts as a declined question. A skipped or declined question runs nothing and changes
+nothing: the analytics stay held, and the next `track` run asks again.
 
 ## When to suggest the hooks instead
 

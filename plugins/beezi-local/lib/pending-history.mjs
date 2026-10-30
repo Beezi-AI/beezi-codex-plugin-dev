@@ -1,5 +1,3 @@
-import { isId } from './anonymization.mjs';
-
 // Pure helpers for the per-account pending-history marker and its notice results; no I/O.
 
 export const HISTORY_RETRY_MS = 60 * 60 * 1000;
@@ -20,18 +18,10 @@ export const RunOutcome = Object.freeze({
 
 export const SettleState = Object.freeze({ CLEARED: 'cleared', KEPT: 'kept', GAVE_UP: 'gave-up', MISSING: 'missing' });
 
-// The workspace of a one-workspace account, else the block's, else the row's (an older portal sends no tenants).
-export function workspaceIdOf(row) {
-  const tenants = Array.isArray(row.tenants) ? row.tenants : [];
-  if (tenants.length === 1 && tenants[0] != null && isId(tenants[0].id)) return tenants[0].id;
-  if (row.anonymization != null && isId(row.anonymization.tenantId)) return row.anonymization.tenantId;
-  return isId(row.tenantId) ? row.tenantId : null;
-}
-
 function memberIds(row) {
-  if (Array.isArray(row.tenants)) return row.tenants.filter((t) => t != null && typeof t.id === 'string').map((t) => t.id);
-  const id = workspaceIdOf(row);
-  return id == null ? [] : [id];
+  return Array.isArray(row.tenants)
+    ? row.tenants.filter((t) => t != null && typeof t.id === 'string').map((t) => t.id)
+    : [];
 }
 
 function entriesOf(row) {
@@ -53,11 +43,22 @@ export function newFoldersSendIds(row) {
 }
 
 // Every workspace a written rule sends to (members only, in member order); a one-workspace account sends unless the rule is [].
-// Re-opening a workspace the place already sent to is harmless: its re-scan leaves out remembered declines and sessions Beezi holds in full.
+// Requesting ids the place already sent to is harmless: the worker uploads only sessions a workspace lacks.
 export function ruleRequestIds(row, tenantIds) {
   const members = memberIds(row);
   if (members.length === 1) return tenantIds.length === 0 ? [] : members;
   return members.filter((id) => tenantIds.indexOf(id) !== -1);
+}
+
+// After a rule is removed its places fall through to some remaining rule or New folders "send", so this requests
+// every member those still reach (a one-workspace account: its workspace); over-requesting is harmless, as above.
+export function removalRequestIds(row) {
+  const members = memberIds(row);
+  if (members.length === 1) return members;
+  const rules = Array.isArray(row.workspaceRules) ? row.workspaceRules : [];
+  const reached = newFoldersSendIds(row);
+  for (const r of rules) if (r != null && Array.isArray(r.tenantIds)) reached.push(...r.tenantIds);
+  return members.filter((id) => reached.indexOf(id) !== -1);
 }
 
 // Ids in `after` that `before` lacks, once each, in `after` order.
@@ -65,35 +66,19 @@ export function gainedIds(before, after) {
   return after.filter((id, i) => before.indexOf(id) === -1 && after.indexOf(id) === i);
 }
 
-const unique = (list) => list.filter((item, i) => isId(item) && list.indexOf(item) === i);
-
-// The kinds an entry was accepted under; none for an entry from before they were recorded.
-export function acceptedKindsOf(entry) {
-  return Array.isArray(entry.kinds) ? unique(entry.kinds) : [];
-}
-
-// An entry runs only for the session ids the developer accepted; one without them is dropped.
-export function hasSessionIds(entry) {
-  return Array.isArray(entry.sessionIds) && entry.sessionIds.length > 0;
-}
-
-// Adds the workspace's entry for the accepted ids, or merges them into it (due now, counts kept);
-// drops entries without ids and workspaces the account left. `override` (a --tenant offer) sends the ids unrouted;
-// `kinds` are the kinds hidden at the yes, which the upload keeps hiding.
-export function requestHistory(row, tenantId, sessionIds, nowIso, { override = false, kinds = [] } = {}) {
-  const entries = pendingHistoryOf(row);
-  const ids = sessionIds.filter((id, i) => isId(id) && sessionIds.indexOf(id) === i);
-  if (memberIds(row).indexOf(tenantId) !== -1 && ids.length > 0) {
-    const found = entries.find((e) => e.tenantId === tenantId);
+// Adds an entry per gained workspace, or refreshes one (due now, counts kept); drops workspaces the account left.
+export function requestHistory(row, tenantIds, nowIso) {
+  const members = memberIds(row);
+  const entries = entriesOf(row).filter((e) => members.indexOf(e.tenantId) !== -1);
+  for (const id of tenantIds) {
+    if (members.indexOf(id) === -1) continue;
+    const found = entries.find((e) => e.tenantId === id);
     if (found != null) {
-      found.sessionIds = found.sessionIds.concat(ids.filter((id) => found.sessionIds.indexOf(id) === -1));
-      found.override = found.override === true || override;
-      found.kinds = unique(acceptedKindsOf(found).concat(kinds));
       found.requestedAt = nowIso;
       found.lastAttemptAt = null;
-    } else {
-      entries.push({ tenantId, sessionIds: ids, override, kinds: unique(kinds), requestedAt: nowIso, attempts: 0, lastAttemptAt: null, inFlight: false, sent: 0, skipped: 0, retryNoticed: false });
+      continue;
     }
+    entries.push({ tenantId: id, requestedAt: nowIso, attempts: 0, lastAttemptAt: null, inFlight: false, sent: 0, skipped: 0, retryNoticed: false });
   }
   if (entries.length > 0 || Array.isArray(row.pendingHistory)) row.pendingHistory = entries;
   return entries;
@@ -101,7 +86,7 @@ export function requestHistory(row, tenantId, sessionIds, nowIso, { override = f
 
 export function pendingHistoryOf(row) {
   const members = memberIds(row);
-  return entriesOf(row).filter((e) => members.indexOf(e.tenantId) !== -1 && hasSessionIds(e));
+  return entriesOf(row).filter((e) => members.indexOf(e.tenantId) !== -1);
 }
 
 // A retry trigger may start the worker: some entry was never tried, or not within the hour.

@@ -76,17 +76,37 @@ function isBookkeeping(rec) {
       || p.type === 'thread_settings_applied'));
 }
 
+// First index whose time is after `ms` (or at/after it when `inclusive`); `times` is ascending.
+function firstIndex(times, ms, inclusive) {
+  let lo = 0;
+  let hi = times.length;
+  while (lo < hi) {
+    const mid = (lo + hi) >>> 1;
+    if (inclusive ? times[mid] < ms : times[mid] <= ms) lo = mid + 1;
+    else hi = mid;
+  }
+  return lo;
+}
+
 export function timelineWaits(records) {
-  const timed = records.filter((r) => Number.isFinite(Date.parse(r.timestamp)))
-    .slice().sort((a, b) => Date.parse(a.timestamp) - Date.parse(b.timestamp));
+  // Parse each timestamp once; the stable sort keeps equal timestamps in input order.
+  const entries = [];
+  for (const rec of records) {
+    const ms = Date.parse(rec.timestamp);
+    if (Number.isFinite(ms)) entries.push({ rec, ms });
+  }
+  entries.sort((a, b) => a.ms - b.ms);
+  const timed = entries.map((e) => e.rec);
+  const times = entries.map((e) => e.ms);
   const calls = new Map();
   const asyncQuestions = new Set();
   const spans = [];
   let presentedPlan = false;
   let pendingQuestion = false;
   let betweenTurns = null;
-  for (const rec of timed) {
-    const ms = Date.parse(rec.timestamp);
+  for (let i = 0; i < timed.length; i++) {
+    const rec = timed[i];
+    const ms = times[i];
     const p = rec.payload || {};
     const event = rec.type === 'event_msg';
     const response = rec.type === 'response_item';
@@ -139,16 +159,16 @@ export function timelineWaits(records) {
   // Only classify complete observed waits, never extend an unanswered call to wall-clock now.
   // A main-thread work record inside a span ends the inference of continuous blocking. This
   // matters for parallel tool batches and makes async work stay working.
+  // Records are sorted by time, so each span scans only the records inside it.
   for (const span of spans) {
     let start = span.start;
-    for (const rec of timed) {
-      const ms = Date.parse(rec.timestamp);
-      if (ms <= span.start || ms >= span.end) continue;
-      if (!isBookkeeping(rec)) start = ms;
+    const innerEnd = firstIndex(times, span.end, true);
+    for (let i = firstIndex(times, span.start, false); i < innerEnd; i++) {
+      if (!isBookkeeping(timed[i])) start = times[i];
     }
-    for (const rec of timed) {
-      const ms = Date.parse(rec.timestamp);
-      if (ms <= start || ms > span.end) continue;
+    const end = firstIndex(times, span.end, false);
+    for (let i = firstIndex(times, start, false); i < end; i++) {
+      const ms = times[i];
       const existing = waits.get(ms);
       // Human decisions have a more specific cause than a concurrent machine wait.
       if (!existing || span.state === 'waiting_user') waits.set(ms, { state: span.state, subtype: span.subtype });

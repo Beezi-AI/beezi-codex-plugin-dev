@@ -6,7 +6,6 @@ import path from 'node:path';
 import { postSessionError } from '../lib/session-error-report.mjs';
 import { recordingFetch } from '../tools/suite-fixtures.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
-import { KINDS } from '../lib/anonymize.mjs';
 
 // A bare token is refused by lib/http.mjs: the client id names the machine row this report belongs
 // to, and with several accounts linked one account's id on another's bearer is a misattribution.
@@ -117,60 +116,3 @@ test('a 400 on a payload without resetsAt is not retried', async () => {
   assert.equal(res.reported, false);
   assert.equal(fetchImpl.calls.length, 1);
 });
-
-// An anonymized target receives the error without its text; resetsAt is a timestamp and stays.
-const kindsOn = (on) => Object.fromEntries(KINDS.map((kind) => [kind, on.includes(kind)]));
-const ANON_BLOCK = { tenantId: 'T1', kinds: kindsOn(['sessions']), key: 'ab'.repeat(32), machineName: null };
-const TEXT_ERROR = {
-  sessionId: 's1', error: 'rate_limit', errorDetails: 'quota for ACME Corp',
-  lastAssistantMessage: 'resets 4:30pm (Europe/Kiev)', occurredAt: '2026-07-08T10:00:00.000Z',
-  resetsAt: '2026-07-08T11:00:00.000Z',
-};
-
-test('an anonymized target is sent no error text and keeps resetsAt', async () => {
-  const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const session = { ...SESSION, tenantId: 'T1', tenants: [{ id: 'T1', anonymization: ANON_BLOCK }] };
-  const res = await postSessionError(TEXT_ERROR, session, { fetchImpl });
-  assert.equal(res.reported, true);
-  assert.deepEqual(JSON.parse(fetchImpl.calls[0].opts.body), {
-    sessionId: 's1', error: 'rate_limit', occurredAt: '2026-07-08T10:00:00.000Z', resetsAt: '2026-07-08T11:00:00.000Z',
-  });
-});
-
-test('the resetsAt retry to an anonymized target is scrubbed too', async () => {
-  const fetchImpl = recordingFetch(async (url, opts) => ({ status: JSON.parse(opts.body).resetsAt ? 400 : 200 }));
-  const session = { ...SESSION, anonymization: ANON_BLOCK };
-  await postSessionError(TEXT_ERROR, session, { fetchImpl, recordIssue: () => true });
-  assert.equal(fetchImpl.calls.length, 2);
-  for (const call of fetchImpl.calls) {
-    const body = JSON.parse(call.opts.body);
-    assert.equal('errorDetails' in body, false);
-    assert.equal('lastAssistantMessage' in body, false);
-  }
-});
-
-test('a target that is not anonymized still receives the error text', async () => {
-  const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const session = { ...SESSION, anonymization: { ...ANON_BLOCK, kinds: kindsOn([]) } };
-  await postSessionError(TEXT_ERROR, session, { fetchImpl });
-  assert.deepEqual(JSON.parse(fetchImpl.calls[0].opts.body), TEXT_ERROR);
-});
-
-test('a target with only repos on keeps errorDetails and lastAssistantMessage', async () => {
-  const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const session = { ...SESSION, anonymization: { ...ANON_BLOCK, kinds: kindsOn(['repos']) } };
-  await postSessionError(TEXT_ERROR, session, { fetchImpl });
-  assert.deepEqual(JSON.parse(fetchImpl.calls[0].opts.body), TEXT_ERROR);
-});
-
-test('with sessions off, a 3,000-character error message goes up as its first 1,000 characters', async () => {
-  const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  const long = 'x'.repeat(3000);
-  const session = { ...SESSION, anonymization: { ...ANON_BLOCK, kinds: kindsOn([]) } };
-  await postSessionError({ ...TEXT_ERROR, errorDetails: long, lastAssistantMessage: long }, session, { fetchImpl });
-  const body = JSON.parse(fetchImpl.calls[0].opts.body);
-  assert.equal(body.lastAssistantMessage, long.slice(0, 1000));
-  assert.equal(body.errorDetails, long.slice(0, 1000));
-  assert.equal(body.error, 'rate_limit');
-});
-

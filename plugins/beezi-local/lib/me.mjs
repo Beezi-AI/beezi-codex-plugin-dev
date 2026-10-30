@@ -50,13 +50,15 @@ function facts(account, deps) {
     return {
       tier: orDefault(who.tenantTier, null),
       mode: orDefault(who.trackingMode, null),
+      done: who.backfillCompleted === true,
     };
   }
   const cached = readTrackingState(account.key, deps);
-  if (!cached) return { tier: null, mode: null };
+  if (!cached) return { tier: null, mode: null, done: false };
   return {
     tier: orDefault(cached.tenantTier, null),
     mode: orDefault(cached.trackingMode, null),
+    done: cached.backfillCompleted === true,
   };
 }
 
@@ -81,7 +83,8 @@ function detail(account, deps) {
   if (problem !== null) return problem;
   const f = facts(account, deps);
   return `plan ${orDefault(f.tier, 'not recorded')}`
-    + ` · tracking ${orDefault(f.mode, 'not recorded')}`;
+    + ` · tracking ${orDefault(f.mode, 'not recorded')}`
+    + ` · history import ${f.done ? 'complete' : 'not finished'}`;
 }
 
 function accountBlock(account, position, defaultKey, deps) {
@@ -161,7 +164,7 @@ export async function accountHealth(account, deps = {}) {
   try {
     await orDefault(deps.updateAccount, _updateAccount)(account.key, {
       email: who.email, name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
-      tenants: who.tenants, anonymization: who.anonymization,
+      tenants: who.tenants,
     }, deps);
   } catch { /* best-effort — the sign-in itself checked out */ }
   return { ok: true, lines: [], identity: who };

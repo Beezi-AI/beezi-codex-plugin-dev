@@ -49,8 +49,11 @@ export const ENDPOINTS = Object.freeze({
   sessionsReport: "/sessions/report",
   sessionErrors: "/sessions/errors",
   sessionsTimeline: "/sessions/timeline",
-  // History sync (lib/session-coverage.mjs, G-3-3/G-9-3): /sessions/sync is tracking-policy-aware,
-  // and /sessions/coverage answers what the server actually holds. Both are agent-scoped by the
+  sessionsBackfill: "/sessions/backfill",
+  sessionsBackfillComplete: "/sessions/backfill/complete",
+  // Repeatable history repair (lib/session-coverage.mjs, G-3-3/G-9-3), as distinct from the
+  // one-time backfill above: /sessions/sync is tracking-policy-aware and never seals, and
+  // /sessions/coverage answers what the server actually holds. Both are agent-scoped by the
   // X-Beezi-Agent header rather than by the path.
   sessionsSync: "/sessions/sync",
   sessionsCoverage: "/sessions/coverage",

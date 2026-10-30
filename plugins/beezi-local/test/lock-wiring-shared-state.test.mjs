@@ -7,13 +7,15 @@ import {
   saveLedger,
   markImported,
   markUnreadable,
+  markComplete,
   isImported,
+  isComplete,
   wasUnreadable,
 } from '../lib/audit-ledger.mjs';
 import {
   readTrackingState,
+  markBackfillCompleted,
   markTrackingDisabled,
-  markTenantDark,
   markLinked,
 } from '../lib/tracking.mjs';
 import { auditLedgerFile, trackingStateFile } from '../lib/paths.mjs';
@@ -85,6 +87,21 @@ test('two runs that both loaded the same ledger keep BOTH their imported rows', 
   assert.equal(isImported(b, 'sess-A'), true);
 });
 
+test('a stale save can never un-seal a one-time pull', (t) => {
+  tmpHome(t);
+  const a = loadLedger(KEY, 'client-1');
+  const b = loadLedger(KEY, 'client-1'); // loaded while the pull was still open
+
+  markComplete(a);
+  assert.equal(saveLedger(KEY, a).written, true);
+
+  markImported(b, 'sess-B', { outcome: 'stored' });
+  assert.equal(saveLedger(KEY, b).written, true);
+
+  assert.equal(isComplete(loadLedger(KEY, 'client-1')), true,
+    'the seal is one-time and has no reopen, so `complete` merges as a logical OR');
+});
+
 test('an unreadable marker is not resurrected for a session that has since imported', (t) => {
   tmpHome(t);
   const a = loadLedger(KEY, 'client-1');
@@ -108,7 +125,8 @@ test('the merge never replays another login\'s imported set', (t) => {
   saveLedger(KEY, other);
 
   // A logout → login into a different workspace. loadLedger discards the foreign record; the save
-  // must discard it too, or the new tenant inherits an imported set it never uploaded.
+  // must discard it too, or the new tenant inherits an imported set it never uploaded and seals its
+  // own one-time pull empty.
   const mine = loadLedger(KEY, 'client-MINE');
   markImported(mine, 'sess-MINE', { outcome: 'stored' });
   saveLedger(KEY, mine);
@@ -144,33 +162,33 @@ test('a tracking write whose lock is held elsewhere defers without writing', (t)
   tmpHome(t);
   const holder = heldElsewhere(sharedLock(`tracking-${KEY}`));
 
-  const blocked = markTrackingDisabled(KEY, 'audit mode');
+  const blocked = markBackfillCompleted(KEY);
   assert.equal(blocked.written, false);
   assert.equal(blocked.reason, 'held');
   assert.equal(fs.existsSync(trackingStateFile(KEY)), false);
 
   assert.equal(holder.release().ok, true);
   forgetHeldLocks();
-  assert.equal(markTrackingDisabled(KEY, 'audit mode').written, true);
-  assert.equal(readTrackingState(KEY).trackingMode, 'disabled');
+  assert.equal(markBackfillCompleted(KEY).written, true);
+  assert.equal(readTrackingState(KEY).backfillCompleted, true);
 });
 
 test('every tracking mutator goes through the one lock, so none of them can clobber another', (t) => {
   tmpHome(t);
   assert.equal(markLinked(KEY).written, true);
   assert.equal(markTrackingDisabled(KEY, 'audit mode').written, true);
-  assert.equal(markTenantDark(KEY, 't1').written, true);
+  assert.equal(markBackfillCompleted(KEY).written, true);
 
   const state = readTrackingState(KEY);
   assert.ok(state.linkedAt, 'the link stamp survived two later merges');
   assert.equal(state.trackingMode, 'disabled');
-  assert.ok(state.darkTenants.t1);
+  assert.equal(state.backfillCompleted, true);
 
   const holder = heldElsewhere(sharedLock(`tracking-${KEY}`));
   for (const [name, call] of [
     ['markLinked', () => markLinked(KEY)],
     ['markTrackingDisabled', () => markTrackingDisabled(KEY, 'x')],
-    ['markTenantDark', () => markTenantDark(KEY, 't1')],
+    ['markBackfillCompleted', () => markBackfillCompleted(KEY)],
   ]) {
     const out = call();
     assert.equal(out.written, false, `${name} must take the same lock`);
@@ -190,7 +208,7 @@ test('rank-3 locks are never nested: tracking-while-holding-queue is a lock-orde
   const queue = acquireLock(sharedLock(`queue-${KEY}`), { leaseMs: 60_000 });
   assert.equal(queue.ok, true);
 
-  const nested = markTrackingDisabled(KEY, 'x');
+  const nested = markBackfillCompleted(KEY);
   assert.equal(nested.written, false);
   assert.equal(nested.reason, 'lock-order',
     "NOT 'held' — this refusal would repeat forever, so it must never be deferred and retried");
@@ -204,19 +222,19 @@ test('rank-3 locks are never nested: tracking-while-holding-queue is a lock-orde
   // Release the queue lock and the identical calls succeed, so the refusal was the ordering guard
   // and nothing else. This is the invariant lib/checkpoint.mjs's hoisted `verdict` exists to keep.
   assert.equal(queue.handle.release().ok, true);
-  assert.equal(markTrackingDisabled(KEY, 'x').written, true);
+  assert.equal(markBackfillCompleted(KEY).written, true);
   assert.equal(saveLedger(KEY, ledger).written, true);
 });
 
 test('coarse-to-fine is fine: a rank-1 or rank-2 holder may still take a rank-3 lock', (t) => {
   tmpHome(t);
-  // The history run holds run(1) across its scan and each checkpoint holds session(2); both reach for
+  // The backfill holds run(1) across its scan and each checkpoint holds session(2); both reach for
   // the ledger and tracking from inside. Refusing that would leave the audit unable to record
   // anything it learned.
   const session = acquireLock(sessionLock('s1'), { leaseMs: 60_000 });
   assert.equal(session.ok, true);
 
-  assert.equal(markTrackingDisabled(KEY, 'x').written, true);
+  assert.equal(markBackfillCompleted(KEY).written, true);
   const ledger = loadLedger(KEY, 'client-1');
   markImported(ledger, 'sess-A', { outcome: 'stored' });
   assert.equal(saveLedger(KEY, ledger).written, true);

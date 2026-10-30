@@ -355,22 +355,3 @@ test('trustInstructions — a block left behind by a removed plugin is cleaned u
   assert.match(text, /cannot be found even with tool_search[^\n]*delete this whole section[^\n]*AGENTS\.md/);
   assert.match(text, /hook-trust begin[^\n]*hook-trust end/);
 });
-
-test('the whoami session carries the row\'s workspace fields, malformed ones read as absent', async () => {
-  let asked = null;
-  const tenants = [{ id: 'A' }, { id: 'B' }];
-  const row = { ...ROW, tenants, anonymization: 'x', newFolders: [], workspaceRules: null };
-  await linkStatus({
-    listAccounts: async () => [row],
-    getDefaultKey: async () => row.key,
-    getAccessToken: async () => 'tok',
-    whoami: async (session) => { asked = session; return { valid: true }; },
-    hooksStatus: HOOKS_ABSENT,
-    apiBase: 'https://api.test/api',
-  });
-  assert.equal(asked.tenants, tenants);
-  assert.equal(asked.anonymization, null);
-  assert.equal(asked.newFolders, null);
-  assert.deepEqual(asked.workspaceRules, []);
-  assert.equal(asked.tenantId, null);
-});

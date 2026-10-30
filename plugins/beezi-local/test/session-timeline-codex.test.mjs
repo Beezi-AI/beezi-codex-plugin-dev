@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { computeSessionTimeline, postSessionTimeline } from '../lib/session-timeline-codex.mjs';
+import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
 
 function writeRollout(records) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-codex-'));
@@ -621,4 +622,16 @@ test('failed async questions do not turn the next instruction into a question an
     callAt(0, 'request_user_input_async', 'q'), resultAt(100, 'q', { error: 'unavailable' }),
     eventAt(MIN, 'task_complete'), promptAt(2 * MIN),
   ]), [['working', undefined, MIN], ['waiting_user', 'next_instruction', MIN]]);
+});
+
+test('computeSessionTimeline with deps.readLines equals the file read', () => {
+  const file = writeRollout([
+    userMsg(0), planMode(0), updatePlan(1, [{ step: 'a', status: 'completed' }]), work(2), work(10), userMsg(12),
+  ]);
+  fs.appendFileSync(file, 'NOT JSON\n\n' + JSON.stringify(work(13)) + '\n');
+  const lines = readRolloutLines(file);
+  const withoutStamp = (tl) => ({ ...tl, generated_at: undefined });
+  const expected = withoutStamp(computeSessionTimeline(file));
+  fs.unlinkSync(file);
+  assert.deepEqual(withoutStamp(computeSessionTimeline(file, null, { readLines: () => lines })), expected);
 });

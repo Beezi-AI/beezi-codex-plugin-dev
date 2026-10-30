@@ -2,9 +2,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import {
   MACHINE_LABEL, PLAN_LABEL, SESSIONS_LABEL, SETTINGS_LABEL, SIGN_IN_LABEL, UPLOAD_LABEL, UPLOAD_PROGRESS, WORKSPACES_LABEL,
-  defaultQuestion, runSetup, uploadChoices,
+  defaultQuestion, runSetup,
 } from '../lib/setup-wizard.mjs';
-import { NO_TERMINAL, setupMain } from '../lib/setup-main.mjs';
 import { failed, fakeCtx, ok } from '../tools/setup-fixtures.mjs';
 
 const KEY = 'a1b2c3d4';
@@ -13,15 +12,12 @@ const NEW_FOLDERS = `workspace.mjs new-folders --history ${ACCOUNT}`;
 const CAPTURE = `billing-capture.mjs --from-codex --via login ${ACCOUNT}`;
 const JOINED = `workspace.mjs joined ${ACCOUNT}`;
 const ROUTES = `workspace.mjs routes ${ACCOUNT}`;
-const OFFER = `sync.mjs --offer --past ${ACCOUNT}`;
-const TOKENS = { t1: 'aa54c8e424fb', t2: 'bb0c733dd7b0' };
-const ACCEPT = (tenant) => `sync.mjs --accept ${ACCOUNT} --tenant ${tenant} --token ${TOKENS[tenant]}`;
-const DECLINE = (tenant) => `sync.mjs --decline ${ACCOUNT} --tenant ${tenant}`;
-const D_LINE = 'Not uploaded. Run `$beezi:sync` any time to upload them.';
+const BACKFILL = `backfill.mjs --via login ${ACCOUNT}`;
 const KEYS = 'settings.mjs keys';
 const HOOKS = 'hooks.mjs install';
 const PLUS = '✓ Beezi billing captured: source=subscription plan=plus via=app-server.';
 const TRUST_NOTE = 'One step left in Codex: run /hooks and trust the Beezi entries.';
+const FINALIZE_NOTE = 'History import is now closed for this account: past sessions on other machines can no longer be imported. New sessions are still tracked everywhere Beezi is installed.';
 const DEFAULT_UNCHANGED = 'The default account is unchanged. The settings skill (Account → Default account) switches it later.';
 const HOOKS_INSTALLED = ['', '  Analytics hooks installed for you.', '  One step left — run /hooks in Codex, review the Beezi entries, and trust them.'];
 const STILL_READS = ["  The analytics skill still reads from this machine's default account.", ...HOOKS_INSTALLED];
@@ -79,13 +75,13 @@ function flow(over) {
     [CAPTURE]: ok(`${PLUS}\n`),
     [JOINED]: ok('joined=0\n'),
     [ROUTES]: ok('routes=0\n'),
-    [OFFER]: ok('offers=0\n'),
+    [BACKFILL]: ok('Beezi: 3/3 sessions read…\n✓ Beezi: uploaded 3 sessions (3 reports stored).\n'),
     [KEYS]: ok(`menu=Rules|Account|Crash reports\naccount=${KEY} default=yes multi=no workspaces=1 status=linked email=ann@example.com\ncrash=correlate\n`),
     ...over,
   };
 }
-const FRESH_RUNS = ['accounts.mjs list', 'login.mjs', NEW_FOLDERS, CAPTURE, JOINED, ROUTES, OFFER, KEYS];
-const CONTINUE_RUNS = ['accounts.mjs list', HOOKS, NEW_FOLDERS, CAPTURE, JOINED, ROUTES, OFFER, KEYS];
+const FRESH_RUNS = ['accounts.mjs list', 'login.mjs', NEW_FOLDERS, CAPTURE, JOINED, ROUTES, BACKFILL, KEYS];
+const CONTINUE_RUNS = ['accounts.mjs list', HOOKS, NEW_FOLDERS, CAPTURE, JOINED, ROUTES, BACKFILL, KEYS];
 
 function joinedListing(n) {
   const lines = [`ann@example.com: you joined Beta — ${n} repos or folders to review account=${KEY} new=t2`,
@@ -102,7 +98,7 @@ test('a fresh single-workspace link runs every step in order and ends with the C
   assert.equal(await runSetup(ctx), 0);
   assert.deepEqual(ctx.runs, FRESH_RUNS);
   assert.deepEqual(ctx.opts['login.mjs'], { stream: true, hide: /^account=/, label: SIGN_IN_LABEL });
-  assert.deepEqual(ctx.opts[OFFER], {});
+  assert.deepEqual(ctx.opts[BACKFILL], { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
   assert.deepEqual(FRESH_RUNS.map((command) => ctx.labels[command]), [
     MACHINE_LABEL, MACHINE_LABEL, WORKSPACES_LABEL, PLAN_LABEL, SESSIONS_LABEL, SESSIONS_LABEL, SESSIONS_LABEL, SETTINGS_LABEL,
   ]);
@@ -126,7 +122,7 @@ test('a multi-workspace account answers New folders, then joined workspaces, the
       'routes=1',
     ].join('\n')),
     [`workspace.mjs rule add --repo github.com/acme/api ${ACCOUNT} t2 --defer-upload`]: ok('✓ api → Beta (rule R1).\nrule=1\n'),
-  }), [2, 0, [1]]);
+  }), [3, 0, [1]]);
   assert.equal(await runSetup(ctx), 0);
   assert.deepEqual(ctx.runs, [
     'accounts.mjs list', 'login.mjs',
@@ -134,11 +130,11 @@ test('a multi-workspace account answers New folders, then joined workspaces, the
     CAPTURE,
     JOINED, `workspace.mjs joined add-all ${ACCOUNT} --defer-upload`,
     ROUTES, `workspace.mjs rule add --repo github.com/acme/api ${ACCOUNT} t2 --defer-upload`,
-    OFFER, KEYS,
+    BACKFILL, KEYS,
   ]);
   assert.deepEqual(ctx.asked.map((a) => a.question), [
     'Where should analytics from this machine go?',
-    'You joined Beta. Where should analytics for these 5 repos and folders go?',
+    'You joined Beta. Where should analytics for these 5 repos and folders go? Their past sessions will be sent there too.',
     '(1 of 1) Where should analytics for api go?',
     'How should Beezi crash reports work?',
   ]);
@@ -152,7 +148,7 @@ test('a multi-workspace account answers New folders, then joined workspaces, the
   ]);
 });
 
-test('the one New-folders question sends everything to the picked workspace, or leaves it to per-repo questions', async () => {
+test('the one New-folders question sends everything to the picked workspace or several, or leaves it to per-repo questions', async () => {
   const unset = ok([...W, 'history=37 places=4', `new-folders=ask set=no multi=yes account=${KEY}`, ''].join('\n'));
   const SEND = `workspace.mjs new-folders send t1 ${ACCOUNT} --defer-upload`;
   const ASK = `workspace.mjs new-folders ask ${ACCOUNT} --defer-upload`;
@@ -164,14 +160,21 @@ test('the one New-folders question sends everything to the picked workspace, or 
   assert.deepEqual(question.options, [
     { label: 'Acme', description: everything },
     { label: 'Beta', description: everything },
+    { label: 'Several workspaces…', description: 'Pick two or more; everything goes to each of them' },
     { label: 'Let me choose per repo', description: 'Beezi asks about each repo and folder with history next, and new ones when a session starts there' },
   ]);
   assert.deepEqual(picked.runs.slice(2, 5), [NEW_FOLDERS, SEND, CAPTURE]);
   assert.equal(picked.printed[0], '✓ New folders → Acme.');
 
-  const perRepo = fakeCtx(flow({ [NEW_FOLDERS]: unset }), [2]);
+  const perRepo = fakeCtx(flow({ [NEW_FOLDERS]: unset }), [3]);
   await runSetup(perRepo);
   assert.deepEqual(perRepo.runs.slice(2, 5), [NEW_FOLDERS, ASK, CAPTURE]);
+
+  const SEND_BOTH = `workspace.mjs new-folders send t1,t2 ${ACCOUNT} --defer-upload`;
+  const several = fakeCtx(flow({ [NEW_FOLDERS]: unset, [SEND_BOTH]: ok('✓ New folders → Acme and Beta.\nnew-folders=send\n') }), [2, [0, 1]]);
+  await runSetup(several);
+  assert.equal(several.asked[1].question, 'Which workspaces should get analytics from this machine?');
+  assert.deepEqual(several.runs.slice(2, 5), [NEW_FOLDERS, SEND_BOTH, CAPTURE]);
 
   const dismissed = fakeCtx(flow({ [NEW_FOLDERS]: unset }), []);
   await runSetup(dismissed);
@@ -185,7 +188,7 @@ test('an unknown ChatGPT plan is asked as the tier and recorded before the works
     [PLAN]: ok('✓ Beezi billing captured: source=subscription plan=plus.\n'),
   }), [1]);
   assert.equal(await runSetup(ctx), 0);
-  assert.deepEqual(ctx.runs, ['accounts.mjs list', 'login.mjs', NEW_FOLDERS, CAPTURE, PLAN, JOINED, ROUTES, OFFER, KEYS]);
+  assert.deepEqual(ctx.runs, ['accounts.mjs list', 'login.mjs', NEW_FOLDERS, CAPTURE, PLAN, JOINED, ROUTES, BACKFILL, KEYS]);
   assert.equal(ctx.asked[0].question, 'How does this machine pay for Codex?');
 });
 
@@ -266,6 +269,7 @@ test('re-running setup on a configured machine and pressing Enter everywhere sig
   const ctx = pressEnter(fakeCtx(flow({
     'accounts.mjs list': LINKED,
     [NEW_FOLDERS]: ok([...W, `new-folders=ask set=yes multi=yes account=${KEY}`, ''].join('\n')),
+    [BACKFILL]: ok('✓ Beezi: nothing new to upload.\n'),
   }), []));
   assert.equal(await runSetup(ctx), 0);
   assert.deepEqual(ctx.runs, [...CONTINUE_RUNS, 'telemetry.mjs correlate']);
@@ -283,7 +287,8 @@ for (const [outcome, line] of [
     const ctx = pressEnter(fakeCtx(flow({
       'accounts.mjs list': LINKED,
       [CAPTURE]: ok(`${line}\n`),
-      }), []));
+      [BACKFILL]: ok('✓ Beezi: nothing new to upload.\n'),
+    }), []));
     assert.equal(await runSetup(ctx), 0);
     assert.deepEqual(ctx.runs, [...CONTINUE_RUNS, 'telemetry.mjs correlate']);
     assert.equal(ctx.runs.some((command) => command.startsWith('billing-capture.mjs --plan')), false);
@@ -319,11 +324,11 @@ test('a dismissed account question stops the setup with exit 1 and runs nothing 
 test('a failing later step is reported and the setup carries on', async () => {
   const ctx = fakeCtx(flow({
     [NEW_FOLDERS]: failed('\n✗ No such linked account.\n'),
-    [OFFER]: failed('✗ Beezi: the data root could not be checked.\n'),
+    [BACKFILL]: failed('✗ Beezi: upload stopped — could not reach the server (fetch failed). Run the Beezi login skill again to continue where it left off.\n'),
   }), []);
   assert.equal(await runSetup(ctx), 0);
   assert.deepEqual(ctx.runs, FRESH_RUNS);
-  assert.deepEqual(ctx.printed, ['✗ No such linked account.', PLUS, '✗ Beezi: the data root could not be checked.', '', TRUST_NOTE]);
+  assert.deepEqual(ctx.printed, ['✗ No such linked account.', PLUS, '', TRUST_NOTE]);
 });
 
 test('the crash question marks the current mode as the default, and keeping it still runs telemetry.mjs', async () => {
@@ -376,7 +381,7 @@ test('a sign-in that left another default offers to switch it, default No, strea
   const confirm = yes.asked[0];
   assert.deepEqual([confirm.kind, confirm.question, confirm.defaultYes],
     ['confirm', 'Make Ann <ann@example.com> (Acme) the account the analytics skill reads from?', false]);
-  assert.deepEqual(yes.runs.slice(-3), [OFFER, `accounts.mjs use ${KEY}`, KEYS]);
+  assert.deepEqual(yes.runs.slice(-3), [BACKFILL, `accounts.mjs use ${KEY}`, KEYS]);
   assert.deepEqual(yes.opts[`accounts.mjs use ${KEY}`], { stream: true });
   assert.equal(yes.printed.includes(DEFAULT_UNCHANGED), false);
   const no = fakeCtx(flow({ 'login.mjs': signInOutput(STILL_READS) }), [false]);
@@ -388,101 +393,13 @@ test('a sign-in that left another default offers to switch it, default No, strea
   assert.equal(dismissed.printed.includes(DEFAULT_UNCHANGED), false);
 });
 
-test('an already-installed hook still gets the trust step', async () => {
+test('a finalized upload adds the finalize note, and an already-installed hook still gets the trust step', async () => {
   const ctx = fakeCtx(flow({
     'login.mjs': signInOutput(['  Analytics hooks are installed. If nothing arrives, run /hooks in Codex, review the Beezi entries, and trust them.']),
+    [BACKFILL]: ok('✓ Beezi: uploaded 3 sessions (3 reports stored).\n✓ Beezi: your history pull is finalized.\n'),
   }), []);
   await runSetup(ctx);
-  assert.deepEqual(ctx.printed, [PLUS, '', TRUST_NOTE]);
-});
-
-function offerBlock(tenant, workspace) {
-  return [
-    'Beezi found 3 past Codex sessions (12 Aug – 14 Aug, 1 folder)',
-    '  in web',
-    '  Sent',
-    '    ✓ dates, duration, models, tokens, cost',
-    '  Hidden by your workspace — Beezi gets made-up names',
-    '    ◆ computer name',
-    '  Never sent',
-    '    ✕ session titles, error messages and subagent names',
-    `Q Upload 3 sessions to ${workspace}?`,
-    `offer account=${KEY} tenant=${tenant} sessions=3 audit=no token=${TOKENS[tenant]}`,
-  ];
-}
-const OFFERS = ok([...offerBlock('t1', 'Acme'), '', `— Ann · Beta —`, ...offerBlock('t2', 'Beta'), 'offers=2', ''].join('\n'));
-const SUMMARY = offerBlock('t1', 'Acme').slice(0, 8);
-const DECLINES = { [DECLINE('t1')]: ok(`${D_LINE}\n`), [DECLINE('t2')]: ok(`${D_LINE}\n`) };
-
-test('Upload now on the upload menu accepts that workspace with the upload progress on the activity line', async () => {
-  const ctx = fakeCtx(flow({ [OFFER]: OFFERS, ...DECLINES }), [0, 1]);
-  assert.equal(await runSetup(ctx), 0);
-  assert.deepEqual(ctx.runs.filter((command) => command.startsWith('sync.mjs')), [OFFER, ACCEPT('t1'), DECLINE('t2')]);
-  assert.deepEqual(ctx.opts[ACCEPT('t1')], { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
-  assert.deepEqual(ctx.asked.slice(0, 2).map((a) => [a.kind, a.question, a.options, a.defaultIndex]), [
-    ['choose', 'Upload 3 sessions to Acme?', uploadChoices(), 0],
-    ['choose', 'Upload 3 sessions to Beta?', uploadChoices(), 0],
-  ]);
-  assert.deepEqual(ctx.printed, [PLUS, ...SUMMARY, '— Ann · Beta —', ...SUMMARY, D_LINE, '', TRUST_NOTE]);
-});
-
-test('a dismissed (Esc) or Not now upload question uploads nothing and prints the decline line for each workspace', async () => {
-  const ctx = fakeCtx(flow({ [OFFER]: OFFERS, ...DECLINES }), [null, 1]);
-  assert.equal(await runSetup(ctx), 0);
-  assert.equal(ctx.runs.some((command) => command.startsWith('sync.mjs --accept')), false);
-  assert.deepEqual(ctx.runs.filter((command) => command.startsWith('sync.mjs --decline')), [DECLINE('t1'), DECLINE('t2')]);
-  assert.deepEqual(ctx.printed.filter((line) => line === D_LINE).length, 2);
-  assert.equal(ctx.printed.some((line) => /^(?:Q |offers?[ =])/.test(line)), false);
-});
-
-test('pressing Enter on the upload menu takes its default row, Upload now, and accepts', async () => {
-  const ctx = pressEnter(fakeCtx(flow({ [OFFER]: ok([...offerBlock('t1', 'Acme'), 'offers=1'].join('\n')), ...DECLINES }), []));
-  await runSetup(ctx);
-  assert.deepEqual(ctx.runs.filter((command) => command.startsWith('sync.mjs')), [OFFER, ACCEPT('t1')]);
-});
-
-test('the upload menu starts on Upload now with Esc allowed, and no answer (Esc, Ctrl+C, end of input) declines', async () => {
-  const ctx = fakeCtx(flow({ [OFFER]: ok([...offerBlock('t1', 'Acme'), 'offers=1'].join('\n')), ...DECLINES }), []);
-  const extras = [];
-  ctx.ask.choose = (question, options, extra) => {
-    extras.push([question, extra]);
-    return Promise.resolve(null);
-  };
-  await runSetup(ctx);
-  assert.deepEqual(extras.filter(([question]) => /^Upload /.test(question)), [['Upload 3 sessions to Acme?', { defaultIndex: 0, escape: true }]]);
-  assert.deepEqual(ctx.runs.filter((command) => command.startsWith('sync.mjs')), [OFFER, DECLINE('t1')]);
-});
-
-test('the upload menu offers Upload now, then Not now with the sync command', () => {
-  assert.deepEqual(uploadChoices(), [{ label: 'Upload now' }, { label: 'Not now', description: 'run $beezi:sync any time' }]);
-});
-
-test('with no offers the wizard asks no upload question', async () => {
-  const ctx = fakeCtx(flow({ [OFFER]: ok('✓ Beezi: nothing new to upload.\noffers=0\n') }), []);
-  await runSetup(ctx);
-  assert.equal(ctx.asked.some((a) => /^Upload /.test(a.question)), false);
-  assert.deepEqual(ctx.printed, [PLUS, '✓ Beezi: nothing new to upload.', '', TRUST_NOTE]);
-});
-
-test('setupMain with no terminal exits 1 and never starts the wizard, so nothing is uploaded', async () => {
-  let started = false;
-  const stderr = { chunks: [], write(s) { this.chunks.push(s); return true; } };
-  const code = await setupMain('/plugin', {
-    stdout: {}, stderr, env: {}, openTerminal: () => null, runSetup: () => { started = true; return Promise.resolve(0); },
-  });
-  assert.equal(code, 1);
-  assert.equal(started, false);
-  assert.deepEqual(stderr.chunks, [`${NO_TERMINAL}\n`]);
-});
-
-test('no wizard question promises that past sessions will be sent', async () => {
-  const many = fakeCtx(flow({ [JOINED]: joinedListing(5) }), [1, [0], [0]]);
-  await runSetup(many);
-  const few = fakeCtx(flow({ [JOINED]: joinedListing(2) }), [[0]]);
-  await runSetup(few);
-  const questions = many.asked.concat(few.asked).map((a) => a.question);
-  assert.ok(questions.some((q) => /send analytics to Beta/.test(q)));
-  assert.equal(questions.some((q) => q.includes('will be sent there too')), false);
+  assert.deepEqual(ctx.printed, [PLUS, FINALIZE_NOTE, '', TRUST_NOTE]);
 });
 
 test('no trust step is printed when the sign-in did not report the hooks', async () => {

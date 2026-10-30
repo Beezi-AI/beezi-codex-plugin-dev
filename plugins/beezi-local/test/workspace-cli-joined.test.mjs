@@ -72,7 +72,7 @@ test('joined pick does not mark the join reviewed', async (t) => {
   assert.equal((row.reviewedTenantIds || []).indexOf('T'), -1);
 });
 
-test('joined pick never starts an upload, deferred or not', async (t) => {
+test('joined pick carries --defer-upload to the worker-start gate', async (t) => {
   link(t);
   await setWorkspaceRule(TEST_KEY, { kind: 'repo', match: MATCH, tenantIds: ['A'] });
   const started = [];
@@ -83,7 +83,7 @@ test('joined pick never starts an upload, deferred or not', async (t) => {
   assert.deepEqual(ruleFor(await rowNow(), 'repo', MATCH).tenantIds, ['A', 'T']);
   const immediate = await workspaceCommand(['joined', 'pick', '--repo', MATCH, 'B', '--account', TEST_KEY], deps);
   assert.equal(immediate.ok, true, immediate.stderr.join('\n'));
-  assert.deepEqual(started, []);
+  assert.deepEqual(started, [TEST_KEY]);
 });
 
 test('joined done prints kept= after reviewed= and marks the join reviewed', async (t) => {
@@ -151,6 +151,26 @@ test('joined done --defer-upload writes the keep-current rules but does not star
   assert.deepEqual(folderRule(row, 'r2').tenantIds, ['X']);
   assert.deepEqual(out.lines.slice(-1), ['kept=2']);
   assert.deepEqual(started, []);
+});
+
+// The seeded rollouts with R2's transcript reported as over 64 MiB.
+function seedHugeR2(t) {
+  const list = seedRollouts(t);
+  return () => list().map((entry) => (entry.sessionId === SESSION_R2 ? { ...entry, size: 65 * 1024 * 1024 } : entry));
+}
+
+test('routes lists a waiting past session larger than 64 MiB', async (t) => {
+  link(t, { tenants: X_T });
+  const out = await run(['routes'], { ...NOOP_DEPS, listAllRollouts: seedHugeR2(t) });
+  assert.equal(out.count, 2);
+  assert.ok(out.lines.some((line) => /kind=folder match=.*r2$/.test(line)), out.lines.join('\n'));
+});
+
+test('joined lists the place of a past session larger than 64 MiB', async (t) => {
+  link(t, { tenants: X_T });
+  const out = await run(['joined'], { ...NOOP_DEPS, listAllRollouts: seedHugeR2(t) });
+  assert.equal(out.count, 2);
+  assert.ok(out.lines.some((line) => /kind=folder match=.*r2 now=/.test(line)), out.lines.join('\n'));
 });
 
 test('joined pick --current is rejected and writes nothing', async (t) => {

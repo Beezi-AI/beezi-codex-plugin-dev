@@ -3,7 +3,6 @@ import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
 import { createPrompt } from '../lib/setup-prompt.mjs';
 import { createStyle } from '../lib/setup-style.mjs';
-import { uploadChoices } from '../lib/setup-wizard.mjs';
 
 const OPTIONS = [
   { label: 'Ask me (recommended)', description: 'Beezi asks once' },
@@ -276,29 +275,6 @@ test('Esc is ignored when the choice has a default', async () => {
   t.prompt.close();
 });
 
-test('the upload menu starts on Upload now, Enter picks it, and with escape on Esc returns null despite the default', async () => {
-  const t = terminal();
-  const picked = t.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
-  await t.press('\r');
-  assert.equal(await picked, 0);
-  assert.ok(t.text().includes('? Upload 3 sessions to Acme?\n❯ Upload now\n  Not now — run $beezi:sync any time\n  ↑/↓ move · Enter select\n'));
-  assert.match(t.text(), /✓ Upload 3 sessions to Acme\? Upload now\n/);
-  const skipped = t.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
-  await t.press(ESC);
-  assert.equal(await skipped, null);
-  assert.match(t.text(), /✓ Upload 3 sessions to Acme\? skipped\n/);
-  t.prompt.close();
-});
-
-test('the upload menu with colour on draws ? bold cyan, the question bold and the active row cyan', async () => {
-  const t = terminal({ style: COLOR });
-  const picked = t.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
-  await t.press(DOWN, '\r');
-  assert.equal(await picked, 1);
-  assert.ok(t.text().includes('\x1b[1;36m?\x1b[0m \x1b[1mUpload 3 sessions to Acme?\x1b[0m\n\x1b[36m❯\x1b[0m \x1b[36mUpload now\x1b[0m\n'));
-  t.prompt.close();
-});
-
 test('keys typed in a menu never reach a later text answer', async () => {
   const t = terminal();
   const skipped = t.prompt.choose('Q?', OPTIONS);
@@ -325,6 +301,47 @@ test('chooseMany toggles with Space and digits, ignores commas, and returns sort
   await t.press('3', '1', '3', '\r');
   assert.deepEqual(await untick, [0]);
   assert.match(t.text(), /  ↑\/↓ move · Space select · Enter confirm \(nothing selected = skip\)\n/);
+  t.prompt.close();
+});
+
+test('an exclusive row clears every other tick, any other tick clears it, and digits toggle the same way', async () => {
+  const t = terminal();
+  const spaced = t.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
+  await t.press(' ', DOWN, ' ', DOWN, ' ', '\r');
+  assert.deepEqual(await spaced, [2]);
+  assert.match(t.text(), /✓ Which\? Don't send\n/);
+  const back = t.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
+  await t.press(DOWN, DOWN, ' ', UP, ' ', '\r');
+  assert.deepEqual(await back, [1]);
+  const digits = t.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
+  await t.press('1', '3', '\r');
+  assert.deepEqual(await digits, [2]);
+  const undo = t.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
+  await t.press('3', '1', '\r');
+  assert.deepEqual(await undo, [0]);
+  t.prompt.close();
+});
+
+test('a longer digit run restores the ticks its shorter run cleared, then applies its own toggle', async () => {
+  const twelve = Array.from({ length: 12 }, (_, i) => ({ label: `Option ${i + 1}` }));
+  const t = terminal();
+  const restored = t.prompt.chooseMany('Which?', twelve, { exclusive: [0] });
+  await t.press(DOWN, DOWN, ' ', '1', '2', '\r');
+  assert.deepEqual(await restored, [2, 11]);
+  const ten = Array.from({ length: 10 }, (_, i) => ({ label: `Option ${i + 1}` }));
+  const exclusiveTen = t.prompt.chooseMany('Which?', ten, { exclusive: [9] });
+  await t.press(DOWN, DOWN, ' ', DOWN, ' ', '1', '0', '\r');
+  assert.deepEqual(await exclusiveTen, [9]);
+  t.prompt.close();
+});
+
+test('the typed refusal is yellow', async () => {
+  const t = terminal({ interactive: false, style: COLOR });
+  const answer = t.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
+  await t.type('1,3');
+  await t.type('1');
+  assert.deepEqual(await answer, [0]);
+  assert.ok(t.text().includes('\x1b[33m"Don\'t send" can\'t be combined with other choices.\x1b[0m\n'));
   t.prompt.close();
 });
 
@@ -513,7 +530,7 @@ test('typed prompts with colour on differ from today\'s bytes only by escape cod
   assert.ok(styled.includes('  1) Ask me (recommended)\x1b[2m (default)\x1b[0m\x1b[2m — Beezi asks once\x1b[0m\n'));
   assert.ok(styled.includes('\x1b[1;36mChoose 1-3 [1]:\x1b[0m '));
   assert.ok(styled.includes('\x1b[33mEnter one number from 1 to 3.\x1b[0m\n'));
-  assert.ok(styled.includes('\x1b[1;36mChoose one or more (for example 1,3), or press Enter to skip:\x1b[0m '));
+  assert.ok(styled.includes('\x1b[1;36mChoose one or more (for example 1,2), or press Enter to skip:\x1b[0m '));
   assert.ok(styled.includes('\x1b[33mEnter numbers from 1 to 3, separated by commas.\x1b[0m\n'));
   assert.ok(styled.includes('\n\x1b[1mUpload?\x1b[0m \x1b[1;36m[y/N]\x1b[0m '));
   assert.ok(styled.includes('\x1b[33mAnswer y or n.\x1b[0m\n'));

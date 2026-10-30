@@ -1,13 +1,13 @@
 import { currentSession, readSessionWorkspace, tenantsOf } from './workspace.mjs';
 import {
-  ACTIVE_SESSION_WINDOW_MS, MAX_SESSION_AGE_MS, MAX_TRANSCRIPT_BYTES, createRouteContext, routeKeyForDir,
+  ACTIVE_SESSION_WINDOW_MS, MAX_SESSION_AGE_MS, createRouteContext, routeKeyForDir,
 } from './workspace-rules.mjs';
 import { listAllRollouts } from './transcript-index-codex.mjs';
 import { isImported, loadLedger } from './audit-ledger.mjs';
 
 const placeId = (key) => `${key.kind}\n${key.match}`;
 
-// Past sessions the history upload would send (not live, active, over 30 days old, oversized or imported) and the distinct
+// Past sessions the history upload would send (not live, active, over 30 days old or imported) and the distinct
 // places they ran in, deduped by kind+match and less `hereKey`'s place; one with no directory counts in sessions only.
 // readState(sessionId)'s cwd wins over readCwd(entry).
 export function countPastSessions(entries, {
@@ -18,7 +18,7 @@ export function countPastSessions(entries, {
   for (const entry of entries || []) {
     if (entry == null || entry.sessionId == null || (liveSessionId != null && entry.sessionId === liveSessionId)) continue;
     const age = now - entry.mtimeMs;
-    if (age < ACTIVE_SESSION_WINDOW_MS || age > MAX_SESSION_AGE_MS || entry.size > MAX_TRANSCRIPT_BYTES || imported(entry.sessionId)) continue;
+    if (age < ACTIVE_SESSION_WINDOW_MS || age > MAX_SESSION_AGE_MS || imported(entry.sessionId)) continue;
     sessions += 1;
     const state = readState(entry.sessionId);
     const dir = state != null && typeof state.cwd === 'string' && state.cwd !== '' ? state.cwd : readCwd(entry);

@@ -13,9 +13,9 @@ import { cliMayProceed } from '../lib/env-guard.mjs';
 // The login skill's commands in as few calls as its questions allow: each call runs from the sign-in (or
 // `--from <step>`) up to the next question, printing every output as a block and `next=<step>` last.
 const SCRIPTS_DIR = path.dirname(url.fileURLToPath(import.meta.url));
-const FROM_STEPS = ['setup', 'here', 'plan', 'joined', 'routes', 'history'];
-const USAGE = 'Usage: login-flow.mjs [--account <ref> --from <setup|here|plan|joined|routes|history>]';
-// Writes made between calls are the login flow's: their lines carry no undo hint.
+const FROM_STEPS = ['setup', 'here', 'plan', 'joined', 'routes'];
+const USAGE = 'Usage: login-flow.mjs [--account <ref> --from <setup|here|plan|joined|routes>]';
+// Writes made between calls leave the upload to the login skill's backfill.
 const DEFER = '--defer-upload';
 
 function runScript(script, args) {
@@ -50,17 +50,17 @@ function printListing(tag, key, result) {
   console.log([`<${tag} account="${key}">`].concat(result.lines, errors, [`</${tag}>`]).join('\n'));
 }
 
-// The output's last `<name>=<n>` count, 0 when it has none.
-function countOf(text, name) {
-  const line = lastLine(text, new RegExp(`^${name}=\\d+$`));
-  return line === null ? 0 : Number(line.slice(name.length + 1));
-}
-
-// A listing in-process, as a block, → its `<tag>=<n>` count; one that fails keeps its ✗ line there and the later steps still run.
-async function listedCount(tag, key, deps) {
+// A listing in-process, as a block; one that fails keeps its ✗ line there and the later steps still run.
+async function listing(tag, key, deps) {
   const result = await deps.workspace([tag, '--account', key, DEFER], { cwd: deps.cwd });
   printListing(tag, key, result);
-  return countOf(result.lines.join('\n'), tag);
+  return result;
+}
+
+// The listing's `<name>=<n>` count, 0 when it has none.
+function countOf(result, name) {
+  const line = lastLine(result.lines.join('\n'), new RegExp(`^${name}=\\d+$`));
+  return line === null ? 0 : Number(line.slice(name.length + 1));
 }
 
 function next(step, key) {
@@ -108,15 +108,7 @@ function tierNeeded(key, deps) {
   return !planSettled(capture.stdout);
 }
 
-// Step 4b: the past sessions' summaries and questions (the offer records each shown one as declined until the
-// skill's --accept); true when there is one to ask.
-function historyOffered(key, deps) {
-  const offer = deps.run('sync.mjs', ['--offer', '--past', '--account', key]);
-  block('history', offer);
-  return countOf(offer.stdout, 'offers') > 0;
-}
-
-// From `from` on, each step's output, stopping at the first one that needs a question; 'default' when none does.
+// From `from` on, each step's output, stopping at the first one that needs a question; 'backfill' when none does.
 async function fromStep(from, key, deps) {
   const row = await getAccount(key);
   if (row == null) throw new UserError('That account is not linked on this machine. Run the login skill again.');
@@ -127,11 +119,10 @@ async function fromStep(from, key, deps) {
     }
     if (step === 'here' && await hereStops(row, deps)) return 'here';
     if (step === 'plan' && tierNeeded(key, deps)) return 'tier';
-    if (step === 'joined' && await listedCount('joined', key, deps) > 0) return 'joined';
-    if (step === 'routes' && await listedCount('routes', key, deps) > 0) return 'routes';
-    if (step === 'history' && historyOffered(key, deps)) return 'history';
+    if (step === 'joined' && countOf(await listing('joined', key, deps), 'joined') > 0) return 'joined';
+    if (step === 'routes' && countOf(await listing('routes', key, deps), 'routes') > 0) return 'routes';
   }
-  return 'default';
+  return 'backfill';
 }
 
 // Step 1: the key login.mjs linked, or null when the sign-in failed.

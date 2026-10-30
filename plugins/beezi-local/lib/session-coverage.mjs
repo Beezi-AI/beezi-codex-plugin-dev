@@ -370,7 +370,7 @@ export const DeferReason = Object.freeze({
  * @param contiguous     true once the caller has proven this workspace's lines contiguous (it
  *                        parsed them); anything else defers attempts past the prefix, and missing
  *                        evidence, as SPLIT. Otherwise the decision is the single-workspace one.
- * @param held           the server's highest stored line for this workspace (history runs only); null
+ * @param held           the server's highest stored line for this workspace (sync mode only); null
  *                        when unknown.
  */
 export function decideReplay(sessionId, facts = {}) {
@@ -393,7 +393,7 @@ export function decideReplay(sessionId, facts = {}) {
   }
 
   // The server said what it holds: a clean prefix replays from its end whatever this machine sent to
-  // other workspaces; anything past the prefix is a proven gap. History runs only (their queue drained first).
+  // other workspaces; anything past the prefix is a proven gap. Sync mode only (its queue drained first).
   if (held !== null) {
     if (held > stored) return { decision: ReplayDecision.DEFER, reason: DeferReason.GAP, startCursor: null, stored };
     return { decision: ReplayDecision.REPLAY, reason: null, startCursor: stored, stored };

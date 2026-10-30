@@ -191,9 +191,10 @@ test("a sibling variant's entry survives — the regression that matters", (t) =
 });
 
 test('beezi-local joins dev and staging rather than displacing either', (t) => {
-  // beezi-dev, beezi-staging and beezi-local each publish from their own branch against the same
-  // target branch. Each run re-fetches the tip, so the listing beezi-local upserts into already
-  // holds whatever beezi-dev and beezi-staging last pushed. Three entries is therefore the real steady state, not
+  // The dev pipeline step publishes beezi-dev and then beezi-local in ONE job, back to back
+  // against the same branch. The second run re-fetches the tip the first just pushed, so the
+  // listing it upserts into already holds beezi-dev - and a staging publish from another branch
+  // may have left its own entry there too. Three entries is therefore the real steady state, not
   // the pair the fixtures above assume.
   const dev = {
     name: 'beezi-dev',

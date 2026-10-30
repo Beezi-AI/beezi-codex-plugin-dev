@@ -7,8 +7,6 @@ import { listAllRollouts } from './transcript-index-codex.mjs';
 import { isLiveTrackingAllowed } from './tracking.mjs';
 import { defaultRoute, kindWords, placeOfDir, routeOfDir, routeTarget, sameKey } from './route-describe.mjs';
 
-// Copied from session-audit.mjs so planning skips what the backfill skips.
-export const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
 export const ACTIVE_SESSION_WINDOW_MS = 30 * 60 * 1000;
 export const MAX_SESSION_AGE_MS = 30 * 24 * 60 * 60 * 1000;
 const OUTSIDE_LABEL = 'outside a project';
@@ -279,7 +277,7 @@ export function planSessionRoutes(row, entries, ctx, { readState = readSessionWo
   return routes;
 }
 
-// The "waiting" test `routes` asks about: New folders is Ask me, settled, within the 30-day upload window, readable, pending, and in no workspace's ledger nor the account's legacy one.
+// The one "waiting" test, shared by `routes` and the backfill seal hold so a pull is held only for what `routes` asks about: New folders is Ask me, settled, within the 30-day upload window, readable, pending, and in no workspace's ledger nor the account's legacy one.
 // Map<sessionId, key> plus `noDirectory` (waiting with no recorded directory); `routes` option reuses planSessionRoutes results.
 export function waitingRoutes(row, entries, ctx, {
   liveSessionId = null,
@@ -303,7 +301,6 @@ export function waitingRoutes(row, entries, ctx, {
     if (nowMs - entry.mtimeMs < ACTIVE_SESSION_WINDOW_MS) continue;
     // Too old for runAudit to upload, whatever rule it gets.
     if (nowMs - entry.mtimeMs > MAX_SESSION_AGE_MS) continue;
-    if (entry.size > MAX_TRANSCRIPT_BYTES) continue;
     if (ledgers.some((ledger) => isImported(ledger, entry.sessionId))) continue;
     const readEntryCwd = entryCwdReader(readCwd, entry);
     let cwd = null;
@@ -381,7 +378,6 @@ export function planReviewPlaces(row, entries, ctx, {
     if (liveSessionId != null && entry.sessionId === liveSessionId) continue;
     if (nowMs - entry.mtimeMs < ACTIVE_SESSION_WINDOW_MS) continue;
     if (nowMs - entry.mtimeMs > MAX_SESSION_AGE_MS) continue;
-    if (entry.size > MAX_TRANSCRIPT_BYTES) continue;
     const state = safeReadState(readState, entry.sessionId);
     const dir = state != null && typeof state.cwd === 'string' && state.cwd !== '' ? state.cwd : entryCwdReader(readCwd, entry)();
     if (dir == null) continue;

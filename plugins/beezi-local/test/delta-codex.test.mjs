@@ -3,7 +3,8 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { computeDelta, lastUsageLine } from '../lib/delta-codex.mjs';
+import { computeDelta } from '../lib/delta-codex.mjs';
+import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
 
 function writeRollout(records) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-codex-'));
@@ -431,6 +432,26 @@ test('a cursor exactly at the line count re-sends nothing — the guard is stric
   const { segments, nextCursor } = computeDelta(file, 3, identityResolvers);
   assert.equal(segments.length, 0);
   assert.equal(nextCursor, 3);
+});
+
+test('computeDelta via readLines matches the file read at every cursor', () => {
+  const file = writeRaw(jsonl([
+    ...PRELUDE,
+    turn('/repoB', 'gpt-5.2-codex', '2026-01-01T00:00:03.000Z'),
+  ]) + '\nNOT JSON\n' + jsonl([tokens('2026-01-01T00:00:04.000Z', 300, 0, 30)]) + '\n{"torn":');
+  const lines = readRolloutLines(file);
+  const cursors = [0, 3, lines.completeLines];
+  const expected = cursors.map((c) => computeDelta(file, c, identityResolvers));
+  fs.unlinkSync(file);
+  const viaReadLines = { ...identityResolvers, readLines: () => lines };
+  assert.deepEqual(cursors.map((c) => computeDelta(file, c, viaReadLines)), expected);
+});
+
+test('CURSOR_MISMATCH through readLines', () => {
+  const lines = readRolloutLines(writeRaw(jsonl(PRELUDE) + '\n{"torn":'));
+  const viaReadLines = { ...identityResolvers, readLines: () => lines };
+  assert.doesNotThrow(() => computeDelta('/missing', lines.lineCount, viaReadLines), 'a cursor on the torn line is not a mismatch');
+  assert.throws(() => computeDelta('/missing', lines.lineCount + 1, viaReadLines), { code: 'CURSOR_MISMATCH' });
 });
 
 test('thread_rolled_back is append-only: the cursor advances past it and deltas stay non-negative', () => {
@@ -1166,39 +1187,4 @@ test('a non-limit error carries no resetsAt', () => {
   const [event] = eventsOf(file);
   assert.equal(event.error, 'authentication_failed');
   assert.equal('resetsAt' in event, false);
-});
-
-// ─── lastUsageLine ──────────────────────────────────────────────────────────────────────────
-
-const item = { timestamp: '2026-01-01T00:00:03.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant' } };
-const done = { timestamp: '2026-01-01T00:00:05.000Z', type: 'event_msg', payload: { type: 'task_complete' } };
-
-test('lastUsageLine is the 1-based line of the last token_count that carries totals', () => {
-  const file = writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9), done]);
-  assert.equal(lastUsageLine(file), 4);
-});
-
-test('lastUsageLine is 0 for a rollout with no token_count', () => {
-  assert.equal(lastUsageLine(writeRollout([meta('/r'), item, done])), 0);
-});
-
-test('lastUsageLine passes over a torn final token_count, as computeDelta does', () => {
-  const torn = JSON.stringify(tokens('2026-01-01T00:00:04.000Z', 20, 0, 9)).slice(0, -3);
-  const file = writeRaw(`${jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item])}\n${torn}`);
-  assert.equal(lastUsageLine(file), 2);
-});
-
-test('lastUsageLine counts a parseable final line without a newline, as computeDelta does', () => {
-  const file = writeRaw(jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9)]));
-  assert.equal(lastUsageLine(file), 4);
-});
-
-test('lastUsageLine skips a token_count with no totals', () => {
-  const empty = { timestamp: '2026-01-01T00:00:04.000Z', type: 'event_msg', payload: { type: 'token_count', info: null } };
-  const file = writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, empty]);
-  assert.equal(lastUsageLine(file), 2);
-});
-
-test('lastUsageLine is null for a path it cannot read', () => {
-  assert.equal(lastUsageLine(path.join(os.tmpdir(), 'beezi-codex-missing', 'rollout.jsonl')), null);
 });

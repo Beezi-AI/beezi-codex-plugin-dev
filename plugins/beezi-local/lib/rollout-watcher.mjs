@@ -7,12 +7,12 @@ import { acquireLock as _acquireLock, electionLock, withLock, sharedLock } from 
 import { hookMayProceed, shouldCheckEnvironment } from './env-guard.mjs';
 import { isUsableSessionId, listRolloutFiles as _listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
 import { readRolloutHead as _readRolloutHead, subagentIdentityFrom as _subagentIdentityFrom } from './subagent-codex.mjs';
-import { runCheckpoint as _runCheckpoint, reconcileSession, listRecipients } from './checkpoint.mjs';
-import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, dontTrackSessionIds, HistoryScope } from './session-audit.mjs';
+import { runCheckpoint as _runCheckpoint, reconcileSession } from './checkpoint.mjs';
+import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, dontTrackSessionIds, SYNC_MODE } from './session-audit.mjs';
 import { runDuePendingHistory } from './pending-history-run.mjs';
 import { linkedSessions as _linkedSessions } from './accounts.mjs';
 import { pruneStale as _pruneStale } from './prune.mjs';
-import { readTrackingState, isLiveTrackingAllowed, isTenantDark, workspaceLinkMs } from './tracking.mjs';
+import { readTrackingState, isLiveTrackingAllowed, isTenantDark } from './tracking.mjs';
 import { isMultiTenant, tenantsOf } from './workspace.mjs';
 import { usesRules } from './workspace-rules.mjs';
 import { loadLedger as _loadLedger, ledgerDelivered } from './audit-ledger.mjs';
@@ -65,16 +65,16 @@ import {
 //
 //   A. ESTABLISHED — a local cursor (state/<id>.json) or a watermark for it exists. The boundary is
 //      known; run the ordinary incremental checkpoint. Cheapest, most common.
-//   B. UNESTABLISHED AND ACTIVE — no boundary, and the file moved inside ACTIVE_WINDOW_MS, at or after
-//      every reporting workspace's link or join (an earlier last write is past, offered only). These are
+//   B. UNESTABLISHED AND ACTIVE — no boundary, and the file moved inside ACTIVE_WINDOW_MS. These are
 //      exactly the sessions lib/session-audit.mjs REFUSES, so nobody else will ever establish them.
 //      ONE `/sessions/coverage` request PER SESSION, inside that session's own reconcile lock (so it
 //      cannot be hoisted out and shared), bounded by MAX_ESTABLISH_PER_PASS. `decideReplay`'s REPLAY
 //      verdict goes to runCheckpoint as a `startCursor` HARD OVERRIDE (G-3-3) with
 //      `sweepSubagents: false`; DEFER is retried, and `coverage === null` is a DEFER, never zero.
-//   C. UNESTABLISHED AND QUIET — still for longer than the active window. Only those last written at
-//      or after the link (HistoryScope.LIVE) are sent, and they ride `runAudit`: it drains the queue first, consults
-//      coverage and honours audit-only tenants. This module reimplements none of that.
+//   C. UNESTABLISHED AND QUIET — still for longer than the active window. That is history, and R2
+//      requires history to ride `runAudit({ mode: SYNC_MODE })`: it drains the queue first, consults
+//      coverage, honours audit-only tenants and neither seals nor reopens the one-time backfill.
+//      This module reimplements none of that.
 //
 // A and B are LIVE capture and are gated on `isLiveTrackingAllowed()`; C gates itself. A CHANGED
 // CHILD SCHEDULES ITS ROOT (R2, G-7-1/G-7-2): `listAllRollouts()` excludes subagent rollouts, so the
@@ -607,52 +607,6 @@ function coverageSessions(session, readState, deps) {
     .map((t) => ({ ...session, tenantId: t.id }));
 }
 
-// Every workspace of an account as a session clone, dark ones included.
-function workspaceTargets(session) {
-  return isMultiTenant(session) ? tenantsOf(session).map((t) => ({ ...session, tenantId: t.id })) : [session];
-}
-
-// Each target's max(linkedAt, joinedAt) folded: the earliest and latest known, whether one is unknown, and whether a read threw.
-function linkSpan(targets, trackingState, deps) {
-  const linkDeps = { ...deps, readTrackingStateImpl: trackingState };
-  const span = { earliest: Infinity, latest: -Infinity, unknown: false, failed: false };
-  for (const target of targets) {
-    let ms = null;
-    try { ms = workspaceLinkMs(target, target.tenantId, linkDeps); } catch { span.failed = true; continue; }
-    if (ms == null) { span.unknown = true; continue; }
-    if (ms < span.earliest) span.earliest = ms;
-    if (ms > span.latest) span.latest = ms;
-  }
-  return span;
-}
-
-const allOf = (lists) => lists.reduce((out, list) => out.concat(list), []);
-
-// Path B's live cutoff: the latest link over every reporting, non-dark workspace; null when any link is unknown.
-function liveCutoffMs(sessions, trackingState, liveAllowed, deps) {
-  const reporting = (session) => {
-    if (isMultiTenant(session)) return true;
-    try { return liveAllowed(session.key, { ...deps, readTrackingStateImpl: trackingState }) !== false; } catch { return true; }
-  };
-  const targets = allOf(sessions.filter(reporting).map((session) => coverageSessions(session, trackingState, deps)));
-  const span = linkSpan(targets, trackingState, deps);
-  return span.unknown || span.failed ? null : span.latest;
-}
-
-// Path A's settle line: the earliest known link over every workspace of every LINKED account, tokenless ones and dark
-// workspaces included; Infinity when none is known, null when a link read throws.
-async function settleBeforeMs(sessions, trackingState, deps) {
-  const span = linkSpan(allOf((await listRecipients(sessions, deps)).map(workspaceTargets)), trackingState, deps);
-  return span.failed ? null : span.earliest;
-}
-
-// A session's last write as Path A knows it: its own file's mtime, else (a child-scheduled root) its newest moved child's.
-function lastWriteMs(entry, kids) {
-  if (typeof entry.mtimeMs === 'number') return entry.mtimeMs;
-  const times = (kids || []).map((kid) => kid.mtimeMs).filter((ms) => typeof ms === 'number');
-  return times.length > 0 ? Math.max.apply(null, times) : null;
-}
-
 /**
  * One complete watcher pass. Synchronous work is chunked and every await point re-checks `stop`.
  * Never throws: a pass that fails is a pass that reports `errors`, because the only thing this
@@ -802,26 +756,15 @@ export async function runWatchPass(deps = {}, options = {}) {
 
   // ── Path A: established sessions ──────────────────────────────────────────────────────────
   if (live) {
-    const settleMs = plan.due.length > 0 ? await settleBeforeMs(sessions, trackingState, deps) : null;
     for (const entry of plan.due) {
       if (shouldStop()) break;
-      const kids = plan.childrenBySession.get(entry.sessionId);
-      // Written before every workspace's link and no child moved: past for all, so it is observed without a checkpoint.
-      if (settleMs != null && !kids && !entry.synthetic && entry.mtimeMs < settleMs) {
-        recordObservation(record, entry.sessionId, { mtimeMs: entry.mtimeMs, size: entry.size }, nowFn());
-        dirty = true;
-        continue;
-      }
-      await checkpointOne(entry.sessionId, entry, { writtenAtMs: lastWriteMs(entry, kids) });
+      await checkpointOne(entry.sessionId, entry, {});
     }
   }
 
   // ── Path B: unestablished but still active — coverage decides the boundary ────────────────
-  // A session last written before the cutoff is past: only the offer sends it.
-  const cutoffMs = live && plan.fresh.length > 0 ? liveCutoffMs(sessions, trackingState, liveAllowed, deps) : null;
-  const fresh = cutoffMs == null ? [] : plan.fresh.filter((entry) => entry.mtimeMs >= cutoffMs);
-  if (fresh.length > 0 && !shouldStop()) {
-    for (const entry of fresh.slice(0, orDefault(options.maxEstablish, MAX_ESTABLISH_PER_PASS))) {
+  if (live && plan.fresh.length > 0 && !shouldStop()) {
+    for (const entry of plan.fresh.slice(0, orDefault(options.maxEstablish, MAX_ESTABLISH_PER_PASS))) {
       if (shouldStop()) break;
       const reconciled = await (deps.reconcileSession || reconcileSession)(entry.sessionId, sessions, async (sessionHandle, reporting) => {
         // ONE boundary for the machine, and it has to be safe for every REPORTING account: the
@@ -889,7 +832,8 @@ export async function runWatchPass(deps = {}, options = {}) {
   if (plan.quiet.length > 0 && historyDue && !shouldStop()) {
     // runAudit takes runLock('backfill') at rank 1 itself — legal under our rank-0 election lock,
     // and a concurrent the sync skill simply refuses this one as 'run-in-progress'. It drains the
-    // queue first, consults coverage and honours an audit-only tenant. None of that is reimplemented here.
+    // queue first, consults coverage, honours an audit-only tenant and never seals or reopens the
+    // one-time backfill (R2). None of that is reimplemented here.
     //
     // ONE RUN PER ACCOUNT, and `history` is therefore a list. The repair pass uploads to the
     // account it was given (lib/session-audit.mjs auditSession), so a machine with two linked
@@ -899,16 +843,15 @@ export async function runWatchPass(deps = {}, options = {}) {
     // An account in several workspaces runs once per workspace its rules and New folders reach, as
     // scripts/sync.mjs does: each answers coverage for itself, and runAudit refuses a headerless run.
     // liveOnly: this pass is unprompted, so an audit-only workspace refuses it; only an explicit history request syncs to one.
-    // HistoryScope.LIVE: only sessions last written at or after each workspace's link time.
     const histories = [];
     try {
       for (const session of sessions) {
         if (!isMultiTenant(session)) {
           if (usesRules(session)) {
             const excludedSessionIds = dontTrackSessionIds(planWorkspaceRuns(session));
-            histories.push(await runAudit({}, { scope: HistoryScope.LIVE, liveOnly: true, key: session.key, excludedSessionIds }));
+            histories.push(await runAudit({}, { mode: SYNC_MODE, liveOnly: true, key: session.key, excludedSessionIds }));
           } else {
-            histories.push(await runAudit({}, { scope: HistoryScope.LIVE, liveOnly: true, key: session.key }));
+            histories.push(await runAudit({}, { mode: SYNC_MODE, liveOnly: true, key: session.key }));
           }
           continue;
         }
@@ -916,7 +859,7 @@ export async function runWatchPass(deps = {}, options = {}) {
         for (const tenantId of workspaces.tenantIds) {
           if (shouldStop()) break;
           histories.push(await runAudit({}, {
-            scope: HistoryScope.LIVE, liveOnly: true, key: session.key, tenantId, sessionRoutes: workspaces.routes,
+            mode: SYNC_MODE, liveOnly: true, key: session.key, tenantId, sessionRoutes: workspaces.routes,
           }));
         }
       }

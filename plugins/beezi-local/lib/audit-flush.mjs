@@ -5,8 +5,6 @@ import { postJson } from './http.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { orDefault } from './compat.mjs';
 import { recordIssue, DIAGNOSTIC_CODES, DIAGNOSTIC_SOURCES } from './diagnostics.mjs';
-import { ANONYMIZATION_KEY_MISSING, kindsOf, sessionAnonymization, withoutMarker } from './anonymization.mjs';
-import { anonymizeReport } from './anonymize.mjs';
 
 // The backfill route caps chunks at 100 array items and mounts a 5mb body limit; 50 items with
 // 1MB of headroom keeps every chunk comfortably inside both.
@@ -46,18 +44,10 @@ export const BackfillHalt = Object.freeze({
   FORBIDDEN: 'forbidden',
   // Client-side, and the only member this module never sets itself: the caller's run lock was
   // taken over mid-run, so another process now owns this machine's history upload. It is a halt
-  // rather than a failure because the work is not lost — the surviving owner is doing it.
+  // rather than a failure because the work is not lost — the surviving owner is doing it — and
+  // because a run that no longer owns the lock must not go on to seal the one-time pull.
   LOCK_LOST: 'lock-lost',
-  // Client-side too: the run's workspace is anonymized and no key is cached, so nothing is sent.
-  ANONYMIZATION_KEY_MISSING,
 });
-
-// A run stopped for a missing anonymization key, at the account check-in (reason) or at the upload (halt).
-export const isKeyMissing = (result) =>
-  result.reason === BackfillHalt.ANONYMIZATION_KEY_MISSING || result.halt === BackfillHalt.ANONYMIZATION_KEY_MISSING;
-
-export const KEY_MISSING_MESSAGE = 'Beezi: this workspace is anonymized but this machine has no key yet. '
-  + 'Sign in to Beezi again (login skill); if this repeats, contact your workspace admin.';
 
 const wireBytes = (reports, timelines = []) =>
   Buffer.byteLength(JSON.stringify({ sessions: reports, timelines }), 'utf-8');
@@ -199,23 +189,14 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
     halt: null,
     lastError: null,
   };
-  const block = sessionAnonymization(session);
-  const kinds = kindsOf(block);
-  if (kinds.length > 0 && !block.key) {
-    result.halt = BackfillHalt.ANONYMIZATION_KEY_MISSING;
-    result.lastError = BackfillHalt.ANONYMIZATION_KEY_MISSING;
-    return result;
-  }
-  // Hashed before planning so chunk sizes are the wire's; sessionId, to_line and agent_id stay raw for the verdicts and coverage.
-  const forWire = kinds.length > 0 ? (r) => anonymizeReport(r, block.key, kinds) : withoutMarker;
-  const groups = sessionGroups.map((g) => ({ ...g, reports: (g.reports || []).map(forWire) }));
-  const chunks = planChunks(groups, options);
+  const chunks = planChunks(sessionGroups, options);
   if (chunks.length === 0) return result;
 
   // Parameterised rather than hardcoded (G-8-6): the ~250 lines below — chunking, bisect-on-400,
   // 401 renewal and per-session verdicts — are route-agnostic, and a repeatable history sync wants
-  // every one of them. Defaults to the sync route, read from ENDPOINTS, never spelled out here.
-  const endpointPath = orDefault(options.endpoint, ENDPOINTS.sessionsSync);
+  // every one of them. Defaults to the one-time backfill route, so no existing caller changes.
+  // The default is read from ENDPOINTS, never spelled out here.
+  const endpointPath = orDefault(options.endpoint, ENDPOINTS.sessionsBackfill);
   const url = `${apiBase()}${endpointPath}`;
   // A 401 is authentication, not a verdict on the payload. Renew once for this call (or per stale
   // token through deps.renewSession) and retry; if renewal fails, the chunk counts as failed and stays eligible.
@@ -363,7 +344,7 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
       const { body } = await readResponseBody(res);
       if (!body || !Array.isArray(body.errors)) {
         // The server accepted the chunk but we cannot attribute it — never ledger an outcome
-        // we did not receive.
+        // we did not receive, and never seal on top of one.
         markChunk(chunk, BackfillSessionStatus.UNATTRIBUTED, 'unreadable-response');
         result.unattributed += 1;
         result.lastError = 'unreadable-response';
@@ -392,8 +373,7 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
 
     if (res.status === 403) {
       // Only the coded 403s are actionable; a code-less 403 (seat revoked, deactivated user)
-      // must never read as "history uploads are refused" or "tracking is off".
-      // BACKFILL_ALREADY_COMPLETED is the portal's refusal of history uploads for this workspace.
+      // must never read as "the pull is done" or "tracking is off".
       if (code === 'BACKFILL_ALREADY_COMPLETED') {
         result.halt = BackfillHalt.ALREADY_COMPLETED;
       } else if (code === 'BACKFILL_NOT_ALLOWED' || code === 'TRACKING_DISABLED') {
@@ -421,8 +401,8 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
     if (res.status === 400 && chunk.timelines && chunk.timelines.length && raw.includes('timelines')) {
       // A server predating the in-band timelines 400s the whole chunk on the unknown field
       // (forbidNonWhitelisted). Retry once without them — losing timelines beats losing the
-      // usage; the ledger then counts these sessions delivered, so a later run does not resend
-      // their timelines. Acceptable for a deploy-order violation.
+      // usage, and the next login (post-deploy) delivers nothing new only because the ledger
+      // already sealed these sessions; acceptable for a deploy-order violation.
       result.timelinesDropped += chunk.timelines.length;
       return sendChunk({ ...chunk, timelines: [] }, depth, plain);
     }
@@ -485,4 +465,24 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
   }
 
   return result;
+}
+
+// Seal this user's pull for the calling tool. Idempotent server-side (snapshot_taken_at is
+// COALESCEd), so retrying a lost response is safe.
+// It takes no account key, unlike flushBackfillChunks: there is no renewal on this path — one
+// small POST, and a 401 here is reported rather than retried — so a key would be an unused
+// parameter, not a contract. A per-workspace clone seals that workspace's pull only.
+export async function completeBackfill(session, deps = {}, options = {}) {
+  const postJsonImpl = deps.postJsonImpl || postJson;
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const timeoutMs = orDefault(options.timeoutMs, DEFAULT_BACKFILL_TIMEOUT_MS);
+  const url = `${apiBase()}${ENDPOINTS.sessionsBackfillComplete}`;
+  try {
+    const res = await postJsonImpl(url, session, {}, { fetchImpl, timeoutMs });
+    if (res.status >= 200 && res.status < 300) return { completed: true, code: null };
+    const { code, message } = await readResponseBody(res);
+    return { completed: false, code, reason: orDefault(message, `HTTP ${res.status}`) };
+  } catch {
+    return { completed: false, code: null, reason: 'network' };
+  }
 }

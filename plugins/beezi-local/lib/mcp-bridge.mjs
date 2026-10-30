@@ -5,7 +5,6 @@ import {
   getAccount as _getAccount,
   getDefaultKey as _getDefaultKey,
   listAccounts as _listAccounts,
-  rowSessionFields,
 } from './accounts.mjs';
 import { checkEnvironment } from './env-guard.mjs';
 import { authHeaders } from './http.mjs';
@@ -792,7 +791,9 @@ export function createBridge(deps = {}) {
         token: auth.accessToken,
         clientId,
         tenantId: null,
-        ...rowSessionFields(row),
+        tenants: Array.isArray(row.tenants) ? row.tenants : null,
+        newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+        workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
       },
       blocked: null,
     };

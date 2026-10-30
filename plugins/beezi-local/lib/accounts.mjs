@@ -17,12 +17,8 @@ import {
   subjectAuthorityPath, LEGACY_SUBJECT,
 } from './credentials.mjs';
 import {
-  ruleRequestIds, newFoldersSendIds, gainedIds, requestHistory, noteAttempt, settleHistory, takeResults, hasSessionIds, SettleState,
+  ruleRequestIds, removalRequestIds, newFoldersSendIds, gainedIds, requestHistory, noteAttempt, settleHistory, takeResults, SettleState,
 } from './pending-history.mjs';
-import { OfferState, offerToken, offerMapOf, offerRecordOf, offerIdsOf, changedAtOf } from './history-offer.mjs';
-import { anonymizationFor, kindsOf, unionKinds } from './anonymization.mjs';
-import { KINDS } from './anonymize.mjs';
-import { NEW_FOLDERS_SOURCE } from './workspace.mjs';
 
 // The one definition of "which Beezi accounts are linked on this machine". accounts.json is its
 // only home; lib/paths.mjs names the file and every per-account directory under it.
@@ -34,7 +30,7 @@ import { NEW_FOLDERS_SOURCE } from './workspace.mjs';
 
 const INDEX_VERSION = 1;
 const FIELDS = [
-  'email', 'name', 'tenantId', 'tenantName', 'tenants', 'anonymization', 'newFolders', 'workspaceRules',
+  'email', 'name', 'tenantId', 'tenantName', 'tenants', 'newFolders', 'workspaceRules',
   'clientId', 'linkedAt', 'status',
 ];
 
@@ -310,7 +306,9 @@ export async function addAccount(row, deps = {}) {
       name: row.name == null ? null : row.name,
       tenantId: row.tenantId == null ? null : row.tenantId,
       tenantName: row.tenantName == null ? null : row.tenantName,
-      ...rowSessionFields(row),
+      tenants: Array.isArray(row.tenants) ? row.tenants : null,
+      newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
+      workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
       clientId: row.clientId == null ? null : row.clientId,
       linkedAt: row.linkedAt == null ? new Date().toISOString() : row.linkedAt,
       status: row.status == null ? AccountStatus.LINKED : row.status,
@@ -352,7 +350,7 @@ export async function setNewFolders(key, { mode, tenantIds = [] } = {}, deps = {
     if (!found) throw new UserError('No such linked account.');
     const before = newFoldersSendIds(found);
     found.newFolders = { mode, tenantIds: mode === 'send' ? ids : [] };
-    reopenOffers(found, gainedIds(before, newFoldersSendIds(found)), { kind: NEW_FOLDERS_SOURCE });
+    requestHistory(found, gainedIds(before, newFoldersSendIds(found)), new Date().toISOString());
     writeIndex(index);
     return found.newFolders;
   });
@@ -400,11 +398,6 @@ export async function settlePendingHistory(key, tenantId, run, timing, deps = {}
     const found = index.accounts.find((a) => a.key === key);
     if (!found) return SettleState.MISSING;
     const state = settleHistory(found, tenantId, run, timing);
-    // A finished upload settles the offer, unless a rule re-opened it or a question was printed after the yes meanwhile.
-    const record = offerRecordOf(found, tenantId);
-    if (state === SettleState.CLEARED && (record == null || (record.state !== OfferState.RESCAN && record.state !== OfferState.DECLINED))) {
-      applyOffer(found, tenantId, { state: OfferState.SETTLED, changedAt: changedAtOf(found, tenantId) });
-    }
     writeIndex(index);
     return state;
   });
@@ -419,95 +412,6 @@ export async function takeHistoryResults(key, limit = null, deps = {}) {
     const taken = takeResults(found, limit);
     writeIndex(index);
     return taken;
-  });
-}
-
-const OFFER_FIELDS = ['state', 'changedAt', 'scanAt', 'offeredIds', 'declinedIds', 'shownKinds', 'summary', 'places', 'override'];
-
-export const AcceptRefusal = Object.freeze({ NONE: 'none', CHANGED: 'changed' });
-
-// Writes the listed fields onto the workspace's record and keeps the rest; a decline or settle closes its re-opened places.
-// Pending entries without accepted ids are dropped from the row.
-function applyOffer(row, tenantId, patch) {
-  const record = Object.assign({}, offerRecordOf(row, tenantId));
-  for (const field of OFFER_FIELDS) if (patch[field] !== undefined) record[field] = patch[field];
-  if (patch.state === OfferState.DECLINED || patch.state === OfferState.SETTLED) record.places = [];
-  row.historyOffers = Object.assign({}, offerMapOf(row), { [tenantId]: record });
-  if (Array.isArray(row.pendingHistory)) row.pendingHistory = row.pendingHistory.filter((e) => e != null && hasSessionIds(e));
-  return record;
-}
-
-// A rule or New folders now sends `place` to these workspaces: each recorded offer is scanned again. Only an offer
-// already shown (declined or settled, or a scan already scoped by one) narrows to the place; any other scans in full.
-function reopenOffers(row, tenantIds, place) {
-  for (const id of tenantIds) {
-    const record = offerRecordOf(row, id);
-    if (record == null) continue;
-    const places = Array.isArray(record.places) ? record.places : [];
-    const scoped = record.state === OfferState.DECLINED || record.state === OfferState.SETTLED || places.length > 0;
-    const known = places.some((p) => p != null && p.kind === place.kind && p.match === place.match);
-    record.state = OfferState.RESCAN;
-    record.places = !scoped ? [] : known ? places : places.concat([place]);
-  }
-}
-
-// One workspace's offer record, `patch` ⊆ OFFER_FIELDS or a function of the fresh (record|null, row) that returns one;
-// returns the stored record, or null without the account or when the function returns null (nothing is written).
-export async function recordOffer(key, tenantId, patch, deps = {}) {
-  return mutate(deps, () => {
-    const index = readIndexForMutation();
-    const found = index.accounts.find((a) => a.key === key);
-    if (!found) return null;
-    const decided = typeof patch === 'function' ? patch(offerRecordOf(found, tenantId), found) : patch;
-    if (decided == null) return null;
-    const record = applyOffer(found, tenantId, decided);
-    writeIndex(index);
-    return record;
-  });
-}
-
-// The same `patch` (⊆ OFFER_FIELDS) on several of one account's workspaces in one write; the stored records, or null without the account.
-export async function recordOffers(key, tenantIds, patch, deps = {}) {
-  return mutate(deps, () => {
-    const index = readIndexForMutation();
-    const found = index.accounts.find((a) => a.key === key);
-    if (!found) return null;
-    const records = tenantIds.map((tenantId) => applyOffer(found, tenantId, patch));
-    writeIndex(index);
-    return records;
-  });
-}
-
-// The kinds the printed question showed as hidden; a record from before they were recorded counts as all of them.
-function shownKindsOf(record) {
-  const shown = record.shownKinds;
-  return Array.isArray(shown) && shown.every((kind) => KINDS.indexOf(kind) !== -1) ? shown : KINDS;
-}
-
-// A yes to the printed question whose token is `token`: owes exactly its shown ids, hiding the kinds it showed as hidden
-// plus those hidden now, and settles the offer. → { ids, refused: AcceptRefusal value | null }; a refusal writes nothing.
-export async function acceptOffer(key, tenantId, token, nowIso, deps = {}) {
-  return mutate(deps, () => {
-    const index = readIndexForMutation();
-    const found = index.accounts.find((a) => a.key === key);
-    const record = found ? offerRecordOf(found, tenantId) : null;
-    const ids = record == null ? [] : offerIdsOf(record.offeredIds);
-    if (ids.length === 0) return { ids: [], refused: AcceptRefusal.NONE };
-    const shown = shownKindsOf(record);
-    // Only printing the question records DECLINED; its token binds the shown ids and the kinds it showed as hidden.
-    if (record.state !== OfferState.DECLINED || token !== offerToken(ids, shown)) return { ids: [], refused: AcceptRefusal.CHANGED };
-    const kinds = unionKinds(shown, kindsOf(anonymizationFor(found, tenantId)));
-    // A workspace the account no longer has gets no entry, so nothing is accepted.
-    if (!requestHistory(found, tenantId, ids, nowIso, { override: record.override === true, kinds }).some((e) => e.tenantId === tenantId)) {
-      return { ids: [], refused: AcceptRefusal.NONE };
-    }
-    applyOffer(found, tenantId, {
-      state: OfferState.SETTLED,
-      changedAt: changedAtOf(found, tenantId),
-      declinedIds: offerIdsOf(record.declinedIds).filter((id) => ids.indexOf(id) === -1),
-    });
-    writeIndex(index);
-    return { ids, refused: null };
   });
 }
 
@@ -535,7 +439,6 @@ export async function setWorkspaceRule(key, { kind, match, label = null, tenantI
     if (!found) throw new UserError('No such linked account.');
     const stored = Array.isArray(found.workspaceRules) ? found.workspaceRules.slice() : [];
     const existing = rulesOf({ workspaceRules: stored }).find((r) => r.kind === kind && r.match === match);
-    const before = existing == null ? [] : ruleRequestIds(found, existing.tenantIds);
     const rule = {
       kind,
       match,
@@ -552,7 +455,8 @@ export async function setWorkspaceRule(key, { kind, match, label = null, tenantI
       n = stored.length;
     }
     found.workspaceRules = stored;
-    reopenOffers(found, gainedIds(before, ruleRequestIds(found, tenantIds)), { kind, match });
+    // Every workspace the rule sends to is owed its history; the worker skips what it already has (lib/pending-history.mjs).
+    requestHistory(found, ruleRequestIds(found, tenantIds), new Date().toISOString());
     writeIndex(index);
     return { index: n, rule };
   });
@@ -569,6 +473,7 @@ export async function removeWorkspaceRule(key, n, deps = {}) {
     const rule = Number.isInteger(position) ? rulesOf(found).find((r) => r.index === position) : null;
     if (rule == null) throw new UserError(`There is no rule ${n}. Ask the settings skill to list the rules.`);
     found.workspaceRules.splice(position - 1, 1);
+    requestHistory(found, removalRequestIds(found), new Date().toISOString());
     writeIndex(index);
     return rule;
   });
@@ -583,6 +488,8 @@ export async function restoreRouting(key, { expected, before }, deps = {}) {
     if (!sameRouting(routingOf(found), expected)) return 'changed';
     found.workspaceRules = before.workspaceRules;
     if (before.newFolders == null) delete found.newFolders; else found.newFolders = before.newFolders;
+    // Every workspace the restored rules or New folders reach is owed its history; over-requesting is harmless.
+    requestHistory(found, removalRequestIds(found), new Date().toISOString());
     writeIndex(index);
     return 'restored';
   });
@@ -600,25 +507,15 @@ export async function removeAccount(key, deps = {}) {
   });
 }
 
-const objectOrNull = (value) => (value != null && typeof value === 'object' && !Array.isArray(value) ? value : null);
-
-// A row's workspace fields as a session carries them: a non-object reads as null, a non-array rule list as [].
-export function rowSessionFields(row) {
-  return {
-    tenants: Array.isArray(row.tenants) ? row.tenants : null,
-    anonymization: objectOrNull(row.anonymization),
-    newFolders: objectOrNull(row.newFolders),
-    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
-  };
-}
-
 function sessionFor(a, auth) {
   return {
     key: a.key,
     email: a.email,
     name: a.name,
     tenantName: a.tenantName,
-    ...rowSessionFields(a),
+    tenants: Array.isArray(a.tenants) ? a.tenants : null,
+    newFolders: a.newFolders != null && typeof a.newFolders === 'object' ? a.newFolders : null,
+    workspaceRules: Array.isArray(a.workspaceRules) ? a.workspaceRules : [],
     // Always null on the base session: only a per-workspace clone sets it, and the row's own
     // web-side tenantId never becomes X-Beezi-Tenant.
     tenantId: null,
@@ -631,7 +528,7 @@ function sessionFor(a, auth) {
 
 /**
  * The object every fan-out site loops over: one { key, email, name, tenantName, tenants,
- * anonymization, newFolders, workspaceRules, tenantId: null, token, clientId } per account that can currently
+ * newFolders, workspaceRules, tenantId: null, token, clientId } per account that can currently
  * produce a token. An account that cannot is DROPPED, never thrown — a transient failure must cost
  * one account, not the whole hook.
  *
