@@ -1,4 +1,5 @@
 import fs from 'fs';
+import { isZstdBuffer, readRolloutBuffer } from './rollout-file.mjs';
 
 const MAX_LINE_BYTES = 256 * 1024 * 1024;
 const CHUNK_BYTES = 1024 * 1024;
@@ -170,13 +171,55 @@ function forEachLine(transcriptPath, { chunkBytes = CHUNK_BYTES, maxLineBytes = 
   }
 }
 
+// forEachLine over a rollout already in memory (a decompressed `.jsonl.zst`): the same lines, the
+// same oversize rule, the same unterminated last line.
+function forEachBufferLine(buf, { maxLineBytes = MAX_LINE_BYTES } = {}, onLine) {
+  let start = 0;
+  for (;;) {
+    const nl = buf.indexOf(NEWLINE, start);
+    if (nl === -1) break;
+    onLine(buf, start, nl, nl - start > maxLineBytes, true);
+    start = nl + 1;
+  }
+  if (buf.length > start) onLine(buf, start, buf.length, buf.length - start > maxLineBytes, false);
+}
+
+function startsWithZstdMagic(transcriptPath) {
+  const fd = fs.openSync(transcriptPath, 'r');
+  try {
+    const magic = Buffer.alloc(4);
+    const got = fs.readSync(fd, magic, 0, 4, 0);
+    return got === 4 && isZstdBuffer(magic);
+  } finally {
+    fs.closeSync(fd);
+  }
+}
+
+// A plain rollout streams from disk; a zstd one (Codex compresses rollouts older than 7 days) is
+// decompressed whole by rollout-file.mjs and walked in memory, so both count physical lines alike.
+// A compressed rollout this Node cannot decompress (or a corrupt frame) is unreadable, not empty:
+// throwing keeps a caller's cursor where it is instead of saving one computed from junk.
+function forEachRolloutLine(transcriptPath, options, onLine) {
+  if (!startsWithZstdMagic(transcriptPath)) {
+    forEachLine(transcriptPath, options, onLine);
+    return;
+  }
+  const buf = readRolloutBuffer(transcriptPath);
+  if (buf === null) {
+    const error = new Error('Transcript is compressed and could not be decompressed');
+    error.code = 'ROLLOUT_UNREADABLE';
+    throw error;
+  }
+  forEachBufferLine(buf, options, onLine);
+}
+
 // delta-codex.mjs line rules: trailing empty lines drop, other blank or malformed lines give null,
 // and an unterminated last line that is neither blank nor JSON is torn: counted but not complete.
 export function readRolloutLines(transcriptPath, options) {
   const records = [];
   let pendingEmpty = 0;
   let torn = false;
-  forEachLine(transcriptPath, options, (buf, start, end, oversize, terminated) => {
+  forEachRolloutLine(transcriptPath, options, (buf, start, end, oversize, terminated) => {
     if (!oversize && start === end) {
       pendingEmpty += 1;
       return;

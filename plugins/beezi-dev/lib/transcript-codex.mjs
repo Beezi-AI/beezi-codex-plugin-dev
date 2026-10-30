@@ -5,18 +5,18 @@ import { listAccountsSync } from './accounts.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { scanRecords } from './session-name-codex.mjs';
 import { orDefault } from './compat.mjs';
+import { ROLLOUT_RE, rolloutIdFromName, resolveRolloutPath, rolloutSupersedes } from './rollout-file.mjs';
 
 // Codex writes one rollout transcript per session at
 //   ~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<sessionId>.jsonl
+// and compresses it in place to `.jsonl.zst` after 7 days (resuming restores the `.jsonl` name), so
+// every lookup here accepts both and keys on the id, never the filename.
 // The filename always ends with the globally-unique session id, so we can locate a session's
 // transcript by id regardless of cwd drift (cd / worktree switches during the session).
 //
 // Only the SessionStart and SessionEnd hooks carry `transcript_path`; PostToolUse and Stop do
 // not. So the checkpoint path resolves the rollout from the session id (this module) instead of
 // relying on the hook payload.
-
-// Exported: the subagent sweep walks the same tree and must agree on what a rollout file is.
-export const ROLLOUT_RE = /^rollout-.*\.jsonl$/;
 
 function isValidSessionId(id) {
   return typeof id === 'string' && /^[a-zA-Z0-9-]+$/.test(id);
@@ -68,13 +68,14 @@ export function findRolloutBySessionId(sessionId) {
   if (!isValidSessionId(sessionId)) return null;
   const suffix = `-${sessionId}.jsonl`;
   const files = listRolloutFiles(codexSessionsDir());
-  // A session id is unique, but if two files somehow match (resume), prefer the newest.
+  // A session id is unique, but if two files somehow match (resume), prefer the plain one — a
+  // resume decompresses back to `.jsonl`, so a surviving `.zst` is the older copy — then the newest.
   let best = null;
   for (const full of files) {
-    if (!full.endsWith(suffix)) continue;
+    if (!full.endsWith(suffix) && !full.endsWith(`${suffix}.zst`)) continue;
     let mtime;
     try { mtime = fs.statSync(full).mtimeMs; } catch { continue; }
-    if (!best || mtime > best.mtime) best = { full, mtime };
+    if (!best || rolloutSupersedes(full, mtime, best.full, best.mtime)) best = { full, mtime };
   }
   return best ? { sessionId, transcriptPath: best.full } : null;
 }
@@ -104,22 +105,16 @@ function findRolloutBySessionState(cwd) {
     const fileId = file.slice(0, -'.json'.length);
     const id = typeof state.sessionId === 'string' ? state.sessionId : fileId;
     if (!isUsableSessionId(id)) continue;
-    try {
-      if (!fs.statSync(state.transcriptPath).isFile()) continue;
-    } catch {
-      continue;
-    }
+    // The recorded path may have flipped between `.jsonl` and `.jsonl.zst` since it was saved.
+    const transcriptPath = resolveRolloutPath(state.transcriptPath);
+    if (!transcriptPath) continue;
     const updatedAt = typeof state.updatedAt === 'string' ? state.updatedAt : '';
     if (!best || updatedAt > best.updatedAt) {
-      best = { sessionId: id, transcriptPath: state.transcriptPath, updatedAt };
+      best = { sessionId: id, transcriptPath, updatedAt };
     }
   }
   return best ? { sessionId: best.sessionId, transcriptPath: best.transcriptPath } : null;
 }
-
-// rollout-<ISO-with-dashes>-<uuid>.jsonl — the session id is the trailing UUID (its internal
-// dashes make a greedy suffix capture wrong).
-const TRAILING_UUID_RE = /-([0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12})\.jsonl$/;
 
 // What a rollout's own session_meta (first line) says about itself: `{ cwd, sessionId }`, either
 // field null when unusable, or null for a file with no readable session_meta at all.
@@ -178,8 +173,8 @@ function rolloutMeta(transcriptPath) {
 function rolloutSessionId(transcriptPath) {
   const meta = rolloutMeta(transcriptPath);
   if (meta && meta.sessionId) return meta.sessionId;
-  const m = TRAILING_UUID_RE.exec(path.basename(transcriptPath));
-  return m && isUsableSessionId(m[1]) ? m[1] : null;
+  const fromName = rolloutIdFromName(path.basename(transcriptPath));
+  return isUsableSessionId(fromName) ? fromName : null;
 }
 
 // Resolve the rollout for a manual invocation (e.g. the track script) that has only process.cwd():
@@ -209,8 +204,8 @@ export function resolveTranscriptByCwd(cwd) {
   // live hooks are already reporting — double-billing it. Pinned by test/session-audit.test.mjs
   // case 7. Callers that need a name for a durable key validate for themselves
   // (lib/track-session.mjs).
-  const m = TRAILING_UUID_RE.exec(path.basename(best.full));
-  const fromName = m && isUsableSessionId(m[1]) ? m[1] : null;
+  const nameId = rolloutIdFromName(path.basename(best.full));
+  const fromName = isUsableSessionId(nameId) ? nameId : null;
   return { sessionId: orDefault(best.sessionId, fromName), transcriptPath: best.full };
 }
 
@@ -221,16 +216,16 @@ export function resolveCodexTranscript(input) {
   const sessionId = orDefault((input || {}).session_id, null);
   const provided = orDefault((input || {}).transcript_path, null);
   if (provided) {
-    try {
-      if (fs.statSync(provided).isFile()) {
-        // A hook can hand over a path with no session_id (or a junk one). The rollout knows its own
-        // id, and we are already touching the file — so answer with it rather than pass the gap on.
-        return {
-          sessionId: isUsableSessionId(sessionId) ? sessionId : rolloutSessionId(provided),
-          transcriptPath: provided,
-        };
-      }
-    } catch { /* fall through to id resolution */ }
+    // A stale `.jsonl` handed over for a rollout since compressed (or the reverse) still resolves.
+    const found = resolveRolloutPath(provided);
+    if (found) {
+      // A hook can hand over a path with no session_id (or a junk one). The rollout knows its own
+      // id, and we are already touching the file — so answer with it rather than pass the gap on.
+      return {
+        sessionId: isUsableSessionId(sessionId) ? sessionId : rolloutSessionId(found),
+        transcriptPath: found,
+      };
+    }
   }
   if (sessionId) {
     const byId = findRolloutBySessionId(sessionId);

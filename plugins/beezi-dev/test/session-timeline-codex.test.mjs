@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import zlib from 'node:zlib';
 import { computeSessionTimeline, postSessionTimeline } from '../lib/session-timeline-codex.mjs';
+import { markerSpans } from '../lib/timeline-waits-codex.mjs';
 import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
 
 function writeRollout(records) {
@@ -622,6 +624,275 @@ test('failed async questions do not turn the next instruction into a question an
     callAt(0, 'request_user_input_async', 'q'), resultAt(100, 'q', { error: 'unavailable' }),
     eventAt(MIN, 'task_complete'), promptAt(2 * MIN),
   ]), [['working', undefined, MIN], ['waiting_user', 'next_instruction', MIN]]);
+});
+
+// ─── PermissionRequest markers: command_approval waits ──────────────────────
+// Codex never writes an approval prompt or its decision to the rollout. A PermissionRequest hook
+// marker is the START of a human wait; the rollout says where it ENDS: the approved command's
+// started_at_ms, the approved patch's completed_at_ms, a turn_aborted (a "No"), or the next real
+// main-thread record.
+
+const policyAt = (ms, approval_policy = 'on-request', approvals_reviewer = 'user') => ({ timestamp: iso(ms),
+  type: 'turn_context', payload: { cwd: '/x', approval_policy, ...(approvals_reviewer === undefined ? {} : { approvals_reviewer }) } });
+const markerAt = (ms, extra = {}) => ({ ts: T0 + ms, turnId: 't1', agentId: null, toolName: 'exec_command',
+  permissionMode: 'default', ...extra });
+const commandDoneAt = (ms, startedMs) => eventAt(ms, 'item_completed',
+  { item: { type: 'CommandExecution', id: `c-${ms}` }, started_at_ms: T0 + startedMs, completed_at_ms: T0 + ms });
+const patchDoneAt = (ms, completedMs) => eventAt(ms, 'item_completed',
+  { item: { type: 'FileChange', id: `f-${ms}`, changes: {} }, started_at_ms: T0 + 1500, completed_at_ms: T0 + completedMs });
+const markedTimeline = (records, markers, file) => computeSessionTimeline(file || writeRollout(records), 'sess-1',
+  { readAgents: () => ({}), readPermissionMarkers: () => markers });
+const markedPeriods = (records, markers, file) => markedTimeline(records, markers, file).periods
+  .map((p) => [p.state, p.waiting_subtype, Date.parse(p.ended_at) - Date.parse(p.started_at)]);
+const approvals = (periods) => periods.filter((p) => p[1] === 'command_approval');
+
+// The canonical exec approval: marker at T=2s, the user approves at T+8s (the command's
+// started_at_ms), the command finishes at T+20s. The function_call_output is written before the
+// completion echo at the same millisecond, so the end must not hinge on record order.
+const execApproval = () => [
+  policyAt(0), workAt(1000), callAt(1500, 'exec_command', 'x', { cmd: 'npm test' }),
+  resultAt(22000, 'x', { output: 'ok' }), commandDoneAt(22000, 10000),
+];
+
+test('an approved command charges marker to started_at_ms as command_approval, the run stays working', () => {
+  assert.deepEqual(markedPeriods(execApproval(), [markerAt(2000)]), [
+    ['working', undefined, 2000],
+    ['waiting_user', 'command_approval', 8000],
+    ['working', undefined, 12000],
+  ]);
+});
+
+test('an approved patch ends its wait at the FileChange completed_at_ms', () => {
+  const periods = markedPeriods([policyAt(0), workAt(1000), patchDoneAt(12000, 8000), workAt(13000)],
+    [markerAt(2000, { toolName: 'apply_patch' })]);
+  assert.deepEqual(approvals(periods), [['waiting_user', 'command_approval', 6000]]);
+});
+
+test('a declined prompt (turn_aborted) is command_approval up to the abort, not idle or working', () => {
+  assert.deepEqual(markedPeriods([policyAt(0), workAt(1000), abortAt(7000)], [markerAt(2000)]), [
+    ['working', undefined, 2000],
+    ['waiting_user', 'command_approval', 5000],
+  ]);
+});
+
+test('a marker is not a human wait when no human could have been asked', () => {
+  const cases = [
+    ['policy never', [policyAt(0, 'never')].concat(execApproval().slice(1)), markerAt(2000)],
+    ['auto reviewer', [policyAt(0, 'on-request', 'auto_review')].concat(execApproval().slice(1)), markerAt(2000)],
+    ['bypassPermissions', execApproval(), markerAt(2000, { permissionMode: 'bypassPermissions' })],
+    ['subagent prompt', execApproval(), markerAt(2000, { agentId: 'agent-1' })],
+    ['no turn_context yet', execApproval().slice(1), markerAt(2000)],
+    ['before the first record', execApproval(), markerAt(-5000)],
+    ['at the last record', execApproval(), markerAt(22000)],
+  ];
+  for (const [name, records, marker] of cases) {
+    assert.deepEqual(approvals(markedPeriods(records, [marker])), [], name);
+  }
+});
+
+test('a turn_context without approvals_reviewer (older builds) counts as a human reviewer', () => {
+  const records = [policyAt(0, 'on-request', undefined)].concat(execApproval().slice(1));
+  assert.deepEqual(approvals(markedPeriods(records, [markerAt(2000)])), [['waiting_user', 'command_approval', 8000]]);
+});
+
+test('a granular approval policy asks, so its markers count', () => {
+  const records = [policyAt(0, { granular: { sandbox_approval: true, rules: true } })].concat(execApproval().slice(1));
+  assert.deepEqual(approvals(markedPeriods(records, [markerAt(2000)])), [['waiting_user', 'command_approval', 8000]]);
+});
+
+test('a parallel batch of prompts is one wait: only the earliest marker opens a span', () => {
+  const markers = [markerAt(2050), markerAt(2000)];
+  assert.deepEqual(markerSpans(execApproval(), markers),
+    [{ start: T0 + 2000, end: T0 + 10000, state: 'waiting_user', subtype: 'command_approval' }]);
+  assert.deepEqual(approvals(markedPeriods(execApproval(), markers)), [['waiting_user', 'command_approval', 8000]]);
+});
+
+test('a sub-second approval is auto-resolved noise and charges nothing', () => {
+  const records = [policyAt(0), workAt(1000), commandDoneAt(5000, 2600), workAt(6000)];
+  assert.deepEqual(markerSpans(records, [markerAt(2000)]), []);
+  assert.deepEqual(approvals(markedPeriods(records, [markerAt(2000)])), []);
+});
+
+test('a request_permissions marker adds nothing to the rollout call that already yields the wait', () => {
+  const records = [policyAt(0), callAt(1000, 'request_permissions', 'p'),
+    resultAt(11000, 'p', { permissions: {} }), workAt(12000)];
+  const marker = markerAt(1100, { toolName: 'request_permissions' });
+  assert.deepEqual(markerSpans(records, [marker]), []);
+  assert.deepEqual(markedPeriods(records, [marker]), [
+    ['working', undefined, 1000],
+    ['waiting_user', 'command_approval', 10000],
+    ['working', undefined, 1000],
+  ]);
+});
+
+test('an approval left unanswered for six hours is a break, not command_approval', () => {
+  assert.deepEqual(markedPeriods([policyAt(0), workAt(1000), promptAt(2000 + BREAK_GAP_MS)], [markerAt(2000)]), [
+    ['working', undefined, 2000],
+    ['break', undefined, BREAK_GAP_MS],
+  ]);
+});
+
+test('a marker with no rollout signal after it is never extended to wall-clock now', () => {
+  // The marker sits before the last record, but nothing after it ends a wait: only bookkeeping.
+  const records = [policyAt(0), workAt(1000), eventAt(9000, 'token_count')];
+  assert.deepEqual(markerSpans(records, [markerAt(2000)]), []);
+});
+
+test('the interval before the marker keeps the mode in force: planning stays planning', () => {
+  const records = [{ ...policyAt(0), payload: { ...policyAt(0).payload, collaboration_mode: { mode: 'plan' } } }]
+    .concat(execApproval().slice(1));
+  assert.deepEqual(markedPeriods(records, [markerAt(2000)]), [
+    ['planning', undefined, 2000],
+    ['waiting_user', 'command_approval', 8000],
+    ['planning', undefined, 12000],
+  ]);
+});
+
+test('a zstd-compressed rollout yields the same marker periods as the plain one',
+  { skip: typeof zlib.zstdCompressSync !== 'function' }, () => {
+    const plain = writeRollout(execApproval());
+    const zst = plain + '.zst';
+    fs.writeFileSync(zst, zlib.zstdCompressSync(fs.readFileSync(plain)));
+    fs.unlinkSync(plain);
+    const fromZst = markedTimeline(null, [markerAt(2000)], zst);
+    assert.ok(fromZst, 'a .zst rollout must be read, not dropped');
+    assert.deepEqual(fromZst.periods, markedTimeline(execApproval(), [markerAt(2000)]).periods);
+  });
+
+test('without a session id the marker reader is never called', () => {
+  let called = false;
+  const tl = computeSessionTimeline(writeRollout(execApproval()), null,
+    { readPermissionMarkers: () => { called = true; return [markerAt(2000)]; } });
+  assert.equal(called, false);
+  assert.deepEqual(tl.periods.filter((p) => p.waiting_subtype === 'command_approval'), []);
+});
+
+test('a throwing marker reader degrades to no markers', () => {
+  const tl = computeSessionTimeline(writeRollout(execApproval()), 'sess-1',
+    { readAgents: () => ({}), readPermissionMarkers: () => { throw new Error('boom'); } });
+  assert.deepEqual(tl.periods.map((p) => p.state), ['working']);
+});
+
+// ─── Plan clear-context handoff ─────────────────────────────────────────────
+// "Yes, clear context" starts a NEW rollout and writes nothing to the old one, so the old
+// timeline would end at task_complete. computeSessionTimeline appends the wait up to the
+// successor's first prompt, found through deps.planHandoff (fakes here: no FS).
+
+const H0 = Date.parse('2026-05-01T10:00:00.000Z');
+const hIso = (ms) => new Date(ms).toISOString();
+const hRec = (ms, type, payload) => ({ timestamp: hIso(ms), type, payload });
+const HANDOFF_PLAN = '# Plan\n' + 'step '.repeat(80);
+const HANDOFF_CWD = path.join(os.tmpdir(), 'handoff-proj');
+const HANDOFF_PREFIX = "A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context. Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation and verification.";
+const HWAIT = H0 + 6000;
+const oldPlanSession = () => [
+  hRec(H0, 'session_meta', { id: 'old-id', cwd: HANDOFF_CWD }),
+  hRec(H0 + 1000, 'event_msg', { type: 'user_message', message: 'plan it' }),
+  hRec(H0 + 5000, 'event_msg', { type: 'item_completed', item: { type: 'Plan', id: 'p', text: HANDOFF_PLAN } }),
+  hRec(HWAIT, 'event_msg', { type: 'task_complete' }),
+  // Trailing bookkeeping past task_complete: the appended wait must not overlap the period it ends.
+  hRec(HWAIT + 1, 'event_msg', { type: 'token_count' }),
+];
+// A successor whose session_meta lands metaDelay after the wait and whose first prompt lands promptDelay after.
+const successorHead = (metaDelay, promptDelay) => [
+  hRec(HWAIT + metaDelay, 'session_meta', { id: 'new-id', cwd: HANDOFF_CWD }),
+  hRec(HWAIT + promptDelay, 'event_msg', { type: 'user_message', message: `${HANDOFF_PREFIX}\n\n${HANDOFF_PLAN}` }),
+];
+const handoffDeps = (head, calls = []) => ({
+  readAgents: () => ({}),
+  readPermissionMarkers: () => [],
+  planHandoff: {
+    platform: 'linux',
+    listRollouts: () => { calls.push('list'); return ['new.jsonl']; },
+    statMtimeMs: () => { calls.push('stat'); return HWAIT + 30000; },
+    readHead: () => { calls.push('head'); return head; },
+    readAll: () => { calls.push('all'); return []; },
+  },
+});
+const tail = (tl) => {
+  const p = tl.periods[tl.periods.length - 1];
+  return [p.state, p.waiting_subtype, Date.parse(p.ended_at) - Date.parse(p.started_at)];
+};
+const assertContiguous = (tl) => {
+  for (let i = 1; i < tl.periods.length; i++) {
+    assert.ok(Date.parse(tl.periods[i].started_at) >= Date.parse(tl.periods[i - 1].ended_at),
+      `period ${i} starts before period ${i - 1} ends`);
+  }
+};
+
+test('a clear-context successor 26 s later appends the plan_approval wait and moves ended_at', () => {
+  const tl = computeSessionTimeline(writeRollout(oldPlanSession()), 'old-id', handoffDeps(successorHead(25000, 26000)));
+  assert.deepEqual(tail(tl), ['waiting_user', 'plan_approval', 26000]);
+  assert.equal(tl.periods[tl.periods.length - 1].started_at, hIso(HWAIT));
+  assert.equal(tl.ended_at, hIso(HWAIT + 26000));
+  assertContiguous(tl);
+});
+
+// The tail real Codex writes after a Plan: the assistant's final_answer message, a
+// token_usage_record and token_count sit between the Plan item and task_complete.
+const realPlanSession = () => [
+  hRec(H0, 'session_meta', { id: 'old-id', cwd: HANDOFF_CWD }),
+  hRec(H0 + 500, 'event_msg', { type: 'task_started', turn_id: 'turn-1' }),
+  hRec(H0 + 1000, 'event_msg', { type: 'user_message', message: 'plan it' }),
+  hRec(H0 + 5000, 'event_msg', { type: 'item_completed', turn_id: 'turn-1', item: { type: 'Plan', id: 'p', text: HANDOFF_PLAN } }),
+  hRec(H0 + 5026, 'response_item', { type: 'message', role: 'assistant', phase: 'final_answer',
+    content: [{ type: 'output_text', text: `<proposed_plan>\n${HANDOFF_PLAN}\n</proposed_plan>` }] }),
+  hRec(H0 + 5041, 'token_usage_record', { turn_id: 'turn-1' }),
+  hRec(H0 + 5059, 'event_msg', { type: 'token_count' }),
+  hRec(HWAIT, 'event_msg', { type: 'task_complete', turn_id: 'turn-1' }),
+];
+
+test('the real Codex Plan tail still appends the plan_approval wait', () => {
+  const tl = computeSessionTimeline(writeRollout(realPlanSession()), 'old-id', handoffDeps(successorHead(25000, 26000)));
+  assert.deepEqual(tail(tl), ['waiting_user', 'plan_approval', 26000]);
+  assert.equal(tl.periods[tl.periods.length - 1].started_at, hIso(HWAIT));
+  assert.equal(tl.ended_at, hIso(HWAIT + 26000));
+  assertContiguous(tl);
+});
+
+// Bookkeeping can land after the successor's first prompt (a late thread_settings_applied):
+// ended_at never moves backward past the rollout's own last record.
+test('ended_at never moves backward when the rollout runs past the successor prompt', () => {
+  const recs = [...oldPlanSession(), hRec(HWAIT + 60000, 'event_msg', { type: 'thread_settings_applied' })];
+  const tl = computeSessionTimeline(writeRollout(recs), 'old-id', handoffDeps(successorHead(25000, 26000)));
+  assert.deepEqual(tail(tl), ['waiting_user', 'plan_approval', 26000]);
+  assert.equal(tl.ended_at, hIso(HWAIT + 60000));
+});
+
+test('a successor whose first prompt is 6 h or more after the wait leaves the timeline unchanged', () => {
+  const file = writeRollout(oldPlanSession());
+  const SIX_H = 6 * 3600 * 1000;
+  // session_meta inside the finder's 6 h window, first prompt past it: only the timeline's own guard rejects.
+  const tl = computeSessionTimeline(file, 'old-id', handoffDeps(successorHead(SIX_H - 2000, SIX_H)));
+  const base = computeSessionTimeline(file, 'old-id', handoffDeps([]));
+  assert.deepEqual(tl.periods, base.periods);
+  assert.equal(tl.ended_at, base.ended_at);
+  assert.equal(tl.ended_at, hIso(HWAIT + 1));
+});
+
+test('no session id: no successor lookup, the timeline is unchanged', () => {
+  const calls = [];
+  const deps = handoffDeps(successorHead(25000, 26000), calls);
+  const tl = computeSessionTimeline(writeRollout(oldPlanSession()), null, deps);
+  assert.deepEqual(calls, []);
+  assert.equal(tl.ended_at, hIso(HWAIT + 1));
+  assert.notDeepEqual(tail(tl), ['waiting_user', 'plan_approval', 26000]);
+});
+
+test('a session that does not end on a Plan wait never looks for a successor', () => {
+  const calls = [];
+  const recs = [...oldPlanSession(), hRec(HWAIT + 9000, 'event_msg', { type: 'user_message', message: 'go on' })];
+  computeSessionTimeline(writeRollout(recs), 'old-id', handoffDeps(successorHead(25000, 26000), calls));
+  assert.deepEqual(calls, []);
+});
+
+test('a throwing successor finder leaves the timeline unchanged', () => {
+  const file = writeRollout(oldPlanSession());
+  const deps = handoffDeps([]);
+  deps.planHandoff.listRollouts = () => { throw new Error('boom'); };
+  deps.planHandoff.readHead = () => { throw new Error('boom'); };
+  const tl = computeSessionTimeline(file, 'old-id', deps);
+  assert.equal(tl.ended_at, hIso(HWAIT + 1));
 });
 
 test('computeSessionTimeline with deps.readLines equals the file read', () => {

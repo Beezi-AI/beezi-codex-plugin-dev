@@ -465,3 +465,80 @@ test('17. a child-scheduled root whose own file was not scanned stamps NO parent
     assert.equal(calls.checkpoints[0].options.sweepSubagents, true, 'the root bills its children');
   }
 });
+
+// ── compressed rollouts (.jsonl.zst) ────────────────────────────────────────────────────────
+
+import zlib from 'node:zlib';
+import { readRolloutText } from '../lib/rollout-file.mjs';
+
+const zstdOn = typeof zlib.zstdCompressSync === 'function';
+
+function writeZstRollout(machine, { id, records, name = `rollout-2026-09-10T00-00-00-${id}.jsonl.zst` }) {
+  const dir = path.join(machine.sessionsDir, '2026', '09', '10');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, name);
+  fs.writeFileSync(file, zlib.zstdCompressSync(Buffer.from(records.map((r) => JSON.stringify(r)).join('\n') + '\n')));
+  return file;
+}
+
+// The head reader the pass classifies with, routed through the shared rollout reader.
+const readRolloutHead = (file) => {
+  const text = readRolloutText(file);
+  return text ? [JSON.parse(text.split('\n')[0])] : [];
+};
+
+test('scanPass sees a .zst session', { skip: zstdOn ? false : 'zstd unavailable' }, async (t) => {
+  const m = makeMachine(t);
+  const id = uuid(40);
+  const file = writeZstRollout(m, { id, records: [parentMeta(id, '/zrepo')] });
+
+  const scan = await scanPass({ sessionsDir: m.sessionsDir }, { readRolloutHead });
+
+  assert.equal(scan.tops.size, 1);
+  assert.equal(scan.tops.get(id).transcriptPath, file);
+  assert.equal(scan.tops.get(id).cwd, '/zrepo');
+});
+
+test('scanPass keeps the plain file when the same id also exists as a newer .zst', { skip: zstdOn ? false : 'zstd unavailable' }, async (t) => {
+  const m = makeMachine(t);
+  const id = uuid(41);
+  const plain = writeRollout(m, { id, records: [parentMeta(id)] });
+  const z = writeZstRollout(m, { id, records: [parentMeta(id)] });
+  touch(plain, 1_000_000);
+  touch(z, 9_000_000);
+
+  const scan = await scanPass({ sessionsDir: m.sessionsDir }, { readRolloutHead });
+
+  assert.equal(scan.tops.get(id).transcriptPath, plain);
+});
+
+// A Node without zstd cannot read a .zst rollout: computeDelta throws ROLLOUT_UNREADABLE, the run
+// fails and records no observation, so the session would be retried every pass. The pass skips
+// .zst files before any stat or head read instead. `decompress: null` is rollout-file.mjs's own
+// "no zstd" seam; the bytes need not be real zstd, so this runs on every Node.
+test('scanPass skips .zst rollouts when this Node cannot decompress them', async (t) => {
+  const m = makeMachine(t);
+  const zid = uuid(42);
+  const pid = uuid(43);
+  const dir = path.join(m.sessionsDir, '2026', '09', '10');
+  fs.mkdirSync(dir, { recursive: true });
+  const z = path.join(dir, `rollout-2026-09-10T00-00-00-${zid}.jsonl.zst`);
+  fs.writeFileSync(z, Buffer.from([0x28, 0xb5, 0x2f, 0xfd, 0, 0, 0, 0]));
+  const plain = writeRollout(m, { id: pid, records: [parentMeta(pid)] });
+  const heads = [];
+  const stats = [];
+  const fsSpy = { ...fs, statSync: (p, ...rest) => { stats.push(p); return fs.statSync(p, ...rest); } };
+  // A head reader that would classify anything as a top session: only the skip keeps .zst out.
+  const head = (file) => { heads.push(file); return [parentMeta(path.basename(file).endsWith('.zst') ? zid : pid)]; };
+
+  const scan = await scanPass({ sessionsDir: m.sessionsDir }, { readRolloutHead: head, decompress: null, fs: fsSpy });
+
+  assert.deepEqual([...scan.tops.keys()], [pid]);
+  assert.equal(scan.tops.get(pid).transcriptPath, plain);
+  assert.ok(!heads.includes(z) && !stats.includes(z), 'the .zst file is neither read nor stat-ed');
+  assert.equal(scan.scanned, 1);
+
+  // With a decompressor the same file is classified again.
+  const withZstd = await scanPass({ sessionsDir: m.sessionsDir }, { readRolloutHead: head, decompress: () => Buffer.alloc(0) });
+  assert.ok(withZstd.tops.has(zid));
+});

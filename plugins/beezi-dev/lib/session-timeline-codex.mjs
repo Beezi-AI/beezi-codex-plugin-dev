@@ -1,6 +1,8 @@
 import { fetchCompat } from './fetch-compat.mjs';
 import path from 'path';
-import { timelineWaits, isBackgroundNotification, isTimelineUserPrompt } from './timeline-waits-codex.mjs';
+import { timelineWaits, markerSpans, firstIndexAfter, isBackgroundNotification, isTimelineUserPrompt } from './timeline-waits-codex.mjs';
+import { readPermissionMarkers } from './permission-markers-codex.mjs';
+import { trailingPlanWait, findPlanSuccessor } from './plan-handoff-codex.mjs';
 import { toolNamesFromProgram } from './exec-program.mjs';
 import { parseArgs } from './operations-codex.mjs';
 import { IDLE_GAP_SEC } from './timing.mjs';
@@ -47,9 +49,13 @@ const STATE = {
 // empty, so 6h sits in a hole and the classification is insensitive between 6h and 8h. 18 gaps
 // >= 6h account for 438 hours — 80% of all >5-minute gap time on this machine — every one of them
 // charted `idle` before this.
-const BREAK_GAP_SEC = 6 * 60 * 60;
+export const BREAK_GAP_SEC = 6 * 60 * 60;
 
-function parseTranscript(transcriptPath, readLines) {
+// Plain or zstd-compressed (Codex compresses rollouts older than 7 days): readRolloutLines reads
+// both, and throws on a rollout this Node cannot decompress like on an unreadable one, so
+// computeSessionTimeline answers null for both. Exported so checkpoint.mjs reads a session's records
+// the same way (and through the same per-run memo) rather than with a second parser.
+export function parseTranscript(transcriptPath, readLines = readRolloutLines) {
   return readLines(transcriptPath).records.filter((record) => record !== null);
 }
 
@@ -101,7 +107,7 @@ function collaborationModeOf(rec) {
   return null;
 }
 
-function buildPeriods(records, skillIntervals) {
+function buildPeriods(records, skillIntervals, markers = []) {
   // A skill-plan window (buildSkillPlanCycles) charts as planning too, at the same rank as plan mode.
   const inSkillPlan = (ms) => {
     for (const iv of skillIntervals || []) {
@@ -109,7 +115,9 @@ function buildPeriods(records, skillIntervals) {
     }
     return false;
   };
-  const waits = timelineWaits(records);
+  // Marker spans feed both the waits and the synthetic anchors below; computed once.
+  const marked = markerSpans(records, markers);
+  const waits = timelineWaits(records, marked);
   const anchors = [];
   // 'default' rather than null: a session whose build predates collaboration_mode must read as
   // working, exactly as it did before, not as an unknown third thing.
@@ -135,6 +143,30 @@ function buildPeriods(records, skillIntervals) {
       isBackground: isBackgroundNotification(rec), mode: currentMode });
   }
   anchors.sort((a, b) => a.ts - b.ts);
+
+  // A command_approval wait opens and closes between records: the marker is a hook timestamp and
+  // its end is usually a started_at_ms / completed_at_ms. Each becomes a synthetic anchor, so the
+  // work up to the marker keeps its own class, (start, end] is the wait (timelineWaits keys it on
+  // the end), and the time after the end is classified by the next record as usual. An instant that
+  // already has a real anchor needs none: the real one classifies it, and a duplicate would let sort
+  // order decide whether its isPrompt/isBackground applies. The mode is the one in force there —
+  // the last real anchor's at or before it — which only matters for (previous record, start].
+  const synthetic = [];
+  const anchorTs = anchors.map((a) => a.ts);
+  const seen = new Set(anchorTs);
+  for (const span of marked) {
+    for (const ts of [span.start, span.end]) {
+      if (seen.has(ts)) continue;
+      seen.add(ts);
+      // The last real anchor at or before ts (anchorTs is sorted, synthetic is apart).
+      const lo = firstIndexAfter(anchorTs, ts);
+      synthetic.push({ ts, isPrompt: false, isBackground: false, mode: lo === 0 ? 'default' : anchors[lo - 1].mode });
+    }
+  }
+  if (synthetic.length > 0) {
+    for (const a of synthetic) anchors.push(a);
+    anchors.sort((a, b) => a.ts - b.ts);
+  }
 
   const merged = [];
   for (let i = 1; i < anchors.length; i++) {
@@ -394,6 +426,43 @@ function buildSkillPlanCycles(records) {
   return { events, intervals };
 }
 
+// A Plan accepted with "Yes, clear context" continues in a NEW rollout and leaves nothing in this one,
+// so this timeline would stop at task_complete and lose the plan-approval wait. When the session ends
+// on a Plan wait, the successor's first prompt (lib/plan-handoff-codex.mjs) closes it: one
+// waiting_user/plan_approval period from task_complete to that prompt, under the same 6 h ceiling
+// that turns any other wait into a break. Bookkeeping after task_complete (token_count,
+// turn_context, ...) still anchors periods in buildPeriods, so any period running past task_complete
+// is trimmed back to it first, keeping periods non-overlapping. Answers the periods and the new end,
+// or null for no change.
+function planHandoffTail(transcriptPath, records, periods, handoffDeps) {
+  const wait = trailingPlanWait(records);
+  if (!wait) return null;
+  const next = findPlanSuccessor(transcriptPath, records, handoffDeps);
+  if (!next) return null;
+  const startMs = wait.waitStartMs;
+  const endMs = next.firstPromptMs;
+  if (!(Number.isFinite(endMs) && endMs > startMs && endMs - startMs < BREAK_GAP_SEC * 1000)) return null;
+  const out = periods.slice();
+  while (out.length > 0 && Date.parse(out[out.length - 1].started_at) >= startMs) out.pop();
+  const last = out[out.length - 1];
+  if (last && Date.parse(last.ended_at) > startMs) {
+    out[out.length - 1] = Object.assign({}, last, { ended_at: new Date(startMs).toISOString() });
+  }
+  const tail = out[out.length - 1];
+  if (tail && tail.state === STATE.WAITING_USER && tail.waiting_subtype === 'plan_approval'
+    && Date.parse(tail.ended_at) === startMs) {
+    out[out.length - 1] = Object.assign({}, tail, { ended_at: new Date(endMs).toISOString() });
+  } else {
+    out.push({
+      state: STATE.WAITING_USER,
+      started_at: new Date(startMs).toISOString(),
+      ended_at: new Date(endMs).toISOString(),
+      waiting_subtype: 'plan_approval',
+    });
+  }
+  return { periods: out, endMs };
+}
+
 const MAX_SUBAGENTS = 1000;
 
 // One active span per subagent, from the records the SubagentStart/SubagentStop hooks left behind.
@@ -432,8 +501,17 @@ export function computeSessionTimeline(transcriptPath, sessionId = null, deps = 
   let records;
   try { records = parseTranscript(transcriptPath, orDefault(deps.readLines, readRolloutLines)); } catch { return null; }
 
+  // PermissionRequest markers live under the session id, so no id means no markers. The reader is
+  // injectable (tests) and defaults to the real one, so checkpoint and the audit need no wiring; an
+  // unreadable marker file degrades to the timeline as it was before markers existed.
+  let markers = [];
+  if (sessionId) {
+    const readMarkers = orDefault(deps.readPermissionMarkers, readPermissionMarkers);
+    try { markers = readMarkers(sessionId); } catch { markers = []; }
+  }
+
   const skillPlan = buildSkillPlanCycles(records);
-  const periods = buildPeriods(records, skillPlan.intervals);
+  let periods = buildPeriods(records, skillPlan.intervals, markers);
   const plan_events = mergePlanEvents(buildPlanEvents(records).concat(skillPlan.events));
 
   let minTs = Infinity;
@@ -445,6 +523,22 @@ export function computeSessionTimeline(transcriptPath, sessionId = null, deps = 
     if (t > maxTs) maxTs = t;
   }
   if (minTs === Infinity) return null;
+
+  // The clear-context handoff walks the sessions directory, so it rides the same condition as the
+  // marker and subagent lookups: no sessionId (pure/unit callers) stays filesystem-free.
+  // `deps.planHandoff` reaches plan-handoff-codex.mjs's deps; undefined means its real defaults. Any
+  // failure leaves the timeline exactly as derived from this rollout alone.
+  let endTs = maxTs;
+  if (sessionId) {
+    try {
+      const handoff = planHandoffTail(transcriptPath, records, periods, deps.planHandoff);
+      if (handoff) {
+        periods = handoff.periods;
+        // Never backward: bookkeeping can land after the successor's first prompt.
+        endTs = Math.max(maxTs, handoff.endMs);
+      }
+    } catch { /* best-effort: the timeline as this rollout alone derives it */ }
+  }
 
   // `deps.readAgents` is REQUIRED alongside a sessionId — both callers (checkpoint and the audit)
   // hand over the agent map they just built, sweep entries included, rather than letting this
@@ -467,7 +561,7 @@ export function computeSessionTimeline(transcriptPath, sessionId = null, deps = 
     plan_events,
     subagents,
     started_at: new Date(minTs).toISOString(),
-    ended_at: new Date(maxTs).toISOString(),
+    ended_at: new Date(endTs).toISOString(),
     generated_at: new Date().toISOString(),
   };
 }

@@ -10,6 +10,7 @@ import {
 import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf } from '../lib/workspace.mjs';
 import { usesRules } from '../lib/workspace-rules.mjs';
 import { startHistoryWorker } from '../lib/history-trigger.mjs';
+import { compressedSkippedLine } from '../lib/rollout-file.mjs';
 import { syncReview } from '../lib/workspace-cli.mjs';
 
 // The repeatable history repair pass (G-3-3 engine, G-9-3 surface).
@@ -268,6 +269,9 @@ async function runOne(key, many, options) {
   if (result.unreadable > 0) {
     console.log(`  ${plural(result.unreadable, 'session')} could not be read — not uploaded.`);
   }
+  if (result.compressedUnsupported > 0) {
+    console.log(`  ${compressedSkippedLine(result.compressedUnsupported)}`);
+  }
   console.log('  Plan and billing details reflect your current setup, not the plan you were on at the time.');
 }
 
@@ -326,6 +330,9 @@ async function syncAccount(row, many, options, argv) {
   }
   const summary = routeSummary(row, plan);
   if (summary != null) console.log(summary);
+  if (plan.compressedUnsupported > 0) {
+    console.log(`  ${compressedSkippedLine(plan.compressedUnsupported)}`);
+  }
   for (const tenantId of plan.tenantIds) {
     console.log(`\n— ${describeAccount(row)} · ${tenantLabel(row, tenantId)} —`);
     await runOne(row.key, true, { ...options, tenantId, sessionRoutes: plan.routes });

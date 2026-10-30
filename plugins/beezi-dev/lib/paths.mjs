@@ -351,6 +351,7 @@ export function codexHome() {
 
 // Codex writes one rollout transcript per session under a date-partitioned tree:
 // ~/.codex/sessions/YYYY/MM/DD/rollout-<ISO>-<sessionId>.jsonl
+// (`.jsonl.zst` once Codex has compressed it, after 7 days)
 export function codexSessionsDir() {
   return path.join(codexHome(), 'sessions');
 }

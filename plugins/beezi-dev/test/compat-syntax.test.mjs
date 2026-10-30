@@ -167,6 +167,11 @@ const CHECKS = [
     match: /['"]base64url['"]/,
     allowed: ['lib/compat.mjs'],
   },
+  {
+    name: 'named import of a zstd symbol from zlib (absent before Node 22.15) — use feature detection',
+    scope: 'raw',
+    match: /import\s*\{[^}]*zstd[^}]*\}\s*from\s*['"]zlib['"]/i,
+  },
   { name: 'optional chaining `?.`', scope: 'code', match: /\?\.[a-zA-Z_$([]/ },
   { name: 'nullish coalescing `??` (and `??=`)', scope: 'code', match: /\?\?/ },
   { name: 'logical assignment `||=` / `&&=`', scope: 'code', match: /(\|\||&&)=/ },
@@ -235,6 +240,7 @@ function scanSource(posixFile, raw) {
 const FIXTURES = [
   ['node:-prefixed import specifier (absent on Node 13.x)', 'node-prefix-import'],
   ["'base64url' encoding literal (Node 15.7+) — use compat base64url helpers", 'base64url-literal'],
+  ['named import of a zstd symbol from zlib (absent before Node 22.15) — use feature detection', 'zlib-zstd-named-import'],
   ['optional chaining `?.`', 'optional-chaining'],
   ['nullish coalescing `??` (and `??=`)', 'nullish-coalescing'],
   ['logical assignment `||=` / `&&=`', 'logical-assignment'],

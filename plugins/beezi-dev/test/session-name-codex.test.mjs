@@ -403,3 +403,45 @@ test('an AI title differing from a short prompt only in case is kept', () => {
     assert.equal(resolveSessionName(SID, writeRollout([eventUser('ping')])), 'Ping');
   });
 });
+
+// --- zstd-compressed rollouts ---
+import zlib from 'node:zlib';
+import { scanRecords } from '../lib/session-name-codex.mjs';
+
+test('scanRecords yields the same records for a .zst rollout, also under a small maxBytes', { skip: typeof zlib.zstdCompressSync !== 'function' }, () => {
+  const dir = tmpdir();
+  const recs = [];
+  for (let i = 0; i < 20; i += 1) recs.push({ type: 'event_msg', payload: { type: 'user_message', message: `hello ${i} ünï` } });
+  const raw = Buffer.from(recs.map((r) => JSON.stringify(r)).join('\n') + '\n');
+  const plain = path.join(dir, 'rollout-a.jsonl');
+  const zst = path.join(dir, 'rollout-b.jsonl.zst');
+  fs.writeFileSync(plain, raw);
+  fs.writeFileSync(zst, zlib.zstdCompressSync(raw));
+  assert.deepEqual([...scanRecords(zst)], [...scanRecords(plain)]);
+  assert.equal([...scanRecords(zst)].length, 20);
+  for (const maxBytes of [1, 150, 500, 777]) {
+    assert.deepEqual([...scanRecords(zst, { maxBytes })], [...scanRecords(plain, { maxBytes })], `maxBytes=${maxBytes}`);
+  }
+});
+
+test('scanRecords yields nothing for a corrupt .zst frame', () => {
+  const dir = tmpdir();
+  const bad = path.join(dir, 'rollout-c.jsonl.zst');
+  fs.writeFileSync(bad, Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), Buffer.from('garbage'.repeat(20))]));
+  assert.deepEqual([...scanRecords(bad)], []);
+});
+
+test('scanRecords: a > 1 MB .zst rollout matches the plain one under several ceilings', { skip: typeof zlib.zstdCompressSync !== 'function' }, () => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'scan-big-'));
+  const lines = [];
+  for (let i = 0; i < 12000; i += 1) lines.push(JSON.stringify({ type: 'event_msg', i, pad: 'é'.repeat(30 + (i % 41)) }));
+  const raw = lines.join('\n') + '\n';
+  assert.ok(Buffer.byteLength(raw) > 1 << 20);
+  const plain = path.join(dir, 'p.jsonl');
+  const zst = path.join(dir, 'z.jsonl.zst');
+  fs.writeFileSync(plain, raw);
+  fs.writeFileSync(zst, zlib.zstdCompressSync(raw));
+  for (const maxBytes of [1000, 65536, 300001, 1 << 20, 64 * 1024 * 1024]) {
+    assert.deepEqual([...scanRecords(zst, { maxBytes })], [...scanRecords(plain, { maxBytes })], `maxBytes=${maxBytes}`);
+  }
+});

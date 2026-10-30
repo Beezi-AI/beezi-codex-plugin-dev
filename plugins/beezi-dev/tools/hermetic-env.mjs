@@ -107,6 +107,11 @@ function install() {
   // Windows, so after the next few lines it would report the sandbox.
   const realHome = os.homedir();
   const tmpRoot = path.resolve(os.tmpdir());
+  // The same temp dir as realpathSync.native spells it. A Windows %TEMP% may be an 8.3 short name
+  // (C:\Users\DMYTRO~1\…) that only .native expands to the long form under the real home, and
+  // lib/repo-root-fast.mjs walks that long form; it is still the temp dir, not an escape.
+  let tmpRootReal = tmpRoot;
+  try { tmpRootReal = fs.realpathSync.native(tmpRoot); } catch { /* keep the resolved spelling */ }
   const repoRoot = resolveRepoRoot(process.cwd());
   const sandbox = fs.mkdtempSync(path.join(tmpRoot, 'beezi-hermetic-'));
   const codexHome = path.join(sandbox, '.codex');
@@ -143,6 +148,7 @@ function install() {
     && inside(candidate, realHome)
     && !inside(candidate, sandbox)
     && !inside(candidate, tmpRoot)
+    && !inside(candidate, tmpRootReal)
     && !inside(candidate, repoRoot);
 
   const record = (what) => {

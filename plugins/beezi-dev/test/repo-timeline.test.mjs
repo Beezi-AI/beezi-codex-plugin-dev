@@ -55,12 +55,13 @@ function withoutGitEnv(t) {
 function tempRepo(t) {
   const base = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-fastroot-'));
   t.after(() => fs.rmSync(base, { recursive: true, force: true }));
-  // A real-path base: the shortcut declines a dir whose realpath differs (macOS tmpdir sits under /var → /private/var).
-  const top = path.join(fs.realpathSync(base), 'top');
+  // A real-path base, read with the same realpath.native the shortcut uses: it declines a dir whose realpath differs
+  // (macOS tmpdir sits under /var → /private/var; a Windows TEMP may be an 8.3 short name that only .native expands).
+  const top = path.join(fs.realpathSync.native(base), 'top');
   fs.mkdirSync(path.join(top, '.git'), { recursive: true });
   fs.mkdirSync(path.join(top, 'a', 'b'), { recursive: true });
   fs.mkdirSync(path.join(top, 'c'), { recursive: true });
-  return { realTop: fs.realpathSync(top), sub: path.join(top, 'a', 'b'), other: path.join(top, 'c') };
+  return { realTop: fs.realpathSync.native(top), sub: path.join(top, 'a', 'b'), other: path.join(top, 'c') };
 }
 
 test('resolveRepoRoot — without gitRoots, git is asked in the directory itself, even inside a repo', (t) => {

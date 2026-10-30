@@ -39,12 +39,17 @@ export const TRUST_STEP = 'run /hooks in Codex, review the Beezi entries, and tr
 // SubagentStart/SubagentStop record identity and timing for spawned agents. They do NOT bill them —
 // the parent's own checkpoint does that, so the wall-clock union is computed in one process. See
 // scripts/subagent-start.mjs for why they are still worth registering.
+//
+// PermissionRequest records that an approval prompt opened (the timeline's command_approval wait).
+// It is SYNCHRONOUS: Codex holds the prompt until the hook exits (default 600 s), so it carries its
+// own 5 s `timeout` instead of HOOK_TIMEOUT_SEC. An entry without `timeout` gets HOOK_TIMEOUT_SEC.
 export const BEEZI_HOOKS = Object.freeze([
   { event: 'SessionStart', script: 'session-start.mjs' },
   { event: 'PostToolUse', script: 'checkpoint.mjs' },
   { event: 'SubagentStart', script: 'subagent-start.mjs' },
   { event: 'SubagentStop', script: 'subagent-stop.mjs' },
   { event: 'Stop', script: 'stop.mjs' },
+  { event: 'PermissionRequest', script: 'permission-request.mjs', timeout: 5 },
 ]);
 
 const BEEZI_EVENTS = BEEZI_HOOKS.map((h) => h.event);
@@ -61,6 +66,11 @@ const MATCH_ALL = '.*';
 // finish inside it — Codex kills what overruns and reports the kill as a failed hook — so the
 // checkpoint's own budget is derived from this number rather than guessed alongside it.
 export const HOOK_TIMEOUT_SEC = 20;
+
+// The timeout one registry entry carries: its own when BEEZI_HOOKS sets one, else the shared default.
+function timeoutFor(entry) {
+  return typeof entry.timeout === 'number' ? entry.timeout : HOOK_TIMEOUT_SEC;
+}
 
 // The interpreter for every hook entry: bare `node`, resolved from the hook's PATH at spawn time.
 // Deliberately not process.execPath — an absolute interpreter path goes stale the moment the user
@@ -86,7 +96,7 @@ const LEGACY_LAUNCHER_EXTENSIONS = ['.cmd', '.sh'];
 //
 // WHY THIS EXISTS: Codex keys hook TRUST to each entry's hash. While the entries named the
 // versioned plugin cache directory (`~/.codex/plugins/cache/<marketplace>/<plugin>/<version>/…`),
-// every plugin upgrade moved that path, every upgrade therefore rewrote all five entries, and every
+// every plugin upgrade moved that path, every upgrade therefore rewrote every entry, and every
 // upgrade sent the user back to `/hooks` to re-trust hooks they had already trusted — with analytics
 // silently dead in between. Indirecting through a fixed path makes an upgrade change NOTHING in the
 // registry.
@@ -130,9 +140,9 @@ export function hookOwner() {
 //
 // DELIBERATELY NOT A NEW JSON KEY. R1 refuses unverified extensions to Codex's schemas, and the
 // hook registry is read by the same engine as the marketplace: a key its loader rejects could take
-// the whole entry with it. A command argument is data, not schema, and none of the five hook
+// the whole entry with it. A command argument is data, not schema, and none of the six hook
 // scripts reads process.argv
-// (session-start, checkpoint, subagent-start, subagent-stop, stop), so the tag is inert at runtime
+// (session-start, checkpoint, subagent-start, subagent-stop, stop, permission-request), so the tag is inert at runtime
 // while being exact, machine-readable, and immune to a label the user reworded.
 const OWNER_FLAG = '--beezi-owner=';
 
@@ -390,7 +400,8 @@ export function statusCommand(scriptsDir = DEFAULT_SCRIPTS_DIR) {
 export function buildHookEntries({ launcherDir = hookLauncherDir(), owner = hookOwner() } = {}) {
   const launcher = launcherPath(launcherDir);
   const out = {};
-  for (const { event, script } of BEEZI_HOOKS) {
+  for (const entry of BEEZI_HOOKS) {
+    const { event, script } = entry;
     out[event] = [
       {
         matcher: MATCH_ALL,
@@ -399,7 +410,7 @@ export function buildHookEntries({ launcherDir = hookLauncherDir(), owner = hook
             type: 'command',
             command: hookCommand(launcher, script, owner),
             statusMessage: ownerLabel(owner),
-            timeout: HOOK_TIMEOUT_SEC,
+            timeout: timeoutFor(entry),
           },
         ],
       },
@@ -523,17 +534,41 @@ export function removeBeeziHooks(existing, launcherDir = hookLauncherDir(), owne
   return { ...existing, hooks };
 }
 
-// Re-install is idempotent: strip THIS OWNER's previous entries first, then append the current
-// ones. Every other hook — the user's own and any sibling variant's — keeps its position and
-// content. Stripping recognises both entry formats, so a re-install on a machine with the old
-// launcher-style entries converts them in one write.
+// Re-install is idempotent: THIS OWNER's previous entry in an event is replaced IN PLACE, at the
+// index it already holds, and the current one is appended only to an event that has none. Codex
+// trust keys are positional, so moving our entry to the end would shift every user hook after it
+// and revoke trust on both. Every other hook — the user's own and any sibling variant's — keeps its
+// position and content. A group holding only our handlers is the slot; later owned duplicates are
+// dropped, and a group a user hand-merged ours into keeps its own handlers where they are. Owned
+// handlers in an event we no longer register are stripped. Recognition covers both entry formats,
+// so a re-install on a machine with the old launcher-style entries converts them in one write.
 export function mergeHooks(existing, beeziHooks, launcherDir = hookLauncherDir(), owner = hookOwner()) {
-  const base = removeBeeziHooks(existing, launcherDir, owner);
-  const hooks = { ...(base.hooks || {}) };
+  const source = existing && existing.hooks && typeof existing.hooks === 'object' ? existing.hooks : {};
+  const hooks = {};
+  const placed = {};
+  for (const [event, groups] of Object.entries(source)) {
+    if (!Array.isArray(groups)) { hooks[event] = groups; continue; }
+    const fresh = Object.prototype.hasOwnProperty.call(beeziHooks, event) ? beeziHooks[event] : null;
+    const kept = [];
+    for (const group of groups) {
+      // A malformed group has no handlers to filter — pass it through rather than reshape it.
+      if (!group || !Array.isArray(group.hooks)) { kept.push(group); continue; }
+      const handlers = group.hooks.filter((h) => !isOwnedHandler(h, owner, launcherDir));
+      if (handlers.length === group.hooks.length) { kept.push(group); continue; }
+      if (handlers.length) { kept.push({ ...group, hooks: handlers }); continue; }
+      // A group of ours alone: the first one is where the current entry goes.
+      if (fresh && !placed[event]) {
+        for (const g of fresh) kept.push(g);
+        placed[event] = true;
+      }
+    }
+    if (kept.length) hooks[event] = kept;
+  }
   for (const [event, groups] of Object.entries(beeziHooks)) {
+    if (placed[event]) continue;
     hooks[event] = [...(hooks[event] || []), ...groups];
   }
-  return { ...base, hooks };
+  return { ...(existing || {}), hooks };
 }
 
 // A registry we cannot parse must never be treated as an empty one. The file is the user's — the
@@ -581,7 +616,7 @@ function isDeadLegacyLauncher(handler) {
   // THE LINE THAT EXCLUDES THE CURRENT LAUNCHER. A legacy entry named the launcher directly, with
   // no interpreter and no quoting, so it has no quoted script; ours is always `node "<launcher>"
   // <script>` and returns a path here. Without this, a launcher dir deleted by hand would look like
-  // five dead legacy entries and the sweep would strip a live install.
+  // six dead legacy entries and the sweep would strip a live install.
   if (handlerScript(handler) !== null) return false;
 
   const command = typeof handler.command === 'string' ? handler.command : handler.commandWindows;
@@ -763,7 +798,7 @@ export function uninstallHooks({
  * costs exactly one final re-trust to migrate.
  *
  * THE LAUNCHER IS REFRESHED FIRST, before the registry is judged. Every entry points at it, so a
- * missing launcher makes all five read as dead, and judging first would rewrite a perfectly good
+ * missing launcher makes all six read as dead, and judging first would rewrite a perfectly good
  * registry — revoking trust over a file we were about to put back anyway.
  *
  * What it cannot do is grant the trust — there is no non-interactive way to, and `repaired: true`
@@ -839,7 +874,8 @@ export function hooksStatus({
   const registered = [];
   const missingEvents = [];
   const staleEvents = [];
-  for (const { event, script } of BEEZI_HOOKS) {
+  for (const entry of BEEZI_HOOKS) {
+    const { event, script } = entry;
     const groups = Array.isArray(source[event]) ? source[event] : [];
     const handlers = [];
     for (const group of groups) {
@@ -857,7 +893,7 @@ export function hooksStatus({
     // old install through `stale` → "run install to repair" → migration, once.
     const expectedCommand = hookCommand(launcherPath(launcherDir), script, owner);
     const current = handlers.some((h) => h.command === expectedCommand
-      && h.timeout === HOOK_TIMEOUT_SEC
+      && h.timeout === timeoutFor(entry)
       && !('arguments' in h));
     if (!current) staleEvents.push(event);
   }

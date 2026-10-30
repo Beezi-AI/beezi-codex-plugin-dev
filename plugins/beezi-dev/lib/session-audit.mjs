@@ -74,6 +74,7 @@ import {
 } from './tracking.mjs';
 import { UserError } from './friendly-error.mjs';
 import { orDefault } from './compat.mjs';
+import { zstdSupported, isCompressedRolloutName } from './rollout-file.mjs';
 import { createTranscriptMemo } from './transcript-memo-codex.mjs';
 
 // Error posts are single small upserts, so a little parallelism is free — but not unbounded,
@@ -352,8 +353,14 @@ export function shouldFinalize(result, options = {}) {
 // A rule's workspace is run even when no session route reaches it: a segment in its repo or folder routes there (runAudit keeps such sessions in).
 // markWaiting sets `waiting` on the routes waitingRoutes finds (New folders: Ask me only), the only ones that hold a seal.
 // `row` should be a linkedSessions() session: waitingRoutes binds the ledgers it reads to row.clientId.
-export function planWorkspaceRuns(row, { markWaiting = false } = {}) {
-  const entries = _listAllRollouts();
+export function planWorkspaceRuns(row, { markWaiting = false, listRollouts = _listAllRollouts } = {}) {
+  // Compressed rollouts this Node cannot read come back too (`compressed: true`, no cwd): they have no
+  // route, so they are set aside and COUNTED here, once for the whole account, for the caller to
+  // print. runAudit skips them when it is handed routes. `scanned` includes them, as runAudit's does.
+  const listed = listRollouts({ includeBlind: true });
+  const entries = listed.filter((e) => e.compressed !== true);
+  const ageCutoffMs = Date.now() - MAX_SESSION_AGE_MS;
+  const compressedUnsupported = listed.filter((e) => e.compressed === true && e.mtimeMs >= ageCutoffMs).length;
   const ctx = createRouteContext();
   const routes = planSessionRoutes(row, entries, ctx);
   if (markWaiting) {
@@ -369,7 +376,7 @@ export function planWorkspaceRuns(row, { markWaiting = false } = {}) {
   // A workspace no route or rule reaches is never run; one only a rule reaches seals only once a
   // run routes it a session (runAudit's nothingRouted).
   const tenantIds = (tenantsOf(row) || []).map((t) => t.id).filter((id) => reached.has(id));
-  return { scanned: entries.length, routes, counts, tenantIds };
+  return { scanned: listed.length, routes, counts, tenantIds, compressedUnsupported };
 }
 
 // A one-workspace account's Don't-track sessions, from a planWorkspaceRuns plan.
@@ -476,6 +483,8 @@ function emptyAuditResult(options = {}) {
     // A transcript we could not read, whether the throw escaped runCheckpoint or was caught
     // inside it — the user-visible fact is the same, so it is one number.
     unreadable: 0,
+    // Compressed (`.jsonl.zst`) rollouts skipped because this Node cannot decompress zstd.
+    compressedUnsupported: 0,
     // Unreadable sessions this run is willing to hold the pull open for: the ones we had not
     // already tried. A file that fails on the retry too is deterministic (a permission error is
     // indistinguishable from a transient one at the call site), and blocking on it forever would
@@ -537,7 +546,8 @@ function emptyAuditResult(options = {}) {
 
 async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
-  const listRollouts = orDefault(deps.listRollouts, _listAllRollouts);
+  // Only the audit asks for rollouts it cannot read (compressed, no zstd here): it counts them.
+  const listRollouts = orDefault(deps.listRollouts, () => _listAllRollouts({ includeBlind: true }));
   const runCheckpoint = orDefault(deps.runCheckpointImpl, _runCheckpoint);
   const flushBackfillChunks = orDefault(deps.flushBackfillChunksImpl, _flushBackfillChunks);
   const completeBackfill = orDefault(deps.completeBackfillImpl, _completeBackfill);
@@ -731,6 +741,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     return route != null && route.tenantIds.indexOf(tenantId) !== -1;
   };
 
+  const readsZstd = zstdSupported(deps);
   const candidates = [];
   for (const entry of all) {
     if (live && (entry.sessionId === live.sessionId || entry.transcriptPath === live.transcriptPath)) {
@@ -738,6 +749,9 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       if (routesHere(entry)) noteRecent(result, entry);
       continue;
     }
+    // Unreadable compressed rollout in a routed run: it has no route and planWorkspaceRuns already
+    // counted it once for the account, so it is neither routed elsewhere nor counted again here.
+    if (sessionRoutes != null && entry.compressed === true) continue;
     // Filtered before the ledger, so a later rule can still send it here.
     if (sessionRoutes != null) {
       const route = sessionRoutes.get(entry.sessionId);
@@ -785,6 +799,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // so the skipped count does not also include sessions that were never going to be uploaded
     // anyway. Excluded sessions still never hold the seal.
     if (excludedSessionIds != null && excludedSessionIds.has(entry.sessionId)) { result.excluded += 1; continue; }
+    // Last of the filters, so a session that was never going to upload is not counted as skipped.
+    if (!readsZstd && isCompressedRolloutName(entry.transcriptPath)) { result.compressedUnsupported += 1; continue; }
     candidates.push(entry);
   }
 

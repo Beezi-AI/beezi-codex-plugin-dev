@@ -9,6 +9,7 @@ import { parseTenantFlags, isMultiTenant, tenantById, newFoldersOf, joinedAfterL
 import { usesRules } from '../lib/workspace-rules.mjs';
 import { readTrackingState, matchesIdentity } from '../lib/tracking.mjs';
 import { startHistoryWorker } from '../lib/history-trigger.mjs';
+import { compressedSkippedLine } from '../lib/rollout-file.mjs';
 
 // The login flow's final step: uploads this machine's past Codex sessions into Beezi. There is
 // no standalone skill for it — the login skill runs it after the link and plan capture, and
@@ -161,6 +162,9 @@ async function backfillOne(options) {
     if (result.tooOld > 0) bits.push(`${result.tooOld} older than 30 days`);
     console.log(`✓ Beezi: nothing new to upload${bits.length ? ` (${bits.join(', ')})` : ''}.`);
     if (result.tooOld > 0) console.log(`  ${OLD_SESSIONS_NOTE}`);
+    if (result.compressedUnsupported > 0) {
+      console.log(`  ${compressedSkippedLine(result.compressedUnsupported)}`);
+    }
     if (result.finalized) console.log('✓ Beezi: your history pull is finalized.');
     else if (result.routeDeferred > 0) console.log(DEFERRED_LINE);
     else if (result.nothingRouted) console.log(NOTHING_ROUTED_LINE);
@@ -230,6 +234,9 @@ async function backfillOne(options) {
   }
   if (result.unreadable > 0) {
     console.log(`  ${plural(result.unreadable, 'session')} could not be read — not uploaded.`);
+  }
+  if (result.compressedUnsupported > 0) {
+    console.log(`  ${compressedSkippedLine(result.compressedUnsupported)}`);
   }
   // The server's stored count against what we actually handed it. A silent shortfall here means
   // reports were acknowledged but not persisted, which nothing else in this summary would show.
@@ -415,6 +422,9 @@ async function main() {
     }
     const summary = routeSummary(row, plan);
     if (summary != null) console.log(summary);
+    if (plan.compressedUnsupported > 0) {
+      console.log(`  ${compressedSkippedLine(plan.compressedUnsupported)}`);
+    }
     tenantIds = plan.tenantIds;
     routes = plan.routes;
   }

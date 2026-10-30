@@ -12,6 +12,7 @@ import {
   MAX_FORK_PREFIX_RECORDS,
   agentRoleFromPath,
 } from '../lib/subagent-codex.mjs';
+import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
 
 // Fixtures mirror the four subagent rollout shapes actually present in a local ~/.codex corpus, plus
 // the long-replay format the repo's own parity notes describe. The boundary numbers here are the
@@ -240,6 +241,19 @@ test('fork boundary with no skipped lines equals the record index', () => {
   assert.equal(inspectSubagentRollout(forkWithPrefixLine()).forkBoundaryLine, 3);
 });
 
+// Codex compresses rollouts older than 7 days; the boundary and computeDelta's line count must not
+// change when the same fork is read through the zstd path.
+test('a zstd-compressed fork gives the same physical-line boundary and line count as the plain one',
+  { skip: typeof zlib.zstdCompressSync !== 'function' }, () => {
+    for (const rawLine of ['', '{"torn', undefined]) {
+      const plain = forkWithPrefixLine(rawLine);
+      const zst = plain + '.zst';
+      fs.writeFileSync(zst, zlib.zstdCompressSync(fs.readFileSync(plain)));
+      assert.equal(inspectSubagentRollout(zst).forkBoundaryLine, inspectSubagentRollout(plain).forkBoundaryLine, String(rawLine));
+      assert.deepEqual(readRolloutLines(zst), readRolloutLines(plain), String(rawLine));
+    }
+  });
+
 // ── findSubagentRollouts: which rollouts a session claims, and what bounds the walk ──────────────
 //
 // Every case here passes an explicit `sessionsDir`, so codexSessionsDir() is never called and the
@@ -467,4 +481,23 @@ test('the index honours the per-call mtime floor the checkpoint passes', () => {
   const index = indexSubagentRollouts({ sessionsDir: root });
   assert.equal(index.find('root-session', { sinceMs: mtime - 1000 }).length, 1);
   assert.equal(index.find('root-session', { sinceMs: mtime + 60_000 }).length, 0);
+});
+
+import zlib from 'node:zlib';
+
+test('a .zst child rollout is found and its agentId carries no .jsonl/.zst suffix', { skip: typeof zlib.zstdCompressSync !== 'function' }, () => {
+  const root = sessionsTree();
+  const dir = dated(root);
+  const plain = rolloutIn(dir, 'zed', {
+    id: undefined, session_id: 'root-session', parent_thread_id: 'root-session',
+    forked_from_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  const zst = plain + '.zst';
+  fs.writeFileSync(zst, zlib.zstdCompressSync(fs.readFileSync(plain)));
+  fs.unlinkSync(plain);
+  const found = findSubagentRollouts('root-session', { sessionsDir: root });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].path, zst);
+  assert.equal(found[0].agentId, 'rollout-2026-08-06T19-41-50-zed');
 });

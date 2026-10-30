@@ -66,3 +66,27 @@ test('pastSessions leaves out the session its caller runs in, by the env it is g
   initSessionWorkspace(UUID_B, { cwd: '/work/here' });
   assert.equal(pastSessions(row, null, { cwd: '/work/here', env: {} }).sessions, 1);
 });
+
+// ── compressed rollouts (.jsonl.zst) ────────────────────────────────────────────────────────
+
+import zlib from 'node:zlib';
+import { listAllRollouts } from '../lib/transcript-index-codex.mjs';
+import { readRolloutText } from '../lib/rollout-file.mjs';
+
+test('counts include a .zst session, sized by its decompressed content', { skip: typeof zlib.zstdCompressSync === 'function' ? false : 'zstd unavailable' }, (t) => {
+  const root = path.join(withCodexAuth(t, null), 'sessions', '2026', '10', '10');
+  fs.mkdirSync(root, { recursive: true });
+  const file = path.join(root, `rollout-2026-10-10T00-00-00-${UUID_A}.jsonl.zst`);
+  const body = `${JSON.stringify({ type: 'session_meta', payload: { id: UUID_A, cwd: '/' } })}\n`;
+  fs.writeFileSync(file, zlib.zstdCompressSync(Buffer.from(body)));
+  const at = (Date.now() - 12 * DAY) / 1000;
+  fs.utimesSync(file, at, at);
+
+  const readHead = (f) => [JSON.parse(readRolloutText(f).split('\n')[0])];
+  const entries = listAllRollouts({ readHead });
+  assert.equal(entries.length, 1);
+  const counts = countPastSessions(entries, {
+    imported: () => false, readCwd: (en) => en.cwd, keyOf: () => ({ kind: 'folder', match: '/' }),
+  });
+  assert.deepEqual(counts, { sessions: 1, places: 1 });
+});

@@ -357,7 +357,8 @@ test('a live checkpoint reads the rollout once', async (t) => {
     transcriptMemo,
   }), { emitTimeline: true });
 
-  assert.equal(parentLookups.length, 2, 'the parent delta and the timeline both ask the memo');
+  // The branch's clear-context handoff check reads the same records: a third lookup, a memo hit.
+  assert.equal(parentLookups.length, 3, 'the parent delta, the timeline and the plan-handoff check all ask the memo');
   assert.equal(reads.get(parent), 1);
   assert.equal(reads.get(child), 1);
 });
@@ -773,3 +774,203 @@ for (const failure of ['queue', 'state']) {
     assert.equal([...delivered.values()].reduce((sum, payload) => sum + payload.token_total, 0), 30);
   });
 }
+
+// ─── plan clear-context handoff ───────────────────────────────────────────────────────────────
+// A session started by "Yes, clear context" re-posts its predecessor's timeline once, from its own
+// first turn end, so the plan-approval wait lands without waiting for a backfill. The finder is
+// faked; the predecessor's timeline is computed for real from a rollout on disk.
+
+const H0 = Date.parse('2026-05-01T10:00:00.000Z');
+const hIso = (ms) => new Date(ms).toISOString();
+const hRec = (ms, type, payload) => ({ timestamp: hIso(ms), type, payload });
+const HPLAN = '# Plan\n' + 'step '.repeat(80);
+const HPREFIX = "A previous agent produced the plan below to accomplish the user's task. Implement the plan in a fresh context. Treat the plan as the source of user intent, re-read files as needed, and carry the work through implementation and verification.";
+const HWAIT = H0 + 6000;
+const writeJsonl = (file, records) => fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+// The tail real Codex writes after a Plan: final_answer message, token_usage_record and token_count
+// between the Plan item and task_complete.
+const realPredTail = () => [
+  hRec(H0 + 500, 'event_msg', { type: 'task_started', turn_id: 'turn-1' }),
+  hRec(H0 + 1000, 'event_msg', { type: 'user_message', message: 'plan it' }),
+  hRec(H0 + 5000, 'event_msg', { type: 'item_completed', turn_id: 'turn-1', item: { type: 'Plan', id: 'p', text: HPLAN } }),
+  hRec(H0 + 5026, 'response_item', { type: 'message', role: 'assistant', phase: 'final_answer',
+    content: [{ type: 'output_text', text: `<proposed_plan>\n${HPLAN}\n</proposed_plan>` }] }),
+  hRec(H0 + 5041, 'token_usage_record', { turn_id: 'turn-1' }),
+  hRec(H0 + 5059, 'event_msg', { type: 'token_count' }),
+  hRec(HWAIT, 'event_msg', { type: 'task_complete', turn_id: 'turn-1' }),
+];
+
+function handoffFixture(home, firstPrompt = `${HPREFIX}\n\n${HPLAN}`, predTail = null) {
+  const predPath = path.join(home, 'rollout-old.jsonl');
+  writeJsonl(predPath, [
+    hRec(H0, 'session_meta', { id: 'old-id', cwd: home }),
+    ...(predTail || [
+      hRec(H0 + 1000, 'event_msg', { type: 'user_message', message: 'plan it' }),
+      hRec(H0 + 5000, 'event_msg', { type: 'item_completed', item: { type: 'Plan', id: 'p', text: HPLAN } }),
+      hRec(HWAIT, 'event_msg', { type: 'task_complete' }),
+    ]),
+  ]);
+  const newPath = path.join(home, 'rollout-new.jsonl');
+  writeJsonl(newPath, [
+    hRec(HWAIT + 25000, 'session_meta', { id: 's1', cwd: home }),
+    hRec(HWAIT + 26000, 'event_msg', { type: 'user_message', message: firstPrompt }),
+    hRec(HWAIT + 40000, 'event_msg', { type: 'agent_message' }),
+    hRec(HWAIT + 41000, 'event_msg', { type: 'task_complete' }),
+  ]);
+  return { predPath, newPath };
+}
+
+// Timeline POSTs captured by sessionId; `failFor` answers 500 for that session's timeline.
+function handoffDeps(home, fx, over = {}) {
+  const posts = [];
+  const lookups = [];
+  const failFor = over.failFor;
+  return {
+    posts,
+    lookups,
+    deps: deps(home, [seg()], {
+      resolveTranscript: () => ({ transcriptPath: fx.newPath, sessionId: 's1' }),
+      drainRateLimitSnapshots: async () => ({ posted: 0 }),
+      fetchImpl: async (url, init) => {
+        if (String(url).indexOf('/sessions/timeline') === -1) throw new Error('offline');
+        const body = JSON.parse(init.body);
+        posts.push(body);
+        return { status: body.sessionId === failFor ? 500 : 200 };
+      },
+      findPlanPredecessor: (transcriptPath, records) => {
+        lookups.push({ transcriptPath, records });
+        return over.noMatch ? null
+          : { transcriptPath: fx.predPath, sessionId: over.predSessionId || 'old-id', waitStartMs: HWAIT };
+      },
+    }),
+  };
+}
+const TURN_END_OPTS = { emitTimeline: true, skipFlush: true };
+
+test('a clear-context session re-posts its predecessor timeline with the plan_approval tail, once', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home);
+  const h = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, TURN_END_OPTS);
+
+  assert.equal(h.lookups.length, 1);
+  assert.equal(h.lookups[0].transcriptPath, fx.newPath);
+  const pred = h.posts.filter((p) => p.sessionId === 'old-id');
+  assert.equal(pred.length, 1, 'one extra timeline post, for the predecessor');
+  const last = pred[0].periods[pred[0].periods.length - 1];
+  assert.deepEqual([last.state, last.waiting_subtype, last.started_at, last.ended_at],
+    ['waiting_user', 'plan_approval', hIso(HWAIT), hIso(HWAIT + 26000)]);
+  assert.equal(pred[0].ended_at, hIso(HWAIT + 26000));
+  assert.equal(h.posts.filter((p) => p.sessionId === 's1').length, 1, 'its own timeline still goes out');
+  assert.equal(readState('s1').planHandoffPosted, true);
+  assert.ok(!fs.existsSync(path.join(stateDir(), 'old-id.json')), 'the predecessor state is never written');
+
+  // Second turn: the flag holds, no lookup and no predecessor post.
+  fs.appendFileSync(fx.newPath, JSON.stringify(hRec(HWAIT + 60000, 'event_msg', { type: 'agent_message' })) + '\n');
+  const h2 = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h2.deps, TURN_END_OPTS);
+  assert.equal(h2.lookups.length, 0);
+  assert.equal(h2.posts.filter((p) => p.sessionId === 'old-id').length, 0);
+});
+
+test('a predecessor ending on the real Codex Plan tail still gets the plan_approval tail re-posted', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home, undefined, realPredTail());
+  const h = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, TURN_END_OPTS);
+
+  const pred = h.posts.filter((p) => p.sessionId === 'old-id');
+  assert.equal(pred.length, 1);
+  const last = pred[0].periods[pred[0].periods.length - 1];
+  assert.deepEqual([last.state, last.waiting_subtype, last.started_at, last.ended_at],
+    ['waiting_user', 'plan_approval', hIso(HWAIT), hIso(HWAIT + 26000)]);
+  assert.equal(pred[0].ended_at, hIso(HWAIT + 26000));
+  assert.equal(readState('s1').planHandoffPosted, true);
+});
+
+// The finder's sessionId comes from a session_meta on disk; one that is not a usable id must never
+// key a timeline post.
+test('a predecessor with an unusable session id is not posted', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home);
+  for (const bad of ['null', '../evil', 'a b']) {
+    const h = handoffDeps(home, fx, { predSessionId: bad });
+    await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, TURN_END_OPTS);
+    assert.equal(h.posts.filter((p) => p.sessionId !== 's1').length, 0, bad);
+    assert.equal(readState('s1').planHandoffPosted, true, bad);
+    // Re-open the lookup for the next id.
+    const state = readState('s1');
+    delete state.planHandoffPosted;
+    writeState('s1', state);
+  }
+});
+
+test('a session without the handoff prefix sets the flag and never looks again', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home, 'just a normal prompt');
+  const h = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, TURN_END_OPTS);
+  assert.equal(h.lookups.length, 0);
+  assert.equal(readState('s1').planHandoffPosted, true);
+
+  const h2 = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h2.deps, TURN_END_OPTS);
+  assert.equal(h2.lookups.length, 0);
+  assert.equal(h2.posts.filter((p) => p.sessionId === 'old-id').length, 0);
+});
+
+// The predecessor is complete before the successor starts, so a miss now is a miss forever: it
+// must not re-walk the sessions directory every turn.
+test('a handoff prompt with no predecessor found sets the flag too', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home);
+  const h = handoffDeps(home, fx, { noMatch: true });
+  await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, TURN_END_OPTS);
+  assert.equal(h.lookups.length, 1);
+  assert.equal(readState('s1').planHandoffPosted, true);
+});
+
+test('a failed predecessor post leaves the flag unset and retries next turn', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home);
+  const h = handoffDeps(home, fx, { failFor: 'old-id' });
+  await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, TURN_END_OPTS);
+  assert.equal(h.posts.filter((p) => p.sessionId === 'old-id').length, 1);
+  assert.notEqual(readState('s1').planHandoffPosted, true);
+
+  const h2 = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h2.deps, TURN_END_OPTS);
+  assert.equal(h2.lookups.length, 1);
+  assert.equal(h2.posts.filter((p) => p.sessionId === 'old-id').length, 1);
+  assert.equal(readState('s1').planHandoffPosted, true);
+});
+
+test('a mid-turn checkpoint never looks for a predecessor', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home);
+  const h = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, { skipFlush: true });
+  assert.equal(h.lookups.length, 0);
+  assert.equal(h.posts.length, 0);
+});
+
+// A turn-end checkpoint can land before the first prompt is written (only session_meta so far). No
+// prompt is not "no handoff": sealing the flag there would shut a handoff session out for good.
+test('a rollout with no prompt yet leaves the flag unset; the handoff is found once the prompt lands', async (t) => {
+  const home = tmpHome(t);
+  const fx = handoffFixture(home);
+  const full = fs.readFileSync(fx.newPath, 'utf-8');
+  fs.writeFileSync(fx.newPath, full.split('\n')[0] + '\n');
+  const h = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h.deps, TURN_END_OPTS);
+  assert.equal(h.lookups.length, 0);
+  assert.notEqual(readState('s1').planHandoffPosted, true);
+
+  fs.writeFileSync(fx.newPath, full);
+  const h2 = handoffDeps(home, fx);
+  await runCheckpoint({ session_id: 's1', cwd: home }, h2.deps, TURN_END_OPTS);
+  assert.equal(h2.lookups.length, 1);
+  assert.equal(h2.posts.filter((p) => p.sessionId === 'old-id').length, 1);
+  assert.equal(readState('s1').planHandoffPosted, true);
+});

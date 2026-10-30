@@ -1,5 +1,14 @@
 # Beezi plugin release notes
 
+## 0.24.14 (2026-10-30) — Approval waits, clear-context plans and older sessions
+
+### New
+- **Approval waits** — time spent waiting on a command or patch approval prompt now shows on the timeline as waiting on you. Trust the new `PermissionRequest` entry once in `/hooks`; until then these waits are not recorded. Note: approval records are kept only on this machine, for 35 days; a backfill after that, or on another machine, shows no approval waits.
+- **Clear-context plans** — accepting a plan with "Yes, clear context" now keeps the plan approval wait on the original session instead of losing it to the new thread.
+
+### Fixed
+- **Older sessions** — sessions Codex has compressed (older than 7 days) are now read by sync and backfill. They need Node 22.15+ or 23.8+; on an older Node they are skipped and the number skipped is printed.
+
 ## 0.24.0 (2026-10-29) — Large sessions upload
 
 ### Fixed
