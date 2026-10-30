@@ -16,7 +16,7 @@ const keyOf = (dir) => ({ kind: 'folder', match: dir.split('/').slice(0, 3).join
 test('counts what the upload would send, and the distinct places, less here', () => {
   const entries = [
     e('live', '/work/a', DAY), e('s1', '/work/a/x', DAY), e('s2', '/work/b', DAY),
-    e('active', '/work/c', 10 * 60 * 1000), e('big', '/work/d', DAY, 65 * 1024 * 1024),
+    e('active', '/work/c', 10 * 60 * 1000),
     e('old', '/work/e', 31 * DAY), e('done', '/work/f', DAY), e('nodir', null, DAY),
   ];
   const counts = countPastSessions(entries, {
@@ -32,6 +32,13 @@ test('a recorded session directory wins over the rollout cwd, and places dedupe'
     now, imported: () => false, readState: (id) => (id === 's1' ? { cwd: '/work/b/x' } : null), readCwd: (en) => en.cwd, keyOf,
   });
   assert.deepEqual(counts, { sessions: 2, places: 1 });
+});
+
+test('counts a past session larger than 64 MiB', () => {
+  const counts = countPastSessions([e('big', '/work/d', DAY, 65 * 1024 * 1024)], {
+    now, imported: () => false, readCwd: (en) => en.cwd, keyOf,
+  });
+  assert.deepEqual(counts, { sessions: 1, places: 1 });
 });
 
 const UUID_A = '019fd897-9320-7c20-9585-8fa3fff07bf7';

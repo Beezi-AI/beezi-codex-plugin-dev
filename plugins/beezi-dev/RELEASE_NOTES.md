@@ -1,5 +1,11 @@
 # Beezi plugin release notes
 
+## 0.24.0 (2026-10-29) — Large sessions upload
+
+### Fixed
+- **Large sessions upload** — rollouts over 64 MB are no longer skipped by the history upload or sync, and each turn reads a session once.
+- **Subagent forks bill only their own work** — even when the replayed prefix holds a blank or unreadable line.
+
 ## 0.23.1 (2026-10-22) — "Don't track" stands alone, and several workspaces at sign-in
 
 ### Fixed

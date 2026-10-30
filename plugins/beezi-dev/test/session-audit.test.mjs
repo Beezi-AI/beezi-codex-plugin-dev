@@ -573,15 +573,35 @@ test('12b. drops rollouts older than the 30-day window and still finalizes', asy
   assert.equal(result.finalized, true, 'a capped run is not a scoped run');
 });
 
-test('13. skips a rollout too large to parse safely', async () => {
+test('13. uploads a rollout larger than 64 MiB', async () => {
   const { deps } = makeDeps({
     listRollouts: () => [{ ...rollout('huge'), size: 128 * 1024 * 1024 }],
   });
 
   const result = await runAudit(deps, {});
 
-  assert.equal(result.oversize, 1);
-  assert.equal(result.candidates, 0);
+  assert.equal(result.candidates, 1);
+});
+
+test('the history timeline reuses the checkpoint\'s read', async () => {
+  const reads = [];
+  const { deps } = makeDeps({
+    readLinesImpl: (p) => { reads.push(p); return { lineCount: 0, completeLines: 0, records: [] }; },
+    runCheckpointImpl: async (input, d, options) => {
+      d.transcriptMemo.readLines(input.transcript_path);
+      options.sink(report(input.session_id));
+      return checkpointResult();
+    },
+    computeSessionTimelineImpl: (transcriptPath, _id, d) => {
+      d.readLines(transcriptPath);
+      return { periods: [{ state: 'working' }], plan_events: [], subagents: [] };
+    },
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.timelinesOffered, 1);
+  assert.deepEqual(reads, [rollout('s1').transcriptPath]);
 });
 
 test('14. an unreadable transcript is skipped without ending the run', async () => {

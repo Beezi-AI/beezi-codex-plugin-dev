@@ -74,10 +74,7 @@ import {
 } from './tracking.mjs';
 import { UserError } from './friendly-error.mjs';
 import { orDefault } from './compat.mjs';
-
-// A rollout this big is read several times over (segments, timeline, head reads) and would put
-// the process into the hundreds of MB. Report it rather than let node die mid-run.
-const MAX_TRANSCRIPT_BYTES = 64 * 1024 * 1024;
+import { createTranscriptMemo } from './transcript-memo-codex.mjs';
 
 // Error posts are single small upserts, so a little parallelism is free — but not unbounded,
 // or a 200-session run opens 200 sockets at once.
@@ -318,7 +315,7 @@ async function mapLimited(items, limit, worker) {
 // Seal only when a re-run could not improve the outcome, and only when the run covered
 // everything: any retryable failure, unattributable chunk, whole-chunk rejection, halt or scope
 // flag leaves the pull open. Per-item errors[] (unconnected repos on platform tenants) and
-// oversize/unreadable transcripts deliberately do NOT block — a re-run cannot help them, and
+// unreadable transcripts deliberately do NOT block — a re-run cannot help them, and
 // blocking would deadlock the seal forever.
 export function shouldFinalize(result, options = {}) {
   if (!result.ok) return false;
@@ -463,7 +460,6 @@ function emptyAuditResult(options = {}) {
     recent: [],
     liveTracked: 0,
     alreadyImported: 0,
-    oversize: 0,
     candidates: 0,
     plannedChunks: 0,
     // Reports built and handed to the flush — in a dry run, what WOULD have been sent. Counted in
@@ -785,7 +781,6 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
     // otherwise prints "nothing new to upload" on a machine that plainly has older history.
     if (entry.mtimeMs < ageCutoffMs) { result.tooOld += 1; continue; }
     if (options.sinceMs != null && entry.mtimeMs < options.sinceMs) continue;
-    if (entry.size > MAX_TRANSCRIPT_BYTES) { result.oversize += 1; continue; }
     // One-workspace accounts only: a matched Don't-track rule. Moved last (M-3, after active/tooOld)
     // so the skipped count does not also include sessions that were never going to be uploaded
     // anyway. Excluded sessions still never hold the seal.
@@ -1211,6 +1206,8 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
       // Parent lines the current rules send to another workspace (or none), for the split check.
       const splitAt = splitChecks.get(entry.sessionId);
       const elsewhere = [];
+      // One read of the rollout, shared by the checkpoint and the timeline below.
+      const transcriptMemo = createTranscriptMemo({ readLines: deps.readLinesImpl });
       try {
         // transcript_path is passed through so runCheckpoint's resolver takes it as-is instead of
         // walking the whole rollout tree per session; cwd rode in on the discovery head-read.
@@ -1230,7 +1227,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
           // sink only what routes here — or, under `unrouted` (a --tenant override), every segment.
           {
             linkedSessions: async () => [session], fetchImpl, gitImpl: deps.gitImpl, recoveryPermit: lockHandle.token,
-            findSubagentRollouts: findSubagents, runCache,
+            findSubagentRollouts: findSubagents, runCache, transcriptMemo,
           },
           {
             sink: (payload) => reports.push({ ...payload, ...subscriptionIdentity }),
@@ -1363,6 +1360,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
         try {
           const computed = computeSessionTimeline(entry.transcriptPath, entry.sessionId, {
             readAgents: () => agents,
+            readLines: transcriptMemo.readLines,
           });
           if (
             computed &&

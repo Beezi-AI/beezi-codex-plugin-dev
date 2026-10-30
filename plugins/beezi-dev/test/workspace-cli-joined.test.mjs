@@ -153,6 +153,26 @@ test('joined done --defer-upload writes the keep-current rules but does not star
   assert.deepEqual(started, []);
 });
 
+// The seeded rollouts with R2's transcript reported as over 64 MiB.
+function seedHugeR2(t) {
+  const list = seedRollouts(t);
+  return () => list().map((entry) => (entry.sessionId === SESSION_R2 ? { ...entry, size: 65 * 1024 * 1024 } : entry));
+}
+
+test('routes lists a waiting past session larger than 64 MiB', async (t) => {
+  link(t, { tenants: X_T });
+  const out = await run(['routes'], { ...NOOP_DEPS, listAllRollouts: seedHugeR2(t) });
+  assert.equal(out.count, 2);
+  assert.ok(out.lines.some((line) => /kind=folder match=.*r2$/.test(line)), out.lines.join('\n'));
+});
+
+test('joined lists the place of a past session larger than 64 MiB', async (t) => {
+  link(t, { tenants: X_T });
+  const out = await run(['joined'], { ...NOOP_DEPS, listAllRollouts: seedHugeR2(t) });
+  assert.equal(out.count, 2);
+  assert.ok(out.lines.some((line) => /kind=folder match=.*r2 now=/.test(line)), out.lines.join('\n'));
+});
+
 test('joined pick --current is rejected and writes nothing', async (t) => {
   link(t, { tenants: X_T });
   const out = await workspaceCommand(['joined', 'pick', '--current', 'T', '--account', TEST_KEY], NOOP_DEPS);

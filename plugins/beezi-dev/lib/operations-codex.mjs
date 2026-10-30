@@ -225,12 +225,6 @@ export function operationWindowEnd(records, fromLine, servers) {
   return records.length;
 }
 
-function outputBytes(output) {
-  if (typeof output === 'string') return Buffer.byteLength(output, 'utf-8');
-  if (output == null) return 0;
-  return Buffer.byteLength(JSON.stringify(output), 'utf-8');
-}
-
 // A tool call's arguments as an object, or null. Codex writes them as a JSON string on
 // `function_call` and as an already-parsed object on some custom calls, so both shapes arrive.
 // Exported because lib/delta-codex.mjs reads workdir off the same field and must agree on what
@@ -302,7 +296,7 @@ function toolOutput(record) {
   const p = record && record.payload;
   if (!p) return null;
   if (p.type === 'function_call_output' || p.type === 'custom_tool_call_output') {
-    return { callId: orDefault(p.call_id, null), bytes: outputBytes(p.output) };
+    return { callId: orDefault(p.call_id, null), bytes: p.outputBytes };
   }
   return null;
 }

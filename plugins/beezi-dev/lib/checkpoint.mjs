@@ -3,6 +3,7 @@ import fs from 'fs';
 import { orDefault } from './compat.mjs';
 import path from 'path';
 import { computeDelta as _computeDelta } from './delta-codex.mjs';
+import { createTranscriptMemo } from './transcript-memo-codex.mjs';
 import { getAccessToken as _getAccessToken } from './token.mjs';
 import { linkedSessions as _linkedSessions, listAccountsSync, getDefaultKey, AccountStatus } from './accounts.mjs';
 import { queueDir, stateDir, beeziCodexHome } from './paths.mjs';
@@ -611,6 +612,7 @@ async function runLockedCheckpoint(lock, ctx) {
   // The history run's memo wins over deps.gitImpl, so each (cwd, args) spawns git once per run.
   const gitImpl = deps.runCache != null ? deps.runCache.git : orDefault(deps.gitImpl, git);
   const computeDelta = orDefault(deps.computeDelta, _computeDelta);
+  const transcriptMemo = orDefault(deps.transcriptMemo, createTranscriptMemo());
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const durable = options.persistState !== false;
   const payloads = [];
@@ -805,7 +807,8 @@ async function runLockedCheckpoint(lock, ctx) {
   const resolvers = { cwd, repoRootOf, branchAt: branchOf };
   let delta;
   try {
-    delta = computeDelta(transcript_path, state.cursor, resolvers);
+    // Children read without the memo, so it still holds the parent for the timeline.
+    delta = computeDelta(transcript_path, state.cursor, { ...resolvers, readLines: transcriptMemo.readLines });
   } catch {
     skipped.deltaFailed = true;
     return emptyResult();
@@ -1046,6 +1049,7 @@ async function runLockedCheckpoint(lock, ctx) {
       // sweep entries are ones a fresh readAgents would not see.
       const timeline = computeSessionTimeline(transcript_path, sessionId, {
         readAgents: () => agentResults.agents,
+        readLines: transcriptMemo.readLines,
       });
       if (timeline && (timeline.periods.length > 0 || timeline.subagents.length > 0 || timeline.plan_events.length > 0)) {
         // The sender list is part of the signature, so a newly answered workspace still gets it.

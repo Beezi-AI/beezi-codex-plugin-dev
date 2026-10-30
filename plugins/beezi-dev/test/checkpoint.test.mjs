@@ -4,6 +4,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir, stateDir } from '../lib/paths.mjs';
+import { writeAgent } from '../lib/subagent-state.mjs';
+import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
+import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
+import { createTranscriptMemo } from '../lib/transcript-memo-codex.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 
@@ -319,6 +323,43 @@ test('a turn-end checkpoint drains alongside the timeline post', async (t) => {
     { emitTimeline: true },
   );
   assert.equal(drains, 1);
+});
+
+test('a live checkpoint reads the rollout once', async (t) => {
+  const home = tmpHome(t);
+  const writeRollout = (name, records) => {
+    const file = path.join(home, name);
+    fs.writeFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+    return file;
+  };
+  const meta = (payload) => ({ timestamp: '2026-01-01T00:00:00.000Z', type: 'session_meta', payload: { cwd: home, ...payload } });
+  const turn = { timestamp: '2026-01-01T00:00:05.000Z', type: 'turn_context', payload: { cwd: home, model: 'gpt-5.4-mini' } };
+  const tokens = { timestamp: '2026-01-01T00:00:10.000Z', type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, cached_input_tokens: 0, output_tokens: 5 } } } };
+  const parent = writeRollout('rollout.jsonl', [meta({ id: 's1', session_id: 's1', thread_source: 'user' }), turn, tokens]);
+  const child = writeRollout('agent-a.jsonl', [
+    meta({ id: 'agent-a', session_id: 's1', parent_thread_id: 's1', thread_source: 'subagent',
+      source: { subagent: { thread_spawn: { parent_thread_id: 's1', depth: 1 } } } }),
+    turn, tokens,
+  ]);
+  writeAgent('s1', 'agent-a', { started_at: '2026-01-01T00:00:00.000Z', transcriptPath: child });
+
+  const reads = new Map();
+  const countingRead = (p) => { reads.set(p, (reads.get(p) || 0) + 1); return readRolloutLines(p); };
+  const memo = createTranscriptMemo({ readLines: countingRead });
+  const parentLookups = [];
+  const transcriptMemo = { readLines: (p) => { if (p === parent) parentLookups.push(p); return memo.readLines(p); } };
+
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [], {
+    resolveTranscript: () => ({ transcriptPath: parent, sessionId: 's1' }),
+    resolveSessionName: () => 'a session',
+    // A child read without the memo goes through the counting reader too.
+    computeDelta: (p, from, resolvers) => realComputeDelta(p, from, resolvers.readLines ? resolvers : { ...resolvers, readLines: countingRead }),
+    transcriptMemo,
+  }), { emitTimeline: true });
+
+  assert.equal(parentLookups.length, 2, 'the parent delta and the timeline both ask the memo');
+  assert.equal(reads.get(parent), 1);
+  assert.equal(reads.get(child), 1);
 });
 
 // `/beezi:track` is a turn end in every sense that matters. Without its own opt-in it queued rows

@@ -1,10 +1,10 @@
-import fs from 'fs';
 import { IDLE_GAP_SEC } from './timing.mjs';
 import { orDefault } from './compat.mjs';
 import { computeCodeChanges } from './code-changes-codex.mjs';
 import { computeOperations, parseArgs, operationContext, operationWindowEnd } from './operations-codex.mjs';
 import { buildActiveIntervals, totalMs } from './active-time.mjs';
 import { rateLimitObservationFromRecord } from './rate-limits-codex.mjs';
+import { readRolloutLines } from './transcript-reader-codex.mjs';
 
 // Attribute new Codex rollout activity to (repoRoot, branch) and bill token usage per segment.
 //
@@ -262,57 +262,22 @@ function dedupeErrors(events) {
   return out;
 }
 
-// The number of lines the cursor is allowed to advance over.
-//
-// A trailing line that is non-blank, unparseable AND not newline-terminated is a TORN record — the
-// writer has not finished it. Skipping it (as the loop does) *and* counting it in the cursor loses
-// it permanently: its metadata and its operations can be recovered from nothing else. So the
-// cursor stops short of it and the next pass re-reads it whole. The cost is one re-read of a
-// record that was never billed. (Its token count is not at stake either way: Codex reports totals
-// cumulatively, so a later token_count record re-states them.)
-//
-// Every OTHER unparseable line is complete-but-corrupt — it is newline-terminated, or another line
-// follows it — and is skipped AND passed over. That is what stops a bad line blocking the file
-// forever: a torn line holds the cursor only while it is the last line, and the moment anything is
-// appended it becomes newline-terminated and is treated as corrupt-but-complete.
-//
-// A valid JSON record with no final newline is accepted and passed over. A torn write cannot
-// produce one: the closing brace is the last byte of the record, so a prefix of it never parses.
-function completeLineCount(raw, endsWithNewline) {
-  if (raw.length === 0 || endsWithNewline) return raw.length;
-  const last = raw[raw.length - 1];
-  // A blank tail holds no record — records start with '{' — so it can never be a torn one.
-  if (!last.trim()) return raw.length;
-  try { JSON.parse(last); } catch { return raw.length - 1; }
-  return raw.length;
-}
-
 export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   const repoRootOf = orDefault(resolvers.repoRootOf, (dir) => dir);
   const branchAt = orDefault(resolvers.branchAt, null);
 
-  const content = fs.readFileSync(transcriptPath, 'utf-8');
-  // A rollout is appended one line at a time, so the final line can be a record that is still
-  // being written. Whether the file ends in a newline is the ONLY signal separating a torn record
-  // from a complete one, and the trim below destroys it — so capture it first.
-  const endsWithNewline = /\n$/.test(content);
-  const trimmed = content.replace(/\n+$/, '');
-  const raw = trimmed === '' ? [] : trimmed.split('\n');
+  // records stop short of a torn trailing record, so the cursor never passes one.
+  const { lineCount, records } = orDefault(resolvers.readLines, readRolloutLines)(transcriptPath);
 
   // A restored/replaced file can be shorter than its durable cursor. Replaying from zero would
   // create overlapping windows with different segment IDs. Preserve the cursor and defer until
   // the file catches up or an explicit coverage reconciliation supplies a valid boundary.
-  if (fromLine > raw.length) {
+  if (fromLine > lineCount) {
     const error = new Error('Transcript is shorter than its saved cursor; reconciliation required');
     error.code = 'CURSOR_MISMATCH';
     throw error;
   }
 
-  // How far the cursor may advance. Everything except a torn trailing record is passed over.
-  const completeLines = completeLineCount(raw, endsWithNewline);
-  const records = raw.slice(0, completeLines).map(line => {
-    try { return JSON.parse(line); } catch { return null; }
-  });
   const operationServers = operationContext(records);
   const windowEnd = operationWindowEnd(records, fromLine, operationServers);
 

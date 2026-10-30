@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { computeDelta } from '../lib/delta-codex.mjs';
+import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
 
 function writeRollout(records) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-codex-'));
@@ -431,6 +432,26 @@ test('a cursor exactly at the line count re-sends nothing — the guard is stric
   const { segments, nextCursor } = computeDelta(file, 3, identityResolvers);
   assert.equal(segments.length, 0);
   assert.equal(nextCursor, 3);
+});
+
+test('computeDelta via readLines matches the file read at every cursor', () => {
+  const file = writeRaw(jsonl([
+    ...PRELUDE,
+    turn('/repoB', 'gpt-5.2-codex', '2026-01-01T00:00:03.000Z'),
+  ]) + '\nNOT JSON\n' + jsonl([tokens('2026-01-01T00:00:04.000Z', 300, 0, 30)]) + '\n{"torn":');
+  const lines = readRolloutLines(file);
+  const cursors = [0, 3, lines.completeLines];
+  const expected = cursors.map((c) => computeDelta(file, c, identityResolvers));
+  fs.unlinkSync(file);
+  const viaReadLines = { ...identityResolvers, readLines: () => lines };
+  assert.deepEqual(cursors.map((c) => computeDelta(file, c, viaReadLines)), expected);
+});
+
+test('CURSOR_MISMATCH through readLines', () => {
+  const lines = readRolloutLines(writeRaw(jsonl(PRELUDE) + '\n{"torn":'));
+  const viaReadLines = { ...identityResolvers, readLines: () => lines };
+  assert.doesNotThrow(() => computeDelta('/missing', lines.lineCount, viaReadLines), 'a cursor on the torn line is not a mismatch');
+  assert.throws(() => computeDelta('/missing', lines.lineCount + 1, viaReadLines), { code: 'CURSOR_MISMATCH' });
 });
 
 test('thread_rolled_back is append-only: the cursor advances past it and deltas stay non-negative', () => {
