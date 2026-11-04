@@ -1,7 +1,9 @@
 import { BillingSource, CHATGPT_PLANS } from './billing.mjs';
+import { naming } from './paths.mjs';
 import {
-  askNewFolders, lastLine, outputLines, report, reviewJoined, reviewRoutes, token,
+  askNewFolders, lastLine, outputLines, printable, report, reviewJoined, reviewRoutes, token,
 } from './setup-routing.mjs';
+import { NEVER_STARTED } from './setup-runner.mjs';
 
 // One `accounts.mjs list` row: "  <n>. <description> [<key>]", then "  (default, revoked)" marks when any.
 const LISTED_ACCOUNT = /^ {2}\d+\. (.+) \[([0-9a-f]{8})\](?: {2}\(([a-z, ]+)\))?$/;
@@ -12,8 +14,16 @@ export const WORKSPACES_LABEL = 'Checking your workspaces…';
 export const PLAN_LABEL = 'Checking your plan…';
 export const SESSIONS_LABEL = 'Looking at your past sessions…';
 export const UPLOAD_LABEL = 'Uploading past sessions…';
-// backfill.mjs prints this once per batch; the wizard shows it on the activity line instead.
+// sync.mjs --accept prints this once per batch; the wizard shows it on the activity line instead.
 export const UPLOAD_PROGRESS = /^Beezi: (\d+)\/(\d+) sessions read…$/;
+export const OFFER_QUESTION = /^Q (.+)$/;
+export const OFFER_LINE = /^offer account=\S+ tenant=\S+ /;
+const COMBINED_QUESTION = /^QM (.+)$/;
+const COMBINED_ALL = /^QM-all=/;
+// An ask-first workspace's row in the combined summary: "    ? <name> · <n> sessions · <hides>".
+const ASK_ROW = /^ {4}\? (.+)$/;
+// The offer run's lines meant for the wizard, never the person.
+export const OFFER_MACHINE_LINE = /^(?:QM? |QM-all=|offer account=|(?:notices|offers)=\d+$)/;
 export const SETTINGS_LABEL = 'Saving your settings…';
 const CAPTURED = / source=(\S+) plan=([^\s.]+)/;
 export const PLAN_EXPIRED = /Codex sign-in expired/;
@@ -98,12 +108,10 @@ export async function capturePlan(ctx, key) {
   report(ctx, await ctx.run('billing-capture.mjs', ['--plan', TIER_CHOICES[pick].value, '--via', 'login-user', '--account', key]));
 }
 
-export const FINALIZED = /your history pull is finalized/;
 export const STILL_DEFAULT = /still reads from this machine/;
 export const LINKED_AS = /linked as (.+?)\. (?:Nothing changed|Credentials stored)/;
 export const TRUST_PENDING = /run \/hooks in Codex/;
 const HOOK_OUTCOME = /^(?:[✓⚠]|Beezi: another )/;
-const FINALIZE_NOTE = 'History import is now closed for this account: past sessions on other machines can no longer be imported. New sessions are still tracked everywhere Beezi is installed.';
 const DEFAULT_UNCHANGED = 'The default account is unchanged. The settings skill (Account → Default account) switches it later.';
 const TRUST_NOTE = 'One step left in Codex: run /hooks and trust the Beezi entries.';
 const CRASH_QUESTION = 'How should Beezi crash reports work?';
@@ -122,9 +130,75 @@ async function checkHooks(ctx) {
   return result.stdout;
 }
 
-async function uploadHistory(ctx, key) {
-  const result = await ctx.run('backfill.mjs', ['--via', 'login', '--account', key], { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
-  if (FINALIZED.test(result.stdout)) ctx.print(FINALIZE_NOTE);
+// Yes uploads exactly the sessions the summary showed, named by its `offer` line's token; No or a dismissal keeps them
+// declined and prints the D line.
+export function uploadChoices() {
+  return [{ label: 'Upload now' }, { label: 'Not now', description: `run ${naming.syncCommand()} any time` }];
+}
+
+const offerTarget = (key, line) => ['--account', key, '--tenant', token(line, 'tenant')];
+
+async function acceptOffer(ctx, key, line) {
+  const target = offerTarget(key, line);
+  const accept = ['--accept'].concat(target, ['--token', token(line, 'token')]);
+  await ctx.run('sync.mjs', accept, { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
+}
+
+async function declineOffer(ctx, key, line) {
+  report(ctx, await ctx.run('sync.mjs', ['--decline'].concat(offerTarget(key, line))));
+}
+
+async function answerOffer(ctx, key, line, question) {
+  if (await ctx.ask.choose(question, uploadChoices(), { defaultIndex: 0, escape: true }) === 0) await acceptOffer(ctx, key, line);
+  else await declineOffer(ctx, key, line);
+}
+
+// "<name> · <n> sessions · <hides>" → the name as the label, the rest as the description.
+function rowOption(row) {
+  const parts = row.split(' · ');
+  return { label: parts.slice(0, -2).join(' · '), description: parts.slice(-2).join(' · ') };
+}
+
+// One menu over the ask-first workspaces a `QM` line leads, all pre-ticked (R12), and a last exclusive Not now row:
+// ticked workspaces upload, the rest decline.
+async function answerCombined(ctx, key, combined) {
+  const workspaces = combined.labels.slice(-combined.lines.length).map(rowOption);
+  const options = workspaces.concat([{ label: 'Not now', description: `Nothing more is uploaded. Run ${naming.syncCommand()} any time.` }]);
+  const picked = await ctx.ask.chooseMany(combined.question, options, {
+    exclusive: [workspaces.length],
+    preselected: workspaces.map((_option, i) => i),
+  });
+  for (let i = 0; i < combined.lines.length; i += 1) {
+    if (picked !== null && picked.indexOf(i) !== -1) await acceptOffer(ctx, key, combined.lines[i]);
+    else await declineOffer(ctx, key, combined.lines[i]);
+  }
+}
+
+// Streams the summaries and any no-ask upload as sync.mjs prints them, then asks the questions in the order it listed them.
+async function offerHistory(ctx, key) {
+  const listed = await ctx.run('sync.mjs', ['--offer', '--past', '--account', key], { stream: true, hide: OFFER_MACHINE_LINE, live: UPLOAD_PROGRESS });
+  const rows = [];
+  let question = null;
+  let combined = null;
+  for (const line of printable(listed.stdout)) {
+    const row = ASK_ROW.exec(line);
+    const many = COMBINED_QUESTION.exec(line);
+    const asked = OFFER_QUESTION.exec(line);
+    if (row !== null) rows.push(row[1]);
+    else if (many !== null) combined = { question: many[1], labels: rows.slice(), lines: [] };
+    else if (asked !== null) question = asked[1];
+    else if (OFFER_LINE.test(line) && combined !== null) combined.lines.push(line);
+    else if (OFFER_LINE.test(line)) await answerOffer(ctx, key, line, question);
+    else if (combined !== null && !COMBINED_ALL.test(line)) {
+      await answerCombined(ctx, key, combined);
+      combined = null;
+    }
+  }
+  if (combined !== null) await answerCombined(ctx, key, combined);
+  // A streamed stderr already showed; a run that never started (its error is in stderr, unstreamed) or a failure
+  // without stderr would otherwise print nothing.
+  if (listed.code === NEVER_STARTED) report(ctx, { code: listed.code, stdout: '', stderr: listed.stderr });
+  else if (listed.code !== 0 && listed.stderr.trim() === '') report(ctx, { code: listed.code, stdout: '', stderr: '' });
 }
 
 // "<name> - <workspace>" from the sign-in's "linked as" sentence becomes "<name> (<workspace>)".
@@ -196,7 +270,7 @@ export async function runSetup(ctx) {
   ctx.progress(SESSIONS_LABEL);
   await reviewJoined(ctx, key);
   await reviewRoutes(ctx, key);
-  await uploadHistory(ctx, key);
+  await offerHistory(ctx, key);
   ctx.progress(SETTINGS_LABEL);
   await offerDefault(ctx, key, signInOutput);
   await chooseCrashMode(ctx);

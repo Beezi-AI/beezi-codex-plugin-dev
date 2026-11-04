@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { computeDelta } from '../lib/delta-codex.mjs';
+import { computeDelta, lastUsageLine } from '../lib/delta-codex.mjs';
 import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
 
 function writeRollout(records) {
@@ -1187,6 +1187,64 @@ test('a non-limit error carries no resetsAt', () => {
   const [event] = eventsOf(file);
   assert.equal(event.error, 'authentication_failed');
   assert.equal('resetsAt' in event, false);
+});
+
+// ─── lastUsageLine ──────────────────────────────────────────────────────────────────────────
+
+const item = { timestamp: '2026-01-01T00:00:03.000Z', type: 'response_item', payload: { type: 'message', role: 'assistant' } };
+const done = { timestamp: '2026-01-01T00:00:05.000Z', type: 'event_msg', payload: { type: 'task_complete' } };
+
+test('lastUsageLine is the 1-based line of the last token_count that carries totals', () => {
+  const file = writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9), done]);
+  assert.equal(lastUsageLine(file), 4);
+});
+
+test('lastUsageLine is 0 for a rollout with no token_count', () => {
+  assert.equal(lastUsageLine(writeRollout([meta('/r'), item, done])), 0);
+});
+
+test('lastUsageLine passes over a torn final token_count, as computeDelta does', () => {
+  const torn = JSON.stringify(tokens('2026-01-01T00:00:04.000Z', 20, 0, 9)).slice(0, -3);
+  const file = writeRaw(`${jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item])}\n${torn}`);
+  assert.equal(lastUsageLine(file), 2);
+});
+
+test('lastUsageLine counts a parseable final line without a newline, as computeDelta does', () => {
+  const file = writeRaw(jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9)]));
+  assert.equal(lastUsageLine(file), 4);
+});
+
+test('lastUsageLine skips a token_count with no totals', () => {
+  const empty = { timestamp: '2026-01-01T00:00:04.000Z', type: 'event_msg', payload: { type: 'token_count', info: null } };
+  const file = writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, empty]);
+  assert.equal(lastUsageLine(file), 2);
+});
+
+test('lastUsageLine is null for a path it cannot read', () => {
+  assert.equal(lastUsageLine(path.join(os.tmpdir(), 'beezi-codex-missing', 'rollout.jsonl')), null);
+});
+
+test('lastUsageLine is null when the streaming reader throws', () => {
+  assert.equal(lastUsageLine('rollout.jsonl', () => { throw new Error('EACCES'); }), null);
+});
+
+test('lastUsageLine reads through the streaming reader, numbering lines the same across chunk boundaries', () => {
+  const file = writeRaw(`${jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5)])}\n\n${jsonl([item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9), done])}\n`);
+  const read = [];
+  const streamed = (p) => { read.push(p); return readRolloutLines(p, { chunkBytes: 16 }); };
+  assert.equal(lastUsageLine(file, streamed), 5);
+  assert.deepEqual(read, [file]);
+  assert.equal(lastUsageLine(file), 5);
+});
+
+// A fully stored session is held in full only when this answers a number: null re-offers it every run.
+test('lastUsageLine of a fully stored rollout is a number its stored prefix reaches', () => {
+  const records = [meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5), item, tokens('2026-01-01T00:00:04.000Z', 20, 0, 9), done];
+  const file = writeRollout(records);
+  const stored = records.length;
+  const last = lastUsageLine(file);
+  assert.equal(typeof last, 'number');
+  assert.ok(stored >= last, `stored ${stored} reaches ${last}`);
 });
 
 // --- zstd-compressed rollouts ---

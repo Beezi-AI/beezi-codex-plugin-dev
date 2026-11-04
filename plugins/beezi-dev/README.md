@@ -189,8 +189,8 @@ captured ChatGPT plan.
 **To remove one**, the `logout` skill logs out a named account or every account at once and reports
 the outcome for each. With only one account linked, it logs that one out in a single step.
 
-Each account and workspace has its own history import. Login and sync ask where past sessions with
-no rule should go before uploading them; with nothing to ask, sync goes straight to the upload.
+Each account and workspace has its own history upload. Login and sync ask where past sessions with
+no rule should go, then show what an upload would send and ask before uploading anything.
 Two users of the same workspace can both link the machine; if both send to that workspace, it
 counts the same sessions twice.
 
@@ -265,6 +265,25 @@ endpoint without credentials or machine headers, so authentication failures can 
 The MCP server flushes in the background, with a short attempt at Stop; undelivered reports expire
 after 14 days. Correlation binds a random installation ID using the default linked account when
 usable, otherwise another linked account. Logging out the last account rotates that ID.
+
+## Anonymization
+
+A workspace can hide any of five kinds: **folder and repository names**, **branch names**,
+**computer name**, **account email** and **Session titles**. A hidden name is replaced on this
+machine, before anything is sent, with a made-up value of the form `anon:<kind>:<hex>`: an HMAC-SHA256
+under the key on that workspace's anonymization settings, computed on this machine. Beezi stores only
+the made-up name. The first request after sign-in, or after a settings change, can carry the computer
+name, which Beezi hashes on arrival.
+
+With Session titles on, session titles, error messages and subagent names are not sent at all.
+
+Without the workspace's key on this machine, a hidden kind is never sent raw: live reports for that
+workspace are dropped, and sync stops with a line asking you to sign in again.
+
+Past sessions need a yes. Login, sync and the setup wizard show what an upload would send — which
+kinds are sent as they are and which the workspace hides — and ask; nothing goes up without
+"Upload now". The kinds the question showed as hidden stay hidden for that upload, even if the
+workspace turns them off before it runs.
 
 ## Updating
 
@@ -355,7 +374,7 @@ Codex writes one rollout transcript per session at
 than 7 days (by mtime) to `rollout-*.jsonl.zst` and deletes the plain file; resuming a session
 decompresses it back. The plugin reads both. Reading `.zst` needs `zlib.zstdDecompressSync`
 (Node 22.15+ or 23.8+; Node 23.0-23.7 have none); on an older Node those sessions are skipped, and
-sync and backfill print how many. Each line is
+sync and the past-sessions upload print how many. Each line is
 `{ timestamp, type, payload }` with types `session_meta`, `turn_context`, `response_item`, and
 `event_msg`.
 
@@ -452,7 +471,7 @@ sync and backfill print how many. Each line is
   comes first. A period under 1 s is not counted. Nothing is counted when
   `approval_policy` is `never`, in bypass mode, when an automatic reviewer rather than you handles
   approvals, or for subagent threads.
-  Markers are local and kept 35 days (longer than the 30-day sync window); a backfill after they
+  Markers are local and kept 35 days (longer than the 30-day sync window); a sync after they
   are pruned, or on another machine, has no approval periods. A plan accepted with "Yes, clear
   context" starts a new Codex thread; the plugin matches it to the plan session (same cwd, plan
   text, within 6 hours), appends the `plan_approval` wait to the old session's timeline and
@@ -544,8 +563,9 @@ Pro split: the $200 tier kept the name `pro` and became 20×, and the new $100 5
 `prolite`. Anything left unmapped normalizes to `unknown`, which never settles — so the
 "refresh your plan" nudge would fire on every session with no way for the user to end it.
 
-Both history paths — the login skill's one-time import and the repeatable `sync` — reach back
-**30 days** and no further. A rollout older than that is skipped with a visible count and is never
+Both history paths — the login skill's past-sessions step, which asks first unless the workspace's owner chose upload without
+asking, and the repeatable
+`sync` — reach back **30 days** and no further. A rollout older than that is skipped with a visible count and is never
 picked up by a later run; the window is shared deliberately, so a session cannot be in scope for
 one command and out of scope for the other.
 
@@ -561,11 +581,12 @@ sessions that started before 2026-09-11 keep their subagents back, because live 
 agent ids were canonicalized may carry a different `agent_id`. Before 0.16.0 a sync sent no
 subagents at all, so the first sync after upgrading uploads the ones it left behind.
 
-New or unfinished historical backfills register and snapshot the current ChatGPT account before
-upload, then attach its `account_uuid` to every imported report, including subagent reports. This
-attributes history to the account active during the import; it does not reconstruct the plan or
-account that was active when each session ran. If no subscription account ID is available, the
-reports are sent without one.
+Past sessions go up only after a yes to the question login or sync showed, or with a notice when the
+workspace's owner chose upload without asking. That upload registers
+and snapshots the current ChatGPT account first, then attaches its `account_uuid` to every report it
+sends, including subagent reports. This attributes history to the account active at the upload; it
+does not reconstruct the plan or account that was active when each session ran. If no subscription
+account ID is available, the reports are sent without one.
 
 **Known limitation:** Codex's third-party providers are configured in `~/.codex/config.toml`
 (`model_provider` / `env_key`), invisible to the environment. Parsing it would need a TOML
@@ -575,7 +596,7 @@ machine on a custom provider with a leftover ChatGPT login resolves as `subscrip
 ## Client identity
 
 Every request carries an `X-Beezi-Agent: codex` header, and this machine's OAuth client registers as
-`Beezi Codex plugin — <hostname>`, so the Beezi API attributes Codex machines and analytics
+`Beezi Codex plugin`, with no hostname, so the Beezi API attributes Codex machines and analytics
 distinctly from the Claude Code plugin.
 
 ## Configuration

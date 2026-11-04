@@ -94,6 +94,21 @@ function totalsFromRecord(rec) {
   };
 }
 
+// The 1-based line of the last token_count with totals, scanning backwards: 0 when none, null when unreadable.
+export function lastUsageLine(transcriptPath, readLines = readRolloutLines) {
+  let records;
+  try {
+    ({ records } = readLines(transcriptPath));
+  } catch {
+    return null;
+  }
+  // records[i] is line i + 1; a blank, torn or corrupt line is null and holds no usage.
+  for (let i = records.length - 1; i >= 0; i -= 1) {
+    if (totalsFromRecord(records[i]) !== null) return i + 1;
+  }
+  return 0;
+}
+
 // Context OCCUPANCY at this request, not the session's cumulative total. `last_token_usage`
 // describes ONE request, so its input_tokens IS that request's whole prompt — the context the model
 // was carrying at that instant. `cached_input_tokens` is a SUBSET of it (10368/10368), not a

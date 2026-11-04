@@ -8,6 +8,7 @@ import { makeHome, linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
 import { settingsLines } from '../lib/settings-cli.mjs';
 import { initSessionWorkspace } from '../lib/workspace.mjs';
 import { workspaceCommand } from '../lib/workspace-cli.mjs';
+import { KINDS } from '../lib/anonymize.mjs';
 
 const TENANTS = [{ id: 'A', name: 'Acme' }, { id: 'B', name: 'Beta' }];
 const EMAIL = 'user@example.com';
@@ -43,6 +44,39 @@ test('the screen says where this folder goes before it counts rules', async (t) 
   ]);
   const card = inside(lines, `<here-card account="${TEST_KEY}">`);
   assert.deepEqual(card, ["● You're here", '  client, a folder', '  /work/client', '', 'Now     → Acme (default)']);
+});
+
+const kindsOn = (on) => Object.fromEntries(KINDS.map((kind) => [kind, on.includes(kind)]));
+const ANONYMIZED = { tenantId: 'A', kinds: kindsOn(['hosts']), key: null, machineName: 'Laptop 7' };
+
+test('an anonymized workspace\'s machine name shows as "Appears as" on the screen and the account view', async (t) => {
+  linkAccount(makeHome(t), TEST_KEY, { email: EMAIL, tenants: [TENANTS[0]], anonymization: ANONYMIZED });
+  assert.deepEqual(inside(await settingsLines('menu', deps()), '<show>'), [
+    `Beezi · ${EMAIL}`, '  Appears as      Laptop 7', '  This folder     client → Acme (default)', '  Crash reports   Off',
+  ]);
+  const account = inside(await settingsLines('account', deps()), '<show>');
+  assert.equal(account[0], `Account · ${EMAIL}`);
+  assert.equal(account.indexOf('  Appears as      Laptop 7'), account.findIndex((l) => l.startsWith('  Workspace ')) + 1);
+});
+
+test('no machine name, no "Appears as"', async (t) => {
+  linkAccount(makeHome(t), TEST_KEY, { email: EMAIL, tenants: [TENANTS[0]], anonymization: { ...ANONYMIZED, machineName: null } });
+  const lines = (await settingsLines('menu', deps())).concat(await settingsLines('account', deps()));
+  assert.ok(!lines.some((l) => l.includes('Appears as')), lines.join('\n'));
+});
+
+test('a workspace with hosts off shows no "Appears as", even with a machine name', async (t) => {
+  linkAccount(makeHome(t), TEST_KEY, { email: EMAIL, tenants: [TENANTS[0]], anonymization: { ...ANONYMIZED, kinds: kindsOn(['accounts']) } });
+  const lines = (await settingsLines('menu', deps())).concat(await settingsLines('account', deps()));
+  assert.ok(!lines.some((l) => l.includes('Appears as')), lines.join('\n'));
+});
+
+test('on several workspaces "Appears as" names the workspace the machine name belongs to', async (t) => {
+  linkAccount(makeHome(t), TEST_KEY, { email: EMAIL, tenants: TENANTS, newFolders: { mode: 'send', tenantIds: ['A'] }, anonymization: ANONYMIZED });
+  for (const view of ['menu', 'account']) {
+    const shown = inside(await settingsLines(view, deps()), '<show>');
+    assert.ok(shown.includes('  Appears as      Laptop 7 in Acme'), shown.join('\n'));
+  }
 });
 
 test('the rules listing inside the menu is the one workspace.mjs prints for this folder', async (t) => {

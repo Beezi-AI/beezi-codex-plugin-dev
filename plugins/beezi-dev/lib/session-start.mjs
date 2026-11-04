@@ -47,6 +47,8 @@ import { orDefault } from './compat.mjs';
 import { captureFromCodexAccount } from './billing-capture.mjs';
 import { readAccountViaAppServer as _readAccountViaAppServer } from './codex-app-server.mjs';
 import { syncAccountIfNeeded as _syncAccountIfNeeded } from './account-sync.mjs';
+import { hasKind, kindsOf, sessionAnonymization } from './anonymization.mjs';
+import { Kind } from './anonymize.mjs';
 
 // Resume guard: create cursor=0 ONLY if absent; never reset an existing session's cursor.
 // Also records where the session lives (cwd + transcript path) so the track script can find
@@ -145,8 +147,12 @@ function workspaceType(target) {
   return t == null || t.type == null ? null : t.type;
 }
 
-// An analytics workspace answers connected for every repo, so its line says nothing; the banner says where analytics go.
-const probesRepo = (target) => workspaceType(target) !== 'analytics';
+const ANONYMIZED_LINE = 'Beezi: this workspace is anonymized.';
+
+const isAnonymizedTarget = (target) => kindsOf(sessionAnonymization(target)).length > 0;
+
+// An analytics workspace answers connected for every repo, and one hiding repos is never sent the raw remote.
+const probesRepo = (target) => workspaceType(target) !== 'analytics' && !hasKind(sessionAnonymization(target), Kind.REPOS);
 
 // The hook's own cwd only: an unknown one gets no route line. Compact shows none.
 function sessionBanner(input, sessions, workspaceState, trackingByKey, ctx) {
@@ -164,9 +170,9 @@ function sessionBanner(input, sessions, workspaceState, trackingByKey, ctx) {
 // Returns the whoami answer itself, so the caller can carry a valid answer's identity forward.
 async function probeToken(key, session, fetchImpl, deps = {}) {
   const who = await whoami(session, { fetchImpl });
-  // Piggyback the tracking-policy refresh on the check we already make: the trackingMode /
-  // backfillCompleted cache goes stale between logins otherwise, and the live gate plus the
-  // backfill fast-path both key off it. Best-effort — never blocks session start.
+  // Piggyback the tracking-policy refresh on the check we already make: the trackingMode cache
+  // goes stale between logins otherwise, and the live gate keys off it. Best-effort — never
+  // blocks session start.
   if ((who || {}).valid === true) {
     // The account's OWN client id, carried on the session this whoami was made with — never a
     // process-global, which with several accounts linked would bind one tenant's policy under
@@ -189,7 +195,7 @@ async function probeToken(key, session, fetchImpl, deps = {}) {
     try {
       await updateAccount(key, {
         email: who.email, name: who.name, tenantId: who.tenantId, tenantName: who.tenantName,
-        tenants: who.tenants,
+        tenants: who.tenants, anonymization: who.anonymization,
       }, deps);
     } catch { /* best-effort — a session must not fail because a row could not be labelled */ }
   }
@@ -200,11 +206,11 @@ const isRejected = (who) => (who || {}).valid === false;
 
 // The session carried past the token check: the identity a valid answer just named overlays the
 // stored one (null keeps it), and tenantId is always null — only a per-workspace clone sets it.
-function withIdentity(session, who) {
+function overlayWhoami(session, who) {
   const next = { ...session, tenantId: null };
   if ((who || {}).valid !== true) return next;
   if (who.email != null) next.email = String(who.email).toLowerCase();
-  for (const field of ['name', 'tenantName', 'tenants']) {
+  for (const field of ['name', 'tenantName', 'tenants', 'anonymization']) {
     if (who[field] != null) next[field] = who[field];
   }
   return next;
@@ -348,7 +354,7 @@ export async function runSessionStart(input, deps = {}) {
       }
       current = { ...current, token: refreshed };
     }
-    active.push(withIdentity(current, who));
+    active.push(overlayWhoami(current, who));
   }
   if (active.length === 0) return warnings.length ? warnings.join('\n') : null;
 
@@ -391,7 +397,8 @@ export async function runSessionStart(input, deps = {}) {
       ...targets.map((target) => (probesRepo(target) ? announceRepo(remote, target, fetchImpl) : null)),
     ]);
     targets.forEach((target, i) => {
-      if (lines[i]) announcements.push(announceLine(target, lines[i], many));
+      const line = isAnonymizedTarget(target) ? ANONYMIZED_LINE : lines[i];
+      if (line) announcements.push(announceLine(target, line, many));
     });
   }
   try { pruneStale(); } catch { /* best-effort */ }

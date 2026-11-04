@@ -196,15 +196,12 @@ test('readRolloutHeadBuffer: no zstd support gives null; corrupt frame gives nul
   assert.equal(readRolloutHeadBuffer(bad, 100), null);
 });
 
-// One definition of the line sync and backfill print. Node 23.0-23.7 have no zstd, so "22.15 or
+// One definition of the line sync prints (lib/history-cli.mjs). Node 23.0-23.7 have no zstd, so "22.15 or
 // newer" was wrong for them.
 test('compressedSkippedLine: the exact CLI line, defined once', () => {
   assert.equal(compressedSkippedLine(3),
     'Skipped 3 compressed Codex sessions: reading them needs Node 22.15+ (or 23.8+).');
-  const scripts = fileURLToPath(new URL('../scripts/', import.meta.url));
-  for (const name of ['sync.mjs', 'backfill.mjs']) {
-    const src = fs.readFileSync(path.join(scripts, name), 'utf-8');
-    assert.ok(src.indexOf('compressed Codex sessions') === -1, `${name} defines its own copy`);
-    assert.ok(src.indexOf('compressedSkippedLine(') !== -1, `${name} uses the shared line`);
-  }
+  const src = fs.readFileSync(fileURLToPath(new URL('../lib/history-cli.mjs', import.meta.url)), 'utf-8');
+  assert.ok(src.indexOf('compressed Codex sessions') === -1, 'history-cli.mjs defines its own copy');
+  assert.ok(src.indexOf('compressedSkippedLine(') !== -1, 'history-cli.mjs uses the shared line');
 });

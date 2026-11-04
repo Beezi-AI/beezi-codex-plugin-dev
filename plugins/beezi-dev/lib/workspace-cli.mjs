@@ -2,7 +2,7 @@ import os from 'os';
 import path from 'path';
 import {
   AccountStatus, getDefaultKey, listAccounts, markTenantsReviewed, parseAccountFlag, removeWorkspaceRule, restoreRouting,
-  setNewFolders, setWorkspaceRule,
+  rowSessionFields, setNewFolders, setWorkspaceRule,
 } from './accounts.mjs';
 import { clearUndo, readUndo, recordUndo, routingOf, sameRouting } from './rule-undo.mjs';
 import { placeOfDir, routeOfDir, sameKey } from './route-describe.mjs';
@@ -39,7 +39,7 @@ import { getAuthentication as _getAuthentication } from './token.mjs';
 import { syncAccountIfNeeded as _syncAccountIfNeeded } from './account-sync.mjs';
 import { sharedLock, withLock } from './single-instance-lock.mjs';
 import { orDefault } from './compat.mjs';
-import { startHistoryWorker as _startHistoryWorker, takeDeferFlag } from './history-trigger.mjs';
+import { takeDeferFlag } from './history-trigger.mjs';
 
 // What scripts/workspace.mjs runs for the settings, login, sync and analytics skills: rules, New
 // folders, the past-session routes pass and the read workspace. Line 1 of each command is for the
@@ -72,7 +72,6 @@ function context(deps) {
     listAllRollouts: orDefault(deps.listAllRollouts, _listAllRollouts),
     getAuthentication: orDefault(deps.getAuthentication, _getAuthentication),
     syncAccountIfNeeded: orDefault(deps.syncAccountIfNeeded, _syncAccountIfNeeded),
-    startHistoryWorker: orDefault(deps.startHistoryWorker, _startHistoryWorker),
     lines: [],
     stderr: [],
   };
@@ -84,11 +83,6 @@ function scriptCommand() {
 }
 
 const deferText = (cx) => (cx.deferUpload ? ' --defer-upload' : '');
-
-// Starts the history upload a write just requested, unless the calling flow uploads next.
-async function afterRuleWrite(cx, key) {
-  if (!cx.deferUpload) await cx.startHistoryWorker(key);
-}
 
 function parseSessionFlag(argv) {
   const rest = [];
@@ -234,7 +228,8 @@ async function checkIn(cx, row, tenantId) {
     const auth = await cx.getAuthentication(row.key);
     if (!auth || auth.state !== 'ready' || !auth.accessToken) return;
     const clientId = auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId;
-    await cx.syncAccountIfNeeded(row.key, { key: row.key, token: auth.accessToken, clientId, tenantId }, { force: true, via: 'workspace' });
+    const session = { key: row.key, token: auth.accessToken, clientId, tenantId, ...rowSessionFields(row) };
+    await cx.syncAccountIfNeeded(row.key, session, { force: true, via: 'workspace' });
   } catch (error) {
     cx.stderr.push(`Beezi: workspace check-in skipped (${friendlyMessage(error)}).`);
   }
@@ -436,7 +431,6 @@ async function ruleAdd(cx, argv) {
   const fresh = await resolveAccount(row.key);
   confirmChange(cx, fresh, `✓ ${placeOf(key)} → ${targetWords(row, tenantIds)} (rule R${n}).`, before);
   await bindOpenSessions(cx, fresh, [n], current, ctx);
-  await afterRuleWrite(cx, row.key);
   cx.lines.push(`rule=${n}`);
 }
 
@@ -458,7 +452,6 @@ async function ruleSet(cx, argv) {
   const was = targetWords(row, found.tenantIds);
   confirmChange(cx, fresh, `✓ ${change} Before: ${was}.`, before, { change, was });
   await bindOpenSessions(cx, fresh, [found.index], current, ctx);
-  await afterRuleWrite(cx, row.key);
   cx.lines.push(`rule=${found.index}`);
 }
 
@@ -473,7 +466,6 @@ async function ruleRemove(cx, argv) {
   confirmChange(cx, fresh, isSingleTenant(row)
     ? `✓ Removed ${ruleText} It's tracked again unless another rule covers it.`
     : `✓ Removed ${ruleText} New sessions there follow the default (${newFoldersLabel(row)}).`, before, { change: `removed ${ruleText}` });
-  await afterRuleWrite(cx, row.key);
   cx.lines.push(`removed=${removed.index}`);
   await rerouteGone(cx, fresh, [removed], createRouteContext());
 }
@@ -524,7 +516,6 @@ async function ruleAddAll(cx, argv) {
     confirmChange(cx, fresh, `✓ Added ${rulesText}`, before, { change: `added ${rulesText}` });
     await bindOpenSessions(cx, fresh, added, current, ctx);
   }
-  await afterRuleWrite(cx, row.key);
   cx.lines.push(`rules-added=${n}`);
 }
 
@@ -651,7 +642,6 @@ async function joinedPick(cx, argv) {
   const n = (await setWorkspaceRule(row.key, { kind: place.kind, match: place.match, label: place.label, tenantIds })).index;
   cx.lines.push(ruleDone(row, place, tenantIds));
   await bindOpenSessions(cx, await resolveAccount(row.key), [n], current, ctx);
-  await afterRuleWrite(cx, row.key);
   cx.lines.push(`rule=${n}`);
 }
 
@@ -683,10 +673,7 @@ async function joinedAddAll(cx, argv) {
   cx.lines.push(n === 0
     ? `✓ Nothing to add: no repo or folder sends anywhere yet. ${names} won't be asked about again.`
     : `✓ ${names} now ${newIds.length === 1 ? 'gets' : 'get'} analytics from ${n === 1 ? '1 repo or folder' : `${n} repos and folders`}.`);
-  if (n > 0) {
-    await bindOpenSessions(cx, await resolveAccount(row.key), added, current, ctx);
-    await afterRuleWrite(cx, row.key);
-  }
+  if (n > 0) await bindOpenSessions(cx, await resolveAccount(row.key), added, current, ctx);
   cx.lines.push(`rules-added=${n}`);
 }
 
@@ -710,10 +697,7 @@ async function joinedDone(cx, argv) {
   await markTenantsReviewed(row.key, newIds);
   cx.lines.push(newIds.length === 0 ? '✓ No new workspaces were waiting for a review.' : `✓ Done reviewing ${joinTenantNames(row, newIds)}.`);
   cx.lines.push(`reviewed=${idList(newIds)}`);
-  if (kept.length > 0) {
-    await bindOpenSessions(cx, await resolveAccount(row.key), kept, current, ctx);
-    await afterRuleWrite(cx, row.key);
-  }
+  if (kept.length > 0) await bindOpenSessions(cx, await resolveAccount(row.key), kept, current, ctx);
   cx.lines.push(`kept=${kept.length}`);
 }
 
@@ -750,7 +734,6 @@ async function newFolders(cx, argv) {
   if (mode === 'none') line = '✓ New folders: not tracked.';
   confirmChange(cx, fresh, line, before);
   await followNewFolders(cx, fresh, current, prior);
-  await afterRuleWrite(cx, row.key);
   cx.lines.push(`new-folders=${mode}`);
 }
 
@@ -808,7 +791,6 @@ async function undo(cx, argv) {
   if (!sameRouting(last.before.newFolders, last.after.newFolders)) {
     await followNewFolders(cx, fresh, current, resolveTargets(row, current.state));
   }
-  await afterRuleWrite(cx, row.key);
   cx.lines.push('undone=1');
 }
 

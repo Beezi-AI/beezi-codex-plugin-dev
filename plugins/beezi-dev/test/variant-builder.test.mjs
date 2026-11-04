@@ -174,7 +174,7 @@ test('a HAND-BUILT local gets its own namespace and NO updateManifestUrl key', (
   // A local built by hand stays on the machine that built it, so there is no published copy to
   // compare itself against. The key is OMITTED rather than written empty: an empty string would
   // fail resolveEnvironment's absolute-URL check, and the variant would then refuse to name a root
-  // at all. Absent is the only form the reader treats as "no update check". The dev pipeline step
+  // at all. Absent is the only form the reader treats as "no update check". The `local` pipeline step
   // also publishes a `local` variant, and that one DOES carry the key - the test below.
   const built = build(t, {
     env: 'local',
@@ -199,7 +199,7 @@ test('a HAND-BUILT local gets its own namespace and NO updateManifestUrl key', (
 });
 
 test('a PUBLISHED local keeps its updateManifestUrl, like every other published variant', (t) => {
-  // The dev pipeline step builds `local` with a real Build.BuildId and the internal repo, and
+  // The `local` pipeline step builds `local` with a real Build.BuildId and the internal repo, and
   // publishes it beside beezi-dev, so developers working on the Beezi API can install a
   // loopback-pointed plugin without building one. Once it is published it must self-update like
   // any other variant: the key has to survive into env.json and out of resolveEnvironment.
@@ -249,7 +249,7 @@ test('the shell validates its arguments before anything is copied', () => {
   );
   assert.match(text, /update-repo '\$UPDATE_REPO' must be exactly owner\/name/);
 
-  // This shell IS the record of the address a local build talks to - the dev pipeline step that
+  // This shell IS the record of the address a local build talks to - the `local` pipeline step that
   // publishes `local` passes an EMPTY api-base precisely so the URL is not repeated in the YAML.
   // Asserted literally: a developer who has to retype the URL will sooner or later retype it
   // wrong, and nothing downstream would notice.

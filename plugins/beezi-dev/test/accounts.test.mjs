@@ -17,9 +17,11 @@ import {
   describeAccount,
   resolveAccountRef,
   parseAccountFlag,
+  rowSessionFields,
 } from '../lib/accounts.mjs';
 import { accountsIndexFile, accountDir } from '../lib/paths.mjs';
-import { makeHome, fakeKeyring } from '../tools/account-fixtures.mjs';
+import { makeHome, fakeKeyring, linkAccount } from '../tools/account-fixtures.mjs';
+import { workspaceIdOf } from '../lib/pending-history.mjs';
 
 const row = (over = {}) => ({
   key: 'a1b2c3d4', email: 'A@Example.com', name: 'Andrii',
@@ -154,4 +156,36 @@ test('13. a row whose email is not a string reads back as no email, and never th
   assert.equal(await findByEmail('[object Object]'), null);
   await assert.rejects(() => resolveAccountRef('nope'), /No linked account matches/);
   assert.equal(await resolveAccountRef('2'), '99887766');
+});
+
+test('14. rowSessionFields nulls a malformed object field and empties a malformed rule list', () => {
+  assert.deepEqual(
+    rowSessionFields({ anonymization: 'x', newFolders: [], workspaceRules: null, tenants: {} }),
+    { anonymization: null, newFolders: null, workspaceRules: [], tenants: null },
+  );
+});
+
+test('14b. rowSessionFields passes a valid row\'s fields through as the same objects', () => {
+  const row = {
+    tenants: [{ id: 'A' }],
+    anonymization: { tenantId: 'A' },
+    newFolders: { mode: 'ask', tenantIds: [] },
+    workspaceRules: [{ kind: 'repo', match: 'x', tenantIds: ['A'] }],
+  };
+  const fields = rowSessionFields(row);
+  assert.equal(fields.tenants, row.tenants);
+  assert.equal(fields.anonymization, row.anonymization);
+  assert.equal(fields.newFolders, row.newFolders);
+  assert.equal(fields.workspaceRules, row.workspaceRules);
+});
+
+test('an unsafe top-level tenantId stored before whoami filtered it reads as absent', async (t) => {
+  const home = makeHome(t);
+  linkAccount(home, 'a1b2c3d4', { tenantId: 't1\nofferQ forged', tenants: null });
+  linkAccount(home, '99887766', { tenantId: 'safe_id-2', tenants: null });
+  const unsafe = await getAccount('a1b2c3d4');
+  assert.equal(unsafe.tenantId, null);
+  assert.equal(workspaceIdOf(unsafe), null);
+  assert.equal(unsafe.email, 'a1b2c3d4@example.com');
+  assert.equal((await getAccount('99887766')).tenantId, 'safe_id-2');
 });

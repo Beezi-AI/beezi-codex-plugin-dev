@@ -13,6 +13,8 @@ import {
   readObservedPlan as _readObservedPlan,
 } from './rate-limits-codex.mjs';
 import { tenantsOf } from './workspace.mjs';
+import { ANONYMIZATION_KEY_MISSING, hasKind, kindsOf, sessionAnonymization } from './anonymization.mjs';
+import { Kind, anonymizeUsage } from './anonymize.mjs';
 
 // The billing ladder's deps, picked BY NAME out of the caller's bag rather than spread from it.
 //
@@ -189,6 +191,10 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
     pending = queued.filter((row) => !(row && sent.indexOf(row.fetched_at) !== -1));
   }
   if (!pending.length) return { posted: 0, reason: 'empty' };
+  // A workspace hiding account emails without its key is sent nothing; the rows stay queued until whoami brings one.
+  const block = sessionAnonymization(session);
+  const anonymized = hasKind(block, Kind.ACCOUNTS);
+  if (anonymized && !block.key) return { posted: 0, deferred: pending.length, reason: ANONYMIZATION_KEY_MISSING };
 
   const url = `${apiBase()}${ENDPOINTS.usageSnapshot}`;
   // Epoch ms after which no further row is STARTED, plus a per-request cap. Null deadline = drain
@@ -222,7 +228,8 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
       const row = pending[i];
       const rowIdentity = row.account_uuid != null || row.account_email != null
         ? {} : { account_uuid, account_email };
-      res = await postJson(url, session, { ...identity, ...rowIdentity, ...row }, postOpts);
+      const body = { ...identity, ...rowIdentity, ...row };
+      res = await postJson(url, session, anonymized ? anonymizeUsage(body, block.key, kindsOf(block)) : body, postOpts);
     } catch (e) {
       stopped = 'network';
       break;

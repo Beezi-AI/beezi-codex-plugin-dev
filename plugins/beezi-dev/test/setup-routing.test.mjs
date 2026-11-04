@@ -354,7 +354,7 @@ function manyJoined(n) {
 test('reviewJoined with more than 4 places offers add-all, choose repos or leave', async () => {
   const add = fakeCtx({ 'joined --account k1': ok(manyJoined(5)) }, [0]);
   await reviewJoined(add, 'k1');
-  assert.equal(add.asked[0].question, 'You joined Beta Team. Where should analytics for these 5 repos and folders go? Their past sessions will be sent there too.');
+  assert.equal(add.asked[0].question, 'You joined Beta Team. Where should analytics for these 5 repos and folders go?');
   assert.deepEqual(add.asked[0].options.map((o) => o.label), ['Add Beta Team to all 5', 'Choose repos', 'Leave them as they are']);
   assert.equal(add.runs[1], 'workspace.mjs joined add-all --account k1 --defer-upload');
 
@@ -392,7 +392,7 @@ test('reviewJoined asks one repo picker per new tenant', async () => {
   await reviewJoined(ctx, 'k1');
   const screens = ctx.asked.filter((a) => a.kind === 'chooseMany');
   assert.equal(screens.length, 2);
-  assert.match(screens[0].question, /send analytics to Acme/);
+  assert.equal(screens[0].question, 'Which repos and folders should also send analytics to Acme?');
   assert.match(screens[1].question, /send analytics to Beta/);
   assert.deepEqual(ctx.runs, [
     'workspace.mjs joined --account k1',

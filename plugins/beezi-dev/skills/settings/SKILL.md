@@ -205,6 +205,8 @@ runs nothing.
 
 ## Rules
 
+A rule change never uploads past sessions. When the workspace's past-sessions setting is to offer them, Beezi looks for them in the background and asks at a later session start; under either setting, the sync skill shows them and asks before it uploads anything, or uploads them with a notice when the workspace's owner chose upload without asking.
+
 Choose the account. Its lines are the `<rules account="<key>">` block, for you only, and its card is
 the `<here-card account="<key>">` block (none when this folder is not known).
 
@@ -406,6 +408,8 @@ verbatim and stop: it says what was put back, or why nothing was (`Nothing to
 undo.`, or that the rules changed after that change). Its `undone=` line is for you only.
 
 ## New folders
+
+A rule change never uploads past sessions. When the workspace's past-sessions setting is to offer them, Beezi looks for them in the background and asks at a later session start; under either setting, the sync skill shows them and asks before it uploads anything, or uploads them with a notice when the workspace's owner chose upload without asking.
 
 Choose the account. Its lines are the `<new-folders account="<key>">` block, for you only: a summary
 line, `W.` lines as in Rules, and last `new-folders=<ask|send|none> set=<yes|no> multi=yes account=<key>`.

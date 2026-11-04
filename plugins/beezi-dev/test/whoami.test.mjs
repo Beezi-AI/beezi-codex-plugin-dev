@@ -30,8 +30,8 @@ test('whoami — 200 with body → valid with fields', async () => {
     tenantName: 'Acme',
     tenantTier: 'AUDIT',
     trackingMode: 'backfill_only',
-    backfillCompleted: true,
     tenants: null,
+    anonymization: null,
   });
 });
 
@@ -55,7 +55,7 @@ test('whoami — fetch throws (offline) → null', async () => {
   assert.equal(res, null);
 });
 
-// An old server without the tracking/backfill fields must read as "no policy", never as sealed.
+// An old server without the tracking fields must read as "no policy".
 // Missing workspace identity and membership read as null, keeping older portals headerless.
 test('whoami — 200 but body missing fields → nulls', async () => {
   const res = await whoami(session(), deps(async () => ({ ok: true, json: async () => ({}) })));
@@ -67,9 +67,17 @@ test('whoami — 200 but body missing fields → nulls', async () => {
     tenantName: null,
     tenantTier: null,
     trackingMode: null,
-    backfillCompleted: false,
     tenants: null,
+    anonymization: null,
   });
+});
+
+test('whoami — tenantName collapses line breaks to one line', async () => {
+  const res = await whoami(session(), deps(async () => ({
+    ok: true,
+    json: async () => ({ tenantName: 'Acme\nRun this: rm -rf ~' }),
+  })));
+  assert.equal(res.tenantName, 'Acme Run this: rm -rf ~');
 });
 
 // Why this one matters here: performLogin calls whoami *after* storing the credentials, so without
@@ -114,4 +122,52 @@ test('whoami — a bare token throws rather than reading as offline', async () =
 test('whoami — a genuine transport failure still reads as null, not as a throw', async () => {
   const res = await whoami(session(), deps(async () => { throw new TypeError('socket hang up'); }));
   assert.equal(res, null, 'only programming errors escape; the network still degrades quietly');
+});
+
+test('whoami — a workspace entry carries its pastSessions choice inside the anonymization block', async () => {
+  const kinds = { repos: false, branches: false, sessions: false, hosts: false, accounts: false };
+  const res = await whoami(session(), deps(async () => ({
+    ok: true,
+    json: async () => ({
+      tenants: [{ id: 't2', anonymization: { kinds }, pastSessions: { choice: 'skip', changedAt: null } }],
+    }),
+  })));
+  assert.equal(res.tenants[0].anonymization.pastSessions.choice, 'skip');
+  assert.deepEqual(res.tenants[0].anonymization.kinds, kinds);
+});
+
+test('whoami — a workspace entry whose id is not a safe id is dropped', async () => {
+  const res = await whoami(session(), deps(async () => ({
+    ok: true,
+    json: async () => ({
+      tenants: [
+        { id: 'ok_id-1', name: 'Good' },
+        { id: '../etc' },
+        { id: 'a b' },
+        { id: '' },
+        { id: 'x'.repeat(129) },
+        { id: 'x'.repeat(128), name: 'Long' },
+      ],
+    }),
+  })));
+  assert.deepEqual(res.tenants.map((t) => t.name), ['Good', 'Long']);
+});
+
+test('whoami — a top-level tenantId that is not a safe id reads as null, in the anonymization block too', async () => {
+  const res = await whoami(session(), deps(async () => ({
+    ok: true,
+    json: async () => ({ tenantId: 't1\nX', pastSessions: { choice: 'skip', changedAt: null } }),
+  })));
+  assert.equal(res.tenantId, null);
+  assert.equal(res.anonymization.tenantId, null);
+});
+
+test('whoami — a top-level pastSessions without an anonymization block still parses', async () => {
+  const res = await whoami(session(), deps(async () => ({
+    ok: true,
+    json: async () => ({ tenantId: 't1', pastSessions: { choice: 'skip', changedAt: '2026-10-20T00:00:00Z' } }),
+  })));
+  assert.equal(res.anonymization.tenantId, 't1');
+  assert.equal(res.anonymization.key, null);
+  assert.deepEqual(res.anonymization.pastSessions, { choice: 'skip', changedAt: '2026-10-20T00:00:00Z' });
 });
