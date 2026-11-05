@@ -61,13 +61,6 @@ function fileKey(filePath) {
   return String(filePath).split('\\').join('/').toLowerCase();
 }
 
-// Claude's rule (lib/code-changes.mjs in the beezi-claude-plugins repo), copied so whole-file adds
-// and deletes are counted identically on both platforms: strip exactly one trailing newline, split.
-function lineCount(s) {
-  if (typeof s !== 'string' || s === '') return 0;
-  return s.replace(/\n$/, '').split('\n').length;
-}
-
 const FILE_HEADER_RE = /^\*\*\* (Update|Add|Delete) File: (.+)$/;
 const MOVE_RE = /^\*\*\* Move to: (.+)$/;
 
@@ -93,25 +86,6 @@ function parsePatch(patch, files, counts) {
   }
 }
 
-// `unified_diff` is a plain unified-diff BODY: "@@ -a,b +c,d @@" hunk headers followed by
-// ' '/'+'/'-' prefixed lines. No "*** Begin Patch" envelope and no ---/+++ preamble appears in any
-// observed sample, which is why parsePatch cannot be reused here -- it derives the filename from
-// "*** Update File:" headers that are not present.
-function countUnifiedDiff(diff, counts) {
-  if (typeof diff !== 'string' || diff === '') return;
-  let inHunk = false;
-  for (const rawLine of diff.split('\n')) {
-    const line = rawLine.replace(/\r$/, '');
-    if (line.startsWith('@@')) { inHunk = true; continue; }
-    // Anything before the first hunk header is preamble and never counts. No further guard inside
-    // a hunk: testing for '+++'/'---' there would silently drop a genuine added line whose content
-    // begins with them (a Markdown rule, a C++ decrement).
-    if (!inHunk) continue;
-    if (line.startsWith('+')) counts.added += 1;
-    else if (line.startsWith('-')) counts.removed += 1;
-  }
-}
-
 function touch(filePath, files) {
   if (!filePath) return;
   const key = fileKey(filePath);
@@ -130,9 +104,9 @@ function applyChangeMap(changes, files, counts) {
     const moved = change.move_path;
     const target = typeof moved === 'string' && moved !== '' ? moved : rawPath;
     touch(target, files);
-    if (change.type === 'update') countUnifiedDiff(change.unified_diff, counts);
-    else if (change.type === 'add') counts.added += lineCount(change.content);
-    else if (change.type === 'delete') counts.removed += lineCount(change.content);
+    // transcript-reader-codex.mjs counted the diff or file text at parse time.
+    counts.added += change.linesAdded;
+    counts.removed += change.linesRemoved;
   }
 }
 

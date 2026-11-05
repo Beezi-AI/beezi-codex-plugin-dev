@@ -41,7 +41,7 @@ test('the workspace ask tells the model to run its command escalated from the st
 // The inverted join re-pick asks per new workspace which repos send to it, mapped to `joined pick`;
 // past request_user_input's caps the fallback is a numbered list of that one workspace's repos.
 test('the joined prompt instructs joined pick and a per-workspace numbered repo list past the caps', async () => {
-  const text = await buildJoinedPrompt({ session_id: 'session-1', source: 'startup' }, {
+  const { context: text } = await buildJoinedPrompt({ session_id: 'session-1', source: 'startup' }, {
     pluginRoot: '/plugin',
     listAccounts: async () => [JOINED_ROW],
     linkedSessions: async () => [{ key: KEY }],

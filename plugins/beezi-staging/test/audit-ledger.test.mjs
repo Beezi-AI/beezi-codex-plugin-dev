@@ -8,8 +8,7 @@ import { auditLedgerFile } from '../lib/paths.mjs';
 import { pruneStale } from '../lib/prune.mjs';
 import { linkAccount, TEST_KEY } from '../tools/account-fixtures.mjs';
 
-// The ledger belongs to ONE ACCOUNT from 0.13 on: the server's pull record is per (tenant, user,
-// tool), and two linked workspaces each get their own one-time import.
+// The ledger belongs to ONE ACCOUNT from 0.13 on: the server's record is per (tenant, user, tool).
 const KEY = TEST_KEY;
 const OTHER = '99887766';
 
@@ -107,40 +106,22 @@ test('7. the ledger file sits in the account directory, outside the pruned trees
   assert.notEqual(auditLedgerFile(KEY), auditLedgerFile(OTHER));
 });
 
-import { markComplete, isComplete } from '../lib/audit-ledger.mjs';
-
-test('7. the complete flag round-trips and survives a reload', (t) => {
-  makeHome(t);
-  const ledger = loadLedger(KEY, 'client-1');
-  assert.equal(isComplete(ledger), false);
-
-  markComplete(ledger);
-  saveLedger(KEY, ledger);
-
-  const reloaded = loadLedger(KEY, 'client-1');
-  assert.equal(isComplete(reloaded), true);
-});
-
-// The ledger is machine-global but the pull is per (tenant, user, tool): a ledger written under
-// another login must read as EMPTY, or a workspace switch would replay it, find zero candidates
-// and seal the new tenant's pull with nothing in it.
+// The ledger is per account but the server's record is per (tenant, user, tool): a ledger written
+// under another login must read as EMPTY, or a workspace switch would read its deliveries as the new tenant's.
 test('8. a foreign-identity ledger is discarded on load', (t) => {
   makeHome(t);
   const original = loadLedger(KEY, 'client-a');
   markImported(original, 'sess-1', { outcome: 'accepted', reports: 3 });
-  markComplete(original);
   saveLedger(KEY, original);
 
   const foreign = loadLedger(KEY, 'client-b');
 
   assert.equal(isImported(foreign, 'sess-1'), false);
-  assert.equal(isComplete(foreign), false);
   assert.equal(foreign.identity, 'client-b');
 
   // The same identity still sees its own ledger.
   const same = loadLedger(KEY, 'client-a');
   assert.equal(isImported(same, 'sess-1'), true);
-  assert.equal(isComplete(same), true);
 });
 
 // A legacy ledger written before identity binding carries none — adopt it for the current login

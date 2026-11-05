@@ -16,7 +16,7 @@ const keyOf = (dir) => ({ kind: 'folder', match: dir.split('/').slice(0, 3).join
 test('counts what the upload would send, and the distinct places, less here', () => {
   const entries = [
     e('live', '/work/a', DAY), e('s1', '/work/a/x', DAY), e('s2', '/work/b', DAY),
-    e('active', '/work/c', 10 * 60 * 1000), e('big', '/work/d', DAY, 65 * 1024 * 1024),
+    e('active', '/work/c', 10 * 60 * 1000),
     e('old', '/work/e', 31 * DAY), e('done', '/work/f', DAY), e('nodir', null, DAY),
   ];
   const counts = countPastSessions(entries, {
@@ -32,6 +32,13 @@ test('a recorded session directory wins over the rollout cwd, and places dedupe'
     now, imported: () => false, readState: (id) => (id === 's1' ? { cwd: '/work/b/x' } : null), readCwd: (en) => en.cwd, keyOf,
   });
   assert.deepEqual(counts, { sessions: 2, places: 1 });
+});
+
+test('counts a past session larger than 64 MiB', () => {
+  const counts = countPastSessions([e('big', '/work/d', DAY, 65 * 1024 * 1024)], {
+    now, imported: () => false, readCwd: (en) => en.cwd, keyOf,
+  });
+  assert.deepEqual(counts, { sessions: 1, places: 1 });
 });
 
 const UUID_A = '019fd897-9320-7c20-9585-8fa3fff07bf7';
@@ -58,4 +65,28 @@ test('pastSessions leaves out the session its caller runs in, by the env it is g
   // With no thread id, the newest session recorded for the caller's directory is the live one (currentSession's rule).
   initSessionWorkspace(UUID_B, { cwd: '/work/here' });
   assert.equal(pastSessions(row, null, { cwd: '/work/here', env: {} }).sessions, 1);
+});
+
+// ── compressed rollouts (.jsonl.zst) ────────────────────────────────────────────────────────
+
+import zlib from 'node:zlib';
+import { listAllRollouts } from '../lib/transcript-index-codex.mjs';
+import { readRolloutText } from '../lib/rollout-file.mjs';
+
+test('counts include a .zst session, sized by its decompressed content', { skip: typeof zlib.zstdCompressSync === 'function' ? false : 'zstd unavailable' }, (t) => {
+  const root = path.join(withCodexAuth(t, null), 'sessions', '2026', '10', '10');
+  fs.mkdirSync(root, { recursive: true });
+  const file = path.join(root, `rollout-2026-10-10T00-00-00-${UUID_A}.jsonl.zst`);
+  const body = `${JSON.stringify({ type: 'session_meta', payload: { id: UUID_A, cwd: '/' } })}\n`;
+  fs.writeFileSync(file, zlib.zstdCompressSync(Buffer.from(body)));
+  const at = (Date.now() - 12 * DAY) / 1000;
+  fs.utimesSync(file, at, at);
+
+  const readHead = (f) => [JSON.parse(readRolloutText(f).split('\n')[0])];
+  const entries = listAllRollouts({ readHead });
+  assert.equal(entries.length, 1);
+  const counts = countPastSessions(entries, {
+    imported: () => false, readCwd: (en) => en.cwd, keyOf: () => ({ kind: 'folder', match: '/' }),
+  });
+  assert.deepEqual(counts, { sessions: 1, places: 1 });
 });

@@ -1,0 +1,14 @@
+// NEGATIVE fixture — default import plus property access behind feature detection.
+//
+// This check runs against the RAW source, so these comments never spell the banned import out.
+import zlib from 'zlib';
+import { gzipSync } from 'zlib';
+
+export function unpack(buf) {
+  if (typeof zlib.zstdDecompressSync !== 'function') return null;
+  return zlib.zstdDecompressSync(buf);
+}
+
+export function pack(buf) {
+  return gzipSync(buf);
+}

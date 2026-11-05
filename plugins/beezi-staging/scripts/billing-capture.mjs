@@ -4,7 +4,7 @@ import { friendlyMessage } from '../lib/friendly-error.mjs';
 import { orDefault } from '../lib/compat.mjs';
 import { getAuthentication } from '../lib/token.mjs';
 import { syncAccountIfNeeded } from '../lib/account-sync.mjs';
-import { getAccount, getDefaultKey, parseAccountFlag } from '../lib/accounts.mjs';
+import { getAccount, getDefaultKey, parseAccountFlag, rowSessionFields } from '../lib/accounts.mjs';
 import { parseCommandTargets, parseTenantFlags } from '../lib/workspace.mjs';
 import { cliMayProceed } from '../lib/env-guard.mjs';
 
@@ -31,9 +31,7 @@ async function sessionFor(key) {
     token: auth.accessToken,
     clientId: auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId,
     tenantId: null,
-    tenants: Array.isArray(row.tenants) ? row.tenants : null,
-    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
-    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+    ...rowSessionFields(row),
   };
 }
 

@@ -8,11 +8,9 @@ import {
   readTrackingState,
   writeTrackingState,
   isLiveTrackingAllowed,
-  shouldBackfill,
   matchesIdentity,
   recordWhoami,
   markTrackingDisabled,
-  markBackfillCompleted,
   clearTrackingState,
   markLinked,
   linkedAtMs,
@@ -61,29 +59,6 @@ test('2. both audit modes block live tracking; live allows it', (t) => {
 
   writeTrackingState(KEY, { trackingMode: TrackingMode.LIVE });
   assert.equal(isLiveTrackingAllowed(KEY), true);
-});
-
-// Mirrors the server's resolveTrackingMode: everything except disabled is offered the pull until
-// it completes — paid tenants included. A null mode is a pre-audit server: no pull to offer.
-test('3. shouldBackfill truth table', (t) => {
-  makeHome(t);
-
-  const cases = [
-    [{ trackingMode: TrackingMode.BACKFILL_ONLY, backfillCompleted: false }, true],
-    [{ trackingMode: TrackingMode.BACKFILL_ONLY, backfillCompleted: true }, false],
-    [{ trackingMode: TrackingMode.LIVE, backfillCompleted: false }, true],
-    [{ trackingMode: TrackingMode.LIVE, backfillCompleted: true }, false],
-    [{ trackingMode: TrackingMode.DISABLED, backfillCompleted: false }, false],
-    [{ trackingMode: null, backfillCompleted: false }, false],
-    [null, false],
-  ];
-  for (const [state, expected] of cases) {
-    // The state is the account's file now, so each case is written and then read back through the
-    // key — which also proves the predicate reads the right account's file.
-    if (state === null) clearTrackingState(KEY);
-    else writeTrackingState(KEY, state);
-    assert.equal(shouldBackfill(KEY), expected, JSON.stringify(state));
-  }
 });
 
 // REWRITTEN for the keyed layout. It used to assert "tracking.json lives at the ROOT"; the file is
@@ -136,7 +111,6 @@ test('6. recordWhoami persists the policy fields bound to the identity', (t) => 
   const state = readTrackingState(KEY);
   assert.equal(state.trackingMode, TrackingMode.BACKFILL_ONLY);
   assert.equal(state.tenantTier, 'audit');
-  assert.equal(state.backfillCompleted, false);
   assert.equal(state.identity, 'client-1');
   assert.ok(state.fetchedAt);
 
@@ -146,7 +120,7 @@ test('6. recordWhoami persists the policy fields bound to the identity', (t) => 
   assert.equal(readTrackingState(KEY).trackingMode, TrackingMode.BACKFILL_ONLY);
 });
 
-test('7. markTrackingDisabled flips the mode and keeps the rest; markBackfillCompleted seals', (t) => {
+test('7. markTrackingDisabled flips the mode and keeps the rest', (t) => {
   makeHome(t);
 
   recordWhoami(
@@ -156,14 +130,10 @@ test('7. markTrackingDisabled flips the mode and keeps the rest; markBackfillCom
   );
   markTrackingDisabled(KEY, 'server said so');
 
-  let state = readTrackingState(KEY);
+  const state = readTrackingState(KEY);
   assert.equal(state.trackingMode, TrackingMode.DISABLED);
   assert.equal(state.tenantTier, 'audit');
   assert.equal(state.reason, 'server said so');
-
-  markBackfillCompleted(KEY);
-  state = readTrackingState(KEY);
-  assert.equal(state.backfillCompleted, true);
 
   clearTrackingState(KEY);
   assert.equal(readTrackingState(KEY), null);

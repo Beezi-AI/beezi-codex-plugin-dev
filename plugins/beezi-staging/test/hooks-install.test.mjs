@@ -113,17 +113,17 @@ function brokenArgumentsInstall(hooksFile, scriptsDir) {
   fs.writeFileSync(hooksFile, JSON.stringify({ hooks }, null, 2));
 }
 
-test('the registered event set is exactly the five Beezi hooks', () => {
+test('the registered event set is exactly the six Beezi hooks', () => {
   // SessionEnd stays out by choice: Stop already runs the identical checkpoint at every turn end,
   // so registering it would only cost the user another entry to review and trust.
   assert.deepEqual(BEEZI_HOOKS.map((h) => h.event),
-    ['SessionStart', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop']);
+    ['SessionStart', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop', 'PermissionRequest']);
 });
 
 test('buildHookEntries puts the complete invocation in command', () => {
   const launcherDir = path.join('/home', '.beezi-codex', 'hooks');
   const entries = buildHookEntries({ launcherDir });
-  assert.deepEqual(Object.keys(entries).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
+  assert.deepEqual(Object.keys(entries).sort(), ['PermissionRequest', 'PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = entries[event][0].hooks[0];
     assert.equal(handler.type, 'command');
@@ -133,7 +133,7 @@ test('buildHookEntries puts the complete invocation in command', () => {
     assert.equal(HOOK_COMMAND, 'node', 'interpreter comes from PATH, never an absolute path');
     assert.ok(!('arguments' in handler), 'Codex 0.154.0 does not pass this field to command hooks');
     assert.equal(handler.statusMessage, BEEZI_STATUS_MESSAGE);
-    assert.equal(handler.timeout, 20, 'analytics hooks need enough time to finish network-backed work');
+    assert.equal(handler.timeout, event === 'PermissionRequest' ? 5 : 20, 'analytics hooks need enough time to finish network-backed work');
     assert.ok(!('commandWindows' in handler), 'one command works on every platform');
   }
 });
@@ -197,7 +197,7 @@ test('installHooks writes a readable registry and the launcher, then uninstall r
   assert.equal(res.launcherRefreshed, true);
 
   const written = JSON.parse(fs.readFileSync(hooksFile, 'utf-8'));
-  assert.deepEqual(Object.keys(written.hooks).sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
+  assert.deepEqual(Object.keys(written.hooks).sort(), ['PermissionRequest', 'PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   for (const { event, script } of BEEZI_HOOKS) {
     const handler = written.hooks[event][0].hooks[0];
     assert.equal(handler.command, hookCommand(launcherPath(launcherDir), script, 'beezi'));
@@ -292,7 +292,7 @@ test('hooksStatus walks absent → installed with the registry alone', () => {
   assert.equal(ok.complete, true);
   assert.equal(ok.launcher, 'current');
   assert.equal(ok.launcherFile, launcherPath(opts.launcherDir));
-  assert.deepEqual(ok.registered.sort(), ['PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
+  assert.deepEqual(ok.registered.sort(), ['PermissionRequest', 'PostToolUse', 'SessionStart', 'Stop', 'SubagentStart', 'SubagentStop']);
   assert.deepEqual(ok.missingEvents, []);
   assert.deepEqual(ok.staleEvents, []);
 });
@@ -458,7 +458,7 @@ test('hooksStatus marks entries with the old 10-second timeout stale so ensureHo
   const result = ensureHooks(opts);
   assert.equal(result.repaired, true);
   const upgraded = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
-  for (const { event } of BEEZI_HOOKS) assert.equal(upgraded.hooks[event][0].hooks[0].timeout, 20);
+  for (const { event } of BEEZI_HOOKS) assert.equal(upgraded.hooks[event][0].hooks[0].timeout, event === 'PermissionRequest' ? 5 : 20);
   assert.equal(hooksStatus(opts).state, 'installed');
 });
 
@@ -511,4 +511,100 @@ test('uninstallHooks strips legacy launcher-style entries too', () => {
   assert.equal(res.removed, true);
   assert.ok(!fs.existsSync(opts.hooksFile));
   assert.ok(!fs.existsSync(opts.launcherDir));
+});
+
+test('only the PermissionRequest entry carries a 5 s timeout; every other entry keeps 20', () => {
+  const entries = buildHookEntries({ launcherDir: '/h/hooks' });
+  for (const event of Object.keys(entries)) {
+    assert.equal(entries[event][0].hooks[0].timeout, event === 'PermissionRequest' ? 5 : 20, event);
+  }
+});
+
+test('an install from before PermissionRequest reads partial, and ensureHooks repairs it', () => {
+  const { opts } = bench();
+  installHooks(opts);
+  const old = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  delete old.hooks.PermissionRequest;
+  fs.writeFileSync(opts.hooksFile, JSON.stringify(old));
+
+  const status = hooksStatus(opts);
+  assert.equal(status.state, 'partial');
+  assert.deepEqual(status.missingEvents, ['PermissionRequest']);
+
+  const result = ensureHooks(opts);
+  assert.equal(result.repaired, true);
+  const after = hooksStatus(opts);
+  assert.equal(after.state, 'installed');
+  assert.equal(JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8')).hooks.PermissionRequest[0].hooks[0].timeout, 5);
+});
+
+test('a PermissionRequest entry with the wrong timeout reads stale', () => {
+  const { opts } = bench();
+  installHooks(opts);
+  const edited = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  edited.hooks.PermissionRequest[0].hooks[0].timeout = 20;
+  fs.writeFileSync(opts.hooksFile, JSON.stringify(edited));
+  assert.deepEqual(hooksStatus(opts).staleEvents, ['PermissionRequest']);
+});
+
+// Codex keys hook trust by POSITION. A rewrite that moves Beezi's entry to the end of an event
+// shifts every user hook after it, and both lose trust: an owned entry is replaced in place.
+const userGroup = (name) => ({ matcher: '*', hooks: [{ type: 'command', command: `node /home/me/${name}.mjs`, timeout: 7 }] });
+
+test('mergeHooks replaces an owned entry in place: [beezi, user] keeps its order byte for byte', () => {
+  const launcherDir = '/h/hooks';
+  const fresh = buildHookEntries({ launcherDir, owner: 'beezi' });
+  const existing = { hooks: {
+    UserPromptSubmit: [userGroup('prompt')],
+    SessionStart: [fresh.SessionStart[0], userGroup('start')],
+  } };
+  const merged = mergeHooks(JSON.parse(JSON.stringify(existing)), fresh, launcherDir, 'beezi');
+  assert.equal(JSON.stringify(merged.hooks.SessionStart), JSON.stringify(existing.hooks.SessionStart));
+  assert.equal(JSON.stringify(merged.hooks.UserPromptSubmit), JSON.stringify(existing.hooks.UserPromptSubmit));
+  assert.deepEqual(Object.keys(merged.hooks).slice(0, 2), ['UserPromptSubmit', 'SessionStart']);
+  // Events Beezi had no entry for are appended.
+  for (const { event } of BEEZI_HOOKS) assert.ok(merged.hooks[event], event);
+});
+
+test('mergeHooks rewrites a stale owned entry at its own index and drops owned duplicates', () => {
+  const launcherDir = '/h/hooks';
+  const fresh = buildHookEntries({ launcherDir, owner: 'beezi' });
+  const stale = JSON.parse(JSON.stringify(fresh.SessionStart[0]));
+  stale.hooks[0].timeout = 10;
+  const existing = { hooks: { SessionStart: [userGroup('a'), stale, userGroup('b'), JSON.parse(JSON.stringify(stale))] } };
+  const merged = mergeHooks(existing, fresh, launcherDir, 'beezi');
+  assert.equal(JSON.stringify(merged.hooks.SessionStart),
+    JSON.stringify([userGroup('a'), fresh.SessionStart[0], userGroup('b')]));
+});
+
+test('mergeHooks strips owned handlers from events Beezi no longer registers', () => {
+  const launcherDir = '/h/hooks';
+  const fresh = buildHookEntries({ launcherDir, owner: 'beezi' });
+  const existing = { hooks: { SessionEnd: [fresh.Stop[0], userGroup('end')] } };
+  const merged = mergeHooks(existing, fresh, launcherDir, 'beezi');
+  assert.equal(JSON.stringify(merged.hooks.SessionEnd), JSON.stringify([userGroup('end')]));
+});
+
+test('ensureHooks on a five-entry install keeps every existing entry byte-identical and in place', () => {
+  const { opts } = bench();
+  installHooks(opts);
+  const full = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  // The install a pre-PermissionRequest release left, with a user hook after Beezi's in each event.
+  const old = { hooks: {} };
+  for (const [event, groups] of Object.entries(full.hooks)) {
+    if (event === 'PermissionRequest') continue;
+    old.hooks[event] = [...groups, userGroup(`mine-${event}`)];
+  }
+  assert.equal(Object.keys(old.hooks).length, 5);
+  fs.writeFileSync(opts.hooksFile, JSON.stringify(old, null, 2));
+
+  const result = ensureHooks(opts);
+  assert.equal(result.repaired, true);
+  const after = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  for (const event of Object.keys(old.hooks)) {
+    assert.equal(JSON.stringify(after.hooks[event]), JSON.stringify(old.hooks[event]), event);
+  }
+  assert.deepEqual(Object.keys(after.hooks), [...Object.keys(old.hooks), 'PermissionRequest']);
+  assert.equal(after.hooks.PermissionRequest[0].hooks[0].timeout, 5);
+  assert.equal(hooksStatus(opts).state, 'installed');
 });

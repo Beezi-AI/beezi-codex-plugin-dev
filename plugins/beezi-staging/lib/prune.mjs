@@ -5,6 +5,7 @@ import { listAccountsSync } from './accounts.mjs';
 import { locksDir, MAX_HOLDER_LEASE_MS, acquireLock, runLock, sharedLock, withLock } from './single-instance-lock.mjs';
 import { expireStaleDiagnostics } from './telemetry-flush.mjs';
 import { removeDirSync } from './compat.mjs';
+import { PERMISSION_MARKER_MAX_AGE_MS } from './permission-markers-codex.mjs';
 
 const FOURTEEN_DAYS_MS = 14 * 24 * 60 * 60 * 1000;
 
@@ -43,7 +44,10 @@ function pruneLocked(now, maxAgeMs) {
       const p = path.join(dir, entry.name);
       try {
         const { mtimeMs } = fs.statSync(p);
-        if (now - mtimeMs <= ageMs) continue;
+        // Approval markers outlive the sync window; see PERMISSION_MARKER_MAX_AGE_MS.
+        const limitMs = dir === stateDir() && entry.name.endsWith('.perm.jsonl')
+          ? Math.max(maxAgeMs, PERMISSION_MARKER_MAX_AGE_MS) : ageMs;
+        if (now - mtimeMs <= limitMs) continue;
         if (dir === locks) {
           // Breaker recovery remains the primitive's responsibility.
           if (!entry.name.endsWith('.lock') || !entry.isFile()) continue;

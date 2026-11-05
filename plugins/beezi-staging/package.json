@@ -1,6 +1,6 @@
 {
   "name": "beezi",
-  "version": "0.23.1-staging.6020",
+  "version": "0.26.0-staging.6195",
   "private": true,
   "type": "module",
   "description": "Beezi analytics + ticket-drafting plugin for Codex.",
@@ -9,6 +9,6 @@
     "node": ">=13.2"
   },
   "scripts": {
-    "test": "node --test --import ./tools/hermetic-env.mjs"
+    "test": "node --test --test-concurrency=1 --import ./tools/hermetic-env.mjs"
   }
 }

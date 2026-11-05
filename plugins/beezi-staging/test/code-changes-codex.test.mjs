@@ -1,6 +1,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { computeCodeChanges, editedPathsOf } from '../lib/code-changes-codex.mjs';
+import { projectRolloutRecord } from '../lib/transcript-reader-codex.mjs';
 
 const applyPatch = (input) => ({ type: 'response_item', payload: { type: 'custom_tool_call', name: 'apply_patch', call_id: 'c1', input } });
 
@@ -50,12 +51,12 @@ test('empty when there are no apply_patch calls', () => {
 // (`event_msg/item_completed` with `item.type === 'FileChange'`, which REPLACED era B in 0.153).
 // ============================================================================================
 
-const patchApplyEnd = (callId, changes, extra) => ({
+const patchApplyEnd = (callId, changes, extra) => projectRolloutRecord({
   type: 'event_msg',
   payload: Object.assign({ type: 'patch_apply_end', call_id: callId, success: true, changes }, extra || {}),
 });
 
-const fileChange = (itemId, changes, extra) => ({
+const fileChange = (itemId, changes, extra) => projectRolloutRecord({
   type: 'event_msg',
   payload: {
     type: 'item_completed',
@@ -270,12 +271,12 @@ test('a change map that is missing, empty or malformed is inert', () => {
 });
 
 test('editedPathsOf — FileChange prefers move_path; a failed patch_apply_end yields nothing', () => {
-  const fc = { type: 'event_msg', payload: { type: 'item_completed', item: { type: 'FileChange', id: 'a', status: 'completed',
-    changes: { 'C:\\r\\old.md': { type: 'update', unified_diff: '@@\n+x', move_path: 'C:\\r\\new.md' }, 'C:\\r\\b.js': { type: 'add', content: 'x' } } } } };
+  const fc = projectRolloutRecord({ type: 'event_msg', payload: { type: 'item_completed', item: { type: 'FileChange', id: 'a', status: 'completed',
+    changes: { 'C:\\r\\old.md': { type: 'update', unified_diff: '@@\n+x', move_path: 'C:\\r\\new.md' }, 'C:\\r\\b.js': { type: 'add', content: 'x' } } } } });
   assert.deepEqual(editedPathsOf(fc), ['C:\\r\\new.md', 'C:\\r\\b.js']);
-  const failed = { type: 'event_msg', payload: { type: 'patch_apply_end', success: false, changes: { 'C:\\r\\x.md': { type: 'add', content: 'x' } } } };
+  const failed = projectRolloutRecord({ type: 'event_msg', payload: { type: 'patch_apply_end', success: false, changes: { 'C:\\r\\x.md': { type: 'add', content: 'x' } } } });
   assert.deepEqual(editedPathsOf(failed), []);
-  const ok = { type: 'event_msg', payload: { type: 'patch_apply_end', success: true, changes: { '/r/x.md': { type: 'add', content: 'x' } } } };
+  const ok = projectRolloutRecord({ type: 'event_msg', payload: { type: 'patch_apply_end', success: true, changes: { '/r/x.md': { type: 'add', content: 'x' } } } });
   assert.deepEqual(editedPathsOf(ok), ['/r/x.md']);
 });
 

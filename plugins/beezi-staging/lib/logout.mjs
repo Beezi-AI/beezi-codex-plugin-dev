@@ -6,7 +6,7 @@ import { getAuthentication } from './token.mjs';
 import { unlinkMachine } from './login.mjs';
 import {
   AccountStatus, getAccount, getDefaultKey, listAccounts, removeAccount, setDefault,
-  describeAccount,
+  describeAccount, rowSessionFields,
 } from './accounts.mjs';
 import { REVOKED_DEFAULT_NOTE } from './accounts-cli.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
@@ -158,9 +158,7 @@ async function sessionFor(row, deps) {
     token: auth.accessToken,
     clientId: auth.clientId == null ? orDefault(row.clientId, null) : auth.clientId,
     tenantId: null,
-    tenants: Array.isArray(row.tenants) ? row.tenants : null,
-    newFolders: row.newFolders != null && typeof row.newFolders === 'object' ? row.newFolders : null,
-    workspaceRules: Array.isArray(row.workspaceRules) ? row.workspaceRules : [],
+    ...rowSessionFields(row),
   };
 }
 

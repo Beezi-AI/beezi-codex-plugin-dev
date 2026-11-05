@@ -3,8 +3,9 @@ import assert from 'node:assert/strict';
 import path from 'node:path';
 import { fastRepoRoot, FAILED } from '../lib/repo-root-fast.mjs';
 
-// Fake absolute paths, built with the same `path` module the implementation walks.
-const P = (...parts) => path.join(path.sep, ...parts);
+// Fake absolute paths, built with the same `path` module the implementation walks. Resolved, so a win32 host gets
+// a drive letter: the shortcut compares realpath against path.resolve(dir), which adds one to a bare `\w\repo`.
+const P = (...parts) => path.resolve(path.sep, ...parts);
 
 const REPO = P('w', 'repo');
 const SRC = P('w', 'repo', 'src', 'deep');
@@ -120,12 +121,18 @@ test('fastRepoRoot — a realpath equal to the input still answers', () => {
 });
 
 test('fastRepoRoot — on win32 a slash-only difference counts as equal', () => {
-  const slashed = `${P('w', 'repo', 'src')}\\deep`;
+  // The last separator is the host's other slash: `\` on a POSIX host, `/` on a win32 host.
+  const otherSep = path.sep === '\\' ? '/' : '\\';
+  const slashed = `${P('w', 'repo', 'src')}${otherSep}deep`;
   const deps = repoFs({ links: { [slashed]: SRC } });
   const { gitImpl, calls } = spyGit(ANSWER);
   assert.equal(fastRepoRoot(gitImpl, slashed, new Map(), { ...deps, platform: 'win32' }), ANSWER);
   assert.deepEqual(calls, [[ARGS, REPO]]);
-  assertGuard({ dir: SRC, deps }, { dir: slashed, deps: { ...deps, platform: 'linux' } });
+  // The implementation walks with the host's `path`, whatever deps.platform says. On a win32 host path.resolve
+  // already turns `/` into `\`, so a linux-platform guard for a slash difference can only be shown on a POSIX host.
+  if (path.sep === '/') {
+    assertGuard({ dir: SRC, deps }, { dir: slashed, deps: { ...deps, platform: 'linux' } });
+  }
 });
 
 test('fastRepoRoot — on win32 a letter-case difference is still a guard', () => {

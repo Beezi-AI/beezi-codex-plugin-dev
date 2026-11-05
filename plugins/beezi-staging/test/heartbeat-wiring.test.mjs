@@ -31,12 +31,12 @@ const scriptsDir = path.join(
 );
 const read = (name) => fs.readFileSync(path.join(scriptsDir, name), 'utf-8');
 
-test('NO NEW HOOK EVENT: the heartbeat rides the five entries already registered', () => {
-  // The whole argument for this row being cheap. A sixth entry is another line the user has to read
+test('NO NEW HOOK EVENT: the heartbeat rides the entries already registered', () => {
+  // The whole argument for this row being cheap. Another entry is another line the user has to read
   // and trust in /hooks, and Codex's trust gate makes that the expensive part of anything here.
   assert.deepEqual(
     BEEZI_HOOKS.map((h) => h.event),
-    ['SessionStart', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop'],
+    ['SessionStart', 'PostToolUse', 'SubagentStart', 'SubagentStop', 'Stop', 'PermissionRequest'],
   );
   assert.equal(BEEZI_HOOKS.filter((h) => h.script === 'checkpoint.mjs').length, 1,
     'one PostToolUse handler, not a second one beside it');

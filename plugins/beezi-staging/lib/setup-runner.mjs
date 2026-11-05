@@ -1,6 +1,9 @@
 import childProcess from 'child_process';
 import path from 'path';
 
+// The code a run answers when its child never started.
+export const NEVER_STARTED = 127;
+
 export function childEnv(env, sessionKeys) {
   const out = {};
   Object.keys(env).forEach((name) => {
@@ -138,7 +141,7 @@ export function createRunner(options) {
         err += chunk;
         if (stream) echoErr.push(chunk);
       });
-      child.on('error', (error) => finish({ code: 127, stdout: out, stderr: err + error.message }));
+      child.on('error', (error) => finish({ code: NEVER_STARTED, stdout: out, stderr: err + error.message }));
       child.on('close', (code) => {
         if (stream) {
           echoOut.flush();

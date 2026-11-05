@@ -13,9 +13,8 @@ const NO_FOLDER = /^\d+ other past sessions? ha(?:s|ve) no recorded folder and (
 const JOINED_NAMES = / you joined (.+) — \d+ repos? or folders? to review account=/;
 const MACHINE_LINES = [/^[\w-]+=/, /^[A-Z]\d*\. .* account=/, /-command=/, /^\s*[{[]/];
 const STOPPED = '✗ That step stopped unexpectedly.';
-// Writes leave the upload to the wizard's backfill that follows.
+// Writes leave the upload to the wizard's offer that follows.
 const DEFER = '--defer-upload';
-const CONSENT = ' Their past sessions will be sent there too.';
 
 export function outputLines(text) {
   return String(text || '').split(/\r?\n/);
@@ -32,7 +31,7 @@ export function token(line, name) {
   return found ? found[1] : null;
 }
 
-function printable(text) {
+export function printable(text) {
   return outputLines(text).map((line) => line.trimEnd()).filter((line) => line !== '');
 }
 
@@ -205,7 +204,7 @@ async function askReposForTenant(ctx, key, tenant, places) {
       label: place.short,
       description: place.where === null ? 'No rule yet' : `Now: ${place.where}`,
     }));
-    const picked = await ctx.ask.chooseMany(`Which repos and folders should also send analytics to ${name}?${CONSENT}`, options);
+    const picked = await ctx.ask.chooseMany(`Which repos and folders should also send analytics to ${name}?`, options);
     if (picked === null) return false;
     for (const j of picked) {
       const place = batch[j];
@@ -229,7 +228,7 @@ export async function reviewJoined(ctx, key) {
   if (places.length > 4) {
     const names = joinedNames(listing.stdout, workspaces);
     const n = places.length;
-    const choice = await ctx.ask.choose(`You joined ${names}. Where should analytics for these ${n} repos and folders go?${CONSENT}`, [
+    const choice = await ctx.ask.choose(`You joined ${names}. Where should analytics for these ${n} repos and folders go?`, [
       { label: `Add ${names} to all ${n}`, description: "Repos you don't track, and ones with no rule yet, stay as they are" },
       { label: 'Choose repos', description: 'Pick which repos and folders go to each new workspace' },
       { label: 'Leave them as they are', description: `Nothing changes, and you're not asked about ${names} again` },

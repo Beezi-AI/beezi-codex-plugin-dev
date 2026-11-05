@@ -467,12 +467,13 @@ test('a directory git cannot answer resolves through each checkpoint\'s own repo
 test('with deps.runCache, repo roots go through one git call at the repository root', async (t) => {
   withoutGitEnv(t);
   const home = tmpHome(t);
-  // A real-path base: the shortcut declines a dir whose realpath differs from the dir itself.
-  const top = path.join(fs.realpathSync(home), 'top');
+  // A real-path base, read with the same realpath.native the shortcut uses: it declines a dir whose realpath differs
+  // from the dir itself (a Windows TEMP may be an 8.3 short name that only .native expands).
+  const top = path.join(fs.realpathSync.native(home), 'top');
   const sub = path.join(top, 'a', 'b');
   fs.mkdirSync(path.join(top, '.git'), { recursive: true });
   fs.mkdirSync(sub, { recursive: true });
-  const realTop = fs.realpathSync(top);
+  const realTop = fs.realpathSync.native(top);
   const toplevel = async (withRunCache) => {
     const git = countingGit();
     const runCache = withRunCache ? { git: memoizeGit(git.impl), gitRoots: new Map() } : null;

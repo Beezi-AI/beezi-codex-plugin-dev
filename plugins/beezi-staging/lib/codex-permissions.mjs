@@ -40,6 +40,11 @@ export function lastTurnContext(file, { chunk = TAIL_CHUNK, limit = TAIL_LIMIT }
   let fd;
   try { fd = fs.openSync(file, 'r'); } catch { return null; }
   try {
+    // Only the live session is read here, and a live rollout is never compressed; a compressed one
+    // is not tail-readable by byte offset, so it has no answer. (Magic checked inline: the preflight
+    // may import nothing outside the sandbox-safe set, rollout-file.mjs included.)
+    const magic = Buffer.alloc(4);
+    if (fs.readSync(fd, magic, 0, 4, 0) === 4 && magic.toString('hex') === '28b52ffd') return null;
     let end = fs.fstatSync(fd).size;
     let carry = Buffer.alloc(0);
     let read = 0;
@@ -71,9 +76,9 @@ export function lastTurnContext(file, { chunk = TAIL_CHUNK, limit = TAIL_LIMIT }
 // Only `on-request` was seen in a rollout. `untrusted` and `on-failure` are Codex's other asking
 // policies (`--ask-for-approval`); unmeasured, they count as asking because neither refuses without
 // a prompt, and an unknown answer would end in the same "carry on" anyway.
-const ASKING_POLICIES = ['on-request', 'untrusted', 'on-failure'];
+export const ASKING_POLICIES = ['on-request', 'untrusted', 'on-failure'];
 
-function approvalLabel(approval) {
+export function approvalLabel(approval) {
   if (typeof approval === 'string') return approval;
   if (approval && typeof approval === 'object' && approval.granular) return 'granular';
   return 'unknown';

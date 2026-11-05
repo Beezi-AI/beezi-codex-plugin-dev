@@ -1,11 +1,12 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { computeOperations } from '../lib/operations-codex.mjs';
+import { projectRolloutRecord } from '../lib/transcript-reader-codex.mjs';
 
 const fn = (name, callId) => ({ type: 'response_item', payload: { type: 'function_call', name, arguments: '{}', call_id: callId } });
-const fnOut = (callId, output) => ({ type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output } });
+const fnOut = (callId, output) => projectRolloutRecord({ type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output } });
 const custom = (name, callId) => ({ type: 'response_item', payload: { type: 'custom_tool_call', name, call_id: callId, input: 'x' } });
-const customOut = (callId, output) => ({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: callId, output } });
+const customOut = (callId, output) => projectRolloutRecord({ type: 'response_item', payload: { type: 'custom_tool_call_output', call_id: callId, output } });
 
 test('categorizes shell, file, and unidentified tools without inventing MCP usage', () => {
   const lines = [
@@ -323,7 +324,7 @@ test('Codex tool-discovery search is not a code search', () => {
 // 0 / 12 on 0.153.x — era-exclusive, never both in one rollout. Field paths below are copied from
 // real records, not from prose: item.{id,server,tool,duration}, with the item nested under
 // payload.item of an `event_msg` whose payload.type is `item_completed`.
-const mcpItem = (id, server, tool, duration = null) => ({
+const mcpItem = (id, server, tool, duration = null) => projectRolloutRecord({
   type: 'event_msg',
   payload: {
     type: 'item_completed',
@@ -365,10 +366,10 @@ test('a 0.153 McpToolCall names the server the call record does not', () => {
 test('an item_completed that is not an McpToolCall names no server', () => {
   // The same envelope carries FileChange and Plan items. Reading `item.server` off those would
   // invent an MCP call out of a file edit.
-  const fileChange = {
+  const fileChange = projectRolloutRecord({
     type: 'event_msg',
     payload: { type: 'item_completed', item: { type: 'FileChange', id: 'exec-1', changes: {} } },
-  };
+  });
   const ops = computeOperations([fn('somenewbuiltin', 'x1'), fileChange]);
   assert.equal(ops.mcp.count, 0);
   assert.equal(ops.other.count, 1);

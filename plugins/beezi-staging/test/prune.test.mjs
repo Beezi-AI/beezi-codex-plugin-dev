@@ -146,6 +146,53 @@ test('5. custom maxAgeMs boundary — 2-day-old file pruned at 1d, kept at 3d', 
   assert.equal(fs.existsSync(pB), true, '2-day-old file kept with maxAgeMs=3days');
 });
 
+// A PermissionRequest marker is the only record of an approval wait. Sync re-derives sessions up to
+// 30 days old, so markers must outlive that window; plain state files keep the 14-day rule.
+test('a permission marker 20 days old survives the 14-day sweep', (t) => {
+  const homeDir = makeTmpDir(t);
+  setHome(homeDir);
+  linkAccount(homeDir, KEY);
+
+  const now = Date.now();
+  const twentyDaysMs = 20 * 24 * 60 * 60 * 1000;
+  const p = writeFile(stateDir(homeDir), 'sess-perm.perm.jsonl', '{"at":"2026-01-01T00:00:00.000Z"}\n');
+  ageFile(p, twentyDaysMs, now);
+
+  pruneStale(now);
+
+  assert.equal(fs.existsSync(p), true, 'a 20-day-old marker must survive the sync window');
+});
+
+test('a permission marker 36 days old is pruned', (t) => {
+  const homeDir = makeTmpDir(t);
+  setHome(homeDir);
+  linkAccount(homeDir, KEY);
+
+  const now = Date.now();
+  const thirtySixDaysMs = 36 * 24 * 60 * 60 * 1000;
+  const p = writeFile(stateDir(homeDir), 'sess-perm.perm.jsonl', '{"at":"2026-01-01T00:00:00.000Z"}\n');
+  ageFile(p, thirtySixDaysMs, now);
+
+  pruneStale(now);
+
+  assert.equal(fs.existsSync(p), false, 'a 36-day-old marker is past the marker window');
+});
+
+test('a plain state file 20 days old is still pruned', (t) => {
+  const homeDir = makeTmpDir(t);
+  setHome(homeDir);
+  linkAccount(homeDir, KEY);
+
+  const now = Date.now();
+  const twentyDaysMs = 20 * 24 * 60 * 60 * 1000;
+  const p = writeFile(stateDir(homeDir), 'sess-plain.json');
+  ageFile(p, twentyDaysMs, now);
+
+  pruneStale(now);
+
+  assert.equal(fs.existsSync(p), false, 'only permission markers get the longer window');
+});
+
 test('a stale session takes its subagent directory with it', (t) => {
   const home = makeTmpDir(t);
   setHome(home);

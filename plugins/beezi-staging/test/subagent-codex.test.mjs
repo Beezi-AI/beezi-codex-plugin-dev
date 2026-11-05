@@ -12,6 +12,7 @@ import {
   MAX_FORK_PREFIX_RECORDS,
   agentRoleFromPath,
 } from '../lib/subagent-codex.mjs';
+import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
 
 // Fixtures mirror the four subagent rollout shapes actually present in a local ~/.codex corpus, plus
 // the long-replay format the repo's own parity notes describe. The boundary numbers here are the
@@ -210,6 +211,48 @@ test('the boundary is exactly the cursor computeDelta needs to drop the replay',
   assert.equal(sum(whole), 65624 + 1571);
   assert.equal(sum(own), (65624 - 51165) + (1571 - 895));
 });
+
+// ── The boundary is a physical-line cursor, the way computeDelta numbers lines ───────────────────
+
+const userPrompt = (ms, text) => ({
+  timestamp: at(ms), type: 'response_item',
+  payload: { type: 'message', role: 'user', content: [{ type: 'input_text', text }] },
+});
+
+// Own meta, replayed parent meta, an optional raw prefix line, the replayed prompt, then own work.
+function forkWithPrefixLine(rawLine) {
+  const lines = [subMeta(), parentMeta(3)].map((r) => JSON.stringify(r));
+  if (rawLine !== undefined) lines.push(rawLine);
+  lines.push(JSON.stringify(userPrompt(10, 'REPLAYED PARENT PROMPT')), JSON.stringify(userPrompt(2000, 'CHILD OWN PROMPT')));
+  const file = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-sub-')), 'rollout.jsonl');
+  fs.writeFileSync(file, lines.join('\n') + '\n');
+  return file;
+}
+
+test('fork boundary counts physical lines past a blank prefix line', () => {
+  assert.equal(inspectSubagentRollout(forkWithPrefixLine('')).forkBoundaryLine, 4);
+});
+
+test('fork boundary counts physical lines past a malformed prefix line', () => {
+  assert.equal(inspectSubagentRollout(forkWithPrefixLine('{"torn')).forkBoundaryLine, 4);
+});
+
+test('fork boundary with no skipped lines equals the record index', () => {
+  assert.equal(inspectSubagentRollout(forkWithPrefixLine()).forkBoundaryLine, 3);
+});
+
+// Codex compresses rollouts older than 7 days; the boundary and computeDelta's line count must not
+// change when the same fork is read through the zstd path.
+test('a zstd-compressed fork gives the same physical-line boundary and line count as the plain one',
+  { skip: typeof zlib.zstdCompressSync !== 'function' }, () => {
+    for (const rawLine of ['', '{"torn', undefined]) {
+      const plain = forkWithPrefixLine(rawLine);
+      const zst = plain + '.zst';
+      fs.writeFileSync(zst, zlib.zstdCompressSync(fs.readFileSync(plain)));
+      assert.equal(inspectSubagentRollout(zst).forkBoundaryLine, inspectSubagentRollout(plain).forkBoundaryLine, String(rawLine));
+      assert.deepEqual(readRolloutLines(zst), readRolloutLines(plain), String(rawLine));
+    }
+  });
 
 // ── findSubagentRollouts: which rollouts a session claims, and what bounds the walk ──────────────
 //
@@ -438,4 +481,23 @@ test('the index honours the per-call mtime floor the checkpoint passes', () => {
   const index = indexSubagentRollouts({ sessionsDir: root });
   assert.equal(index.find('root-session', { sinceMs: mtime - 1000 }).length, 1);
   assert.equal(index.find('root-session', { sinceMs: mtime + 60_000 }).length, 0);
+});
+
+import zlib from 'node:zlib';
+
+test('a .zst child rollout is found and its agentId carries no .jsonl/.zst suffix', { skip: typeof zlib.zstdCompressSync !== 'function' }, () => {
+  const root = sessionsTree();
+  const dir = dated(root);
+  const plain = rolloutIn(dir, 'zed', {
+    id: undefined, session_id: 'root-session', parent_thread_id: 'root-session',
+    forked_from_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  const zst = plain + '.zst';
+  fs.writeFileSync(zst, zlib.zstdCompressSync(fs.readFileSync(plain)));
+  fs.unlinkSync(plain);
+  const found = findSubagentRollouts('root-session', { sessionsDir: root });
+  assert.equal(found.length, 1);
+  assert.equal(found[0].path, zst);
+  assert.equal(found[0].agentId, 'rollout-2026-08-06T19-41-50-zed');
 });

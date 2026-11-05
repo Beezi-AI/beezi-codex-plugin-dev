@@ -1,0 +1,6 @@
+// POSITIVE fixture — a named import of a zstd symbol from zlib. The gate must flag this.
+import { gzipSync, zstdCompressSync } from 'zlib';
+
+export function pack(buf) {
+  return zstdCompressSync(buf) || gzipSync(buf);
+}

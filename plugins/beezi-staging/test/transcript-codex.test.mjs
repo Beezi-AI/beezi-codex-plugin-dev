@@ -311,3 +311,51 @@ test('isUsableSessionId rejects the strings a missing id stringifies to', () => 
   assert.equal(isUsableSessionId('constructor'), true);
   assert.equal(isUsableSessionId('toString'), true);
 });
+
+// ── compressed rollouts (.jsonl.zst) ────────────────────────────────────────────────────────
+
+import zlib from 'node:zlib';
+
+function writeZstRollout(home, sessionId, records) {
+  const dir = path.join(home, 'sessions', '2026', '01', '08');
+  fs.mkdirSync(dir, { recursive: true });
+  const file = path.join(dir, `rollout-2026-01-08T18-15-41-${sessionId}.jsonl.zst`);
+  fs.writeFileSync(file, zlib.zstdCompressSync(Buffer.from(records.map((r) => JSON.stringify(r)).join('\n') + '\n')));
+  return file;
+}
+
+const zstSkip = { skip: typeof zlib.zstdCompressSync === 'function' ? false : 'zlib.zstdCompressSync unavailable' };
+
+test('findRolloutBySessionId finds a .zst rollout', zstSkip, () => {
+  withCodexHome((home) => {
+    const file = writeZstRollout(home, SID, [{ type: 'session_meta', payload: { cwd: '/repo' } }]);
+    assert.deepEqual(findRolloutBySessionId(SID), { sessionId: SID, transcriptPath: file });
+  });
+});
+
+test('findRolloutBySessionId prefers the plain file over a leftover .zst, whatever the mtimes', zstSkip, () => {
+  withCodexHome((home) => {
+    const plain = writeRollout(home, SID, [{ type: 'session_meta', payload: { cwd: '/repo' } }]);
+    const z = writeZstRollout(home, SID, [{ type: 'session_meta', payload: { cwd: '/repo' } }]);
+    fs.utimesSync(plain, 1000, 1000);
+    fs.utimesSync(z, 9000, 9000);
+    assert.equal(findRolloutBySessionId(SID).transcriptPath, plain);
+  });
+});
+
+test('resolveCodexTranscript follows a stale provided .jsonl path to the .zst that replaced it', zstSkip, () => {
+  withCodexHome((home) => {
+    const z = writeZstRollout(home, SID, [{ type: 'session_meta', payload: { cwd: '/repo' } }]);
+    const stale = z.slice(0, -'.zst'.length);
+    const r = resolveCodexTranscript({ transcript_path: stale });
+    assert.equal(r.transcriptPath, z);
+  });
+});
+
+test('findRolloutBySessionState follows a recorded .jsonl path to its .zst', zstSkip, () => {
+  withCodexHome((home) => withBeeziHome((beezi) => {
+    const z = writeZstRollout(home, SID, [{ type: 'session_meta', payload: { cwd: '/repo' } }]);
+    writeState(beezi, SID, { cwd: '/repo', sessionId: SID, transcriptPath: z.slice(0, -'.zst'.length), updatedAt: '2026-01-09T00:00:00Z' });
+    assert.equal(resolveCodexTranscript({ cwd: '/repo' }).transcriptPath, z);
+  }));
+});

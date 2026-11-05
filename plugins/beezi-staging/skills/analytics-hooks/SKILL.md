@@ -74,11 +74,12 @@ them to `/hooks` for no reason, mention it only if analytics still are not arriv
 the other half — the `beezi_status` tool (or the `settings` skill) says whether it is, and the
 `login` skill links it.
 
-There is one entry per lifecycle event: `SessionStart`, `PostToolUse`, `Stop`, `SubagentStart`,
-`SubagentStop`. `install` and `status` both print the list back, so check `/hooks` against what the
+There is one entry per lifecycle event: `SessionStart`, `PostToolUse`, `PermissionRequest`, `Stop`,
+`SubagentStart`, `SubagentStop`. `install` and `status` both print the list back, so check `/hooks` against what the
 script named rather than against a count. The two subagent hooks only record which agent ran and
 when — a subagent's *usage* is billed by the parent session's checkpoint, so trusting only some
 entries still reports subagent tokens and loses only the agent's name and its span on the timeline.
+An untrusted `PermissionRequest` entry loses only the approval waits (`command_approval`) on the timeline.
 
 `install` writes `~/.codex/hooks.json` only, and **merges**: hooks the user configured themselves
 and a working sibling variant's entries are left alone, and only dead ones are swept. `uninstall`

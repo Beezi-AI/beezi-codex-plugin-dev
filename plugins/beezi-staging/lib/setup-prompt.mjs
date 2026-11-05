@@ -269,7 +269,7 @@ export function createPrompt(io) {
     return rows;
   }
 
-  function keyChoose(question, options, defaultIndex) {
+  function keyChoose(question, options, defaultIndex, escape) {
     let cursor = defaultIndex === -1 ? 0 : defaultIndex;
     let run = '';
     const hint = defaultIndex === -1 ? HINT_SKIP : HINT_CHOOSE;
@@ -278,7 +278,7 @@ export function createPrompt(io) {
         finish(cursor, style.cyan(options[cursor].label));
         return false;
       }
-      if (key.name === 'escape' && defaultIndex === -1) {
+      if (key.name === 'escape' && (defaultIndex === -1 || escape)) {
         finish(null, style.dim('skipped'));
         return false;
       }
@@ -291,11 +291,11 @@ export function createPrompt(io) {
     });
   }
 
-  function keyChooseMany(question, options, exclusive) {
+  function keyChooseMany(question, options, exclusive, preselected) {
     let cursor = 0;
     let run = '';
     let before = [];
-    let picked = [];
+    let picked = preselected.slice();
     return keyQuestion(question, () => menuRows(question, options, cursor, picked, HINT_MANY), (str, key, finish) => {
       if (isSubmit(key)) {
         const chosen = picked.slice().sort((a, b) => a - b);
@@ -353,7 +353,8 @@ export function createPrompt(io) {
   async function choose(question, options, opts) {
     if (closed) return null;
     const defaultIndex = opts && typeof opts.defaultIndex === 'number' ? opts.defaultIndex : -1;
-    if (fitsScreen(options.length + 2) && rawOn()) return keyChoose(question, options, defaultIndex);
+    const escape = Boolean(opts && opts.escape);
+    if (fitsScreen(options.length + 2) && rawOn()) return keyChoose(question, options, defaultIndex, escape);
     showMenu(question, options, defaultIndex);
     const range = `1-${options.length}`;
     const query = defaultIndex === -1 ? `Choose ${range}, or press Enter to skip:` : `Choose ${range} [${defaultIndex + 1}]:`;
@@ -371,11 +372,16 @@ export function createPrompt(io) {
     if (closed) return null;
     if (options.length === 0) return [];
     const exclusive = opts && Array.isArray(opts.exclusive) ? opts.exclusive : [];
-    if (fitsScreen(options.length + 2) && rawOn()) return keyChooseMany(question, options, exclusive);
+    const preselected = opts && Array.isArray(opts.preselected) ? opts.preselected : [];
+    if (fitsScreen(options.length + 2) && rawOn()) return keyChooseMany(question, options, exclusive, preselected);
     showMenu(question, options, -1);
+    const query = preselected.length === 0
+      ? 'Choose one or more (for example 1,2), or press Enter to skip:'
+      : `Choose one or more (for example 1,2) [${preselected.map((i) => i + 1).join(',')}]:`;
     for (;;) {
-      const answer = await ask(`${style.boldCyan('Choose one or more (for example 1,2), or press Enter to skip:')} `);
+      const answer = await ask(`${style.boldCyan(query)} `);
       if (answer === null) return null;
+      if (answer === '') return preselected.slice();
       const picked = parseNumbers(answer, options.length);
       const mixed = picked === null ? -1 : mixedExclusive(picked, exclusive);
       if (picked !== null && mixed === -1) return picked;

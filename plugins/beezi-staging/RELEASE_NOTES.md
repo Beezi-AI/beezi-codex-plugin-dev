@@ -1,5 +1,38 @@
 # Beezi plugin release notes
 
+## 0.26.0 (2026-11-03) — Past sessions without a question, and one question for several workspaces
+
+### New
+- **Upload without asking** — when a workspace owner chooses to upload past sessions without asking, login, sync, session start and the terminal setup show the same summary as a notice, say which workspace chose it, and upload. One that fails is retried on its own, without a second notice.
+- **One question for several workspaces** — in several workspaces, one summary lists what each sends and hides, the no-ask uploads run, and the others are asked once: "Upload to both" (or "Upload to all N"), "Choose for each" or "Not now". The terminal setup asks it as one list with every workspace ticked, and a last "Not now" row.
+
+## 0.25.0 (2026-10-30) — Anonymized workspaces and ask-first past sessions
+
+### New
+- **Past sessions after a yes** — Past sessions are uploaded after you say yes, unless the workspace owner chose to upload them without asking (0.26.0); login, sync and the setup wizard now show what would be sent and ask.
+- **Anonymized workspaces** — when a workspace has anonymization on, repo, folder, branch, machine, account and session names are replaced with made-up values on this machine, and Beezi stores only the made-up name. The first request after sign-in, or after a settings change, can carry the computer name, which Beezi hashes on arrival. Error text and agent names stay here.
+- **Notice at start** — a new Codex thread says "Beezi: this workspace is anonymized." for each workspace that has it on, and the repo check is no longer sent when the workspace hides folder and repository names.
+- **Appears as** — the settings skill shows the name an anonymized workspace sees this machine as.
+
+### Improved
+- **Clear stop for a missing key** — sync and the history upload say when an anonymized workspace has no key on this machine yet, instead of reporting nothing uploaded.
+- **Past-sessions checklist** — login, sync and the setup wizard show what an upload sends, hides and never sends as a short checklist, and the wizard asks with an Upload now / Not now menu.
+
+## 0.24.14 (2026-10-30) — Approval waits, clear-context plans and older sessions
+
+### New
+- **Approval waits** — time spent waiting on a command or patch approval prompt now shows on the timeline as waiting on you. Trust the new `PermissionRequest` entry once in `/hooks`; until then these waits are not recorded. Note: approval records are kept only on this machine, for 35 days; a backfill after that, or on another machine, shows no approval waits.
+- **Clear-context plans** — accepting a plan with "Yes, clear context" now keeps the plan approval wait on the original session instead of losing it to the new thread.
+
+### Fixed
+- **Older sessions** — sessions Codex has compressed (older than 7 days) are now read by sync and backfill. They need Node 22.15+ or 23.8+; on an older Node they are skipped and the number skipped is printed.
+
+## 0.24.0 (2026-10-29) — Large sessions upload
+
+### Fixed
+- **Large sessions upload** — rollouts over 64 MB are no longer skipped by the history upload or sync, and each turn reads a session once.
+- **Subagent forks bill only their own work** — even when the replayed prefix holds a blank or unreadable line.
+
 ## 0.23.1 (2026-10-22) — "Don't track" stands alone, and several workspaces at sign-in
 
 ### Fixed
