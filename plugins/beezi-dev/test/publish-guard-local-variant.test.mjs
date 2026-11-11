@@ -52,6 +52,22 @@ test('the guard still refuses every non-production URL shape it was written for'
   assert.match(text, /refusing to publish - non-production connector URL found/);
 });
 
+test('both scans read the dot-less mcp.json of the portable plugin layout', () => {
+  const text = syncText();
+  // plugins/beezi-analytics/mcp.json has no leading dot, so neither '*.mcp.json' nor '.mcp.json'
+  // matches it, and its connector URL would otherwise reach the public repo unchecked.
+  assert.match(text, /--include='env\.json' --include='mcp\.json' \|\| true\)"/);
+  assert.match(text, /-- '\*\.mcp\.json' '\*mcp\.json' '\*env\.json' \|\| true\)"/);
+});
+
+test('the scan pattern refuses a loopback connector URL and passes the production one', () => {
+  const match = syncText().match(/git grep -n -I -E '([^']+)'/);
+  assert.ok(match, 'sync-to-github.sh no longer carries the snapshot scan pattern');
+  const scan = new RegExp(match[1]);
+  assert.ok(scan.test('plugins/beezi-analytics/mcp.json:5:      "url": "http://localhost:5001/api/mcp"'));
+  assert.ok(!scan.test('plugins/beezi-analytics/mcp.json:5:      "url": "https://api.beezi.ai/api/mcp"'));
+});
+
 test('the carve-out is gated on the beezi-local variant alone', () => {
   assert.match(
     syncText(),
