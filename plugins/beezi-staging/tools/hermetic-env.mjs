@@ -57,6 +57,9 @@ const SCRUBBED_ENV_KEYS = Object.freeze([
   'AZURE_OPENAI_API_KEY', 'OPENROUTER_API_KEY', 'ANTHROPIC_API_KEY',
   // Endpoint / environment selection (config.mjs:3, :59) and debug output.
   'BEEZI_API_URL', 'BEEZI_MCP_URL', 'BEEZI_ENV', 'BEEZI_DEBUG',
+  // Turns the queue drain's batch path off (lib/queue-flush.mjs); a developer's own setting must not
+  // silently send the batch tests down the single route.
+  'BEEZI_NO_BATCH',
   // Session routing must use fixture state, never the controller's live thread.
   'CODEX_THREAD_ID', 'CODEX_SESSION_ID',
   // Set on a command Codex sandboxes. `npm test` run from inside Codex would otherwise take the
@@ -126,6 +129,10 @@ function install() {
   process.env.USERPROFILE = sandbox;
   process.env.CODEX_HOME = codexHome;
   process.env.BEEZI_CODEX_HOME = beeziHome;
+
+  // No test may start a real detached upload worker (lib/upload-trigger.mjs answers 'disabled').
+  // Set, not scrubbed, so every hook a test runs as a child inherits it too.
+  process.env.BEEZI_TEST_NO_SPAWN = '1';
 
   // ── L3 ── see SCRUBBED_ENV_KEYS.
   for (const key of SCRUBBED_ENV_KEYS) delete process.env[key];

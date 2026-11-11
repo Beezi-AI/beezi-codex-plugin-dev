@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { postSessionError } from '../lib/session-error-report.mjs';
+import { postSessionError, sessionErrorBody } from '../lib/session-error-report.mjs';
 import { recordingFetch } from '../tools/suite-fixtures.mjs';
 import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 import { KINDS } from '../lib/anonymize.mjs';
@@ -174,3 +174,13 @@ test('with sessions off, a 3,000-character error message goes up as its first 1,
   assert.equal(body.error, 'rate_limit');
 });
 
+
+// The per-target body a parked error stores (lib/checkpoint.mjs): the same transform the POST applies.
+test('sessionErrorBody scrubs for a target that hides sessions and caps for one that does not', () => {
+  const payload = { sessionId: 's1', error: 'rate_limit', errorDetails: 'd'.repeat(1001),
+    lastAssistantMessage: 'x'.repeat(1001), occurredAt: '2026-07-08T10:00:00.000Z' };
+  assert.deepEqual(sessionErrorBody(payload, { ...SESSION, anonymization: ANON_BLOCK }),
+    { sessionId: 's1', error: 'rate_limit', occurredAt: '2026-07-08T10:00:00.000Z' });
+  assert.deepEqual(sessionErrorBody(payload, SESSION), { ...payload,
+    errorDetails: 'd'.repeat(1000), lastAssistantMessage: 'x'.repeat(1000) });
+});

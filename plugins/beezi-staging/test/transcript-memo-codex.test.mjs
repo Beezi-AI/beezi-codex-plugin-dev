@@ -41,3 +41,35 @@ test('a second path replaces the first', () => {
   memo.readLines('/a.jsonl');
   assert.deepEqual(reader.calls, ['/a.jsonl', '/b.jsonl', '/a.jsonl']);
 });
+
+const RESUME = { line: 1, byte: 24, size: 24, head: 'h' };
+
+test('readTail cuts the cached whole read instead of reading again', () => {
+  const reader = countingReader();
+  const tails = [];
+  const sliced = [];
+  const memo = createTranscriptMemo({
+    readLines: reader.readLines,
+    readTail: (p) => { tails.push(p); return null; },
+    sliceLines: (lines, resume) => { sliced.push([lines.path, resume.byte]); return { cut: true }; },
+  });
+  memo.readLines('/a.jsonl');
+  assert.deepEqual(memo.readTail('/a.jsonl', RESUME), { cut: true });
+  assert.deepEqual(reader.calls, ['/a.jsonl']);
+  assert.deepEqual(tails, []);
+  assert.deepEqual(sliced, [['/a.jsonl', 24]]);
+});
+
+test('readTail without a cached read of that path reads the tail from disk and caches nothing', () => {
+  const reader = countingReader();
+  const tails = [];
+  const memo = createTranscriptMemo({
+    readLines: reader.readLines,
+    readTail: (p, resume) => { tails.push([p, resume.byte]); return { tail: p }; },
+  });
+  memo.readLines('/a.jsonl');
+  assert.deepEqual(memo.readTail('/b.jsonl', RESUME), { tail: '/b.jsonl' });
+  assert.deepEqual(tails, [['/b.jsonl', 24]]);
+  assert.equal(memo.peek('/b.jsonl'), null);
+  assert.equal(memo.peek('/a.jsonl').path, '/a.jsonl');
+});

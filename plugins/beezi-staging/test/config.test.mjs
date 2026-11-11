@@ -101,6 +101,10 @@ test('the analytics endpoints are agent-neutral', () => {
   assert.equal(ENDPOINTS.reposStatus, '/repos/status');
 });
 
+test('the batch report route sits next to the single one', () => {
+  assert.equal(ENDPOINTS.sessionsReportBatch, '/sessions/report-batch');
+});
+
 test('AGENT identifies this client as codex', () => {
   assert.equal(AGENT, 'codex');
   assert.equal(OAUTH_SCOPES, 'email profile');

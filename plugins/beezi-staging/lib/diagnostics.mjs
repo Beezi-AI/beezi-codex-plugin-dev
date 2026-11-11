@@ -237,6 +237,13 @@ export function hasBeenAsked() {
   return !!record && (record.askedAt != null || record.consent != null);
 }
 
+// Undecided is no consent file, or a current record of a prompt shown and never answered; an unreadable or other-version file counts as decided.
+export function hasDecided() {
+  if (!fs.existsSync(diagnosticsConsentFile())) return false;
+  const record = readConsent();
+  return !record || record.consent === 'granted' || record.consent === 'denied' || record.correlation === 'denied';
+}
+
 export function hasCorrelationBeenAsked() {
   const record = readConsent();
   return !!record && record.correlationAskedAt != null;

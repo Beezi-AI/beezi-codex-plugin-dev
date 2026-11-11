@@ -17,7 +17,9 @@
         "BEEZI_CODEX_WATCHER",
         "BEEZI_CODEX_APP_SERVER",
         "BEEZI_CODEX_CLI",
-        "OPENAI_API_KEY"
+        "BEEZI_NO_BATCH",
+        "OPENAI_API_KEY",
+        "BEEZI_TEST_NO_SPAWN"
       ]
     }
   }

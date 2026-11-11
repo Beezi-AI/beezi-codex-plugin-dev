@@ -1,5 +1,32 @@
 # Beezi plugin release notes
 
+## 0.28.1 (2026-11-11) — Faster hooks, background uploads
+
+### Improved
+- **Hooks no longer wait on the network** — session start, turn end and the shell-command hook now only save to disk. One background upload signs in once and sends everything, so Codex no longer waits several seconds for Beezi at the end of a turn.
+- **No sign-in reads in hooks** — hooks never read your saved sign-in, which on Windows started a PowerShell process for every read. Several linked accounts no longer multiply the wait.
+- **Batch upload** — when your Beezi server supports it, reports go up in batches of up to 50. Older servers get one report at a time, as before.
+- **Fewer hook runs** — the analytics hook after a tool call now runs only for shell commands, not for every file edit, MCP call or web search. Trust the updated `PostToolUse` entry once in `/hooks`.
+- **Less reading** — a checkpoint reads only the new part of a session file, and skips finished subagent files.
+- **Upload status** — `beezi_status` now says when the background upload last ran and what to do when it is stuck.
+- **Quiet background check** — between turns, Beezi no longer reads your saved sign-in every 20 seconds when nothing changed.
+
+### Fixed
+- **No lost reports when Beezi is busy** — a report the server asks to retry later (busy or rate-limited) is kept and sent again, instead of being dropped.
+- **Right session, right file** — a new session in a folder can no longer be matched to an older session’s file there.
+- **Sign in again, message gone** — after you sign in again, session start no longer says your link was rejected.
+
+## 0.27.0 (2026-11-11) — One-question setup
+
+### New
+- **One question: what to track** — terminal setup and the login skill show the summary of your past sessions, then ask one question: track everything, or let you choose the repos and folders. With several workspaces it asks where everything goes, or lets you pick repos for each workspace. The answer is your consent: past sessions from what you track upload in the background, and nothing is sent from a repo or folder you left out. A workspace whose owner chose never to upload past sessions still gets none.
+- **Asked once per account** — once tracking is set up for an account on this machine, signing in again asks nothing and says it is already set up. Change it any time in the settings skill.
+
+### Improved
+- **Fewer questions** — the plan is detected without asking; when it can't be, Beezi says to set it in the settings skill. The questions about this session's folder, new workspaces, repos with no rule, uploading past sessions and the default account are gone from sign-in.
+- **Crash reports are on after setup** — terminal setup and the login skill turn crash reports on unless you already chose. The last lines say what is on, or that `/hooks` still needs your trust; the settings skill changes it.
+- **Beezi's colours in terminal setup** — the Beezi mark at the top, violet marks for what is done, a shorter closing block, and tick lists that scroll on small terminals. `NO_COLOR` still turns the colours off.
+
 ## 0.26.0 (2026-11-03) — Past sessions without a question, and one question for several workspaces
 
 ### New

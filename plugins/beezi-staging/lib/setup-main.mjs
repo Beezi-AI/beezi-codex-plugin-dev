@@ -2,19 +2,20 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { removeDirSync } from './compat.mjs';
-import { finaleLines } from './setup-finale.mjs';
+import { probeHookTrust } from './hook-trust.mjs';
+import { headerLines } from './setup-finale.mjs';
 import { createPrompt, openTerminal } from './setup-prompt.mjs';
 import { createRunner } from './setup-runner.mjs';
-import { canReadKeys, colorEnabled, createStyle, formatLine, paint } from './setup-style.mjs';
-import { runSetup } from './setup-wizard.mjs';
+import { canReadKeys, formatLine, paint, terminalStyle } from './setup-style.mjs';
+import { AGENT, runSetup } from './setup-wizard.mjs';
 
 // Session-id variables Codex exports to shell commands; the runner drops them from every child's env.
 export const SESSION_KEYS = Object.freeze(['CODEX_THREAD_ID', 'CODEX_SESSION_ID']);
 export const NO_TERMINAL = '✗ Beezi setup needs a terminal. Ask "Sign me in to Beezi" in a new Codex thread instead.';
-export const STOPPED = 'Setup stopped. Run the installer again, or ask "Sign me in to Beezi" in a new Codex thread, to finish.';
+export const STOPPED = 'Setup stopped. Ask "Sign me in to Beezi" in a new Codex thread to finish.';
 const INTERRUPTED = 130;
-const AGENT = 'Codex';
 const SHOW_CURSOR = '\x1b[?25h';
+const MARGIN = '  ';
 
 function makeTempDir() {
   return fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-setup-'));
@@ -28,22 +29,28 @@ function onProcessExit(handler) {
   process.on('exit', handler);
 }
 
-// Runs the wizard on the terminal from a fresh temp cwd and resolves its exit code; Ctrl+C exits 130.
+// Each non-empty \n-separated row starts at the setup's left margin.
+function indent(text) {
+  return String(text).split('\n').map((row) => (row === '' ? row : MARGIN + row)).join('\n');
+}
+
+// Runs the wizard on the terminal from a fresh temp cwd and resolves its exit code; Ctrl+C exits 130. The header is left to the installer when it ran the setup.
 export function setupMain(root, deps) {
   const d = deps || {};
   const stdout = d.stdout || process.stdout;
   const stderr = d.stderr || process.stderr;
   const env = d.env || process.env;
-  const style = createStyle({ enabled: colorEnabled({ stream: stdout, env }) });
+  const style = terminalStyle({ stream: stdout, env });
+  if (env.BEEZI_INSTALLER !== '1') headerLines({ agent: AGENT, style }).forEach((line) => { stdout.write(`${line}\n`); });
   const input = (d.openTerminal || openTerminal)();
   if (input === null) {
-    stderr.write(`${paint(style, NO_TERMINAL)}\n`);
+    stderr.write(`${indent(paint(style, NO_TERMINAL))}\n`);
     return Promise.resolve(1);
   }
   // Shows the cursor again on process exit.
   if (stdout.isTTY) (d.onExit || onProcessExit)(() => { stdout.write(SHOW_CURSOR); });
-  // Wrapped to the width on a terminal; a log keeps each line whole.
-  const format = (line) => (stdout.isTTY ? formatLine(style, line, stdout.columns || 80) : paint(style, line));
+  // Wrapped to the width left of the margin on a terminal, so the offer shapes still match; a log keeps each line whole.
+  const format = (line) => indent(stdout.isTTY ? formatLine(style, line, (stdout.columns || 80) - MARGIN.length) : paint(style, line));
   const print = (line) => { stdout.write(`${format(line)}\n`); };
   const removeDir = d.removeDir || removeDirSync;
   const exit = d.exit || ((code) => process.exit(code));
@@ -63,21 +70,14 @@ export function setupMain(root, deps) {
     exit(INTERRUPTED);
   };
   prompt = (d.createPrompt || createPrompt)({
-    input, output: stdout, style, interactive: canReadKeys({ input, output: stdout, env }), onInterrupt: stop,
+    input, output: stdout, style, interactive: canReadKeys({ input, output: stdout, env }), onInterrupt: stop, format,
   });
   (d.onInterrupt || onSigint)(stop);
   run = (d.createRunner || createRunner)({
     root, cwd, env, sessionKeys: SESSION_KEYS, paint: format, stdout, stderr,
-    output: stdout, activity: stdout.isTTY === true && env.TERM !== 'dumb',
+    output: stdout, activity: stdout.isTTY === true && env.TERM !== 'dumb', margin: MARGIN, accent: style.accent,
   });
   const progress = (label) => { run.setLabel(label); };
-  return (d.runSetup || runSetup)({ run, ask: prompt, print, progress })
-    .finally(cleanup)
-    .then((code) => {
-      if (code === 0) {
-        finaleLines({ agent: AGENT, style, columns: stdout.columns || 80, random: d.random || Math.random })
-          .forEach((line) => { stdout.write(`${line}\n`); });
-      }
-      return code;
-    });
+  const trust = d.trust || (() => probeHookTrust());
+  return (d.runSetup || runSetup)({ run, ask: prompt, print, progress, style, trust }).finally(cleanup);
 }

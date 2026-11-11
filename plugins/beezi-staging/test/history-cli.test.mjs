@@ -1273,3 +1273,25 @@ test('an upload result with skipped compressed sessions says how many', async (t
   assert.equal(code, 0);
   assert.ok(io.out.includes(SKIPPED_TWO));
 });
+
+// ── one drainer: the upload worker (or a migration) holding the upload lock ─────────────────────
+
+const UPLOAD_BUSY_TEXT = `✓ Beezi: Beezi is busy on this machine right now (a background upload or a data migration), so nothing was synced this time. Run \`${naming.syncCommand()}\` again in a minute.`;
+
+test('an upload-busy run is its own notice: busy uploading, and run sync again', async (t) => {
+  one(t);
+  const io = capture(t);
+  const done = await offerCommand({ key: TEST_KEY }, deps({ null: { ok: true, reason: 'upload-busy', lastError: 'the background upload is sending' } }).deps);
+  assert.equal(done.status, 0);
+  assert.deepEqual(io.out, [UPLOAD_BUSY_TEXT, 'offers=0']);
+});
+
+test('a busy upload lock stops a multi-workspace offer after the first workspace instead of waiting once per workspace', async (t) => {
+  two(t);
+  const io = capture(t);
+  const h = deps({ t1: { ok: true, reason: 'upload-busy' }, t2: listed([session('s2')]) });
+  await offerCommand({ key: TEST_KEY }, h.deps);
+  assert.deepEqual(h.audits.map((o) => o.tenantId), ['t1']);
+  assert.equal(io.out.filter((line) => line === UPLOAD_BUSY_TEXT).length, 1);
+  assert.ok(!io.out.some((line) => line.startsWith('offer ')));
+});

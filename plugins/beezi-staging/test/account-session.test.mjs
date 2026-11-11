@@ -1,6 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
+import path from 'node:path';
+import { ensureEnvironmentMigrated } from '../lib/env-migration.mjs';
 import { linkedSessions, addAccount, AccountStatus, getAccount } from '../lib/accounts.mjs';
 import { getAuthentication, getAccessToken } from '../lib/token.mjs';
 import { machineHeaders } from '../lib/machine-identity.mjs';
@@ -313,4 +315,91 @@ test('13. getAccessToken still answers null when the revoke write fails', async 
   });
 
   assert.equal(token, null);
+});
+
+// ── credential reads per linkedSessions call (hook performance, Task 2) ─────────────────────
+//
+// Every credential read is a PowerShell spawn on Windows (~1.1 s). One counter sees both kinds:
+// the guard's raw read of each account's blob, and getAuthentication's own read. The guard is the
+// REAL lib/env-migration.mjs one over a bound root, so the count is the guard's true cost.
+function countedReads(home) {
+  const counter = { reads: 0 };
+  const blob = JSON.stringify({ access_token: 'at', token_endpoint: 'https://clerk.beezi.ai/oauth/token' });
+  return {
+    counter,
+    getCredentials: async (key) => {
+      counter.reads += 1;
+      return credentialBlob({ client_id: `c-${key}` });
+    },
+    checkEnvironment: () => ensureEnvironmentMigrated({
+      env: '', apiOrigin: 'https://api.beezi.ai', home: () => home,
+      readRawCredential: () => { counter.reads += 1; return blob; },
+    }),
+  };
+}
+
+function boundRoot(home) {
+  fs.writeFileSync(path.join(home, 'environment.json'),
+    JSON.stringify({ version: 1, env: '', apiOrigin: 'https://api.beezi.ai' }));
+}
+
+const READ_CASES = [
+  { accounts: [KEY_A], reads: 2 },
+  { accounts: [KEY_A, KEY_B], reads: 4 },
+];
+
+for (const c of READ_CASES) {
+  test(`14. linkedSessions over ${c.accounts.length} account(s) reads credentials ${c.reads} times, guard included`, async (t) => {
+    const home = makeHome(t);
+    boundRoot(home);
+    for (const key of c.accounts) await addAccount(row(key));
+    const deps = countedReads(home);
+
+    const sessions = await linkedSessions(deps);
+
+    assert.deepEqual(sessions.map((s) => s.key).sort(), c.accounts.slice().sort());
+    assert.equal(deps.counter.reads, c.reads);
+  });
+}
+
+test('15. linkedSessions refused by the guard reads no account credential and yields nothing', async (t) => {
+  makeHome(t);
+  await addAccount(row(KEY_A));
+  let reads = 0;
+  let guards = 0;
+
+  const sessions = await linkedSessions({
+    getCredentials: async () => { reads += 1; return credentialBlob(); },
+    checkEnvironment: () => { guards += 1; return { status: 'blocked', reason: 'binding-mismatch' }; },
+  });
+
+  assert.deepEqual(sessions, []);
+  assert.equal(guards, 1);
+  assert.equal(reads, 0);
+});
+
+test('16. getAuthentication with guardChecked skips its own guard', async (t) => {
+  makeHome(t);
+  let guards = 0;
+
+  const auth = await getAuthentication(KEY_A, {
+    getCredentials: async () => credentialBlob({ access_token: 'at-guarded', client_id: 'c-g' }),
+    checkEnvironment: () => { guards += 1; return { status: 'blocked', reason: 'binding-mismatch' }; },
+  }, { guardChecked: true });
+
+  assert.equal(auth.state, 'ready');
+  assert.equal(auth.accessToken, 'at-guarded');
+  assert.equal(guards, 0);
+});
+
+test('17. getAuthentication without guardChecked still refuses on a blocked guard', async (t) => {
+  makeHome(t);
+
+  const auth = await getAuthentication(KEY_A, {
+    getCredentials: async () => credentialBlob(),
+    checkEnvironment: () => ({ status: 'blocked', reason: 'binding-mismatch' }),
+  });
+
+  assert.equal(auth.state, 'unavailable');
+  assert.equal(auth.reason, 'environment-blocked');
 });

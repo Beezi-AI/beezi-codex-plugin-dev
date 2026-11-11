@@ -139,7 +139,8 @@ function countFailure(row, entry) {
   }
 }
 
-// Applies one run to the workspace's entry. `run` = { outcome, sent, skipped }; `plannedAtMs` = when the run built its plan.
+// Applies one run to the workspace's entry. `run` = { outcome, sent, skipped, failing? }; `plannedAtMs` = when the run built its plan.
+// `failing` (busy behind an upload that keeps failing) keeps the busy retry delay but counts a failure.
 export function settleHistory(row, tenantId, run, { plannedAtMs, nowMs }) {
   const entries = entriesOf(row);
   const entry = entries.find((e) => e.tenantId === tenantId);
@@ -148,7 +149,7 @@ export function settleHistory(row, tenantId, run, { plannedAtMs, nowMs }) {
   entry.sent = count(entry.sent) + count(run.sent);
   entry.skipped = count(entry.skipped) + count(run.skipped);
   if (run.outcome === RunOutcome.BUSY) entry.lastAttemptAt = new Date(nowMs - HISTORY_RETRY_MS + HISTORY_BUSY_RETRY_MS).toISOString();
-  if (run.outcome === RunOutcome.FAILED) countFailure(row, entry);
+  if (run.outcome === RunOutcome.FAILED || (run.outcome === RunOutcome.BUSY && run.failing === true)) countFailure(row, entry);
   const requestedMs = Date.parse(entry.requestedAt);
   // A request newer than the plan was not covered by this run.
   const coveredByRun = Number.isFinite(requestedMs) && requestedMs <= plannedAtMs;

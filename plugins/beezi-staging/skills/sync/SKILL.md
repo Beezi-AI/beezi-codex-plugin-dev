@@ -294,7 +294,7 @@ others under "Asks you first". Its lines:
   4-space indents.
 
 `offers=0` → nothing to ask; say nothing about past sessions only when it printed no `notices=` line either.
-Otherwise ask exactly as the `login` skill's step 4b does for each `Q` line, whatever the
+Otherwise ask each `Q` line's question as set out below, whatever the
 workspace's past-sessions setting is and even when the user said not now before. With a `QM` line,
 first ask that one question (its text after `QM `), with the choices `<the QM-all= value>`, "Choose
 for each" (described "One question per workspace, as today.") and "Not now" (described "Nothing is

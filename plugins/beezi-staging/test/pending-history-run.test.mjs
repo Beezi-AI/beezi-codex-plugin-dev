@@ -82,6 +82,47 @@ test('busy settles every remaining entry as busy without another run', async () 
   assert.deepEqual(h.settled.map((s) => s.outcome), [RunOutcome.BUSY, RunOutcome.BUSY]);
 });
 
+// The watcher's no-drain run defers to a worker whose last run failed with this queue on disk: busy
+// (retried in minutes) and charged a failure. A worker merely on its way is busy and uncharged.
+test('an upload-busy run behind a failing upload settles busy and charged', async () => {
+  const h = harness({ row: multiRow([{ tenantId: 'B', sessionIds: ['s1'], requestedAt: REQ }]), results: [{ ok: true, reason: 'upload-busy', uploadFailing: true }], plan: { tenantIds: ['B'], routes: new Map() } });
+  await runPendingHistory('k1', h.deps);
+  assert.deepEqual(h.settled, [{ tenantId: 'B', outcome: 'busy', sent: 0, skipped: 0, failing: true }]);
+});
+
+test('an upload-busy run waiting on a worker that has not failed settles busy and uncharged', async () => {
+  const h = harness({ row: multiRow([{ tenantId: 'B', sessionIds: ['s1'], requestedAt: REQ }]), results: [{ ok: true, reason: 'upload-busy' }], plan: { tenantIds: ['B'], routes: new Map() } });
+  await runPendingHistory('k1', h.deps);
+  assert.deepEqual(h.settled, [{ tenantId: 'B', outcome: 'busy', sent: 0, skipped: 0 }]);
+});
+
+// Repeated 503s, end to end through the marker: every pass is busy behind a failing upload, so the
+// attempts climb to the retry notice, and the pass at the deadline gives up with the failure notice.
+test('a request whose upload keeps failing reaches the retry notice and then the give-up notice', async () => {
+  const row = multiRow([{ tenantId: 'B', sessionIds: ['s1'], requestedAt: REQ, attempts: 0, lastAttemptAt: null, inFlight: false, sent: 0, skipped: 0, retryNoticed: false }]);
+  let nowMs = T0;
+  const accounts = {
+    AccountStatus: { LINKED: 'linked' },
+    listAccounts: async () => [row],
+    notePendingAttempt: async () => {},
+    settlePendingHistory: async (key, tenantId, run, timing) => settleHistory(row, tenantId, run, timing),
+  };
+  const deps = {
+    accounts, now: () => nowMs, planWorkspaceRuns: () => ({ tenantIds: ['B'], routes: new Map() }),
+    runAudit: async () => ({ ok: true, reason: 'upload-busy', uploadFailing: true }), rolloutStartedAt: () => null,
+  };
+  for (let i = 0; i < 3; i += 1) {
+    await runPendingHistory('k1', deps);
+    nowMs += 5 * 60 * 1000;
+  }
+  assert.equal(row.pendingHistory[0].attempts, 3);
+  assert.deepEqual(row.historyResults, [{ tenantId: 'B', status: 'retrying', sent: 0, skipped: 0 }]);
+  nowMs = Date.parse(REQ) + 7 * 24 * 60 * 60 * 1000;
+  const done = await runPendingHistory('k1', deps);
+  assert.deepEqual(done, [{ tenantId: 'B', outcome: 'busy', state: 'gave-up' }]);
+  assert.deepEqual(row.historyResults.map((r) => r.status), ['retrying', 'gave-up']);
+});
+
 test('a throwing run settles as failed', async () => {
   const row = multiRow([{ tenantId: 'A', sessionIds: ['s1'], requestedAt: REQ }, { tenantId: 'B', sessionIds: ['s1'], requestedAt: REQ }]);
   const h = harness({ row, results: [clean()], plan: { tenantIds: ['A', 'B'], routes: new Map() } });
@@ -166,6 +207,8 @@ test('without an override the real factory builds the shared cache', async () =>
 
 test('classifyRun — Codex reasons', () => {
   assert.equal(classifyRun({ ok: true, reason: 'run-in-progress' }, false), RunOutcome.BUSY);
+  // The upload worker or a migration held the upload lock for the whole wait: busy, retried in minutes.
+  assert.equal(classifyRun({ ok: true, reason: 'upload-busy' }, false), RunOutcome.BUSY);
   assert.equal(classifyRun({ ok: true, reason: 'active-writer' }, false), RunOutcome.BUSY);
   assert.equal(classifyRun({ ok: true, reason: 'pending-transaction' }, false), RunOutcome.BUSY);
   assert.equal(classifyRun({ ok: true, reason: 'audit-only' }, false), RunOutcome.REFUSED);

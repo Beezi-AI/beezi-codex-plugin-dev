@@ -8,6 +8,7 @@ import {
   accountsMigrationJournalFile,
   accountDir,
   trackingStateFile,
+  sessionStartCacheFile,
   queueDir,
   environment,
 } from '../lib/paths.mjs';
@@ -30,12 +31,13 @@ test('2. keyed accessors live under accounts/<key>/', (t) => {
   assert.equal(accountDir('a1b2c3d4'), path.join(home, 'accounts', 'a1b2c3d4'));
   assert.equal(trackingStateFile('a1b2c3d4'), path.join(home, 'accounts', 'a1b2c3d4', 'tracking.json'));
   assert.equal(queueDir('a1b2c3d4'), path.join(home, 'accounts', 'a1b2c3d4', 'queue'));
+  assert.equal(sessionStartCacheFile('a1b2c3d4'), path.join(home, 'accounts', 'a1b2c3d4', 'session-start.json'));
 });
 
 // The guarantee that a missed call site fails loudly instead of writing to a root-level file.
 test('3. a keyed accessor throws without a key', (t) => {
   makeHome(t);
-  for (const fn of [accountDir, trackingStateFile, queueDir]) {
+  for (const fn of [accountDir, trackingStateFile, sessionStartCacheFile, queueDir]) {
     assert.throws(() => fn(), /account key/i, `${fn.name}() must refuse a missing key`);
     assert.throws(() => fn(''), /account key/i, `${fn.name}('') must refuse an empty key`);
   }
@@ -56,5 +58,6 @@ test('4. a key outside the 8-hex shape is refused', (t) => {
   // the case above and still let `../etc` out of the account directory.
   assert.throws(() => queueDir('../etc'), /account key/i);
   assert.throws(() => trackingStateFile("a1b2'c3d"), /account key/i);
+  assert.throws(() => sessionStartCacheFile('../etc'), /account key/i);
   assert.throws(() => accountDir('a1b2c3d/'), /account key/i);
 });

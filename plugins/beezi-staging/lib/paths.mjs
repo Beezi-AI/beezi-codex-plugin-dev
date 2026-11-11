@@ -404,6 +404,25 @@ export function hookTrustFile() {
   return path.join(beeziCodexHome(), 'hook-trust.json');
 }
 
+// The upload worker's status record; its fields are listed where it is written (lib/upload-worker.mjs,
+// "The status file"). Machine-level — one worker
+// drains every account — and root-level for the pruneStale() reason above: an expiring backoff
+// would let an offline machine respawn a worker on every hook.
+export function uploadWorkerStatusFile() {
+  return path.join(beeziCodexHome(), 'upload-worker.json');
+}
+
+// One file per session whose network work is owed to the upload worker (lib/upload-due.mjs).
+// NOT under state/: the checkpoint and the poisoned-state quarantine scan state/<id>.json, so a
+// marker there would be read as session state.
+export function uploadDueDir() {
+  return path.join(beeziCodexHome(), 'upload-due');
+}
+
+export function uploadDueFile(sessionId) {
+  return path.join(uploadDueDir(), `${assertSessionId(sessionId)}.json`);
+}
+
 // ── the per-account layout ────────────────────────────────────────────────────────────────────
 //
 // Every identity-bound file lives under `accounts/<key>/`; only the index and its migration
@@ -456,6 +475,14 @@ export function coverageFile(key, tenantId = null) {
 // failing call. Never holds a token.
 export function authStateFile(key) {
   return path.join(accountDir(key), 'auth-state.json');
+}
+
+// The answers SessionStart prints from, per account: the last whoami verdict and identity and the
+// last /repos/status answers. Written only by the upload worker's session-start step
+// (lib/session-start-upload.mjs), read by the hook, so the hook needs no credential and no request.
+// Never holds a token.
+export function sessionStartCacheFile(key) {
+  return path.join(accountDir(key), 'session-start.json');
 }
 
 export function usagePendingFile(key) {

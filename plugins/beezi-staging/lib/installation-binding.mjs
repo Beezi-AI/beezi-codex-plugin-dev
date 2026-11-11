@@ -1,10 +1,13 @@
 import { apiBase, ENDPOINTS } from './config.mjs';
-import { postJson } from './http.mjs';
+import { postJson, POST_TIMEOUT_MS } from './http.mjs';
+import { getDefaultKey as _getDefaultKey } from './accounts.mjs';
 import {
   recordIssue as _recordIssue,
   DIAGNOSTIC_CODES,
   AUTH_REASONS,
   CORRELATION_CONSENT_VERSION,
+  diagnosticsSession,
+  isCorrelationGranted,
 } from './diagnostics.mjs';
 import { ensureInstallationId, markBound, needsBinding, rotateInstallationId } from './installation-id.mjs';
 
@@ -68,4 +71,29 @@ export async function bindInstallationIfNeeded(session, deps = {}) {
     httpStatus: status,
   });
   return { status: 'failed' };
+}
+
+/**
+ * The binding as a reporting path runs it, once its own sends are done: with correlation granted
+ * and time left, bind with the default account's tokened session among `sessions` (else the first
+ * tokened one), account-wide even when the session is a workspace clone. The non-local checkpoint
+ * (track) and the upload worker's `installation-binding` step both call this, so they pick the
+ * same account. `deps.deadline` (epoch ms, null = none) bounds it, and the request timeout is cut
+ * to what is left of it; `deps.getDefaultKey` is a test seam. Never throws.
+ */
+export async function bindInstallationForSessions(sessions, deps = {}) {
+  const now = deps.now == null ? Date.now : deps.now;
+  const deadline = deps.deadline == null ? null : deps.deadline;
+  const timeLeft = () => (deadline === null ? null : deadline - now());
+  try {
+    if (!isCorrelationGranted() || (deadline !== null && timeLeft() <= 0)) return { status: 'skipped' };
+    const defaultKey = await (deps.getDefaultKey == null ? _getDefaultKey : deps.getDefaultKey)(deps);
+    if (deadline !== null && timeLeft() <= 0) return { status: 'skipped' };
+    const timeoutMs = deadline === null ? POST_TIMEOUT_MS : Math.max(1, Math.min(POST_TIMEOUT_MS, timeLeft()));
+    const tokened = (Array.isArray(sessions) ? sessions : []).filter((session) => session && session.token);
+    const diagnostic = diagnosticsSession(tokened, defaultKey);
+    return await bindInstallationIfNeeded(diagnostic && { ...diagnostic, tenantId: null }, { ...deps, timeoutMs });
+  } catch {
+    return { status: 'failed' };
+  }
 }

@@ -9,7 +9,7 @@ import { runPendingHistory } from '../lib/pending-history-run.mjs';
 
 // PK5 and PK6 (decisions 2026-10-22): no typed account identifier is ever sent, and no history run uploads a session
 // the developer did not say yes to, outside live tracking. The one upload without a yes is a workspace whose fresh
-// answer (the run's own whoami) is `upload`.
+// answer (the run's own whoami) is `upload`, or the setup's consented run after the developer answered what to track.
 
 const libDir = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..', 'lib');
 const readLib = (name) => fs.readFileSync(path.join(libDir, name), 'utf-8');
@@ -71,6 +71,7 @@ const AuditForm = Object.freeze({
   LIVE: 'live',
   CONSENTED: 'consented',
   FORWARDER: 'forwarder',
+  NO_DRAIN: 'noDrain',
 });
 
 function formOf({ name, text }) {
@@ -78,6 +79,8 @@ function formOf({ name, text }) {
   if (name === 'rollout-watcher.mjs' && setsLast(text, 'scope: HistoryScope.LIVE')) return AuditForm.LIVE;
   if (name === 'pending-history-run.mjs' && text === 'runAudit({ runCache }, { ...options, key })') return AuditForm.CONSENTED;
   if (name === 'history-cli.mjs' && text === 'runAudit({ ...auditDeps, onProgress: printProgress }, auditOptions)') return AuditForm.FORWARDER;
+  // The watcher's pending-history forwarder: the consented options unchanged, plus only the queue options after them.
+  if (name === 'rollout-watcher.mjs' && text === 'runAudit(auditDeps, { ...auditOptions, drainQueue: false, queuedBefore })') return AuditForm.NO_DRAIN;
   return null;
 }
 
@@ -87,8 +90,8 @@ test('PK6: every runAudit call in lib/ lists only, runs LIVE, or uploads a conse
   assert.deepEqual(forms.filter((c) => c.form == null), [], 'an unclassified runAudit call');
   const count = (form) => forms.filter((c) => c.form === form).length;
   assert.deepEqual(
-    { listOnly: count(AuditForm.LIST_ONLY), live: count(AuditForm.LIVE), consented: count(AuditForm.CONSENTED), forwarder: count(AuditForm.FORWARDER) },
-    { listOnly: 1, live: 3, consented: 1, forwarder: 1 },
+    { listOnly: count(AuditForm.LIST_ONLY), live: count(AuditForm.LIVE), consented: count(AuditForm.CONSENTED), forwarder: count(AuditForm.FORWARDER), noDrain: count(AuditForm.NO_DRAIN) },
+    { listOnly: 1, live: 3, consented: 1, forwarder: 1, noDrain: 1 },
   );
 });
 
@@ -121,10 +124,18 @@ const bodyOf = (src, fn) => {
   return start === -1 ? '' : src.slice(start, src.indexOf('\n}\n', start));
 };
 
-test('PK6: owePastSessions, the no-ask owe, is called once in lib/, inside uploadNoAsk', () => {
+test('PK6: owePastSessions, the owe without an offer, is called only by uploadNoAsk and the setup\'s consentedCommand', () => {
   const calls = callsOf('owePastSessions');
-  assert.deepEqual(calls.map((c) => c.name), ['history-cli.mjs']);
+  assert.deepEqual(calls.map((c) => c.name), ['history-cli.mjs', 'history-cli.mjs']);
   assert.ok(bodyOf(calls[0].src, 'uploadNoAsk').includes('owePastSessions('));
+  const consented = bodyOf(calls[0].src, 'consentedCommand');
+  assert.ok(consented.includes('owePastSessions('));
+  // It owes only from the answered listing record, and only the recorded ids among those routed there now.
+  assert.ok(consented.includes('const listing = await takeAnsweredListing(row.key);\n  if (listing === null) return printUploading([], 0);'));
+  assert.ok(consented.includes('const shownIds = offerIdsOf(listing.sessionIds);'));
+  assert.ok(consented.includes('const listedIds = consentedIds(row, run.id, result.listed).filter((id) => shownIds.indexOf(id) !== -1);'));
+  assert.ok(consented.includes('owePastSessions(row.key, run.id, listedIds, kinds, nowIso, changedAt)'));
+  assert.ok(consented.indexOf('takeAnsweredListing(') < consented.indexOf('owePastSessions('));
 });
 
 // The name of the function declared last before `at` in `src`.

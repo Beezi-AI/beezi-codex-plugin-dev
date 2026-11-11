@@ -1,16 +1,16 @@
 import { consentPrompt, correlationPrompt } from './diagnostics.mjs';
 import { fetchCompat } from './fetch-compat.mjs';
-import { checkForUpdate as _checkForUpdate, updateNotice } from './update-check.mjs';
+import { checkForUpdate as _checkForUpdate, updateNotice, cachedUpdate, installedPlugin } from './update-check.mjs';
+import { compareVersions } from './version-compare.mjs';
 import fs from 'fs';
 import path from 'path';
 import { getAuthentication as _getAuthentication } from './token.mjs';
-import {
-  linkedSessions as _linkedSessions,
-  listAccounts as _listAccounts,
-  updateAccount as _updateAccount,
-  AccountStatus,
-} from './accounts.mjs';
-import { flushQueue, SESSION_LOCK_LEASE_MS } from './checkpoint.mjs';
+import { updateAccount as _updateAccount, rowSessionFields } from './accounts.mjs';
+import { listRecipients, SESSION_LOCK_LEASE_MS } from './checkpoint.mjs';
+import { markUploadDue as _markUploadDue } from './upload-due.mjs';
+import { readUploadStatus, writeUploadStatus } from './upload-worker.mjs';
+import { readSessionStartCache, writeSessionStartCache } from './session-start-upload.mjs';
+import { readAuthState } from './telemetry-auth.mjs';
 import { git as _git, resolveOriginRemote } from './git.mjs';
 import { resolveRepoRoot } from './repo-timeline.mjs';
 import {
@@ -119,24 +119,42 @@ export function discoverRepos(cwd, gitImpl, map, deps = {}) {
   return { map, dirty };
 }
 
-// The remote is resolved ONCE by the caller and handed in: it is a git shell-out and it is the
-// same answer for every linked account, so resolving it per account would multiply a subprocess
-// inside the hook budget by however many workspaces happen to be linked.
-async function announceRepo(remote, session, fetchImpl) {
+function isPlainObject(value) {
+  return value != null && typeof value === 'object' && !Array.isArray(value);
+}
+
+// The upload worker's /repos/status answer for one target, by the remote it was asked about. The
+// repo→project mapping is a fact about a TENANT, so the target's workspace is part of the key.
+const repoKey = (target, remote) => `${target.tenantId == null ? '' : target.tenantId}|${remote}`;
+
+// Both branches are informational only. Nothing downstream gates on `connected`: the checkpoint
+// reports every branch of every repo, and work with no origin at all under a `local:<folder>`
+// remote. Saying "no analytics tracked here" would be false.
+function repoLine(answer) {
+  return answer.connected
+    ? `Beezi: repo connected${answer.projectName ? ` to "${answer.projectName}"` : ''}. Sessions here are tracked.`
+    : 'Beezi: this repo is not connected to a Beezi project. Sessions are still tracked, against the repo itself.';
+}
+
+const repoAnswersOf = (cache) => (cache && isPlainObject(cache.repos) ? cache.repos : null);
+
+// The line for a target from the last answer the worker cached; none for a remote never asked about.
+function cachedRepoLine(cache, target, remote) {
   if (!remote) return null; // not a git repo — silent
+  const repos = repoAnswersOf(cache);
+  const answer = repos == null ? null : repos[repoKey(target, remote)];
+  return isPlainObject(answer) ? repoLine(answer) : null;
+}
+
+// The worker side. The remote is resolved ONCE by the caller and handed in: it is a git shell-out
+// and it is the same answer for every linked account. postJson, not a bare fetch: a stalled API
+// must fail into the silent "offline" null, not hold the worker's run open.
+async function probeRepo(remote, session, fetchImpl) {
   try {
-    // postJson, not a bare fetch: this runs inside the SessionStart hook's 10s budget, and an
-    // unbounded request against a stalled API would hold the whole turn open rather than
-    // degrading to the silent "offline" path below.
     const res = await postJson(`${apiBase()}${ENDPOINTS.reposStatus}`, session, { remote }, { fetchImpl });
     if (!res.ok) return null;
-    const { connected, projectName } = await res.json();
-    // Both branches are informational only. Nothing downstream gates on `connected`: the
-    // checkpoint reports every branch of every repo, and work with no origin at all under a
-    // `local:<folder>` remote. Saying "no analytics tracked here" would be false.
-    return connected
-      ? `Beezi: repo connected${projectName ? ` to "${projectName}"` : ''}. Sessions here are tracked.`
-      : 'Beezi: this repo is not connected to a Beezi project. Sessions are still tracked, against the repo itself.';
+    const body = await res.json();
+    return isPlainObject(body) ? body : null;
   } catch { return null; } // offline — silent
 }
 
@@ -257,9 +275,99 @@ function readAuthFileMtimeMs() {
   }
 }
 
+const isTemporary = (state) => state === 'unavailable' || state === 'refreshing';
+
+const TEMPORARY_MESSAGE = 'Beezi authentication is temporarily unavailable or refreshing. Your saved link is preserved; analytics will retry.';
+const REJECTED_MESSAGE = '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.';
+export const NOT_LINKED_MESSAGE = '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Ask Beezi to sign you in.';
+
+// A refusal the worker cached that still describes this link. Login rewrites the verdict on both
+// re-login branches; this is the second guard, for a cache written by a worker run that raced the
+// login or for a login that could not write it: a refusal reached under another client than the
+// row's (a re-login re-arms the key with a new one) or before the account was linked is stale.
+function isCurrentRefusal(cache, account) {
+  if (cache.verdict !== 'rejected' && cache.verdict !== 'temporary') return false;
+  if (cache.clientId != null && account.clientId != null && cache.clientId !== account.clientId) return false;
+  const linkedAt = typeof account.linkedAt === 'string' ? Date.parse(account.linkedAt) : NaN;
+  return !(isFinite(linkedAt) && linkedAt > Number(cache.checkedAt));
+}
+
+const temporaryLine = (account) => `Beezi: ${workspaceLabel(account)} is temporarily unavailable or refreshing — its analytics will retry.`;
+const rejectedLine = (account) => `⚠ Beezi: ${workspaceLabel(account)} is not reporting — its link was rejected. Ask Beezi to sign you in again.`;
+
+// Why an account produced no token, from the token module's own record of its last answer
+// (accounts/<key>/auth-state.json, written by every getAuthentication — the upload worker's
+// included). Reading it is not a credential read. Never recorded reads as ready: a check that
+// could not run stays silent, as it always did.
+function lastAuthStateOf(key) {
+  try {
+    const state = readAuthState(key).lastState;
+    return typeof state === 'string' ? state : null;
+  } catch {
+    return null;
+  }
+}
+
+const producesToken = (state) => state == null || state === 'ready';
+
+/**
+ * The linked accounts that can produce a token, as far as their last recorded authentication says
+ * — the index and one small file per account, no credential read. Tokenless rows (token: null),
+ * for the SessionStart prompts, which only need to know who is linked and usable.
+ */
+export async function usableSessions(deps = {}) {
+  let rows;
+  try { rows = orDefault(await listRecipients([], deps), []); } catch { rows = []; }
+  return rows.filter((row) => producesToken(lastAuthStateOf(row.key)));
+}
+
+// One clone per target workspace that tracks live, and none for an account still waiting for the
+// user's answer. Only this session's own rule scopes requests; the row's web-side tenantId never does.
+function liveTargets(active, workspaceState, trackingByKey) {
+  return expandTargets(active, workspaceState)
+    .filter((target) => allowsLiveFor(target, trackingByKey.get(target.key)));
+}
+
+/**
+ * The migration notice the upload worker recorded when ITS guard migrated this data root, once.
+ * The hook runs only the credential-free guard, which never migrates, so this is how a migration
+ * the worker performed reaches the user: on the next SessionStart. → the text, or null. Never throws.
+ */
+export function takeMigrationNotice() {
+  try {
+    const notice = readUploadStatus().migrationNotice;
+    if (typeof notice !== 'string' || notice === '') return null;
+    writeUploadStatus({ migrationNotice: null });
+    return notice;
+  } catch {
+    return null;
+  }
+}
+
+// The update notice from the last check the worker made (update-check.json), with no request: the
+// installed version against the last published one it saw. Null unless that one is newer.
+function cachedUpdateNotice(deps) {
+  try {
+    const state = cachedUpdate(deps);
+    const installed = installedPlugin(deps);
+    if (!installed || typeof state.latest !== 'string') return null;
+    if (compareVersions(installed.version, state.latest) !== -1) return null;
+    return updateNotice({ status: 'behind', current: installed.version, latest: state.latest });
+  } catch {
+    return null;
+  }
+}
+
 // Returns an optional systemMessage string (or null). Never throws for expected failures.
+//
+// READS NO CREDENTIAL AND MAKES NO REQUEST. What it used to ask the portal — whoami per account,
+// the forced renewal, /repos/status, the account check-in, the update check — and the queue drain
+// now run in the upload worker (runSessionStartUpload below, and the worker's `queue` step), which
+// this hook hands the session to with a `sessionStart` due marker. What it prints from those
+// answers is the last one the worker cached, so a change the portal reports shows one session later.
+// What stays here is local: state init, the repo-map pre-warm, the banner, the billing realignment
+// and its gated `codex app-server` probe (a subprocess, not a credential read), the nudges.
 export async function runSessionStart(input, deps = {}) {
-  const fetchImpl = deps.fetchImpl || fetchCompat;
   const gitImpl = orDefault(deps.gitImpl, _git);
   const resolveSource = orDefault(deps.resolveSource, _resolveSource);
   const readBillingConfig = orDefault(deps.readBillingConfig, _readBillingConfig);
@@ -271,96 +379,75 @@ export async function runSessionStart(input, deps = {}) {
   // would SPAWN A REAL `codex app-server` from the test suite, which tools/hermetic-env.mjs records
   // as an escape to the developer's own ~/.codex.
   const readAccountViaAppServer = orDefault(deps.readAccountViaAppServer, _readAccountViaAppServer);
-  const syncAccount = orDefault(deps.syncAccount, _syncAccountIfNeeded);
   const readAuthMtime = orDefault(deps.readAuthFileMtimeMs, readAuthFileMtimeMs);
   // Threaded rather than read inside the ladder: step 1 of resolveSource is an environment lookup
   // (`resolveSource` in billing-config.mjs) and a caller with a resolved environment must be able
   // to hand it over instead of having the host's consulted behind its back (G-10-1 L3).
   const env = orDefault(deps.env, process.env);
-  const checkForUpdate = orDefault(deps.checkForUpdate, _checkForUpdate);
+  const markUploadDue = orDefault(deps.markUploadDue, _markUploadDue);
 
-  const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
-  const listAccounts = orDefault(deps.listAccounts, _listAccounts);
-  const authenticate = orDefault(deps.getAuthentication, _getAuthentication);
-
-  // Every account that can currently produce a token. linkedSessions DROPS one it cannot — that is
-  // what keeps a single failing account from costing the whole hook — so an account missing from
-  // this list still has to be explained, below, or a machine whose only account is mid-refresh
-  // would be told it is "not linked" and the user sent to sign in again for nothing.
-  let sessions;
-  try { sessions = orDefault(await listSessions(deps), []); } catch { sessions = []; }
-  let indexed;
-  try { indexed = orDefault(await listAccounts(deps), []); } catch { indexed = []; }
-  const linked = indexed.filter((account) => account.status !== AccountStatus.REVOKED);
+  // Every linked account, tokenless: the index alone (listRecipients), never the credential store.
+  // Whether each can produce a token, and what the portal last said about it, is read below from
+  // what the token module and the upload worker left on disk.
+  let linked;
+  try { linked = orDefault(await listRecipients([], deps), []); } catch { linked = []; }
   const many = linked.length > 1;
 
-  // One authentication read per unresolved account, SERIALLY: getAuthentication takes
-  // `shared:token-refresh-<key>` when it renews, and two rank-3 locks under different names at
-  // once in one process is a 'lock-order' refusal rather than a wait.
-  const unresolved = [];
-  for (const account of linked) {
-    if (sessions.some((session) => session.key === account.key)) continue;
-    let state = 'unavailable';
-    try { state = orDefault((await authenticate(account.key, deps)).state, 'unavailable'); }
-    catch { state = 'unavailable'; }
-    unresolved.push({ account, state });
+  // Hand the network half to the upload worker (scripts/session-start.mjs starts it, last). Marked
+  // before any answer below, so a machine whose only account is mid-refresh still gets its retry.
+  // An unlinked machine owes the worker nothing.
+  if (linked.length > 0) {
+    try {
+      markUploadDue(input.session_id, {
+        transcriptPath: orDefault(input.transcript_path, null),
+        cwd: orDefault(input.cwd, null),
+        timeline: false,
+        sessionStart: true,
+      });
+    } catch { /* best-effort: the session's next hook marks it again */ }
   }
-  const isTemporary = (state) => state === 'unavailable' || state === 'refreshing';
 
-  if (sessions.length === 0) {
-    if (unresolved.some((one) => isTemporary(one.state))) {
-      return 'Beezi authentication is temporarily unavailable or refreshing. Your saved link is preserved; analytics will retry.';
-    }
-    if (unresolved.some((one) => one.state === 'reauth_required')) {
-      return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.';
-    }
-    return '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Ask Beezi to sign you in.';
+  // An account that produced no token is explained rather than read as "not linked", or a machine
+  // whose only account is mid-refresh would send the user to sign in again for nothing. One whose
+  // token the portal refused on the worker's last check — still refused after one forced renewal —
+  // is named too. Every other account reports, with the identity its last valid whoami named.
+  const unresolved = [];
+  const refused = [];
+  const active = [];
+  const caches = new Map();
+  for (const account of linked) {
+    const state = lastAuthStateOf(account.key);
+    if (!producesToken(state)) { unresolved.push({ account, state }); continue; }
+    const cache = readSessionStartCache(account.key);
+    caches.set(account.key, cache);
+    if (isCurrentRefusal(cache, account)) { refused.push({ account, verdict: cache.verdict }); continue; }
+    // The row's session fields exactly as linkedSessions shapes them, then the identity overlay.
+    active.push(overlayWhoami({ ...account, ...rowSessionFields(account) }, cache.who));
+  }
+
+  if (unresolved.length === linked.length) {
+    if (unresolved.some((one) => isTemporary(one.state))) return TEMPORARY_MESSAGE;
+    if (unresolved.some((one) => one.state === 'reauth_required')) return REJECTED_MESSAGE;
+    return NOT_LINKED_MESSAGE;
   }
 
   // Lines about accounts that will not report this session. With one account linked these are the
-  // whole answer and the function has already returned above; past that point they ride alongside
-  // the accounts that DID resolve, because one broken workspace must not silence a working one.
+  // whole answer; with several they ride alongside the accounts that DID resolve, because one broken
+  // workspace must not silence a working one.
   const warnings = [];
   for (const one of unresolved) {
     if (!many) continue;
-    warnings.push(isTemporary(one.state)
-      ? `Beezi: ${workspaceLabel(one.account)} is temporarily unavailable or refreshing — its analytics will retry.`
-      : `⚠ Beezi: ${workspaceLabel(one.account)} is not reporting — its link was rejected. Ask Beezi to sign you in again.`);
+    warnings.push(isTemporary(one.state) ? temporaryLine(one.account) : rejectedLine(one.account));
   }
-
-  // The token check, per account and serially for the same lock-order reason as above.
-  const active = [];
-  for (const session of sessions) {
-    let current = session;
-    let who = await probeToken(session.key, current, fetchImpl, deps);
-    if (isRejected(who)) {
-      // The 401 is the server's verdict on the token; expires_at was only ours, and a server that
-      // omits expires_in leaves it a guess. Take the server's word and refresh once before
-      // declaring the link bad — otherwise a token that died earlier than we estimated is never
-      // renewed, and every session reports a rejection that a single refresh would have fixed.
-      const retry = await authenticate(session.key, deps, { forceRefresh: true })
-        .catch(() => ({ state: 'unavailable' }));
-      if (!retry.accessToken && isTemporary(retry.state)) {
-        if (!many) return 'Beezi authentication is temporarily unavailable or refreshing. Your saved link is preserved; analytics will retry.';
-        warnings.push(`Beezi: ${workspaceLabel(session)} is temporarily unavailable or refreshing — its analytics will retry.`);
-        continue;
-      }
-      const refreshed = retry.accessToken;
-      if (refreshed) who = await probeToken(session.key, { ...current, token: refreshed }, fetchImpl, deps);
-      if (!refreshed || isRejected(who)) {
-        if (!many) return '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.';
-        warnings.push(`⚠ Beezi: ${workspaceLabel(session)} is not reporting — its link was rejected. Ask Beezi to sign you in again.`);
-        continue;
-      }
-      current = { ...current, token: refreshed };
-    }
-    active.push(overlayWhoami(current, who));
+  for (const one of refused) {
+    if (!many) return one.verdict === 'temporary' ? TEMPORARY_MESSAGE : REJECTED_MESSAGE;
+    warnings.push(one.verdict === 'temporary' ? temporaryLine(one.account) : rejectedLine(one.account));
   }
   if (active.length === 0) return warnings.length ? warnings.join('\n') : null;
 
   // Best-effort like every other write here: writeJsonSecure refuses to overwrite a file it could
   // not replace atomically, and losing this mapping costs one checkpoint's cwd hint — not the
-  // flush, the repo probe or the billing capture below.
+  // repo-map pre-warm or the billing capture below.
   try {
     initSessionState(input.session_id, {
       cwd: orDefault(input.cwd, null),
@@ -368,38 +455,29 @@ export async function runSessionStart(input, deps = {}) {
     });
   } catch { /* best-effort */ }
 
-  // Only this session's own rule scopes requests; the row's web-side tenantId never does. One clone
-  // per target workspace that tracks live — the tracking state was just refreshed by the whoami
-  // above — and none for an account still waiting for the user's answer.
+  // The tracking state is the one the worker's last whoami refreshed.
   let workspaceState = null;
   try { workspaceState = readSessionWorkspace(input.session_id); } catch { workspaceState = null; }
   const trackingByKey = new Map(active.map((session) => [session.key, trackingOf(session.key)]));
-  const targetSessions = expandTargets(active, workspaceState)
-    .filter((target) => allowsLiveFor(target, trackingByKey.get(target.key)));
+  const targetSessions = liveTargets(active, workspaceState, trackingByKey);
 
-  // The repo's origin: one git shell-out for the machine, then one probe per platform target, because
-  // the repo→project mapping is a fact about a TENANT and two workspaces answer it differently.
+  // The repo's origin, one git shell-out for the machine — and only when a probing target has a
+  // cached answer the line could come from.
   let remote = null;
-  if (targetSessions.some(probesRepo)) {
+  if (targetSessions.some((target) => probesRepo(target) && repoAnswersOf(caches.get(target.key)) != null)) {
     try { remote = resolveOriginRemote(gitImpl, input.cwd); } catch { remote = null; }
   }
 
-  // SERIAL over the accounts: flushQueue takes `shared:queue-<key>`, rank 3, so two drains at once
-  // in this one process would be refused as 'lock-order' — an account silently not uploading,
-  // which is the exact failure the fan-out exists to prevent. The drain is once per account (it
-  // routes each queued file itself); the repo probe carries no lock, so one per target clone rides
-  // along inside its account's turn.
+  // One line per target clone, in account order: the anonymized notice, or the last /repos/status
+  // answer the worker cached for that workspace and remote.
   const announcements = [];
   for (const session of active) {
-    const targets = targetSessions.filter((target) => target.key === session.key);
-    const [, ...lines] = await Promise.all([
-      flushQueue(session.key, session, { fetchImpl }),
-      ...targets.map((target) => (probesRepo(target) ? announceRepo(remote, target, fetchImpl) : null)),
-    ]);
-    targets.forEach((target, i) => {
-      const line = isAnonymizedTarget(target) ? ANONYMIZED_LINE : lines[i];
+    for (const target of targetSessions.filter((one) => one.key === session.key)) {
+      const line = isAnonymizedTarget(target)
+        ? ANONYMIZED_LINE
+        : (probesRepo(target) ? cachedRepoLine(caches.get(target.key), target, remote) : null);
       if (line) announcements.push(announceLine(target, line, many));
-    });
+    }
   }
   try { pruneStale(); } catch { /* best-effort */ }
 
@@ -430,10 +508,6 @@ export async function runSessionStart(input, deps = {}) {
   // a disk failure must not break session start.
   let billingConfig = null;
   let billingSource = BillingSource.UNKNOWN;
-  // Whether the auto-capture below learned information outside an auth-file change that needs an
-  // immediate check-in. Auth-file validation relies on the payload hash, so a token-only rewrite
-  // does not create network traffic; a true first sync has no matching marker and posts anyway.
-  let forceAccountSync = false;
   try {
     billingConfig = readBillingConfig();
     billingSource = resolveSource(billingConfig, env);
@@ -504,9 +578,6 @@ export async function runSessionStart(input, deps = {}) {
           : config;
         writeBillingConfig(captured);
         billingConfig = captured;
-        // A changed auth file already changes the payload hash when the identity or plan changed.
-        // Do not force its check-in: a token-only refresh should remain a zero-network event.
-        forceAccountSync = !authChangeNeedsProbe;
         // RE-RESOLVE on the config we just wrote. The capture can teach the ladder something it
         // did not know a moment ago — step 4b reads the `authType` only a live app-server reading
         // can record — and on a machine with no auth.json that is the difference between
@@ -526,43 +597,6 @@ export async function runSessionStart(input, deps = {}) {
     }
   } catch { /* best-effort */ }
 
-  // Tell Beezi which ChatGPT account and plan this machine is on (G-2-1). Best-effort and gated:
-  // its steady state — unchanged payload, checked in within the week — is two reads and NO network.
-  //
-  // Three things travel that are not optional:
-  //   fetchImpl / readChatgptAuth — the seams this hook already threads. A bare call would run the
-  //                                  real reader and the real fetch, reopening exactly the
-  //                                  hermeticity class G-10-1 closed on this path.
-  //   timeoutMs: 1500              — a refusal never seals the marker, so an unreachable API would
-  //                                  otherwise cost the full POST_TIMEOUT_MS on EVERY session start,
-  //                                  forever, inside the hook's 10s budget.
-  //   readBillingConfig            — reuses the config this hook just resolved: one fewer read, and
-  //                                  the check-in cannot disagree with the hook about the plan. If
-  //                                  the billing try threw before its read, billingConfig is null
-  //                                  and the module falls through to the id_token decode, which is
-  //                                  the correct answer for a machine with no config.
-  //
-  // `force` is reserved for periodic/non-file captures. An auth-file revalidation already moves the
-  // payload hash when account or plan changed; leaving force false keeps token-only refreshes
-  // network-free while still propagating an account switch in this run.
-  //
-  // One check-in per target clone (account and workspace), serially and awaited — the script exits
-  // as soon as this returns. The payload is the same for all of them — it describes the ChatGPT
-  // sign-in and plan this MACHINE is on — but the marker that suppresses a redundant POST is per
-  // account and workspace, so a workspace linked yesterday still gets its first check-in even
-  // though another was told the same thing last week. A clone the tracking policy darkens, or an
-  // account still waiting for its answer, checks in nowhere.
-  for (const target of targetSessions) {
-    try {
-      await syncAccount(target.key, target, { force: forceAccountSync }, {
-        fetchImpl,
-        readChatgptAuth,
-        readBillingConfig: () => billingConfig,
-        timeoutMs: 1500,
-      });
-    } catch { /* best-effort */ }
-  }
-
   let message = [...warnings, banner, ...announcements].filter(Boolean).join('\n') || null;
   let nudge = null;
   if (billingSource === BillingSource.SUBSCRIPTION && isStale(billingConfig)) {
@@ -580,14 +614,220 @@ export async function runSessionStart(input, deps = {}) {
   }
   if (nudge) message = message ? `${message}\n${nudge}` : nudge;
 
-  // The stale-version check (G-8-4). Last, and deliberately after everything that reports
-  // analytics: it is the only thing here the user can act on outside this session, and it must
-  // never be the reason a checkpoint did not flush. At most one request an hour, bounded at 1.5s,
-  // and silent on every outcome except a published version newer than this one.
-  try {
-    const update = updateNotice(await checkForUpdate({ fetchImpl }));
-    if (update) message = message ? `${message}\n${update}` : update;
-  } catch { /* best-effort */ }
+  // The stale-version check (G-8-4), last: it is the only thing here the user can act on outside
+  // this session. From the answer the worker's check cached — silent on every outcome except a
+  // published version newer than this one.
+  const update = cachedUpdateNotice(deps);
+  if (update) message = message ? `${message}\n${update}` : update;
   const prompts = [consentPrompt(), correlationPrompt()].filter(Boolean);
   return [message, ...prompts].filter(Boolean).join('\n\n') || null;
+}
+
+// ── The worker half (the upload worker's `session-start` due handler) ─────────────────────────────
+//
+// lib/session-start-upload.mjs loads this on the first session-start marker it handles. It runs
+// inside the upload worker, after the worker's full environment guard and with the run's tokened
+// sessions (`ctx.sessions`, one credential read per account per run), and leaves on disk what
+// runSessionStart above prints next time.
+
+// Per worker run (keyed on the run's `ctx.sessions` array, one per run): each account's token check
+// and the update check happen once, however many sessions started.
+const uploadRuns = new WeakMap();
+
+function uploadRunOf(ctx) {
+  let run = uploadRuns.get(ctx.sessions);
+  if (!run) {
+    run = { probed: new Map(), updateChecked: false };
+    uploadRuns.set(ctx.sessions, run);
+  }
+  return run;
+}
+
+// What a valid whoami said about who the account is: overlaid on the index row by the next start.
+function identityOf(who) {
+  return {
+    valid: true,
+    email: orDefault(who.email, null),
+    name: orDefault(who.name, null),
+    tenantName: orDefault(who.tenantName, null),
+    tenants: orDefault(who.tenants, null),
+    anonymization: orDefault(who.anonymization, null),
+  };
+}
+
+// The token check for one account, cached: → the session to report with (the renewed token, the
+// whoami identity overlaid), or null when the portal refused it.
+//
+// whoami reports invalid for any 401/403 — an expired token as well as a permissions or
+// wrong-environment refusal — so this only decides what to TELL the user; discarding credentials is
+// left to the token endpoint naming the grant revoked. The 401 is the server's verdict on the
+// token; expires_at was only ours, and a server that omits expires_in leaves it a guess. So the
+// token is renewed once before the link is called bad — otherwise a token that died earlier than
+// estimated is never renewed, and every session reports a rejection a single refresh would fix.
+// `guardChecked`: the worker ran the full guard before its run, and it passed.
+async function checkAccount(session, fetchImpl, deps, now) {
+  const authenticate = orDefault(deps.getAuthentication, _getAuthentication);
+  let current = session;
+  let who = await probeToken(session.key, current, fetchImpl, deps);
+  let verdict = 'ok';
+  if (isRejected(who)) {
+    let retry = null;
+    try { retry = await authenticate(session.key, deps, { forceRefresh: true, guardChecked: true }); } catch { retry = null; }
+    if (!isPlainObject(retry)) retry = { state: 'unavailable' };
+    if (!retry.accessToken && isTemporary(retry.state)) {
+      verdict = 'temporary';
+    } else {
+      const refreshed = retry.accessToken;
+      if (refreshed) who = await probeToken(session.key, { ...current, token: refreshed }, fetchImpl, deps);
+      if (!refreshed || isRejected(who)) verdict = 'rejected';
+      else current = { ...current, token: refreshed };
+    }
+  }
+  // An unreachable whoami (null) still reads as fine, and keeps the identity the last valid one named.
+  const valid = (who || {}).valid === true;
+  writeSessionStartCache(session.key, {
+    checkedAt: now(),
+    verdict,
+    // The client the verdict was reached under: a re-login re-arms the key with a new one.
+    clientId: orDefault(current.clientId, null),
+    who: valid ? identityOf(who) : orDefault(readSessionStartCache(session.key).who, null),
+  });
+  return verdict === 'ok' ? overlayWhoami(current, who) : null;
+}
+
+// The sessions whose WHOLE start this account took part in, kept in its cache as `completed`:
+// { '<sessionId>': <markedAt of the marker handled> }. Recorded only when the handler finished every
+// step for that marker, and keyed on the session because the repo probe is the session's own (its
+// cwd): another session's finished start says nothing about it. The marker's `markedAt`, not the
+// clock, so a re-mark that lands mid-run is never counted as done. whoami's `checkedAt` is only
+// whoami's. At most this many, newest marks kept: dropping one only means its work runs again.
+export const START_DONE_MAX = 64;
+
+function startDoneMap(key) {
+  const done = readSessionStartCache(key).completed;
+  return isPlainObject(done) ? done : {};
+}
+
+// → the markedAt this account's last finished start for `sessionId` covered, or NaN.
+function startDoneFor(key, sessionId) {
+  const done = startDoneMap(key);
+  return typeof sessionId === 'string' && Object.prototype.hasOwnProperty.call(done, sessionId) ? Number(done[sessionId]) : NaN;
+}
+
+function recordStartDone(key, sessionId, markedAt) {
+  if (typeof sessionId !== 'string' || !isFinite(markedAt)) return;
+  const merged = Object.assign({}, startDoneMap(key), { [sessionId]: markedAt });
+  const newest = Object.keys(merged)
+    .filter((id) => isFinite(Number(merged[id])))
+    .sort((a, b) => Number(merged[b]) - Number(merged[a]))
+    .slice(0, START_DONE_MAX);
+  const completed = {};
+  for (const id of newest) completed[id] = Number(merged[id]);
+  writeSessionStartCache(key, { completed });
+}
+
+function cacheRepoAnswer(target, remote, answer, at) {
+  const cache = readSessionStartCache(target.key);
+  const repos = Object.assign({}, repoAnswersOf(cache), {
+    [repoKey(target, remote)]: { connected: Boolean(answer.connected), projectName: orDefault(answer.projectName, null), checkedAt: at },
+  });
+  writeSessionStartCache(target.key, { repos });
+}
+
+/**
+ * The network half of one session's start, for a due marker with `sessionStart: true`:
+ * (entry, ctx) → { settled }. Unsettled only when the run's deadline cut it short — an offline
+ * portal settles (it was silent in the hook too, and the session's next start re-marks).
+ *
+ * Idempotent across runs: a marker that outlives the run that handled it (kept for its timeline or
+ * a checkpoint that did not commit) reaches every later run's handlers, and settles at once when
+ * every account finished this session's whole start for this mark or a later one (`completed`). A
+ * run cut short after whoami records nothing, so the next run does the rest.
+ */
+export async function runSessionStartUpload(entry, ctx) {
+  const deps = orDefault(ctx.deps, {});
+  const now = orDefault(ctx.now, Date.now);
+  const deadline = typeof ctx.deadline === 'number' ? ctx.deadline : Infinity;
+  const past = () => now() >= deadline;
+  const fetchImpl = orDefault(ctx.fetchImpl, fetchCompat);
+  const sessions = (Array.isArray(ctx.sessions) ? ctx.sessions : []).filter((s) => s != null && s.token);
+  if (sessions.length === 0) return { settled: true };
+  const run = uploadRunOf(ctx);
+  const markedAt = Number(entry.markedAt);
+  if (sessions.every((s) => startDoneFor(s.key, entry.sessionId) >= markedAt)) return { settled: true };
+  const complete = () => {
+    for (const s of sessions) recordStartDone(s.key, entry.sessionId, markedAt);
+    return { settled: true };
+  };
+
+  // The token check, per account and SERIALLY: getAuthentication takes `shared:token-refresh-<key>`
+  // when it renews, and two rank-3 locks under different names at once in one process is a
+  // 'lock-order' refusal rather than a wait.
+  const active = [];
+  for (const session of sessions) {
+    let checked = run.probed.get(session.key);
+    if (checked === undefined) {
+      if (past()) return { settled: false };
+      checked = await checkAccount(session, fetchImpl, deps, now);
+      run.probed.set(session.key, checked);
+    }
+    if (checked !== null) active.push(checked);
+  }
+  if (active.length === 0) return complete();
+
+  let workspaceState = null;
+  try { workspaceState = readSessionWorkspace(entry.sessionId); } catch { workspaceState = null; }
+  const trackingByKey = new Map(active.map((session) => [session.key, trackingOf(session.key)]));
+  const targetSessions = liveTargets(active, workspaceState, trackingByKey);
+
+  // The repo's origin: one git shell-out, in the session's own cwd (never the worker's), then one
+  // probe per platform target.
+  let remote = null;
+  if (entry.cwd && targetSessions.some(probesRepo)) {
+    try { remote = resolveOriginRemote(orDefault(deps.gitImpl, _git), entry.cwd); } catch { remote = null; }
+  }
+  if (remote) {
+    for (const target of targetSessions) {
+      if (!probesRepo(target)) continue;
+      if (past()) return { settled: false };
+      const answer = await probeRepo(remote, target, fetchImpl);
+      if (answer) cacheRepoAnswer(target, remote, answer, now());
+    }
+  }
+
+  // Tell Beezi which ChatGPT account and plan this machine is on (G-2-1). Gated in the module: its
+  // steady state — unchanged payload, checked in within the week — is two reads and NO network.
+  //   fetchImpl / readChatgptAuth — the run's seams; a bare call would reach the real ones.
+  //   timeoutMs: 1500 — a refusal never seals the marker, so an unreachable API costs this every run.
+  //   readBillingConfig — billing.json as SessionStart left it (its capture and realignment run in
+  //                       the hook), read once; null when unreadable, and the module falls through
+  //                       to the id_token decode.
+  //   force: false — the payload hash moves on any account or plan change. A capture that learned
+  //                  nothing new waits for the weekly resync instead of forcing a check-in.
+  // One check-in per target clone, serially: the suppression marker is per account and workspace.
+  const syncAccount = orDefault(deps.syncAccount, _syncAccountIfNeeded);
+  const readChatgptAuth = orDefault(deps.readChatgptAuth, _readChatgptAuth);
+  const readBillingConfig = orDefault(deps.readBillingConfig, _readBillingConfig);
+  let billingConfig = null;
+  try { billingConfig = readBillingConfig(); } catch { billingConfig = null; }
+  for (const target of targetSessions) {
+    if (past()) return { settled: false };
+    try {
+      await syncAccount(target.key, target, { force: false }, {
+        fetchImpl,
+        readChatgptAuth,
+        readBillingConfig: () => billingConfig,
+        timeoutMs: 1500,
+      });
+    } catch { /* best-effort */ }
+  }
+
+  // The stale-version check (G-8-4): at most one request an hour (its own gate), once per run.
+  if (!run.updateChecked) {
+    if (past()) return { settled: false };
+    run.updateChecked = true;
+    const checkForUpdate = orDefault(deps.checkForUpdate, _checkForUpdate);
+    try { await checkForUpdate({ fetchImpl }); } catch { /* best-effort */ }
+  }
+  return complete();
 }

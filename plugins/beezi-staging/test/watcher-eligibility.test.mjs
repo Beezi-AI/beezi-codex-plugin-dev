@@ -12,11 +12,15 @@ import { runCheckpoint } from '../lib/checkpoint.mjs';
 import { queueDir } from '../lib/paths.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
 import { writeTrackingState } from '../lib/tracking.mjs';
+import { listUploadDue } from '../lib/upload-due.mjs';
 
 // The pass resolves every linked account and hands the whole list to runCheckpoint, which fans the
 // one delta out into each of their queues. `linkedSessions` is therefore the seam that says
 // whether this machine is linked at all.
 const SESSION = accountSession(TEST_KEY, 'token');
+// Path A's checkpoints are local-only and queue for the accounts in the index (no credential read),
+// so the pass also asks the index: this is its answer, the same account, linked and tokenless.
+const ROW = { key: SESSION.key, email: SESSION.email, name: SESSION.name, tenantName: SESSION.tenantName, clientId: SESSION.clientId, status: 'linked' };
 
 
 // R2's eligibility matrix, driven through the watcher rather than through the coverage core.
@@ -60,6 +64,7 @@ function passDeps(overrides) {
   const deps = {
     now: () => NOW,
     linkedSessions: async () => [SESSION],
+    listAccounts: async () => [ROW],
     runCheckpoint: async (input, _d, options) => {
       calls.checkpoints.push({ id: input.session_id, options });
       return { outcome: 'committed', enqueued: 1, skipped: {} };
@@ -250,7 +255,8 @@ test('10. an unestablished QUIET session goes down the sync route, not a direct 
   assert.equal(calls.checkpoints.length, 0, 'no direct replay of history');
   // One repair pass PER ACCOUNT, each naming the account it uploads to: the audit uploads to the
   // account it was given, so a second linked workspace would never have its history repaired.
-  assert.deepEqual(calls.audits, [{ scope: 'live', liveOnly: true, key: SESSION.key }], 'exactly one audit, for the one linked account');
+  // drainQueue false: the upload worker drains the queue, never the watcher's history pass.
+  assert.deepEqual(calls.audits.map(({ queuedBefore, ...rest }) => rest), [{ scope: 'live', liveOnly: true, key: SESSION.key, drainQueue: false }], 'exactly one audit, for the one linked account');
   assert.equal(out.history.length, 1, 'one audit result per linked account is surfaced');
 });
 
@@ -300,7 +306,7 @@ test('13. an audit-only tenant gets no live capture from the watcher', async (t)
 
   assert.equal(calls.checkpoints.length, 0, 'no live checkpoint on a dark tenant');
   // The history route still runs, asking liveOnly so runAudit refuses an audit-only tenant itself (it alone knows the server's verdict).
-  assert.deepEqual(calls.audits, [{ scope: 'live', liveOnly: true, key: SESSION.key }]);
+  assert.deepEqual(calls.audits.map(({ queuedBefore, ...rest }) => rest), [{ scope: 'live', liveOnly: true, key: SESSION.key, drainQueue: false }]);
 });
 
 test('14. a missing tracking cache fails OPEN, matching lib/tracking.mjs\'s documented posture', async (t) => {
@@ -557,8 +563,11 @@ const KEY_B = 'b2c3d4e5';
 const LINK_A = NOW - 60 * MINUTE;
 const LINK_B = NOW - 50 * MINUTE;
 
-// The real runCheckpoint behind the watcher's seam, for accounts A and B; reports stay queued and only timeline posts answer.
+// The real runCheckpoint behind the watcher's seam, for accounts A and B. It is local-only: reports
+// stay queued, the session is marked due for the upload worker, and nothing is posted or drained.
 function twoAccountBench(m) {
+  linkAccount(m.home, TEST_KEY);
+  linkAccount(m.home, KEY_B);
   const bearers = [];
   const drained = [];
   const timeline = path.join(m.home, 'timeline.jsonl');
@@ -588,7 +597,9 @@ function twoAccountBench(m) {
   };
   const { deps } = passDeps({
     linkedSessions: accounts,
-    runCheckpoint: (input, d, options) => runCheckpoint(input, { ...d, ...seams }, options),
+    listAccounts: undefined,
+    maybeSpawnUploadWorker: () => 'disabled',
+    runCheckpoint: (input, d, options) => runCheckpoint(input, { ...d, ...seams, maybeSpawnUploadWorker: () => 'disabled' }, options),
   });
   return { deps, bearers, drained };
 }
@@ -604,7 +615,7 @@ function linkTwoAccounts(m, id, mtimeMs) {
   writeCursor(m, id, 0);
 }
 
-test('26. an established session last written between two links is sent to the earlier account only', async (t) => {
+test('26. an established session last written between two links is queued for the earlier account only', async (t) => {
   const m = makeMachine(t);
   const id = uuid(99);
   linkTwoAccounts(m, id, LINK_A + 5 * MINUTE);
@@ -615,11 +626,13 @@ test('26. an established session last written between two links is sent to the e
   assert.equal(out.succeeded, 1);
   assert.ok(queued(TEST_KEY).length > 0, 'A gets the segments');
   assert.deepEqual(queued(KEY_B), [], 'B, linked after the last write, gets no file');
-  assert.deepEqual(bench.bearers, ['Bearer tok-a'], 'the timeline reaches A only');
-  assert.deepEqual(bench.drained, [TEST_KEY]);
+  // One drainer: the watcher posts no timeline and drains no rate-limit row; the worker owes both.
+  assert.deepEqual(bench.bearers, []);
+  assert.deepEqual(bench.drained, []);
+  assert.deepEqual(listUploadDue().map((e) => [e.sessionId, e.timeline]), [[id, true]]);
 });
 
-test('27. once the session is written again after the later link, the next pass sends to both', async (t) => {
+test('27. once the session is written again after the later link, the next pass queues for both', async (t) => {
   const m = makeMachine(t);
   const id = uuid(100);
   linkTwoAccounts(m, id, LINK_A + 5 * MINUTE);
@@ -630,7 +643,7 @@ test('27. once the session is written again after the later link, the next pass 
   await runWatchPass(bench.deps, opts(m));
 
   assert.ok(queued(KEY_B).length > 0, 'the resumed session is live for B');
-  assert.deepEqual(bench.bearers.slice().sort(), ['Bearer tok-a', 'Bearer tok-b']);
+  assert.deepEqual(bench.bearers, [], 'the upload worker, not the watcher, sends it');
 });
 
 test('28. an established session last written before every link is observed without a checkpoint, freeing its slot', async (t) => {
@@ -664,7 +677,8 @@ test('M5: a LINKED account with no usable token right now still holds the settle
   linkAccount(m.home, TOKENLESS);
   writeRollout(m, id, { mtimeMs: NOW - 30 * MINUTE });
   writeCursor(m, id, 4);
-  const { deps, calls } = passDeps({ readTrackingState: (key) => ({ linkedAt: new Date(links[key]).toISOString() }) });
+  // The real index read: it is what holds the tokenless account.
+  const { deps, calls } = passDeps({ listAccounts: undefined, readTrackingState: (key) => ({ linkedAt: new Date(links[key]).toISOString() }) });
 
   await runWatchPass(deps, opts(m));
 

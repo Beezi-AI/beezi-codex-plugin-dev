@@ -31,7 +31,11 @@ const REQUIRED = Object.freeze([
   'BEEZI_CODEX_WATCHER',
   'BEEZI_CODEX_APP_SERVER',
   'BEEZI_CODEX_CLI',
+  'BEEZI_NO_BATCH',
   'OPENAI_API_KEY',
+  // Set by tools/hermetic-env.mjs. The MCP server is a child process in tests, and anything it
+  // starts must see the same "never spawn a real upload worker" switch the hooks see.
+  'BEEZI_TEST_NO_SPAWN',
 ]);
 
 test('.mcp.json forwards every variable the MCP server needs to agree with the hooks', () => {

@@ -6,53 +6,22 @@ import { fileURLToPath } from 'node:url';
 import { renderList } from '../lib/accounts-cli.mjs';
 import { CRASH_MODES } from '../lib/diagnostics.mjs';
 import { keysLines } from '../lib/settings-cli.mjs';
-import { lastLine, parseHistory, parsePlaces, parseWorkspaces, token } from '../lib/setup-routing.mjs';
+import { parseListing, token } from '../lib/setup-routing.mjs';
 import {
-  ACCOUNT_LINE, CRASH_CHOICES, LINKED_AS, OFFER_LINE, OFFER_QUESTION, PLAN_EXPIRED, STILL_DEFAULT, TIER_CHOICES,
-  TRUST_PENDING, UPLOAD_PROGRESS,
-  crashModeOf, parseLinkedAccounts, planSettled,
+  ACCOUNT_LINE, PLAN_EXPIRED, crashModeOf, parseLinkedAccounts, planSettled, uploadPast,
 } from '../lib/setup-wizard.mjs';
 import { linkAccount, makeHome } from '../tools/account-fixtures.mjs';
-import { offerToken } from '../lib/history-offer.mjs';
 
 // The terminal setup branches on other scripts' output text. Each row is two-sided: the script still prints the fragment, and the setup still reads a line of that shape.
 
 const pluginRoot = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
 const read = (...parts) => fs.readFileSync(path.join(pluginRoot, ...parts), 'utf-8');
-const escapeRe = (s) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 const KEY = 'a1b2c3d4';
 
 // [file that prints it, the fragment it must still print, a line of that shape, what the setup reads from it]
 const LINES = [
   [['scripts', 'login.mjs'], 'account=${result.key}', `account=${KEY}`,
     (line) => ACCOUNT_LINE.exec(line)[1] === KEY],
-  [['scripts', 'login.mjs'], 'linked as ${who}. Credentials stored in',
-    '✓ Beezi analytics re-linked as Ann - Acme. Credentials stored in the macOS keychain.',
-    (line) => LINKED_AS.exec(line)[1] === 'Ann - Acme'],
-  [['scripts', 'login.mjs'], 'already linked as ${who}. Nothing changed',
-    '✓ already linked as Ann. Nothing changed — the sign-in you just completed was handed back.',
-    (line) => LINKED_AS.exec(line)[1] === 'Ann'],
-  [['scripts', 'login.mjs'], 'The analytics skill still reads from this machine',
-    "  The analytics skill still reads from this machine's default account.",
-    (line) => STILL_DEFAULT.test(line)],
-  [['scripts', 'login.mjs'], 'One step left — ${TRUST_STEP}',
-    '  One step left — run /hooks in Codex, review the Beezi entries, and trust them.',
-    (line) => TRUST_PENDING.test(line)],
-  [['scripts', 'login.mjs'], 'If nothing arrives, ${TRUST_STEP}',
-    '  Analytics hooks are installed. If nothing arrives, run /hooks in Codex, review the Beezi entries, and trust them.',
-    (line) => TRUST_PENDING.test(line)],
-  [['lib', 'hooks-install.mjs'], "export const TRUST_STEP = 'run /hooks in Codex, ",
-    '    run /hooks in Codex, review the Beezi entries, and trust them.',
-    (line) => TRUST_PENDING.test(line)],
-  [['scripts', 'hooks.mjs'], 'If analytics still are not arriving, ${TRUST_STEP}.',
-    '  If analytics still are not arriving, run /hooks in Codex, review the Beezi entries, and trust them.',
-    (line) => TRUST_PENDING.test(line)],
-  [['scripts', 'hooks.mjs'], '`    ${TRUST_STEP}.`',
-    '    run /hooks in Codex, review the Beezi entries, and trust them.',
-    (line) => TRUST_PENDING.test(line)],
-  [['scripts', 'hooks.mjs'], 'there is NOTHING to re-trust — /hooks can stay closed.',
-    '  The registry entries did not change, so there is NOTHING to re-trust — /hooks can stay closed.',
-    (line) => !TRUST_PENDING.test(line)],
   [['scripts', 'billing-capture.mjs'], "✓ Beezi billing captured: source=${config.source} plan=${orDefault(config.plan, 'n/a')}${capturedVia}.",
     '✓ Beezi billing captured: source=subscription plan=pro_5x via=app-server.',
     (line) => planSettled(line)],
@@ -61,53 +30,48 @@ const LINES = [
     (line) => PLAN_EXPIRED.test(line)],
   [['lib', 'settings-cli.mjs'], 'crash=${crashMode()}', 'crash=anonymous',
     (line) => crashModeOf(line) === 'anonymous'],
-  [['lib', 'workspace-cli.mjs'], "new-folders=${newFoldersNow.mode} set=${newFoldersNow.set ? 'yes' : 'no'} multi=yes account=${row.key}",
-    `new-folders=ask set=no multi=yes account=${KEY}`,
-    (line) => token(lastLine(line, /^new-folders=/), 'set') === 'no'],
-  [['lib', 'workspace-cli.mjs'], 'new-folders=n/a multi=no account=${row.key}', `new-folders=n/a multi=no account=${KEY}`,
-    (line) => token(lastLine(line, /^new-folders=/), 'set') === null],
-  [['lib', 'workspace-cli.mjs'], 'history=${counts.sessions} places=${counts.places}', 'history=37 places=4',
-    (line) => parseHistory(line).sessions === 37 && parseHistory(line).places === 4],
+  [['lib', 'settings-cli.mjs'], "workspaces=${workspaceCount(a)} status=${a.status || 'linked'} email=${a.email || 'unknown'}",
+    `account=${KEY} default=yes multi=no workspaces=1 status=linked email=ann@example.com`,
+    (line) => token(line, 'workspaces') === '1' && token(line, 'email') === 'ann@example.com'],
   [['lib', 'workspace-cli.mjs'], 'W. ${t.name ? t.name : t.id} account=${row.key} tenant=${t.id} role=${roleLabel(t)}',
     `W. Acme Team account=${KEY} tenant=t1 role=Owner`,
-    (line) => parseWorkspaces(line)[0].name === 'Acme Team' && parseWorkspaces(line)[0].tenant === 't1'],
-  [['lib', 'workspace-cli.mjs'], "new=${newIds.indexOf(t.id) === -1 ? 'no' : 'yes'} role=${roleLabel(t)}",
-    `W. Beta account=${KEY} tenant=t2 new=yes role=`,
-    (line) => parseWorkspaces(line)[0].isNew === true],
-  [['lib', 'workspace-cli.mjs'], 'P${total}. ${labeled(g)}, ${sessionsCount(g.sessions)} account=${row.key} kind=${g.kind} match=${g.match}',
-    `P1. My docs (~/My docs), 2 sessions account=${KEY} kind=folder match=/Users/dev/My docs`,
-    (line) => parsePlaces(line, 'P')[0].match === '/Users/dev/My docs'],
-  [['lib', 'workspace-cli.mjs'], 'J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${',
-    `J1. api (github.com/acme/api), 1 session, now: Acme account=${KEY} kind=repo match=github.com/acme/api now=t1`,
-    (line) => parsePlaces(line, 'J')[0].where === 'Acme' && parsePlaces(line, 'J')[0].match === 'github.com/acme/api'],
-  [['lib', 'history-cli.mjs'], 'Beezi: ${processed}/${total} sessions read…', 'Beezi: 3/12 sessions read…',
-    (line) => UPLOAD_PROGRESS.test(line)],
-  [['lib', 'history-cli.mjs'], 'console.log(`Q ${questionText(', 'Q Upload 3 sessions to Acme?',
-    (line) => OFFER_QUESTION.exec(line)[1] === 'Upload 3 sessions to Acme?'],
-  [['lib', 'history-cli.mjs'], 'console.log(`offer account=${row.key} tenant=${run.id} sessions=',
-    `offer account=${KEY} tenant=t1 sessions=3 audit=no token=aa54c8e424fb`,
-    (line) => OFFER_LINE.test(line) && token(line, 'tenant') === 't1'],
-  [['lib', 'history-cli.mjs'], "audit=${summary.audit ? 'yes' : 'no'} token=${offerToken(offeredIds, shownKinds)}`);",
-    `offer account=${KEY} tenant=t1 sessions=1 audit=no token=aa54c8e424fb`,
-    (line) => OFFER_LINE.test(line) && token(line, 'token') === offerToken(['s1'], [])],
+    (line) => parseListing(line).workspaces[0].name === 'Acme Team' && parseListing(line).workspaces[0].tenant === 't1'],
+  [['lib', 'workspace-cli.mjs'], 'T${i + 1}. ${labeled(place)}, ${sessionsCount(place.sessions)} account=${row.key} kind=${place.kind} now=${now} match=${place.match}',
+    `T1. My docs (~/My docs), 2 sessions account=${KEY} kind=folder now=none match=/Users/dev/My docs`,
+    (line) => JSON.stringify(parseListing(line).places[0]) === JSON.stringify({ kind: 'folder', match: '/Users/dev/My docs', now: 'none', name: '~/My docs', sessions: 2 })],
+  [['lib', 'workspace-cli.mjs'], "setup=${found.places.length} sessions=${found.sessions} workspaces=${tenants.length} chosen=${chosen ? 'yes' : 'no'}",
+    'setup=3 sessions=212 workspaces=2 chosen=yes',
+    (line) => parseListing(line).workspaceCount === 2 && parseListing(line).chosen === true],
 ];
 
 // Shapes setup-routing splits on whose reading its own tests already cover.
 const SHAPES = [
   "return key.kind === 'outside' ? shortLabel(key) : `${shortLabel(key)} (${key.label})`;",
   "return `${n} session${n === 1 ? '' : 's'}`;",
-  ': you joined ${joinTenantNames(row, newIds)} — ${count} to review account=${row.key}',
   "'1 other past session has no recorded folder and is not sent.'",
   '`${lost} other past sessions have no recorded folder and are not sent.`',
+  'cx.lines.push(`rule=${n}`);\n}',
+  "cx.lines.push('setup=everything');\n}",
+  "cx.lines.push('setup=chosen');\n}",
 ];
 
 // The argv setup-routing builds, as workspace.mjs documents it.
 const USAGE = [
   ' | rule add (--current | --repo <url> | --folder <path> | --outside) (<id|name|n>… | none) [--session <id>] [--account <ref>]',
-  ' | rule add-all (<id|name|n>… | none) [--session <id>] [--account <ref>]',
-  ' | routes [--session <id>] [--account <ref>]',
-  ' | joined [add-all | done | pick (--repo <url> | --folder <path> | --outside) <id|name|n>] [--session <id>] [--account <ref>]',
-  ' | new-folders [ask | send <id|name|n>… | none] [--history] [--session <id>] [--account <ref>]',
+];
+
+// login.mjs lines the setup hides behind its own signed-in line and closing /hooks step (test/setup-wizard.test.mjs reads samples of each).
+const LOGIN_REPLACED = [
+  "console.log('\\nBeezi analytics — link this machine\\n');",
+  'console.log(`\\n✓ already linked as ${who}. Nothing changed',
+  'console.log(`\\n✓ Beezi analytics re-linked as ${who}. Credentials stored in ${result.storedIn}.`);',
+  'console.log(`\\n✓ Beezi analytics linked as ${who}. Credentials stored in ${result.storedIn}.`);',
+  "console.log('  The analytics skill still reads from this machine\\'s default account.');",
+  "console.log('  Another Beezi process is updating the hook registry; it will be current in a moment.');",
+  'console.log(`  Analytics hooks are installed. If nothing arrives, ${TRUST_STEP}.`);',
+  "? '\\n  Analytics hooks installed for you.'",
+  ': `\\n  Analytics hooks repaired for you (they were ${result.before}).`);',
+  'console.log(`  One step left — ${TRUST_STEP}.`);',
 ];
 
 test('every line the setup reads is still printed in that shape, and the setup still reads it', () => {
@@ -122,27 +86,19 @@ test('the place shapes and summary lines setup-routing relies on are unchanged',
   for (const fragment of SHAPES) assert.ok(cli.includes(fragment), fragment);
 });
 
-test('workspace.mjs still takes the argv the setup builds', () => {
+test('workspace.mjs still takes the rule argv the setup builds', () => {
   const cli = read('lib', 'workspace-cli.mjs');
   for (const usage of USAGE) assert.ok(cli.includes(usage), usage);
-  assert.ok(cli.includes("argv.indexOf('--history') !== -1"), 'new-folders reads --history');
-  assert.ok(cli.includes("if (sub === 'pick') { await joinedPick(cx, after); return; }"), 'joined pick dispatch');
-  assert.ok(cli.includes('J${total}-command=${script} joined pick ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenant>'), 'J-command is joined pick');
-  assert.ok(cli.includes('done-command=${script} joined done --account ${row.key}${deferText(cx)}'), 'done-command carries the defer flag');
 });
 
-test('sync.mjs still takes the offer, accept and decline argv the setup builds', () => {
+test('sync.mjs still takes the offer argv the setup builds', () => {
   const sync = read('scripts', 'sync.mjs');
-  for (const fragment of [
-    "const OFFER = '--offer';", "const ACCEPT = '--accept';", "const DECLINE = '--decline';", "const TOKEN = '--token';",
-    "'--past'", "rest.indexOf('--tenant')",
-  ]) assert.ok(sync.includes(fragment), fragment);
+  for (const fragment of ["const OFFER = '--offer';", "'--past'"]) assert.ok(sync.includes(fragment), fragment);
 });
 
-test('the wizard answers a yes with the offer line\'s token as the accept argv\'s last pair', () => {
-  const wizard = read('lib', 'setup-wizard.mjs');
-  assert.ok(wizard.includes("['--accept'].concat(target, ['--token', token(line, 'token')])"));
-  assert.ok(wizard.includes('else if (OFFER_LINE.test(line)) await answerOffer(ctx, key, line, question);'));
+test('login.mjs still prints each line the setup hides from its sign-in', () => {
+  const login = read('scripts', 'login.mjs');
+  for (const fragment of LOGIN_REPLACED) assert.ok(login.includes(fragment), fragment);
 });
 
 test('every sign-in failure exits non-zero, so the setup needs no failure text of its own', () => {
@@ -182,22 +138,9 @@ test('settings.mjs keys still carries the crash= line the setup reads', async (t
   assert.equal(crashModeOf((await keysLines({})).join('\n')), CRASH_MODES.OFF);
 });
 
-test("the tier question offers the login skill's table, label for label and value for value", () => {
-  const skill = read('skills', 'login', 'SKILL.md');
-  assert.ok(skill.includes('How does this machine pay for Codex: '));
-  for (const choice of TIER_CHOICES) {
-    assert.match(skill, new RegExp(`\\| ${escapeRe(choice.label)} +\\| \`${choice.value}\` +\\|`), choice.label);
-  }
-});
-
-test("the crash question is the settings skill's four-way sentence, one choice per telemetry mode", () => {
-  const sentence = read('skills', 'settings', 'SKILL.md').replace(/\r?\n> /g, ' ');
-  assert.ok(sentence.includes('How should Beezi crash reports work: '));
-  for (const choice of CRASH_CHOICES) {
-    const words = choice.mode === CRASH_MODES.CORRELATE
-      ? `Correlate (recommended; ${choice.description})`
-      : `${choice.label} (${choice.description})`;
-    assert.ok(sentence.includes(words), words);
-  }
-  assert.deepEqual(CRASH_CHOICES.map((choice) => choice.mode), Object.values(CRASH_MODES));
+test('sync.mjs --consented still ends with uploading=, and the setup reads its count', async () => {
+  assert.ok(read('lib', 'history-cli.mjs').includes('console.log(`uploading=${owed.reduce((all, ids) => union(all, ids), []).length} workspaces=${owed.length}`);'));
+  const printed = [];
+  await uploadPast({ run: async () => ({ code: 0, stdout: 'uploading=37 workspaces=2\n', stderr: '' }), print: (line) => printed.push(line) }, KEY);
+  assert.deepEqual(printed, ['✓ 37 past sessions are uploading in the background']);
 });

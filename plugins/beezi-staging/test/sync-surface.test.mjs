@@ -79,13 +79,16 @@ test('sync — --accept without the question\'s --token uploads nothing and says
   assert.equal(res.stdout, '');
 });
 
-test('sync — --dry-run with an answer, or --background or --token without --accept, is refused naming the pair', (t) => {
+test('sync — --dry-run with an answer, --background or --token without --accept, or --consented with --dry-run, --tenant or --background, is refused naming the pair', (t) => {
   for (const [args, message] of [
     [['--dry-run', '--accept'], /--dry-run previews the offer only; it does not go with --accept\./],
     [['--dry-run', '--decline'], /--dry-run previews the offer only; it does not go with --decline\./],
     [['--background', '--decline'], /--background goes only with --offer or --accept, not with --decline\./],
     [['--decline', '--token', 'abc'], /--token goes only with --accept, not with --decline\./],
     [['--offer', '--token', 'abc'], /--token goes only with --accept, not with --offer\./],
+    [['--offer', '--past', '--consented', '--account', 'a1b2c3d4', '--dry-run'], /--consented uploads what the setup listed; it does not go with --dry-run\./],
+    [['--offer', '--past', '--consented', '--account', 'a1b2c3d4', '--tenant', 't1'], /--consented uploads what the setup listed; it does not go with --tenant\./],
+    [['--offer', '--past', '--consented', '--account', 'a1b2c3d4', '--background'], /--consented uploads what the setup listed; it does not go with --background\./],
   ]) {
     const res = runSync(t, args);
     assert.equal(res.status, 1, args.join(' '));
@@ -135,11 +138,11 @@ test('sync — a missing key gets its own line before the coverage and upload su
   assert.ok(at < script.indexOf('result.scanned === 0'));
 });
 
-test('login — the past-sessions answers pass the --account and --tenant sync requires', () => {
+test('login — the skill no longer answers past-sessions offers; the tracking answer is the consent', () => {
   const skill = fs.readFileSync(path.join(pluginRoot, 'skills', 'login', 'SKILL.md'), 'utf-8');
-  assert.match(skill, /scripts\/sync\.mjs" --accept --account <key> --tenant <id> --token <token>/);
-  assert.match(skill, /scripts\/sync\.mjs" --decline --account <key> --tenant <id>/);
-  assert.match(skill, /`offer account=<key> tenant=<id> sessions=<n> audit=<yes\|no> token=<token>`/);
+  assert.doesNotMatch(skill, /scripts\/sync\.mjs" --accept/);
+  assert.doesNotMatch(skill, /scripts\/sync\.mjs" --decline/);
+  assert.doesNotMatch(skill, /`offer account=<key> tenant=<id>/);
 });
 
 // THE ASSERTION ABOVE IS NOT ENOUGH, and shipping it as if it were is how this broke: it greps for
@@ -164,14 +167,11 @@ test('login — the past-sessions answers pass the --account and --tenant sync r
 //     the safe direction, and a one-word edit clears it.
 const SKIPS_ACCOUNT_FLAG = /(without|skip|omit|drop|leave off|leave out|no)\b[^.\n]{0,20}`?--account/i;
 
-test('login — every sync invocation carries --account, and no enumerated phrasing tells a path to skip it', () => {
+test('login — invokes no sync, and no enumerated phrasing tells a path to skip --account', () => {
   const skill = fs.readFileSync(path.join(pluginRoot, 'skills', 'login', 'SKILL.md'), 'utf-8');
 
   const invocations = skill.split('\n').filter((line) => line.includes('scripts/sync.mjs"'));
-  assert.ok(invocations.length > 0, 'the skill still answers the past-sessions question');
-  for (const line of invocations) {
-    assert.match(line, /--account/, `sync is invoked without --account: ${line}`);
-  }
+  assert.deepEqual(invocations, [], 'login-flow.mjs runs the upload; the skill invokes sync.mjs nowhere');
 
   const skipped = skill.match(SKIPS_ACCOUNT_FLAG);
   assert.equal(

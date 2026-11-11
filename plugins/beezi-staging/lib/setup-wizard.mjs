@@ -1,50 +1,23 @@
 import { BillingSource, CHATGPT_PLANS } from './billing.mjs';
-import { naming } from './paths.mjs';
-import {
-  askNewFolders, lastLine, outputLines, printable, report, reviewJoined, reviewRoutes, token,
-} from './setup-routing.mjs';
-import { NEVER_STARTED } from './setup-runner.mjs';
+import { TrustVerdict } from './hook-trust.mjs';
+import { PLAN_LABELS } from './settings-cli.mjs';
+import { closingLines } from './setup-finale.mjs';
+import { askTracking, lastLine, outputLines, report, token } from './setup-routing.mjs';
 
 // One `accounts.mjs list` row: "  <n>. <description> [<key>]", then "  (default, revoked)" marks when any.
 const LISTED_ACCOUNT = /^ {2}\d+\. (.+) \[([0-9a-f]{8})\](?: {2}\(([a-z, ]+)\))?$/;
 export const ACCOUNT_LINE = /^account=([0-9a-f]{8})$/;
-export const MACHINE_LABEL = 'Checking this machine…';
-export const SIGN_IN_LABEL = 'Waiting for you to sign in in your browser…';
-export const WORKSPACES_LABEL = 'Checking your workspaces…';
-export const PLAN_LABEL = 'Checking your plan…';
-export const SESSIONS_LABEL = 'Looking at your past sessions…';
-export const UPLOAD_LABEL = 'Uploading past sessions…';
-// sync.mjs --accept prints this once per batch; the wizard shows it on the activity line instead.
-export const UPLOAD_PROGRESS = /^Beezi: (\d+)\/(\d+) sessions read…$/;
-export const OFFER_QUESTION = /^Q (.+)$/;
-export const OFFER_LINE = /^offer account=\S+ tenant=\S+ /;
-const COMBINED_QUESTION = /^QM (.+)$/;
-const COMBINED_ALL = /^QM-all=/;
-// An ask-first workspace's row in the combined summary: "    ? <name> · <n> sessions · <hides>".
-const ASK_ROW = /^ {4}\? (.+)$/;
-// The offer run's lines meant for the wizard, never the person.
-export const OFFER_MACHINE_LINE = /^(?:QM? |QM-all=|offer account=|(?:notices|offers)=\d+$)/;
-export const SETTINGS_LABEL = 'Saving your settings…';
+export const AGENT = 'Codex';
+const MACHINE_LABEL = 'Checking this machine';
+const SIGN_IN_LABEL = 'Waiting for you to sign in in your browser';
+const SESSIONS_LABEL = 'Checking past sessions';
+// login.mjs lines the setup's own lines replace (signed in, the closing /hooks step); the browser link and failures still show.
+const LOGIN_HIDDEN = /^(?:account=|Beezi analytics — link this machine$|✓ (?:Beezi analytics (?:re-)?linked|already linked) as | {2}(?:The analytics skill still reads from|Analytics hooks |One step left — |Another Beezi process is updating the hook registry)|\s*$)/;
+const WORKSPACE_AFTER_EMAIL = '> - ';
+const WORKSPACE_SEPARATOR = ' - ';
 const CAPTURED = / source=(\S+) plan=([^\s.]+)/;
 export const PLAN_EXPIRED = /Codex sign-in expired/;
-const ACCOUNT_QUESTION = 'This machine is already linked to Beezi. Which account should setup use?';
-const KEEP_ACCOUNT = 'Keep this account; no browser sign-in';
-const LINK_ANOTHER = { label: 'Link another account', description: 'Sign in through your browser' };
-const EXPIRED_NOTE = 'Run `codex login`, then run this installer again.';
-const PLAN_SKIPPED = 'No plan was saved. Your Beezi link itself already succeeded.';
-const TIER_QUESTION = 'How does this machine pay for Codex?';
-export const TIER_CHOICES = Object.freeze([
-  { label: 'ChatGPT Free', value: 'free' },
-  { label: 'ChatGPT Plus', value: 'plus' },
-  { label: 'ChatGPT Pro — $100/mo (5× Plus usage)', value: 'pro_5x' },
-  { label: 'ChatGPT Pro — $200/mo (20× Plus usage)', value: 'pro_20x' },
-  { label: 'ChatGPT Go', value: 'go' },
-  { label: 'ChatGPT Team', value: 'team' },
-  { label: 'ChatGPT Business', value: 'business' },
-  { label: 'ChatGPT Enterprise', value: 'enterprise' },
-  { label: 'ChatGPT Edu', value: 'edu' },
-  { label: 'An OpenAI API key (no ChatGPT subscription)', value: 'api_key' },
-]);
+const SOURCE_LABELS = { [BillingSource.OPENAI_API_KEY]: 'API key', [BillingSource.THIRD_PARTY]: 'Third-party provider' };
 
 export function parseLinkedAccounts(text) {
   return outputLines(text)
@@ -61,25 +34,38 @@ export function parseLinkedAccounts(text) {
     });
 }
 
-// The linked account to continue with, null to sign in, or false when the question is dismissed.
-export async function pickAccount(ctx) {
+// The usable linked accounts, the analytics default first, then the rest in listed order.
+async function usableAccounts(ctx) {
   const listing = await ctx.run('accounts.mjs', ['list']);
   if (listing.code !== 0) report(ctx, listing);
   const linked = parseLinkedAccounts(listing.stdout).filter((account) => !account.revoked);
-  // The analytics default first, then the rest in listed order.
-  const usable = linked.filter((account) => account.isDefault).concat(linked.filter((account) => !account.isDefault));
-  if (usable.length === 0) return null;
-  const options = usable.map((account) => ({ label: `Continue with ${account.description}`, description: KEEP_ACCOUNT })).concat([LINK_ANOTHER]);
-  const pick = await ctx.ask.choose(ACCOUNT_QUESTION, options, { defaultIndex: 0 });
-  if (pick === null) return false;
-  return pick < usable.length ? usable[pick].key : null;
+  return linked.filter((account) => account.isDefault).concat(linked.filter((account) => !account.isDefault));
 }
 
-// Streams login.mjs with its key line hidden; the key is null unless it exited 0 with an `account=` line.
-export async function signIn(ctx) {
-  const result = await ctx.run('login.mjs', [], { stream: true, hide: /^account=/, label: SIGN_IN_LABEL });
+// Streams login.mjs with the lines the setup replaces hidden; the key is null unless it exited 0 with an `account=` line.
+async function signIn(ctx) {
+  const result = await ctx.run('login.mjs', [], { stream: true, hide: LOGIN_HIDDEN, label: SIGN_IN_LABEL });
   const last = lastLine(result.stdout, ACCOUNT_LINE);
-  return { key: result.code === 0 && last !== null ? ACCOUNT_LINE.exec(last)[1] : null, output: result.stdout };
+  return { key: result.code === 0 && last !== null ? ACCOUNT_LINE.exec(last)[1] : null };
+}
+
+// The workspace a "<name> <<email>> - <workspace>" description names, or null.
+function workspaceOf(description) {
+  if (description === null) return null;
+  const named = description.indexOf(WORKSPACE_AFTER_EMAIL);
+  if (named !== -1) return description.slice(named + WORKSPACE_AFTER_EMAIL.length);
+  const at = description.indexOf(WORKSPACE_SEPARATOR);
+  return at === -1 ? null : description.slice(at + WORKSPACE_SEPARATOR.length);
+}
+
+// "✓ Signed in as <email>", with ", workspace <name>" for a one-workspace account, from its `settings.mjs keys` row.
+async function signedInLine(ctx, account) {
+  const keys = await ctx.run('settings.mjs', ['keys']);
+  const row = outputLines(keys.stdout).filter((line) => line.indexOf(`account=${account.key} `) === 0)[0];
+  const email = row === undefined ? null : token(row, 'email');
+  const workspace = row !== undefined && token(row, 'workspaces') === '1' ? workspaceOf(account.description) : null;
+  const who = email !== null && email !== 'unknown' ? ` as ${ctx.style.bold(email)}` : '';
+  return `✓ Signed in${who}${workspace === null ? '' : `, workspace ${ctx.style.bold(workspace)}`}`;
 }
 
 // True when the capture line names a priced plan or a billing source that is not a subscription.
@@ -92,129 +78,50 @@ export function planSettled(text) {
     || found[1] === BillingSource.THIRD_PARTY;
 }
 
+// The silent capture; the settled plan's label, or null. Only a failure and the expired sign-in notice print.
 export async function capturePlan(ctx, key) {
   const captured = await ctx.run('billing-capture.mjs', ['--from-codex', '--via', 'login', '--account', key]);
-  report(ctx, captured);
-  if (planSettled(captured.stdout)) return;
-  if (PLAN_EXPIRED.test(captured.stdout)) {
-    ctx.print(EXPIRED_NOTE);
-    return;
+  if (captured.code !== 0) {
+    report(ctx, captured);
+    return null;
   }
-  const pick = await ctx.ask.choose(TIER_QUESTION, TIER_CHOICES);
-  if (pick === null) {
-    ctx.print(PLAN_SKIPPED);
-    return;
+  if (planSettled(captured.stdout)) {
+    const found = CAPTURED.exec(lastLine(captured.stdout, CAPTURED));
+    if (SOURCE_LABELS[found[1]] !== undefined) return SOURCE_LABELS[found[1]];
+    return PLAN_LABELS[found[2]] !== undefined ? PLAN_LABELS[found[2]] : found[2];
   }
-  report(ctx, await ctx.run('billing-capture.mjs', ['--plan', TIER_CHOICES[pick].value, '--via', 'login-user', '--account', key]));
+  const expired = lastLine(captured.stdout, PLAN_EXPIRED);
+  if (expired !== null) ctx.print(expired);
+  return null;
 }
 
-export const STILL_DEFAULT = /still reads from this machine/;
-export const LINKED_AS = /linked as (.+?)\. (?:Nothing changed|Credentials stored)/;
-export const TRUST_PENDING = /run \/hooks in Codex/;
-const HOOK_OUTCOME = /^(?:[✓⚠]|Beezi: another )/;
-const DEFAULT_UNCHANGED = 'The default account is unchanged. The settings skill (Account → Default account) switches it later.';
-const TRUST_NOTE = 'One step left in Codex: run /hooks and trust the Beezi entries.';
-const CRASH_QUESTION = 'How should Beezi crash reports work?';
-export const CRASH_CHOICES = Object.freeze([
-  { mode: 'correlate', label: 'Correlate (recommended)', description: 'attaches an installation ID so support can find your report' },
-  { mode: 'on', label: 'On', description: 'sends reports without an installation ID and leaves that choice open' },
-  { mode: 'anonymous', label: 'Anonymous', description: 'sends reports without an installation ID and never offers one again' },
-  { mode: 'off', label: 'Off', description: 'sends nothing and deletes pending reports' },
-]);
+const HOOK_WARNING = /^⚠/;
 
-// Runs `hooks.mjs install` and prints its ✓/⚠/busy outcome lines; resolves its stdout for the trust check.
-async function checkHooks(ctx) {
+// Runs `hooks.mjs install`, printing only its ⚠ lines, or its failure; resolves whether it failed.
+export async function checkHooks(ctx) {
   const result = await ctx.run('hooks.mjs', ['install']);
   if (result.code !== 0) report(ctx, result);
-  else outputLines(result.stdout).filter((line) => HOOK_OUTCOME.test(line)).forEach((line) => ctx.print(line));
-  return result.stdout;
+  else outputLines(result.stdout).filter((line) => HOOK_WARNING.test(line)).forEach((line) => ctx.print(line));
+  return result.code !== 0;
 }
 
-// Yes uploads exactly the sessions the summary showed, named by its `offer` line's token; No or a dismissal keeps them
-// declined and prints the D line.
-export function uploadChoices() {
-  return [{ label: 'Upload now' }, { label: 'Not now', description: `run ${naming.syncCommand()} any time` }];
+// Whether Codex still has to trust the hooks, from lib/hook-trust.mjs's verdict (ctx.trust).
+export async function trustPending(ctx) {
+  const trust = await ctx.trust();
+  return trust != null && trust.verdict === TrustVerdict.UNTRUSTED;
 }
 
-const offerTarget = (key, line) => ['--account', key, '--tenant', token(line, 'tenant')];
-
-async function acceptOffer(ctx, key, line) {
-  const target = offerTarget(key, line);
-  const accept = ['--accept'].concat(target, ['--token', token(line, 'token')]);
-  await ctx.run('sync.mjs', accept, { stream: true, label: UPLOAD_LABEL, live: UPLOAD_PROGRESS });
-}
-
-async function declineOffer(ctx, key, line) {
-  report(ctx, await ctx.run('sync.mjs', ['--decline'].concat(offerTarget(key, line))));
-}
-
-async function answerOffer(ctx, key, line, question) {
-  if (await ctx.ask.choose(question, uploadChoices(), { defaultIndex: 0, escape: true }) === 0) await acceptOffer(ctx, key, line);
-  else await declineOffer(ctx, key, line);
-}
-
-// "<name> · <n> sessions · <hides>" → the name as the label, the rest as the description.
-function rowOption(row) {
-  const parts = row.split(' · ');
-  return { label: parts.slice(0, -2).join(' · '), description: parts.slice(-2).join(' · ') };
-}
-
-// One menu over the ask-first workspaces a `QM` line leads, all pre-ticked (R12), and a last exclusive Not now row:
-// ticked workspaces upload, the rest decline.
-async function answerCombined(ctx, key, combined) {
-  const workspaces = combined.labels.slice(-combined.lines.length).map(rowOption);
-  const options = workspaces.concat([{ label: 'Not now', description: `Nothing more is uploaded. Run ${naming.syncCommand()} any time.` }]);
-  const picked = await ctx.ask.chooseMany(combined.question, options, {
-    exclusive: [workspaces.length],
-    preselected: workspaces.map((_option, i) => i),
-  });
-  for (let i = 0; i < combined.lines.length; i += 1) {
-    if (picked !== null && picked.indexOf(i) !== -1) await acceptOffer(ctx, key, combined.lines[i]);
-    else await declineOffer(ctx, key, combined.lines[i]);
+// Queues the consented upload and says how many sessions are on their way; a failure prints its own lines.
+export async function uploadPast(ctx, key) {
+  const result = await ctx.run('sync.mjs', ['--offer', '--past', '--account', key, '--consented']);
+  if (result.code !== 0) {
+    report(ctx, result);
+    return;
   }
-}
-
-// Streams the summaries and any no-ask upload as sync.mjs prints them, then asks the questions in the order it listed them.
-async function offerHistory(ctx, key) {
-  const listed = await ctx.run('sync.mjs', ['--offer', '--past', '--account', key], { stream: true, hide: OFFER_MACHINE_LINE, live: UPLOAD_PROGRESS });
-  const rows = [];
-  let question = null;
-  let combined = null;
-  for (const line of printable(listed.stdout)) {
-    const row = ASK_ROW.exec(line);
-    const many = COMBINED_QUESTION.exec(line);
-    const asked = OFFER_QUESTION.exec(line);
-    if (row !== null) rows.push(row[1]);
-    else if (many !== null) combined = { question: many[1], labels: rows.slice(), lines: [] };
-    else if (asked !== null) question = asked[1];
-    else if (OFFER_LINE.test(line) && combined !== null) combined.lines.push(line);
-    else if (OFFER_LINE.test(line)) await answerOffer(ctx, key, line, question);
-    else if (combined !== null && !COMBINED_ALL.test(line)) {
-      await answerCombined(ctx, key, combined);
-      combined = null;
-    }
-  }
-  if (combined !== null) await answerCombined(ctx, key, combined);
-  // A streamed stderr already showed; a run that never started (its error is in stderr, unstreamed) or a failure
-  // without stderr would otherwise print nothing.
-  if (listed.code === NEVER_STARTED) report(ctx, { code: listed.code, stdout: '', stderr: listed.stderr });
-  else if (listed.code !== 0 && listed.stderr.trim() === '') report(ctx, { code: listed.code, stdout: '', stderr: '' });
-}
-
-// "<name> - <workspace>" from the sign-in's "linked as" sentence becomes "<name> (<workspace>)".
-export function defaultQuestion(signInOutput) {
-  const found = LINKED_AS.exec(signInOutput);
-  const who = found === null ? 'this account' : found[1];
-  const at = who.lastIndexOf(' - ');
-  const name = at === -1 ? who : `${who.slice(0, at)} (${who.slice(at + 3)})`;
-  return `Make ${name} the account the analytics skill reads from?`;
-}
-
-async function offerDefault(ctx, key, signInOutput) {
-  if (!STILL_DEFAULT.test(signInOutput)) return;
-  const yes = await ctx.ask.confirm(defaultQuestion(signInOutput), false);
-  if (yes === true) await ctx.run('accounts.mjs', ['use', key], { stream: true });
-  if (yes === false) ctx.print(DEFAULT_UNCHANGED);
+  const line = lastLine(result.stdout, /^uploading=\d+ /);
+  const n = line === null ? 0 : Number(token(line, 'uploading'));
+  if (n === 1) ctx.print('✓ 1 past session is uploading in the background');
+  if (n > 1) ctx.print(`✓ ${n} past sessions are uploading in the background`);
 }
 
 export function crashModeOf(text) {
@@ -222,58 +129,48 @@ export function crashModeOf(text) {
   return line === null ? null : token(line, 'crash');
 }
 
-// Asks only when the current mode is known; it is the default, and every answer runs telemetry.mjs.
-async function chooseCrashMode(ctx) {
+// Crash reports on for an undecided machine; resolves whether they are on afterwards.
+export async function applyDefaults(ctx) {
+  const telemetry = await ctx.run('telemetry.mjs', ['default']);
+  if (telemetry.code !== 0) report(ctx, telemetry);
   const keys = await ctx.run('settings.mjs', ['keys']);
+  if (keys.code !== 0) report(ctx, keys);
   const mode = crashModeOf(keys.stdout);
-  const current = CRASH_CHOICES.findIndex((choice) => choice.mode === mode);
-  if (current === -1) {
-    if (keys.code !== 0) report(ctx, keys);
-    return;
-  }
-  const options = CRASH_CHOICES.map((choice, i) => ({
-    label: choice.label,
-    description: i === current ? `${choice.description}, current setting` : choice.description,
-  }));
-  const pick = await ctx.ask.choose(CRASH_QUESTION, options, { defaultIndex: current });
-  if (pick === null) return;
-  report(ctx, await ctx.run('telemetry.mjs', [CRASH_CHOICES[pick].mode]));
+  return mode !== null && mode !== 'off';
 }
 
-// A blank line and the /hooks trust reminder, only when the sign-in or hooks check asked for it.
-function finish(ctx, hooksOutput) {
-  if (!TRUST_PENDING.test(hooksOutput)) return;
-  ctx.print('');
-  ctx.print(TRUST_NOTE);
-}
-
-// The login skill's steps in the terminal: 0 when done, 1 when the sign-in failed or the account question was dismissed.
+// Account, hooks, plan, tracking, upload, machine defaults, closing block; 1 when no account signed in.
 export async function runSetup(ctx) {
   ctx.progress(MACHINE_LABEL);
-  let key = await pickAccount(ctx);
-  let signInOutput = '';
-  let hooksOutput;
-  if (key === false) return 1;
-  if (key === null) {
+  const usable = await usableAccounts(ctx);
+  let account = usable.length > 0 ? usable[0] : null;
+  // The sign-in installs the hooks itself; a reused account checks them here.
+  const reused = account !== null;
+  if (account === null) {
     const signedIn = await signIn(ctx);
     if (signedIn.key === null) return 1;
-    key = signedIn.key;
-    signInOutput = signedIn.output;
-    hooksOutput = signedIn.output;
-  } else {
-    hooksOutput = await checkHooks(ctx);
+    const linked = (await usableAccounts(ctx)).filter((a) => a.key === signedIn.key);
+    account = linked.length > 0 ? linked[0] : { key: signedIn.key, description: null };
   }
-  ctx.progress(WORKSPACES_LABEL);
-  await askNewFolders(ctx, key);
-  ctx.progress(PLAN_LABEL);
-  await capturePlan(ctx, key);
+  ctx.print(await signedInLine(ctx, account));
+  const hooksFailed = reused ? await checkHooks(ctx) : false;
+  const pending = await trustPending(ctx);
+  const plan = await capturePlan(ctx, account.key);
+  if (plan !== null) ctx.print(`✓ Plan found: ${plan}`);
   ctx.progress(SESSIONS_LABEL);
-  await reviewJoined(ctx, key);
-  await reviewRoutes(ctx, key);
-  await offerHistory(ctx, key);
-  ctx.progress(SETTINGS_LABEL);
-  await offerDefault(ctx, key, signInOutput);
-  await chooseCrashMode(ctx);
-  finish(ctx, hooksOutput);
+  const tracking = await askTracking(ctx, account.key);
+  if (tracking !== null && tracking.tracked) await uploadPast(ctx, account.key);
+  if (tracking !== null) tracking.trailer.forEach((line) => ctx.print(line));
+  ctx.progress(MACHINE_LABEL);
+  const crash = await applyDefaults(ctx);
+  closingLines({
+    agent: AGENT,
+    style: ctx.style,
+    crash,
+    trustPending: pending,
+    hooksFailed,
+    planFound: plan !== null,
+    pastFailed: tracking !== null && tracking.failed === true,
+  }).forEach((line) => ctx.print(line));
   return 0;
 }

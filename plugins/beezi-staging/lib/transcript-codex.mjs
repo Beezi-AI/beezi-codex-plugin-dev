@@ -14,9 +14,10 @@ import { ROLLOUT_RE, rolloutIdFromName, resolveRolloutPath, rolloutSupersedes } 
 // The filename always ends with the globally-unique session id, so we can locate a session's
 // transcript by id regardless of cwd drift (cd / worktree switches during the session).
 //
-// Only the SessionStart and SessionEnd hooks carry `transcript_path`; PostToolUse and Stop do
-// not. So the checkpoint path resolves the rollout from the session id (this module) instead of
-// relying on the hook payload.
+// Codex sends `transcript_path` on SessionStart, PostToolUse, Stop and SubagentStart/Stop (the
+// parent's there; SubagentStop's own is `agent_transcript_path`), and it can be null. A payload path
+// whose session_meta names the hook's session is used as-is; anything else falls back to locating
+// the rollout by id (this module), which walks the sessions tree.
 
 function isValidSessionId(id) {
   return typeof id === 'string' && /^[a-zA-Z0-9-]+$/.test(id);
@@ -152,11 +153,15 @@ function findRolloutBySessionState(cwd) {
 // sites that want this narrower one.
 export const ROLLOUT_HEAD_BYTES = 512 * 1024;
 
+// The chunk the one-record read starts with: session_meta is 37-48KB on a modern install, so one
+// 64KB read holds it, and a larger record just costs the next chunk.
+const META_CHUNK_BYTES = 64 * 1024;
+
 function rolloutMeta(transcriptPath) {
   let rec = null;
   // One record is all this needs, and scanRecords is a generator — the loop breaks before a second
   // chunk is ever read on all but a pathological file.
-  for (const first of scanRecords(transcriptPath, { maxBytes: ROLLOUT_HEAD_BYTES })) {
+  for (const first of scanRecords(transcriptPath, { maxBytes: ROLLOUT_HEAD_BYTES, chunkBytes: META_CHUNK_BYTES })) {
     rec = first;
     break;
   }
@@ -209,10 +214,11 @@ export function resolveTranscriptByCwd(cwd) {
   return { sessionId: orDefault(best.sessionId, fromName), transcriptPath: best.full };
 }
 
-// Resolve the rollout transcript for a hook invocation. Prefer the path the hook handed us
-// (SessionStart / SessionEnd), then the session id (PostToolUse / Stop), then the cwd mapping
-// checkpoints persisted in state. Returns { sessionId, transcriptPath } or null.
-export function resolveCodexTranscript(input) {
+// Resolve the rollout transcript for a hook invocation. Prefer the path the hook handed us, then
+// the session id, then the cwd mapping checkpoints persisted in state. Returns
+// { sessionId, transcriptPath } or null. `deps.findRolloutBySessionId` is the tree walk (a seam).
+export function resolveCodexTranscript(input, deps = {}) {
+  const findById = orDefault(deps.findRolloutBySessionId, findRolloutBySessionId);
   const sessionId = orDefault((input || {}).session_id, null);
   const provided = orDefault((input || {}).transcript_path, null);
   if (provided) {
@@ -221,21 +227,57 @@ export function resolveCodexTranscript(input) {
     if (found) {
       // A hook can hand over a path with no session_id (or a junk one). The rollout knows its own
       // id, and we are already touching the file — so answer with it rather than pass the gap on.
-      return {
-        sessionId: isUsableSessionId(sessionId) ? sessionId : rolloutSessionId(found),
-        transcriptPath: found,
-      };
+      if (!isUsableSessionId(sessionId)) return { sessionId: rolloutSessionId(found), transcriptPath: found };
+      // A filename ending in the id is the very match findRolloutBySessionId makes, so the walk could
+      // only answer with this file (or its plain/.zst sibling, which resolveRolloutPath already
+      // followed). It is checked first because it costs no read. Codex names every rollout this way,
+      // and the history sync, track and the watcher hand over exactly such paths.
+      const suffix = `-${sessionId}.jsonl`;
+      if (found.endsWith(suffix) || found.endsWith(`${suffix}.zst`)) return { sessionId, transcriptPath: found };
+      // Otherwise only the rollout's own session_meta can confirm it (one 64KB read).
+      const meta = rolloutMeta(found);
+      if (meta && meta.sessionId === sessionId) return { sessionId, transcriptPath: found };
+      // Not confirmed: the session's own rollout wins when the walk finds one.
+      const own = findById(sessionId);
+      if (own) return own;
+      // A rollout that positively states ANOTHER usable id is never billed as this session: pairing
+      // the two would write this session's cursor from that session's lines. Only a rollout that
+      // states no id at all (or cannot be read) stays, under the hook's id — the hook is
+      // authoritative for its own session there, as before the check existed.
+      if (meta && meta.sessionId) return null;
+      return { sessionId, transcriptPath: found };
     }
   }
   if (sessionId) {
-    const byId = findRolloutBySessionId(sessionId);
+    const byId = findById(sessionId);
     if (byId) return byId;
   }
   if (input && input.cwd) {
     const byState = findRolloutBySessionState(input.cwd);
-    if (byState) return byState;
+    // Matched on cwd alone, so it is the newest session in that folder, whoever it is. A caller with
+    // no usable id of its own takes it as before. A caller that names its session takes it only when
+    // it IS that session: SessionStart marks a session due before Codex has written its rollout, and
+    // answering with an older session there would re-read that session's lines under the new id,
+    // with segment ids the server cannot dedupe. Not found instead, and the checkpoint defers.
+    if (byState && (!isUsableSessionId(sessionId) || rolloutIsSession(byState, sessionId))) {
+      return isUsableSessionId(sessionId) ? { sessionId, transcriptPath: byState.transcriptPath } : byState;
+    }
   }
   return null;
+}
+
+// Does this fallback answer belong to `sessionId`? The rollout's own word decides: a filename ending
+// in the id (the walk's own match, no read), else its session_meta id. Only a rollout that states no
+// id at all falls back to the state record it came from naming this session.
+function rolloutIsSession(found, sessionId) {
+  const file = found.transcriptPath;
+  const suffix = `-${sessionId}.jsonl`;
+  if (file.endsWith(suffix) || file.endsWith(`${suffix}.zst`)) return true;
+  const meta = rolloutMeta(file);
+  if (meta && meta.sessionId) return meta.sessionId === sessionId;
+  // A filename naming another id is that session's rollout.
+  if (isUsableSessionId(rolloutIdFromName(path.basename(file)))) return false;
+  return found.sessionId === sessionId;
 }
 
 // ─── quarantine ─────────────────────────────────────────────────────────────

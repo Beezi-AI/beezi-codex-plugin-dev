@@ -528,3 +528,65 @@ test('a zero parent prefix never authorizes ambiguous child history', async t =>
   assert.equal(result.reason, 'child-coverage-unavailable');
   assert.equal(sent.some(p => p.is_subagent), false);
 });
+
+// ─── finished and growing children ───────────────────────────────────────────
+
+// Calls that opened `file` while `fn` ran, through the real fs.
+async function opensOf(t, file, fn) {
+  const open = t.mock.method(fs, 'openSync');
+  await fn();
+  const n = open.mock.calls.filter((c) => c.arguments[0] === file).length;
+  open.mock.restore();
+  return n;
+}
+
+test('a subagent rollout unchanged since its cursor was saved is not opened again', async (t) => {
+  const home = tmpHome(t);
+  const child = subagentRollout(home, 'agent-a');
+  writeAgent('parent-1', 'agent-a', { started_at: at(0), transcriptPath: child });
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
+  const billed = queued().filter((p) => p.is_subagent).length;
+  const saved = readAgents('parent-1')['agent-a'];
+  assert.equal(saved.size, fs.statSync(child).size, 'the size the cursor was read against is saved with it');
+  assert.equal(saved.mtimeMs, fs.statSync(child).mtimeMs);
+  assert.equal(saved.inspected.ownThreadId, 'agent-a');
+
+  const opens = await opensOf(t, child, () => runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home)));
+
+  assert.equal(opens, 0, 'neither the head nor the delta read touched the file');
+  assert.equal(queued().filter((p) => p.is_subagent).length, billed, 'and nothing new was billed');
+});
+
+test('an unchanged rollout under a second agent key is skipped too, not billed from its fork boundary', async (t) => {
+  const home = tmpHome(t);
+  const child = subagentRollout(home, 'agent-a');
+  writeAgent('parent-1', 'agent-a', { started_at: at(0), transcriptPath: child });
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
+  const billed = queued().filter((p) => p.is_subagent).length;
+  // A hook sidecar keyed by something other than the rollout's own id, for the same file.
+  writeAgent('parent-1', '/root/explorer', { started_at: at(0), transcriptPath: child, agent_type: 'explore' });
+
+  const opens = await opensOf(t, child, () => runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home)));
+
+  assert.equal(opens, 0);
+  assert.equal(queued().filter((p) => p.is_subagent).length, billed);
+});
+
+test('a subagent rollout that grew is billed from its saved byte cursor', async (t) => {
+  const home = tmpHome(t);
+  const child = subagentRollout(home, 'agent-a');
+  writeAgent('parent-1', 'agent-a', { started_at: at(0), transcriptPath: child });
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
+  assert.equal(readAgents('parent-1')['agent-a'].cursorByte, fs.statSync(child).size);
+  fs.appendFileSync(child, JSON.stringify({ timestamp: at(20000), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 6400, cached_input_tokens: 0, output_tokens: 170 } } } }) + '\n');
+
+  await runCheckpoint({ session_id: 'parent-1', cwd: home }, deps(home));
+
+  const grown = queued().find((p) => p.is_subagent && p.segmentId === 'parent-1:agent-a:6-6');
+  assert.ok(grown, 'the new line is its own window');
+  assert.equal(grown.token_input, 400);
+  assert.equal(grown.token_output, 20);
+  const saved = readAgents('parent-1')['agent-a'];
+  assert.equal(saved.cursor, 6);
+  assert.equal(saved.cursorByte, fs.statSync(child).size);
+});

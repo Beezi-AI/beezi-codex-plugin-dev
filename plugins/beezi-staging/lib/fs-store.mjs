@@ -74,8 +74,9 @@ export function readJsonSalvaged(filePath) {
 const RENAME_ATTEMPTS = 4;
 
 // A real blocking sleep in synchronous code. Every caller of writeJsonSecure is sync and runs inside
-// a hook budget, so a busy-wait would burn the very milliseconds it is waiting out.
-function sleepSync(ms) {
+// a hook budget, so a busy-wait would burn the very milliseconds it is waiting out. Exported for
+// lib/upload-due.mjs's short lock retry, which is sync for the same reason.
+export function sleepSync(ms) {
   try {
     Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
   } catch { /* SharedArrayBuffer unavailable — proceed without the pause */ }

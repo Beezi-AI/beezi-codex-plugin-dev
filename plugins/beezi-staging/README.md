@@ -36,11 +36,15 @@ Codex's own MCP OAuth is not used: it only covers streamable-HTTP servers, and i
 token in Codex's store while the analytics hooks read `~/.beezi-codex/credentials.json` — so the machine
 would have to be linked twice.
 
-After the browser sign-in, an account in several workspaces is asked one question, "Where should
-analytics from this machine go?": each workspace (described with how many past sessions go there),
-"Several workspaces…" (pick two or more; everything goes to each), or "Let me choose per repo",
-which goes on to a question per repo and folder. With two workspaces it is a choice, and several
-are named under Other; with more, Codex asks it as one sentence with a numbered list.
+After the browser sign-in, the login skill detects the plan without asking, shows the summary of
+this machine's past sessions and asks one question, "What should it track?": **Everything**, or
+**Let me choose** to pick the repos and folders. For an account in several workspaces the question is
+"Where should they go?": everything to one workspace, to both (or **Several workspaces…** with more
+than two), or **Let me choose** to pick repos for each workspace. The answer is the consent: past
+sessions from what you track upload in the background, except to a workspace whose owner chose
+never to upload them. The flow then turns crash reports on unless you already chose, and its last
+lines say what is on, or that `/hooks` still needs your trust. An account that already chose on this
+machine is not asked again.
 
 Once signed in, every new Codex thread starts with a short banner: the account you're signed in
 as, its workspaces, and where this folder's analytics go (or that it has no rule yet). It needs the
@@ -250,7 +254,8 @@ behavior and send no tenant header.
 
 ### Crash reports
 
-Crash reporting starts **Off**. Change it through Settings → Crash reports:
+Terminal setup and the login skill turn crash reports on, in **Correlate** mode, unless you already
+chose a setting (`telemetry.mjs default`). Change it through Settings → Crash reports:
 
 | Mode | What it sends |
 | --- | --- |
@@ -281,9 +286,10 @@ Without the workspace's key on this machine, a hidden kind is never sent raw: li
 workspace are dropped, and sync stops with a line asking you to sign in again.
 
 Past sessions need a yes. Login, sync and the setup wizard show what an upload would send — which
-kinds are sent as they are and which the workspace hides — and ask; nothing goes up without
-"Upload now". The kinds the question showed as hidden stay hidden for that upload, even if the
-workspace turns them off before it runs.
+kinds are sent as they are and which the workspace hides — and ask. In sync nothing goes up without
+"Upload now"; at login and in the setup wizard the answer to the tracking question is the yes, for
+the repos and folders you track. The kinds the summary showed as hidden stay hidden for that upload,
+even if the workspace turns them off before it runs.
 
 ## Updating
 
@@ -331,6 +337,15 @@ still carry an older version's script paths has them rewritten to the launcher f
 session afterwards, so that upgrade — and only that one — asks for trust again in `/hooks`. See
 "Analytics needs the hooks installed and trusted" above.
 
+**0.27.0 asks for trust once more, for `PostToolUse` only.** That entry now matches the shell tool
+by name (`Bash|shell|shell_command|exec_command|local_shell`) instead of every tool, so its hash
+changes. Trust it again in `/hooks`; the other entries are untouched.
+
+**Uploads run in the background.** From 0.27.0 the hooks only save to disk; one background process
+per data root (`node …/scripts/upload-worker.mjs`) signs in once and uploads. It writes its state
+to `~/.beezi-codex/upload-worker.json` (`outcome`, `lastRunAt`, `retryAfterAt`). A report waits on
+disk until the server confirms it, so a killed upload is sent again by the next run.
+
 ## Entry points
 
 Codex has no per-plugin slash commands ([openai/codex#13893](https://github.com/openai/codex/issues/13893)),
@@ -344,7 +359,7 @@ exist.
 
 | Skill | Covers |
 | --- | --- |
-| `login` | Link a Beezi account and choose where its analytics go |
+| `login` | Link a Beezi account and choose what it tracks |
 | `settings` | Workspace rules, New folders, account health/default, plan refresh and crash reports |
 | `logout` | Log one account, or every one, out and drop its stored credentials |
 | `analytics-hooks` | Install, repair, remove, or check the analytics hooks (never asks you to run the command yourself) |
@@ -358,14 +373,14 @@ Two flows are MCP tools rather than skills, because they have to run in the serv
 
 Each skill runs a script under `scripts/`; those stay directly runnable from a terminal —
 `login.mjs`, `accounts.mjs [list|use <account>]`, `logout.mjs [--list|--account <a>|--all]`,
-`settings.mjs`, `workspace.mjs`, `telemetry.mjs [status|correlate|on|anonymous|off]`,
+`settings.mjs`, `workspace.mjs`, `telemetry.mjs [status|correlate|on|anonymous|off|default]`
+(`default` turns on Correlate only where no choice was made),
 `hooks.mjs [install|uninstall|status]`, `track.mjs`, `billing-capture.mjs --from-codex`,
 `release-notes.mjs [all|<version>]`.
-`setup.mjs` asks the login skill's questions in the terminal instead of a Codex thread, starting
-with the same single "Where should analytics from this machine go?"; the
-one-line installers run it after installing the plugin. Its questions are colourful arrow-key
-menus (↑/↓, then Enter), with typed numbers as the fallback where keys cannot be read;
-`NO_COLOR` turns the colours off.
+`setup.mjs` runs the login skill's flow in the terminal instead of a Codex thread, with the same
+one tracking question; the one-line installers run it after installing the plugin. Its question is
+an arrow-key menu (↑/↓, then Enter; Space ticks in a tick list), with typed numbers as the fallback
+where keys cannot be read; `NO_COLOR` turns the colours off.
 
 ## How analytics work
 
@@ -550,7 +565,7 @@ and the account id are ever captured — **no token ever leaves the machine**, a
    **That rule applies to this tier only.** A tier-1 reading is live and carries no expiry; applying
    the rule to it would downgrade a correct plan to `unknown` and re-nudge the user forever.
 
-3. **The user's own answer** — the login skill's plan-capture step, recorded as `selfReported`, which nothing
+3. **The user's own answer** — set in the settings skill, recorded as `selfReported`, which nothing
    automatic overwrites. Reached only when neither tier above named a plan.
 
 The account id and email are persisted into `billing.json` alongside the plan, and read back from
@@ -563,8 +578,7 @@ Pro split: the $200 tier kept the name `pro` and became 20×, and the new $100 5
 `prolite`. Anything left unmapped normalizes to `unknown`, which never settles — so the
 "refresh your plan" nudge would fire on every session with no way for the user to end it.
 
-Both history paths — the login skill's past-sessions step, which asks first unless the workspace's owner chose upload without
-asking, and the repeatable
+Both history paths — the login skill's upload after the tracking question, and the repeatable
 `sync` — reach back **30 days** and no further. A rollout older than that is skipped with a visible count and is never
 picked up by a later run; the window is shared deliberately, so a session cannot be in scope for
 one command and out of scope for the other.

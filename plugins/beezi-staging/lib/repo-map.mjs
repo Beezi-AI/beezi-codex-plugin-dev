@@ -25,6 +25,14 @@ function fold(p) {
   return CASE_INSENSITIVE ? p.toLowerCase() : p;
 }
 
+// Whether two spellings name one directory: git prints `C:/a/b`, Node's cwd is `C:\a\b`, and the
+// drive letter's case varies. normPath for the slashes, fold for the case, as every lookup here.
+export function samePath(a, b) {
+  const na = normPath(a);
+  const nb = normPath(b);
+  return na !== null && nb !== null && fold(na) === fold(nb);
+}
+
 function hasGitEntry(root) {
   try {
     // .git is a directory in a normal checkout, a FILE in a worktree/submodule — existsSync covers both.
@@ -143,6 +151,15 @@ export function originFromGitConfig(root) {
 }
 
 function resolveGitConfigPath(root) {
+  const dirs = gitDirsOf(root);
+  return dirs === null ? null : path.join(dirs.commonDir, 'config');
+}
+
+// A checkout's git directories, WITHOUT shelling git: `gitDir` holds its HEAD and reflog, and
+// `commonDir` its config (they differ for a worktree). `.git` is a directory in a normal checkout
+// and a FILE in a worktree or submodule (`gitdir: <path-to-real-git-dir>`). Null when there is no
+// `.git`, it cannot be read, or the pointer names nothing. Never throws.
+export function gitDirsOf(root) {
   const gitPath = path.join(root, '.git');
   let stat;
   try {
@@ -150,9 +167,9 @@ function resolveGitConfigPath(root) {
   } catch {
     return null;
   }
-  if (stat.isDirectory()) return path.join(gitPath, 'config');
-  // `.git` is a file: `gitdir: <path-to-real-git-dir>`.
-  const contents = fs.readFileSync(gitPath, 'utf-8');
+  if (stat.isDirectory()) return { gitDir: gitPath, commonDir: gitPath };
+  let contents;
+  try { contents = fs.readFileSync(gitPath, 'utf-8'); } catch { return null; }
   const m = contents.match(/^gitdir:\s*(.+)\s*$/m);
   if (!m) return null;
   let gitDir = m[1].trim();
@@ -161,11 +178,10 @@ function resolveGitConfigPath(root) {
   const commondirFile = path.join(gitDir, 'commondir');
   try {
     const rel = fs.readFileSync(commondirFile, 'utf-8').trim();
-    const common = path.isAbsolute(rel) ? rel : path.resolve(gitDir, rel);
-    return path.join(common, 'config');
+    return { gitDir, commonDir: path.isAbsolute(rel) ? rel : path.resolve(gitDir, rel) };
   } catch {
     // Submodule (or worktree without commondir): config sits in the git dir itself.
-    return path.join(gitDir, 'config');
+    return { gitDir, commonDir: gitDir };
   }
 }
 

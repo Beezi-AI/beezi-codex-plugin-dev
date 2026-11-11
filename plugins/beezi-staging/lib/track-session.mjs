@@ -9,6 +9,7 @@ import {
 import { isMultiTenant, isSingleTenant, readSessionWorkspace, resolveTargets } from './workspace.mjs';
 import { createRouteContext, routeForDir, routeKeyForDir } from './workspace-rules.mjs';
 import { orDefault } from './compat.mjs';
+import { withUploadLock } from './upload-lock.mjs';
 
 // What the track skill will report on, or a refusal — `{ ok: true, sessionId, transcriptPath }` or
 // `{ ok: false, message }`.
@@ -132,19 +133,31 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
   // a cursor that the first run would advance, so a second pass would find nothing left to bill
   // and the later accounts would silently receive an empty report. runCheckpoint fans the one
   // delta out into every allowed account's queue itself and hands back a drain result each.
-  const { enqueued, routedCopies, flushes, outcome, reason } = await runCheckpoint(
-    {
-      session_id: sessionId,
-      transcript_path: transcriptPath,
-      cwd,
-    },
-    {},
-    { drainRateLimits: true },
+  //
+  // ONE DRAINER: the checkpoint and its drain run inside runLock('upload'), the lock the background
+  // upload worker sends under, so the two never send at once (lib/upload-lock.mjs). Rank 1 above the
+  // checkpoint's session lock (2) and flushQueue's `shared:queue-<key>` (3): a legal order. A worker
+  // that keeps it for the whole wait is sending already — this run then saves on this machine only
+  // (localOnly: no credential, no request; the worker is told the session is due) and says so.
+  const input = { session_id: sessionId, transcript_path: transcriptPath, cwd };
+  const locked = await withUploadLock(
+    () => runCheckpoint(input, {}, { drainRateLimits: true }),
+    orDefault(deps.uploadLock, {}),
   );
-
-  if (outcome !== 'committed') {
-    return refusal(`Beezi: checkpoint ${outcome || 'deferred'} (${reason || 'not committed'}); retry tracking.`);
+  if (!locked.ok && locked.reason === 'busy') {
+    const saved = await runCheckpoint(input, {}, { localOnly: true });
+    if (saved.outcome !== 'committed') return notCommitted(saved);
+    const text = 'Beezi: the background upload is sending right now, so nothing was sent from here. '
+      + `The analytics for ${label} are saved on this machine and go up when it finishes.`;
+    return { ok: true, message: text, lines: [{ ok: true, held: true, text }], pending: [] };
   }
+  if (!locked.ok) {
+    const why = locked.detail ? `${locked.reason}: ${locked.detail}` : locked.reason;
+    return refusal(`Beezi: could not take the upload lock (${why}). Nothing was sent; retry tracking.`);
+  }
+  const { enqueued, routedCopies, flushes, outcome } = locked.value;
+
+  if (outcome !== 'committed') return notCommitted(locked.value);
 
   // One outcome per account. With a single account linked the lines are byte-identical to what a
   // single-account install has always printed; with several, each is named, because "saved" and
@@ -207,6 +220,11 @@ export async function trackSession({ sessionId, transcriptPath, cwd }, deps = {}
     return { ok: true, message: nothing, lines: [{ ok: true, text: nothing }], pending };
   }
   return { ok, message: lines.map((line) => line.text).join('\n'), lines, pending };
+}
+
+// The checkpoint ran and did not commit: nothing of this run was saved.
+function notCommitted({ outcome, reason }) {
+  return refusal(`Beezi: checkpoint ${outcome || 'deferred'} (${reason || 'not committed'}); retry tracking.`);
 }
 
 // An outcome that belongs to no account: the session could not be identified, nothing is linked, or

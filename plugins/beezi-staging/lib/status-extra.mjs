@@ -64,9 +64,85 @@ function updateSteps(plugin) {
   return ['', `To update to ${plugin.latest}:`, '  Run: codex plugin marketplace upgrade', '  Then start a new Codex thread to apply it.'];
 }
 
+// ── the background upload ───────────────────────────────────────────────────────────────────────
+// The hooks only capture; the upload worker (lib/upload-worker.mjs) sends. A worker that keeps
+// failing is otherwise invisible, so this answer reports its last run from upload-worker.json and,
+// when something needs the user, ONE warning that says what to do. The status record is not a
+// liveness signal (a killed worker leaves `state: 'running'`), so `state` is never reported.
+
+const DAY_MS = 24 * 60 * 60 * 1000;
+
+// What each recorded outcome means, as the end of "last run <time>, …".
+const OUTCOME_TEXT = {
+  empty: 'everything was sent',
+  deadline: 'stopped at its time limit with more to send; the next run continues',
+  'lock-lost': 'handed over to another upload run',
+  // A run that sent some and then idled on the rest is recorded `stalled` too.
+  stalled: 'could not send everything',
+  crash: 'crashed',
+  watchdog: 'was stopped for running too long',
+  'lock-failed': 'could not start, because its lock file could not be written',
+  'tracking-disabled': 'sent nothing because tracking is off',
+  'no-accounts': 'sent nothing because no linked account could sign in',
+};
+
+// The outcomes that need the user, each with what to do. `retry` is " after <time>" while the
+// worker's backoff runs, else "". tracking-disabled is written both when the server says every
+// account is dark and when the environment guard refused, so its wording covers both.
+const OUTCOME_WARNINGS = {
+  stalled: (retry) => 'Warning: the last background upload could not send everything it had, usually because there is no network or '
+    + 'the sign-in has expired. Check your connection, and if this keeps happening run the login skill. '
+    + `Beezi retries on its own${retry}.`,
+  crash: (retry) => `Warning: the last background upload crashed. Beezi retries on its own${retry}; to send now and see the error, run the track skill.`,
+  watchdog: (retry) => `Warning: the last background upload was stopped for running too long. Beezi retries on its own${retry}; to send now, run the track skill.`,
+  'lock-failed': (retry) => 'Warning: the background upload could not write its lock file in Beezi’s data folder. '
+    + `Check that the folder is writable and the disk is not full. Beezi retries on its own${retry}.`,
+  'tracking-disabled': () => 'Warning: the last background upload sent nothing: tracking is off for every linked account, or this '
+    + 'machine’s Beezi data is waiting on an environment check. Run the settings skill to see each account’s state.',
+  'no-accounts': () => 'Warning: the last background upload found no linked account that could sign in. Run the login skill to sign in again.',
+};
+
+const STALE_WARNING = 'Warning: analytics are waiting to upload, but no background upload has finished in the last 24 hours. '
+  + 'Run the track skill to send them now.';
+
+function formatMs(ms) {
+  return typeof ms === 'number' && isFinite(ms) ? formatTime(new Date(ms).toISOString()) : null;
+}
+
+/**
+ * The background upload's lines for beezi_status: [] when no run was ever recorded and nothing is
+ * waiting, else the last run and at most one warning — a failing outcome first, then a backoff
+ * still running, then work waiting with no run finished in the last 24 hours. `status` is
+ * readUploadStatus(); `workWaiting` is whether a due marker or a postable queue file exists
+ * (hasPostableWork(0)); `now` is epoch ms.
+ */
+export function uploadStatusLines({ status, now, workWaiting }) {
+  const record = status != null && typeof status === 'object' ? status : {};
+  const lastRunAt = typeof record.lastRunAt === 'number' && isFinite(record.lastRunAt) ? record.lastRunAt : null;
+  const outcome = typeof record.outcome === 'string' ? record.outcome : null;
+  if (lastRunAt === null && outcome === null && !workWaiting) return [];
+
+  const what = outcome === null ? null : (OUTCOME_TEXT[outcome] || `ended "${outcome}"`);
+  // A lock-failed exit writes no `lastRunAt`, so the one on file is an earlier run's: not this outcome's time.
+  const when = outcome === 'lock-failed' ? null : formatMs(lastRunAt);
+  let line;
+  if (when !== null) line = `Background upload: last run ${when}${what === null ? '' : `, ${what}`}.`;
+  else if (what !== null) line = `Background upload: ${what}.`;
+  else line = 'Background upload: no run has finished yet.';
+
+  const retryAt = typeof record.retryAfterAt === 'number' && record.retryAfterAt > now ? formatMs(record.retryAfterAt) : null;
+  const retry = retryAt === null ? '' : ` after ${retryAt}`;
+  let warning = null;
+  if (outcome !== null && OUTCOME_WARNINGS[outcome]) warning = OUTCOME_WARNINGS[outcome](retry);
+  else if (retryAt !== null) warning = `Warning: background uploads are paused until ${retryAt} after a failed run. Beezi retries on its own then; to send now, run the track skill.`;
+  else if (workWaiting && (lastRunAt === null || now - lastRunAt > DAY_MS)) warning = STALE_WARNING;
+  return warning === null ? [line] : [line, warning];
+}
+
 // `dir` is the thread's recorded folder (null when none); `tracking` is each account's tracking state by key;
-// `plugin` is pluginInfo(). A revoked account reports nothing, so it gets no route line.
-export function statusExtraLines({ rows, dir, ctx, tracking, plugin }) {
+// `plugin` is pluginInfo(); `upload` is uploadStatusLines' input, or null when it could not be read. A revoked
+// account reports nothing, so it gets no route line, and a machine with no linked account gets no upload lines.
+export function statusExtraLines({ rows, dir, ctx, tracking, plugin, upload = null }) {
   const place = placeOf(dir, ctx);
   const linked = rows.filter((row) => row.status !== AccountStatus.REVOKED);
   const lines = [];
@@ -79,6 +155,9 @@ export function statusExtraLines({ rows, dir, ctx, tracking, plugin }) {
         if (line != null) lines.push(line);
       } catch { /* this row's line is left out */ }
     });
+  }
+  if (upload != null && linked.some((row) => row.status === AccountStatus.LINKED)) {
+    try { lines.push(...uploadStatusLines(upload)); } catch { /* the upload lines are left out */ }
   }
   return lines.concat([`Plugin: ${pluginText(plugin)}`], updateSteps(plugin));
 }

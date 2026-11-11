@@ -966,7 +966,7 @@ test('gzip 18. a coded 403 on a compressed chunk is not resent and halts as toda
   assert.equal(result.halt, BackfillHalt.ALREADY_COMPLETED);
 });
 
-test('gzip 19. a 429 on a compressed chunk is not resent plain', async () => {
+test('gzip 19. a 429 on a compressed chunk is not resent plain and stays retryable', async () => {
   const post = fakePost([{ status: 429, body: { statusCode: 429, message: 'Too Many Requests' } }]);
   const compression = { enabled: true };
 
@@ -974,8 +974,23 @@ test('gzip 19. a 429 on a compressed chunk is not resent plain', async () => {
 
   assert.deepEqual(gzipFlags(post.calls), [true]);
   assert.equal(compression.enabled, true);
-  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.REJECTED);
+  assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
+  assert.equal(result.retryableFailures, 1);
+  assert.equal(result.permanentRejections, 0);
 });
+
+for (const status of [408, 429]) {
+  test(`a plain ${status} is retryable, never REJECTED`, async () => {
+    const post = fakePost([{ status, body: { statusCode: status, message: 'later' } }]);
+
+    const result = await flushBackfillChunks([group('s1', 1)], KEY, SESSION, { postJsonImpl: post.impl, ...noIssues });
+
+    assert.equal(result.bySession.get('s1').status, BackfillSessionStatus.FAILED);
+    assert.equal(result.retryableFailures, 1);
+    assert.equal(result.permanentRejections, 0);
+    assert.equal(result.lastError, `HTTP ${status}`);
+  });
+}
 
 // ─── anonymization ──────────────────────────────────────────────────────────
 

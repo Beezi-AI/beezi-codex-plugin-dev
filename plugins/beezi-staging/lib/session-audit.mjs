@@ -52,7 +52,11 @@ import { postSessionError as _postSessionError } from './session-error-report.mj
 import { resolveTranscriptByCwd } from './transcript-codex.mjs';
 import { lastUsageLine as _lastUsageLine } from './delta-codex.mjs';
 import { whoami as _whoami } from './whoami.mjs';
-import { stateDir, beeziCodexHome } from './paths.mjs';
+import { stateDir, beeziCodexHome, queueDir } from './paths.mjs';
+import { postableQueueNames } from './workspace-queue.mjs';
+import { withUploadLock as _withUploadLock } from './upload-lock.mjs';
+import { maybeSpawnUploadWorker as _maybeSpawnUploadWorker } from './upload-trigger.mjs';
+import { readUploadStatus as _readUploadStatus, workerWillRetry, workerRetryFailing } from './upload-worker.mjs';
 import { readJson } from './fs-store.mjs';
 import { isMultiTenant, tenantsOf } from './workspace.mjs';
 import { createRouteContext, planSessionRoutes, rulesOf } from './workspace-rules.mjs';
@@ -301,7 +305,9 @@ function noteRecent(result, entry) {
   if (typeof entry.transcriptPath === 'string') result.recent.push({ sessionId: entry.sessionId, path: entry.transcriptPath });
 }
 
-// Sync past Codex sessions on this machine into Beezi (G-3-3): drain the durable queue, ask
+// Sync past Codex sessions on this machine into Beezi (G-3-3): drain the durable queue (under the
+// upload worker's lock, before the history lock — or, with `options.drainQueue === false`, the MCP
+// watcher's pass, not at all: a queue holding a report defers the run to the worker), ask
 // /sessions/coverage how far each session already reaches, and send only what lies past it through
 // the tracking-policy-aware sync route. Timelines ride IN the chunk payload (the tracking-gated
 // standalone timeline route is unreachable for audit tenants); only rate-limit error reports remain a
@@ -320,6 +326,9 @@ export function createRunCache(deps = {}) {
 }
 
 export async function runAudit(deps = {}, options = {}) {
+  // The account, its gates and the drain, BEFORE the history lock (see prepareAudit).
+  const prepared = await prepareAudit(deps, options);
+  if (prepared.stop) return prepared.stop;
   const acquire = orDefault(deps.acquireLockImpl, _acquireLock);
   let lock;
   try {
@@ -353,7 +362,17 @@ export async function runAudit(deps = {}, options = {}) {
       const seen = inspectLock({ name, kind: 'session', file: path.join(locksDir(), name) });
       if (seen.held && !seen.takeoverReady) return { ...emptyAuditResult(), ok: true, reason: 'active-writer' };
     }
-    return await runAuditLocked(lock.handle, deps, options);
+    // The drain ran outside this lock, so a hook could queue a report between the two: one this
+    // run's coverage answer would be stale by. Under the lock no new checkpoint starts, so a report
+    // that was not on disk before the drain and is on disk now stops the run here, for the worker.
+    let late;
+    try { late = postableQueueNames(prepared.key).filter((name) => !prepared.beforeDrain.has(name)); }
+    catch (error) { return { ...prepared.result, ok: true, reason: 'pending-unreadable', lastError: error.message }; }
+    if (late.length > 0) {
+      startUploadWorker(deps);
+      return { ...prepared.result, ok: true, reason: 'pending-not-drained', lastError: 'reports were queued after the drain' };
+    }
+    return await runAuditLocked(lock.handle, deps, options, prepared);
   } finally {
     try { lock.handle.release(); } catch { /* best-effort */ }
   }
@@ -449,40 +468,16 @@ function emptyAuditResult() {
   };
 }
 
-async function runAuditLocked(lockHandle, deps = {}, options = {}) {
-  const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
-  // Only the audit asks for rollouts it cannot read (compressed, no zstd here): it counts them.
-  const listRollouts = orDefault(deps.listRollouts, () => _listAllRollouts({ includeBlind: true }));
-  const runCheckpoint = orDefault(deps.runCheckpointImpl, _runCheckpoint);
-  const flushBackfillChunks = orDefault(deps.flushBackfillChunksImpl, _flushBackfillChunks);
-  const loadLedger = orDefault(deps.loadLedgerImpl, _loadLedger);
-  const saveLedger = orDefault(deps.saveLedgerImpl, _saveLedger);
-  const computeSessionTimeline = orDefault(deps.computeSessionTimelineImpl, _computeSessionTimeline);
-  const rolloutStartedAtImpl = orDefault(deps.rolloutStartedAtImpl, _rolloutStartedAt);
-  const indexSubagentRollouts = orDefault(deps.indexSubagentRolloutsImpl, _indexSubagentRollouts);
-  const postSessionError = orDefault(deps.postSessionErrorImpl, _postSessionError);
+// The run's account and every gate that needs no history lock, then the drain before
+// reconciliation (R2). -> { stop: <result> } to return as is, or the prepared run: the session
+// (cloned per workspace), its tracking reads and the queue's report names from before the drain.
+async function prepareAudit(deps, options) {
   const readTracking = orDefault(deps.readTrackingStateImpl, readTrackingState);
-  const whoamiImpl = orDefault(deps.whoamiImpl, _whoami);
-  const recordWhoamiImpl = orDefault(deps.recordWhoamiImpl, recordWhoami);
-  const fetchImpl = deps.fetchImpl || fetchCompat;
-  const onProgress = orDefault(deps.onProgress, () => {});
-  const now = orDefault(deps.now, () => Date.now());
-  const fetchCoverage = orDefault(deps.fetchCoverageImpl, _fetchCoverage);
-  const lastUsageLine = orDefault(deps.lastUsageLineImpl, _lastUsageLine);
-  const loadCoverage = orDefault(deps.loadCoverageCheckpointsImpl, _loadCoverageCheckpoints);
-  const saveCoverage = orDefault(deps.saveCoverageCheckpointsImpl, _saveCoverageCheckpoints);
-  const flushQueue = orDefault(deps.flushQueueImpl, _flushQueue);
-  const postJson = orDefault(deps.postJsonImpl, _postJson);
-  const readChatgptAuth = orDefault(deps.readChatgptAuthImpl, _readChatgptAuth);
-  const readBillingConfig = orDefault(deps.readBillingConfigImpl, _readBillingConfig);
-
   const result = emptyAuditResult();
+  const stop = (fields) => ({ stop: { ...result, ...fields } });
 
   let session = await auditSession(deps, options);
-  if (!session) {
-    result.reason = 'no-token';
-    return result;
-  }
+  if (!session) return stop({ reason: 'no-token' });
   const key = session.key;
 
   // A multi-workspace account never sends headerless: the caller names the workspace. Cloned HERE,
@@ -492,10 +487,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // coverage files too.
   const multi = isMultiTenant(session);
   const tenantId = multi && options.tenantId != null ? options.tenantId : null;
-  if (multi && tenantId == null) {
-    result.reason = 'workspace-required';
-    return result;
-  }
+  if (multi && tenantId == null) return stop({ reason: 'workspace-required' });
   if (multi) session = { ...session, tenantId };
 
   // The binding key for the ledger and the tracking cache. It used to be a process-global primed
@@ -514,9 +506,7 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
 
   // The sync route admits audit tenants; only liveOnly (the watcher's unprompted pass) stops here.
   if (options.liveOnly === true && trackingValid && (multi ? isTenantDark(tracking, tenantId) : !isLiveTrackingAllowed(key, deps))) {
-    result.ok = true;
-    result.reason = 'audit-only';
-    return result;
+    return stop({ ok: true, reason: 'audit-only' });
   }
 
   // ── Drain durable pending reports BEFORE reconciliation (R2) ──────────────────────────────
@@ -530,24 +520,127 @@ async function runAuditLocked(lockHandle, deps = {}, options = {}) {
   // retries them.
   try {
     if (fs.readdirSync(path.join(beeziCodexHome(), 'checkpoint-transactions')).some(name => name.endsWith('.json'))) {
-      return { ...result, ok: true, reason: 'pending-transaction' };
+      return stop({ ok: true, reason: 'pending-transaction' });
     }
-  } catch (error) { if (error.code !== 'ENOENT') return { ...result, ok: true, reason: 'pending-unreadable', lastError: error.message }; }
-  const drained = await flushQueue(key, session, { fetchImpl });
+  } catch (error) { if (error.code !== 'ENOENT') return stop({ ok: true, reason: 'pending-unreadable', lastError: error.message }); }
+
+  const prepared = { stop: null, result, session, key, multi, tenantId, identity, tracking, trackingValid, beforeDrain: new Set() };
+  // ── The watcher's pass (drainQueue: false): the upload worker drains, never this process ──
+  // A queue holding a report it could send defers the run and starts the worker; a held
+  // workspace-ask file is on disk by design and does not. No upload lock is taken.
+  if (options.drainQueue === false) {
+    let present;
+    try { present = postableQueueNames(key); } catch (error) { return stop({ ok: true, reason: 'pending-unreadable', lastError: error.message }); }
+    // `queuedBefore` (a Map of key -> Set of names) is what the watcher's pass asks this run to
+    // wait on: the queue as the pass found it, plus the reports it queued since for any session it
+    // captured (lib/rollout-watcher.mjs waitOnCaptured), which this run could otherwise replay under.
+    // Any other report the pass queued is another session's: it neither waits here nor counts as
+    // queued late below.
+    const before = options.queuedBefore instanceof Map ? options.queuedBefore.get(key) : null;
+    const waiting = before instanceof Set ? present.filter((name) => before.has(name)) : present;
+    if (waiting.length > 0) {
+      const trigger = startUploadWorker(deps);
+      // A worker that will retry this queue soon — its last run left work on disk (`pendingWork`),
+      // or a report is newer than that run and untried — makes this 'upload-busy', a busy skip, so
+      // the watcher and a pending-history entry come back in minutes (lib/pending-history-run.mjs
+      // classifyRun) instead of counting a failure. Otherwise the reports are the drain's old
+      // verdict (left after a clean run: route absent, a rejection no retry sends), not drained.
+      // Exactly the line the trigger draws (workerWillRetry): busy while a worker is coming, never
+      // after, or a stuck queue would retry every few minutes forever. A queue that keeps failing
+      // (5xx, 401) keeps `pendingWork`, so it stays busy for as long as the trigger keeps retrying it.
+      // Busy is only the retry delay: when that retry is of a run that FAILED (workerRetryFailing)
+      // and no worker is running now, `uploadFailing` charges the pending-history request an attempt
+      // (lib/pending-history.mjs settleHistory), so it reaches the failure notices, not a silent expiry.
+      const status = readStatusFor(deps);
+      if (workerWillRetry(status, (since) => anyNewerThan(key, waiting, since))) {
+        const busy = { ok: true, reason: 'upload-busy', lastError: 'queued reports wait for the background upload' };
+        if (trigger !== 'running' && workerRetryFailing(status)) busy.uploadFailing = true;
+        return stop(busy);
+      }
+      return stop({ ok: true, reason: 'pending-not-drained', lastError: 'queued reports the background upload could not deliver' });
+    }
+    prepared.beforeDrain = new Set(present);
+    return prepared;
+  }
+
+  // ── The manual drain: under the upload worker's lock, waiting up to 60 s for it ────────────
+  // 'upload' and 'backfill' are both rank-1 run locks, and the primitive refuses a second rank-1
+  // lock whichever is taken first ('lock-order'), so they are taken in SEQUENCE: this drain under
+  // 'upload', then the history lock in runAudit. What the queue held before the drain is recorded
+  // here, so runAudit can tell a report queued after it from one the drain kept.
+  const flushQueue = orDefault(deps.flushQueueImpl, _flushQueue);
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  // An unreadable queue here is caught again under the history lock, as pending-unreadable.
+  const locked = await _withUploadLock(async () => {
+    try { prepared.beforeDrain = new Set(postableQueueNames(key)); } catch { prepared.beforeDrain = new Set(); }
+    return flushQueue(key, session, { fetchImpl });
+  }, orDefault(deps.uploadLock, {}));
+  // Busy is a running worker sending this very queue, or a migration holding the root: a benign
+  // skip with its own line (lib/history-cli.mjs), retried like any busy run.
+  if (!locked.ok && locked.reason === 'busy') {
+    const what = locked.detail === 'migration' ? 'a data migration holds this machine' : 'the background upload is sending';
+    return stop({ ok: true, reason: 'upload-busy', lastError: what });
+  }
+  if (!locked.ok) {
+    return stop({ reason: locked.reason === 'lock-order' ? 'lock-order' : 'lock-failed', lastError: orDefault(locked.detail, locked.reason) });
+  }
+  const drained = locked.value;
   result.pendingDrained = orDefault(drained.flushed, 0);
   // Without liveOnly a dark queue does not stop the run: coverage lacks those reports, so the sync route re-sends their lines.
-  if (drained.trackingDisabled === true && options.liveOnly === true) {
-    result.ok = true;
-    result.reason = 'audit-only';
-    return result;
-  }
+  if (drained.trackingDisabled === true && options.liveOnly === true) return stop({ ok: true, reason: 'audit-only' });
   if (drained.lockSkipped || orDefault(drained.unreadable, 0) > 0
     || orDefault(drained.failed, 0) > 0 || orDefault(drained.deferred, 0) > 0) {
-    result.ok = true;
-    result.reason = 'pending-not-drained';
-    result.lastError = orDefault(drained.lastError, 'queued reports could not be delivered');
-    return result;
+    return stop({ ok: true, reason: 'pending-not-drained', lastError: orDefault(drained.lastError, 'queued reports could not be delivered') });
   }
+  return prepared;
+}
+
+// The upload worker's status record; {} (no run seen, so every report counts as new) when unreadable.
+function readStatusFor(deps) {
+  try { return orDefault(deps.readUploadStatus, _readUploadStatus)(); } catch { return {}; }
+}
+
+// Whether any of `names` in this account's queue was written after `since`.
+// An unreadable file counts as new: the worker has not been seen to try it.
+function anyNewerThan(key, names, since) {
+  return names.some((name) => {
+    try { return fs.statSync(path.join(queueDir(key), name)).mtimeMs > since; } catch { return true; }
+  });
+}
+
+// The trigger (I-trigger): sync, cheap, never throws. The worker sends what this run left queued.
+// → the trigger's answer ('running' when a worker holds the upload lock), or null when it threw.
+function startUploadWorker(deps) {
+  try { return orDefault(deps.maybeSpawnUploadWorker, _maybeSpawnUploadWorker)(); } catch { return null; /* the next hook triggers */ }
+}
+
+async function runAuditLocked(lockHandle, deps, options, prepared) {
+  const getAccessToken = orDefault(deps.getAccessToken, _getAccessToken);
+  // Only the audit asks for rollouts it cannot read (compressed, no zstd here): it counts them.
+  const listRollouts = orDefault(deps.listRollouts, () => _listAllRollouts({ includeBlind: true }));
+  const runCheckpoint = orDefault(deps.runCheckpointImpl, _runCheckpoint);
+  const flushBackfillChunks = orDefault(deps.flushBackfillChunksImpl, _flushBackfillChunks);
+  const loadLedger = orDefault(deps.loadLedgerImpl, _loadLedger);
+  const saveLedger = orDefault(deps.saveLedgerImpl, _saveLedger);
+  const computeSessionTimeline = orDefault(deps.computeSessionTimelineImpl, _computeSessionTimeline);
+  const rolloutStartedAtImpl = orDefault(deps.rolloutStartedAtImpl, _rolloutStartedAt);
+  const indexSubagentRollouts = orDefault(deps.indexSubagentRolloutsImpl, _indexSubagentRollouts);
+  const postSessionError = orDefault(deps.postSessionErrorImpl, _postSessionError);
+  const whoamiImpl = orDefault(deps.whoamiImpl, _whoami);
+  const recordWhoamiImpl = orDefault(deps.recordWhoamiImpl, recordWhoami);
+  const fetchImpl = deps.fetchImpl || fetchCompat;
+  const onProgress = orDefault(deps.onProgress, () => {});
+  const now = orDefault(deps.now, () => Date.now());
+  const fetchCoverage = orDefault(deps.fetchCoverageImpl, _fetchCoverage);
+  const lastUsageLine = orDefault(deps.lastUsageLineImpl, _lastUsageLine);
+  const loadCoverage = orDefault(deps.loadCoverageCheckpointsImpl, _loadCoverageCheckpoints);
+  const saveCoverage = orDefault(deps.saveCoverageCheckpointsImpl, _saveCoverageCheckpoints);
+  const postJson = orDefault(deps.postJsonImpl, _postJson);
+  const readChatgptAuth = orDefault(deps.readChatgptAuthImpl, _readChatgptAuth);
+  const readBillingConfig = orDefault(deps.readBillingConfigImpl, _readBillingConfig);
+
+  const { result, key, multi, tenantId, identity, tracking, trackingValid } = prepared;
+  let session = prepared.session;
   // After the drain, so queued live reports keep their own kinds: an accepted upload hides at least what was hidden at the yes.
   session = withKinds(session, options.acceptedKinds);
 

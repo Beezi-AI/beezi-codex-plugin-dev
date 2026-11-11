@@ -152,7 +152,8 @@ export function* scanRecords(transcriptPath, options) {
 }
 
 // scanRecords with each record's 0-based physical line, counted as computeDelta counts it.
-export function* scanNumberedRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES } = {}) {
+// `chunkBytes` sizes each read; a caller after one small record passes less than the default.
+export function* scanNumberedRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES, chunkBytes = CHUNK_BYTES } = {}) {
   let fd;
   try { fd = fs.openSync(transcriptPath, 'r'); } catch { return; }
   try {
@@ -165,7 +166,7 @@ export function* scanNumberedRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES
       if (whole !== null) yield* scanDecompressed(whole, maxBytes);
       return;
     }
-    const buf = Buffer.alloc(CHUNK_BYTES);
+    const buf = Buffer.alloc(chunkBytes);
     // Streaming decode, not buf.toString(): a multi-byte UTF-8 sequence straddling a chunk boundary
     // would otherwise decode to U+FFFD, and a mangled character in a name we POST is a visible bug
     // on a corpus full of non-ASCII prompts.
@@ -175,7 +176,7 @@ export function* scanNumberedRecords(transcriptPath, { maxBytes = MAX_SCAN_BYTES
     let lineNo = 0;
     while (read < maxBytes) {
       let n;
-      try { n = fs.readSync(fd, buf, 0, Math.min(CHUNK_BYTES, maxBytes - read), read); } catch { return; }
+      try { n = fs.readSync(fd, buf, 0, Math.min(chunkBytes, maxBytes - read), read); } catch { return; }
       if (n <= 0) break;
       read += n;
       const text = carry + decoder.decode(buf.subarray(0, n), { stream: true });
@@ -324,8 +325,14 @@ export function isSafeSessionName(text) {
 // or safety check is SKIPPED and scanning continues. It used to latch on the first non-skipped
 // candidate, which is how <environment_context> at byte 37,915 beat the actual prompt at 51,636.
 export function sessionNameFrom(transcriptPath) {
+  return sessionNameFromRecords(scanRecords(transcriptPath));
+}
+
+// sessionNameFrom over records already read (a whole read the caller holds); null entries — blank
+// or malformed lines — are passed over.
+export function sessionNameFromRecords(records) {
   let fallback = null;
-  for (const rec of scanRecords(transcriptPath)) {
+  for (const rec of records) {
     if (rec && rec.type === 'event_msg' && rec.payload && rec.payload.type === 'user_message') {
       const text = candidateText(rec);
       if (text && !isPreamble(text) && isSafeSessionName(text)) return text.slice(0, MAX);
@@ -340,16 +347,20 @@ export function sessionNameFrom(transcriptPath) {
 
 // Session display name: prefer Codex's session index (the live thread title), falling back to the
 // first user prompt in the rollout. The transcript path is passed through so the index lookup can
-// recover a codex home that codexHome() got wrong.
-export function resolveSessionName(sessionId, transcriptPath) {
+// recover a codex home that codexHome() got wrong. `options.rolloutName` supplies that prompt name
+// when the caller already holds the rollout (lib/checkpoint.mjs's memo); it is only called when the
+// answer can depend on it. Default: a bounded scan of the rollout's head.
+export function resolveSessionName(sessionId, transcriptPath, options = {}) {
+  const fromRolloutFile = () => sessionNameFrom(transcriptPath);
+  const rolloutName = typeof options.rolloutName === 'function' ? options.rolloutName : fromRolloutFile;
   // Written out (not orDefault) so the rollout scan only runs when it can change the answer.
   const entry = indexEntry(sessionId, transcriptPath);
-  if (entry === null) return sessionNameFrom(transcriptPath);
+  if (entry === null) return rolloutName();
   // More than one record for this id means Codex has already written past the placeholder seed, so
   // the chosen name is a real title and the rollout never has to be opened. (The chosen record is
   // the newest that passed the gate, which on a two-record session is the AI title.)
   if (entry.total > 1) return entry.name;
-  const fromRollout = sessionNameFrom(transcriptPath);
+  const fromRollout = rolloutName();
   return isTruncatedPrompt(entry.name, fromRollout) ? fromRollout : entry.name;
 }
 

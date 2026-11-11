@@ -387,6 +387,42 @@ export async function markTenantsReviewed(key, ids, deps = {}) {
   return addTenantIds(key, 'reviewedTenantIds', ids, deps);
 }
 
+// The setup's tracking question was answered for this account on this machine (workspace.mjs setup everything / chosen), and so was its listing record.
+export async function markTrackingChosen(key, nowIso, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) throw new UserError('No such linked account.');
+    found.trackingChosenAt = nowIso;
+    if (found.setupListing != null && typeof found.setupListing === 'object') found.setupListing = { ...found.setupListing, answeredAt: nowIso };
+    writeIndex(index);
+  });
+}
+
+// The setup listing's consent record, replacing any earlier one: { listedAt, sessionIds, kinds: { <tenantId>: [kind…] } }.
+export async function saveSetupListing(key, record, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) throw new UserError('No such linked account.');
+    found.setupListing = record;
+    writeIndex(index);
+  });
+}
+
+// Removes and returns the account's answered setup listing record; null, removing nothing, when there is none or it is unanswered.
+export async function takeAnsweredListing(key, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    const record = found ? found.setupListing : null;
+    if (record == null || typeof record !== 'object' || typeof record.answeredAt !== 'string') return null;
+    delete found.setupListing;
+    writeIndex(index);
+    return record;
+  });
+}
+
 // The history worker stamps the start of its pass on the entries it is about to run.
 export async function notePendingAttempt(key, tenantIds, nowIso, deps = {}) {
   return mutate(deps, () => {
@@ -673,15 +709,25 @@ function sessionFor(a, auth) {
  *
  * The concurrent first pass stays, because it is free in the common case and not in the rare one:
  * getAuthentication answers `ready` BEFORE acquiring any lock when the stored token is still
- * fresh, so an ordinary tick takes no locks at all and the credential read — a PowerShell spawn on
- * Windows, inside a hook budget with room for one — is not multiplied by the number of accounts.
- * Only simultaneous expiry serializes, and that path is network-bound anyway.
+ * fresh, so an ordinary tick takes no locks at all. Only simultaneous expiry serializes, and that
+ * path is network-bound anyway.
+ *
+ * THE GUARD RUNS ONCE, HERE. Each credential read is a PowerShell spawn on Windows (~1.1 s), and
+ * the environment guard itself reads every account's blob. Left to getAuthentication it ran once
+ * per account, so N accounts cost N·(N+1) reads (6 for two accounts); checked once and passed down
+ * as `guardChecked`, they cost N for the guard plus N for the tokens. A refusal drops every
+ * account, exactly as N refusals from getAuthentication did.
  */
 export async function linkedSessions(deps = {}) {
   const { getAuthentication } = await import('./token.mjs');
+  const { checkEnvironment, shouldCheckEnvironment } = await import('./env-guard.mjs');
+  if (shouldCheckEnvironment(deps, 'getCredentials', 'checkEnvironment')) {
+    const guard = (deps.checkEnvironment || checkEnvironment)();
+    if (guard.status !== 'ok' && guard.status !== 'migrated') return [];
+  }
   const linked = (await listAccounts(deps)).filter((a) => a.status === AccountStatus.LINKED);
   const authenticate = async (a) => {
-    try { return await getAuthentication(a.key, deps); } catch (error) { return null; }
+    try { return await getAuthentication(a.key, deps, { guardChecked: true }); } catch (error) { return null; }
   };
   const first = await Promise.all(linked.map(authenticate));
   const sessions = [];
