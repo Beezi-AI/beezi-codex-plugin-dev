@@ -293,6 +293,32 @@ test('migration — the legacy root is preserved, production starts fresh, both 
   assert.equal(result.report.credentialPreserved, true);
 });
 
+// The upload worker's hand-off belongs to the root's own sessions: a sibling environment's worker
+// must never run them. Not copied, and not data, so the source keeps them (and still binds clean).
+test('migration — due markers and the worker status stay with the source root, never copied', (t) => {
+  const source = sandbox(t, 'src');
+  const destination = path.join(sandbox(t, 'dst-parent'), '.beezi-codex-staging');
+  legacyRoot(source, { credential: stagingCredential });
+  fs.mkdirSync(path.join(source, 'upload-due'), { recursive: true });
+  fs.writeFileSync(path.join(source, 'upload-due', 'sess-1.json'), JSON.stringify({ version: 1, sessionId: 'sess-1', sessionStart: true, markedAt: 1 }));
+  fs.writeFileSync(path.join(source, 'upload-worker.json'), JSON.stringify({ version: 1, attemptedAt: 1 }));
+
+  assert.equal(ensureEnvironmentMigrated(depsFor(source, destination, { credential: stagingCredential })).status, 'migrated');
+
+  assert.equal(fs.existsSync(path.join(destination, 'upload-due')), false);
+  assert.equal(fs.existsSync(path.join(destination, 'upload-worker.json')), false);
+  assert.equal(fs.existsSync(path.join(source, 'upload-due', 'sess-1.json')), true);
+  assert.equal(fs.existsSync(path.join(source, 'upload-worker.json')), true);
+});
+
+test('rootHasData — due markers and the worker status alone leave a root fresh', (t) => {
+  const dir = sandbox(t, 'fresh');
+  fs.mkdirSync(path.join(dir, 'upload-due'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'upload-due', 'sess-1.json'), '{}');
+  fs.writeFileSync(path.join(dir, 'upload-worker.json'), '{}');
+  assert.equal(rootHasData(dir), false);
+});
+
 test('migration — the notice never contains the token', (t) => {
   const source = sandbox(t, 'src-notice');
   const destination = path.join(sandbox(t, 'dst-notice'), '.beezi-codex-staging');

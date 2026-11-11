@@ -6,7 +6,7 @@ import { rolloutStartedAt as _rolloutStartedAt } from './subagent-codex.mjs';
 import { pendingHistoryOf, historyDue, waitingOnRecent, acceptedKindsOf, RunOutcome, SettleState } from './pending-history.mjs';
 
 // A live checkpoint transaction or a run that took the lock over is busy, not a failure.
-const BUSY_REASONS = ['run-in-progress', 'active-writer', 'pending-transaction'];
+const BUSY_REASONS = ['run-in-progress', 'upload-busy', 'active-writer', 'pending-transaction'];
 const BUSY_HALTS = [BackfillHalt.LOCK_LOST];
 const REFUSED_REASONS = ['workspace-required', 'audit-only'];
 const REFUSED_HALTS = [BackfillHalt.NOT_ALLOWED, BackfillHalt.FORBIDDEN, BackfillHalt.UNSUPPORTED_SERVER];
@@ -85,6 +85,8 @@ export async function runPendingHistory(key, deps = {}, { tenantIds = null, onRe
         sent: ran.sessionsImported || 0,
         skipped: (ran.deferredGap || 0) + (ran.deferredSplit || 0) + (ran.deferredOverlap || 0),
       };
+      // Busy behind an upload that keeps failing: retried at the busy delay, charged as a failure.
+      if (run.outcome === RunOutcome.BUSY && ran.uploadFailing === true) run.failing = true;
       busy = run.outcome === RunOutcome.BUSY;
     }
     // A busy index lock leaves this entry for the next pass instead of abandoning the rest.
@@ -113,6 +115,13 @@ export async function runPendingHistoryPatiently(key, deps = {}, { waitMs = BUSY
 
 // The watcher's retry: every linked account whose pending history is due, one after another.
 // Reads the index as written: an unmigrated install has no marker, and its migration may reach the keyring.
+// Credential-free: is any linked account's pending history due? The watcher folds this into its guard-or-idle decision.
+export async function pendingHistoryDueNow(deps = {}) {
+  const accounts = deps.accounts == null ? await import('./accounts.mjs') : deps.accounts;
+  const nowMs = deps.now == null ? Date.now() : deps.now();
+  return accounts.listAccountsSync().some((a) => a.status === accounts.AccountStatus.LINKED && historyDue(a, nowMs));
+}
+
 export async function runDuePendingHistory(deps = {}) {
   const accounts = deps.accounts == null ? await import('./accounts.mjs') : deps.accounts;
   const nowMs = deps.now == null ? Date.now() : deps.now();

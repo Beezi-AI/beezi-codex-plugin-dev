@@ -191,14 +191,22 @@ function walkSubagentRollouts(root, { sinceMs = null, maxReads = 500 } = {}, vis
   // Counts files OPENED, not files matched. Bounding matches would be no bound at all: a machine
   // with thousands of rollouts and no subagents is exactly the case that never hits a match cap.
   let reads = 0;
-  const walk = (dir, depth) => {
+  const floor = sinceMs == null ? null : dateFloor(sinceMs);
+  // `date` is the [year, month, day] prefix this directory's path spells, or null once a name on the
+  // way down is not a number (such a subtree is walked whole).
+  const walk = (dir, depth, date) => {
     if (depth > 4 || reads >= maxReads) return;
     let entries;
     try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
     for (const entry of entries) {
       if (reads >= maxReads) return;
       const full = path.join(dir, entry.name);
-      if (entry.isDirectory()) { walk(full, depth + 1); continue; }
+      if (entry.isDirectory()) {
+        const next = date !== null && depth < 3 && /^\d+$/.test(entry.name) ? date.concat(Number(entry.name)) : null;
+        if (next !== null && floor !== null && endsBefore(next, floor)) continue;
+        walk(full, depth + 1, next);
+        continue;
+      }
       if (!ROLLOUT_RE.test(entry.name)) continue;
       // mtime first: it is one stat, and it rejects most of the tree before any file is opened.
       let mtimeMs;
@@ -211,7 +219,26 @@ function walkSubagentRollouts(root, { sinceMs = null, maxReads = 500 } = {}, vis
       visit(identity, full, mtimeMs, entry.name);
     }
   };
-  walk(root, 0);
+  walk(root, 0, []);
+}
+
+// The earliest sessions/<yyyy>/<mm>/<dd> directory a rollout created at or after `sinceMs` can sit
+// in. Codex names the directory by LOCAL date, which this process may not share with the one that
+// wrote it, so the floor is the UTC date a day earlier: no offset (UTC-12 to UTC+14) reaches past it.
+function dateFloor(sinceMs) {
+  const d = new Date(sinceMs - 24 * 60 * 60 * 1000);
+  if (!Number.isFinite(d.getTime())) return null;
+  return [d.getUTCFullYear(), d.getUTCMonth() + 1, d.getUTCDate()];
+}
+
+// Does the date prefix `parts` (year, then month, then day) end before `floor` does? A directory is
+// skipped only then; an equal prefix may still hold days at or after the floor.
+function endsBefore(parts, floor) {
+  for (let i = 0; i < parts.length; i++) {
+    if (parts[i] < floor[i]) return true;
+    if (parts[i] > floor[i]) return false;
+  }
+  return false;
 }
 
 // Does this subagent rollout belong to `sessionId`?

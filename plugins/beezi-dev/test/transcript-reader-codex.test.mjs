@@ -3,7 +3,9 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { projectRolloutRecord, readRolloutLines } from '../lib/transcript-reader-codex.mjs';
+import {
+  projectRolloutRecord, readRolloutLines, readRolloutTail, rolloutHeadHash, sliceRolloutLines,
+} from '../lib/transcript-reader-codex.mjs';
 
 // Projection contract read by Task X3:
 // - `*_output` payloads: `output` is replaced by `outputBytes` (read by operations-codex.mjs). An output
@@ -101,6 +103,130 @@ test('an unterminated last line over maxLineBytes is torn', (t) => {
   const actual = readRolloutLines(file, { chunkBytes: 16, maxLineBytes: 32 });
   assert.equal(actual.lineCount, 2);
   assert.equal(actual.completeLines, 1);
+});
+
+// ─── byte offsets and the tail read ──────────────────────────────────────────
+
+test('every line records the byte offset just past its newline, -1 when unterminated', (t) => {
+  // 23-byte records: line 1 ends at 24, the blank line 2 at 25, line 3 at 49; line 4 has no newline.
+  const file = tempFile(t, `${SHORT}
+
+${SHORT}
+${SHORT}`);
+  for (const chunkBytes of [7, 16, 1 << 20]) {
+    const actual = readRolloutLines(file, { chunkBytes });
+    assert.deepEqual(actual.lineEnds, [24, 25, 49, -1], `chunk ${chunkBytes}`);
+    assert.equal(actual.size, 72);
+  }
+});
+
+test('an oversize line still ends where its newline is', (t) => {
+  const file = tempFile(t, `${SHORT}
+${'z'.repeat(100)}
+${SHORT}
+`);
+  for (const chunkBytes of [7, 16, 1 << 20]) {
+    const actual = readRolloutLines(file, { chunkBytes, maxLineBytes: 32 });
+    assert.deepEqual(actual.lineEnds, [24, 125, 149], `chunk ${chunkBytes}`);
+  }
+});
+
+// A first line padded past 4 KiB, so the head hash and the tail never overlap. 5032 bytes + newline.
+const BIG = j({ type: 'turn_context', pad: 'p'.repeat(5000) });
+
+function resumeAfterFirstLine(file) {
+  const full = readRolloutLines(file);
+  return { line: 1, byte: full.lineEnds[0], size: full.size, head: rolloutHeadHash(full.head, full.lineEnds[0]) };
+}
+
+test('the tail read starts at the saved byte and reads only the head check plus the new bytes', (t) => {
+  const file = tempFile(t, `${BIG}
+`);
+  const resume = resumeAfterFirstLine(file);
+  assert.equal(resume.byte, 5033);
+  fs.appendFileSync(file, `${SHORT}
+${TOKENS}
+`);
+
+  const read = t.mock.method(fs, 'readSync');
+  const tail = readRolloutTail(file, resume);
+  const bytes = read.mock.calls.reduce((sum, call) => sum + call.result, 0);
+
+  assert.deepEqual(tail.records, [{ type: 'turn_context' }, projectRolloutRecord(JSON.parse(TOKENS))]);
+  assert.equal(tail.lineCount, 2);
+  assert.equal(tail.completeLines, 2);
+  assert.deepEqual(tail.lineEnds, [5057, 5162]);
+  assert.equal(tail.size, 5162);
+  // 4096 head bytes for the hash, 1 byte to see the newline before the cursor, 24 + 105 new bytes.
+  assert.equal(bytes, 4096 + 1 + 129);
+});
+
+test('the tail read holds a torn last line back exactly as the whole read does', (t) => {
+  const file = tempFile(t, `${BIG}
+`);
+  const resume = resumeAfterFirstLine(file);
+  fs.appendFileSync(file, `${SHORT}
+{"type":"event_m`);
+  const tail = readRolloutTail(file, resume);
+  assert.deepEqual(tail.records, [{ type: 'turn_context' }]);
+  assert.equal(tail.lineCount, 2);
+  assert.equal(tail.completeLines, 1);
+  assert.deepEqual(tail.lineEnds, [5057]);
+});
+
+const fallbackCases = [
+  { name: 'the file shrank below the saved size', mutate: (file) => fs.writeFileSync(file, `${SHORT}
+`) },
+  {
+    name: 'the head changed under the same size',
+    mutate: (file) => fs.writeFileSync(file, `${j({ type: 'turn_context', pad: 'q'.repeat(5000) })}
+${SHORT}
+`),
+  },
+  { name: 'the zstd magic replaced the plain head', mutate: (file) => {
+    const buf = fs.readFileSync(file);
+    Buffer.from([0x28, 0xb5, 0x2f, 0xfd]).copy(buf, 0);
+    fs.writeFileSync(file, buf);
+  } },
+];
+for (const c of fallbackCases) {
+  test(`the tail read answers null when ${c.name}`, (t) => {
+    const file = tempFile(t, `${BIG}
+`);
+    const resume = resumeAfterFirstLine(file);
+    c.mutate(file);
+    assert.equal(readRolloutTail(file, resume), null);
+  });
+}
+
+test('the tail read answers null when the saved byte is not just past a newline', (t) => {
+  const file = tempFile(t, `${SHORT}
+${SHORT}
+`);
+  const full = readRolloutLines(file);
+  assert.equal(readRolloutTail(file, { line: 1, byte: 10, size: full.size, head: rolloutHeadHash(full.head, 10) }), null);
+});
+
+test('a slice of the whole read equals the tail read from disk', (t) => {
+  const file = tempFile(t, `${BIG}
+`);
+  const resume = resumeAfterFirstLine(file);
+  fs.appendFileSync(file, `${SHORT}
+${TOKENS}
+`);
+  const sliced = sliceRolloutLines(readRolloutLines(file), resume);
+  assert.deepEqual(sliced.records, [{ type: 'turn_context' }, projectRolloutRecord(JSON.parse(TOKENS))]);
+  assert.deepEqual(sliced.lineEnds, [5057, 5162]);
+  assert.equal(sliced.lineCount, 2);
+  assert.equal(sliced.completeLines, 2);
+});
+
+test('a slice answers null when the saved line does not end at the saved byte', (t) => {
+  const file = tempFile(t, `${BIG}
+${SHORT}
+`);
+  const resume = { ...resumeAfterFirstLine(file), line: 2 };
+  assert.equal(sliceRolloutLines(readRolloutLines(file), resume), null);
 });
 
 test('throws on an unreadable file', () => {

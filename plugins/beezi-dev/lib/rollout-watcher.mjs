@@ -1,16 +1,20 @@
 import fs from 'fs';
 import path from 'path';
-import { beeziCodexHome, codexSessionsDir, stateDir } from './paths.mjs';
+import { beeziCodexHome, codexSessionsDir, stateDir, queueDir } from './paths.mjs';
 import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { orDefault } from './compat.mjs';
 import { rolloutIdFromName, zstdSupported, isCompressedRolloutName, rolloutSupersedes } from './rollout-file.mjs';
 import { acquireLock as _acquireLock, electionLock, withLock, sharedLock } from './single-instance-lock.mjs';
-import { hookMayProceed, shouldCheckEnvironment } from './env-guard.mjs';
+import { hookMayProceed, hookMayProceedLocal, shouldCheckEnvironment } from './env-guard.mjs';
 import { isUsableSessionId, listRolloutFiles as _listRolloutFiles, ROLLOUT_HEAD_BYTES } from './transcript-codex.mjs';
 import { readRolloutHead as _readRolloutHead, subagentIdentityFrom as _subagentIdentityFrom } from './subagent-codex.mjs';
 import { runCheckpoint as _runCheckpoint, reconcileSession, listRecipients } from './checkpoint.mjs';
 import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, dontTrackSessionIds, HistoryScope } from './session-audit.mjs';
-import { runDuePendingHistory } from './pending-history-run.mjs';
+import { runDuePendingHistory, pendingHistoryDueNow } from './pending-history-run.mjs';
+import { HISTORY_BUSY_RETRY_MS } from './pending-history.mjs';
+import { maybeSpawnUploadWorker as _maybeSpawnUploadWorker } from './upload-trigger.mjs';
+import { routeAbsentFilesFor } from './upload-worker.mjs';
+import { isQueueFile, isAskFile, isPostableQueueFile, postableQueueNames } from './workspace-queue.mjs';
 import { linkedSessions as _linkedSessions } from './accounts.mjs';
 import { pruneStale as _pruneStale } from './prune.mjs';
 import { readTrackingState, isLiveTrackingAllowed, isTenantDark, workspaceLinkMs } from './tracking.mjs';
@@ -74,8 +78,24 @@ import {
 //      verdict goes to runCheckpoint as a `startCursor` HARD OVERRIDE (G-3-3) with
 //      `sweepSubagents: false`; DEFER is retried, and `coverage === null` is a DEFER, never zero.
 //   C. UNESTABLISHED AND QUIET — still for longer than the active window. Only those last written at
-//      or after the link (HistoryScope.LIVE) are sent, and they ride `runAudit`: it drains the queue first, consults
-//      coverage and honours audit-only tenants. This module reimplements none of that.
+//      or after the link (HistoryScope.LIVE) are sent, and they ride `runAudit`: it consults coverage and
+//      honours audit-only tenants, and with `drainQueue: false` it defers while the queue holds a report
+//      rather than draining it. This module reimplements none of that.
+//
+// ── ONE DRAINER ─────────────────────────────────────────────────────────────────────────────
+// The watcher never sends the live queue. Every checkpoint here is `localOnly` (no credential, no
+// request: the segments queue and the session is marked due), and the pass then starts the
+// background upload worker (lib/upload-trigger.mjs), which alone drains. Path A therefore reads no
+// credential at all; paths B and C still do, because coverage and the history sync ask the server,
+// but both wait for the worker instead of draining: B's reconcile drain is `queueForWorker`, C runs
+// runAudit with `drainQueue: false`. Both judge the queue AS IT STOOD BEFORE THIS PASS CAPTURED
+// anything (`queuedBefore`): a report this pass queued for ANOTHER session says nothing about the
+// one being reconciled, and letting it block would defer every fresh session on an active machine.
+// A report this pass queued for a session the audit may reconcile does block: path B waits on its
+// own session's reports, and before C and pending history run, the reports of every session this
+// pass captured join the set (`waitOnCaptured`). Path A captures quiet established sessions too (a
+// resume), and an audit replaying such a session from its stored coverage line would upload the
+// lines its still-queued report carries.
 //
 // A and B are LIVE capture and are gated on `isLiveTrackingAllowed()`; C gates itself. A CHANGED
 // CHILD SCHEDULES ITS ROOT (R2, G-7-1/G-7-2): `listAllRollouts()` excludes subagent rollouts, so the
@@ -647,11 +667,62 @@ function liveCutoffMs(sessions, trackingState, liveAllowed, deps) {
   return span.unknown || span.failed ? null : span.latest;
 }
 
-// Path A's settle line: the earliest known link over every workspace of every LINKED account, tokenless ones and dark
-// workspaces included; Infinity when none is known, null when a link read throws.
-async function settleBeforeMs(sessions, trackingState, deps) {
-  const span = linkSpan(allOf((await listRecipients(sessions, deps)).map(workspaceTargets)), trackingState, deps);
+// Path A's settle line: the earliest known link over every workspace of every LINKED account (`recipients`, tokenless
+// ones included) and dark workspaces included; Infinity when none is known, null when a link read throws.
+function settleBeforeMs(recipients, trackingState, deps) {
+  const span = linkSpan(allOf(recipients.map(workspaceTargets)), trackingState, deps);
   return span.failed ? null : span.earliest;
+}
+
+// Each account's postable queue names before this pass captures anything: key -> Set. An unreadable
+// queue is left out, so the drain step below reads it again (and reconcile reads its throw as unavailable).
+function queueSnapshot(recipients) {
+  const out = new Map();
+  for (const session of recipients) {
+    try { out.set(session.key, new Set(postableQueueNames(session.key))); } catch { /* judged again later */ }
+  }
+  return out;
+}
+
+// Before path C and pending history: add to each account's `queuedBefore` set the reports now on
+// disk that belong to a session this pass captured (`<sessionId>…`, the prefix queueForWorker uses),
+// so the audit waits on them rather than replaying under them. In place: path B is done with it.
+function waitOnCaptured(queuedBefore, captured) {
+  if (captured.size === 0) return;
+  const ids = [...captured];
+  for (const [key, names] of queuedBefore) {
+    let present;
+    try { present = postableQueueNames(key); } catch { queuedBefore.delete(key); continue; } // unknown: the audit waits on all
+    for (const name of present) if (ids.some((id) => name.indexOf(id) === 0)) names.add(name);
+  }
+}
+
+// Path B's drain step for reconcileSession, which sends nothing: the upload worker drains. It judges
+// every file itself (`queueJudged`), as base reconcile judged the real drain's answer:
+//   * a report that was queued before this pass, or that belongs to this very session (a hook's
+//     capture of it in between would make coverage stale), waits: `deferred`, and the pass starts the
+//     worker;
+//   * a file the worker kept because the report route is absent (its recorded `routeAbsent` names)
+//     does not: `routeAbsent`, the tolerance reconcileSession gives the real drain's 404/405s;
+//   * a report this pass's own capture of ANOTHER session queued does not wait either;
+//   * held workspace-ask files answer `workspacePending`, on disk by design.
+function queueForWorker(sessionId, queuedBefore, onWaiting) {
+  return async (key) => {
+    let names;
+    try { names = fs.readdirSync(queueDir(key)); } catch (error) { if (error.code !== 'ENOENT') throw error; names = []; }
+    const held = names.filter((name) => isQueueFile(name) && isAskFile(name)).length;
+    const postable = names.filter(isPostableQueueFile);
+    const absent = routeAbsentFilesFor(key);
+    const before = queuedBefore.get(key);
+    const kept = postable.filter((name) => absent.has(name)).length;
+    const waiting = postable.filter((name) => !absent.has(name)
+      && (!(before instanceof Set) || before.has(name) || name.indexOf(sessionId) === 0)).length;
+    if (waiting > 0) onWaiting();
+    return {
+      flushed: 0, failed: kept, routeAbsent: kept, deferred: waiting, unreadable: 0,
+      workspacePending: held, trackingDisabled: false, queueJudged: true,
+    };
+  };
 }
 
 // A session's last write as Path A knows it: its own file's mtime, else (a child-scheduled root) its newest moved child's.
@@ -667,12 +738,6 @@ function lastWriteMs(entry, kids) {
  * process must never do is take the MCP bridge down with it.
  */
 export async function runWatchPass(deps = {}, options = {}) {
-  // `linkedSessions` is this module's real-work seam now that the pass resolves accounts rather
-  // than one token — a test that stands in for it is standing in for the whole operation.
-  if (shouldCheckEnvironment(deps, 'linkedSessions', 'hookMayProceed')
-    && !(deps.hookMayProceed || hookMayProceed)()) {
-    return emptyPass('environment-blocked');
-  }
   const nowFn = orDefault(deps.now, Date.now);
   const shouldStop = orDefault(deps.shouldStop, () => false);
   const listSessions = orDefault(deps.linkedSessions, _linkedSessions);
@@ -685,6 +750,7 @@ export async function runWatchPass(deps = {}, options = {}) {
   const loadLedger = orDefault(deps.loadLedger, _loadLedger);
   const trackingState = orDefault(deps.readTrackingState, readTrackingState);
   const liveAllowed = orDefault(deps.isLiveTrackingAllowed, isLiveTrackingAllowed);
+  const startWorker = orDefault(deps.maybeSpawnUploadWorker, _maybeSpawnUploadWorker);
 
   const result = emptyPass(null);
   const record = loadObservations(deps);
@@ -700,20 +766,14 @@ export async function runWatchPass(deps = {}, options = {}) {
     dirty = true;
   }
 
-  let sessions = [];
-  try {
-    sessions = orDefault(await listSessions(deps), []);
-  } catch {
-    sessions = [];
-  }
-  if (sessions.length === 0) {
-    // Unlinked. Quiet by design — the option-C constraint: ticket drafting must keep working when
-    // analytics cannot, and an unlinked machine must not produce one error per tick forever.
+  // The credential-free guard (binding, accounts.json, apiBase), before discovery: a root bound to
+  // another environment or mid-migration is not scanned at all. The full guard still runs below,
+  // once, when the pass needs a token.
+  if (shouldCheckEnvironment(deps, 'linkedSessions', 'hookMayProceedLocal')
+    && !(deps.hookMayProceedLocal || hookMayProceedLocal)()) {
     if (dirty) saveObservations(record);
-    result.reason = 'unlinked';
-    return result;
+    return emptyPass('environment-blocked');
   }
-  if (shouldStop()) { if (dirty) saveObservations(record); result.reason = 'stopped'; return result; }
 
   const scan = await scanPass(
     {
@@ -742,6 +802,47 @@ export async function runWatchPass(deps = {}, options = {}) {
   });
   result.cooling = plan.cooling;
 
+  // Discovery is credential-free, and so is Path A: its checkpoints are local-only, and the accounts
+  // they queue for come from the index. The full env guard and `linkedSessions` (a keyring read per
+  // account) run only when this pass asks the server: a session to establish (B), an audit that is
+  // due (C), or pending history.
+  const historyAt = typeof record.historyAt === 'number' ? record.historyAt : null;
+  const historyInterval = orDefault(options.historyIntervalMs, HISTORY_INTERVAL_MS);
+  const historyDue = historyAt === null || nowMs - historyAt >= historyInterval;
+  // Pending history writes accounts.json and posts through runAudit, so it is account work and waits behind the guard.
+  let pendingDue = false;
+  try { pendingDue = await orDefault(deps.pendingHistoryDue, pendingHistoryDueNow)({ now: nowFn }); } catch { pendingDue = false; }
+  const needsTokens = plan.fresh.length > 0 || (plan.quiet.length > 0 && historyDue) || pendingDue;
+  const needsAccounts = plan.due.length > 0 || needsTokens;
+  let sessions = [];
+  if (needsTokens) {
+    // `linkedSessions` is this module's real-work seam now that the pass resolves accounts rather
+    // than one token — a test that stands in for it is standing in for the whole operation.
+    if (shouldCheckEnvironment(deps, 'linkedSessions', 'hookMayProceed')
+      && !(deps.hookMayProceed || hookMayProceed)()) {
+      if (dirty) saveObservations(record);
+      return emptyPass('environment-blocked');
+    }
+    try {
+      sessions = orDefault(await listSessions(deps), []);
+    } catch {
+      sessions = [];
+    }
+  }
+  // Every LINKED account, tokenless ones kept (an index read): who Path A's local checkpoints queue
+  // for, and who its gates below are asked about. The tokened `sessions` are for B, C and pending.
+  let recipients = [];
+  if (needsAccounts) {
+    try { recipients = await listRecipients(sessions, deps); } catch { recipients = sessions; }
+    if (recipients.length === 0) {
+      // Unlinked. Quiet by design — the option-C constraint: ticket drafting must keep working when
+      // analytics cannot, and an unlinked machine must not produce one error per tick forever.
+      if (dirty) saveObservations(record);
+      result.reason = 'unlinked';
+      return result;
+    }
+  }
+
   // The live-capture gate. An audit-only or disabled tenant gets no live checkpoint from the
   // watcher, exactly as flushQueue refuses one from a hook. It asks whether ANY linked account
   // still allows live capture — runCheckpoint gates the accounts individually, so one dark tenant
@@ -752,9 +853,9 @@ export async function runWatchPass(deps = {}, options = {}) {
   // read per account either way, and an unreadable cache has to throw somewhere this try can catch
   // it — which is what makes the fail-open posture a property of this pass and not of whichever
   // reader happens to be wired in.
-  let live = true;
+  let live = needsAccounts;
   try {
-    live = sessions.some((session) => {
+    if (needsAccounts) live = recipients.some((session) => {
       // An account in several workspaces is gated per workspace inside runCheckpoint; its
       // account-wide mode is the web workspace's.
       if (isMultiTenant(session)) return true;
@@ -762,6 +863,12 @@ export async function runWatchPass(deps = {}, options = {}) {
       return liveAllowed(session.key, { ...deps, readTrackingStateImpl: () => state }) !== false;
     });
   } catch { live = true; }
+  // Set when this pass left work for the upload worker: a capture, or a queue B or C waited on.
+  let handOff = false;
+  // The queue before any capture of this pass, for B, C and pending history to judge (see the header).
+  const queuedBefore = needsTokens ? queueSnapshot(recipients) : new Map();
+  // Every session this pass checkpointed (A and B), for waitOnCaptured.
+  const captured = new Set();
 
   const checkpointOne = async (sessionId, entry, extra, sessionHandle) => {
     // Null for a SYNTHETIC entry (a child-scheduled root whose own file this pass never stat'ed).
@@ -782,9 +889,10 @@ export async function runWatchPass(deps = {}, options = {}) {
           // A changed child bills through its ROOT's sweep. Excluding subagents from a listing
           // does not bill them (R2/G-7-1); this flag is what does.
           sweepSubagents: true,
-          // Stands in for a Stop hook that may never run, so it ships the session timeline too.
+          // Saves to disk only; the upload worker sends (see ONE DRAINER in the header).
+          localOnly: true,
+          // Stands in for a Stop hook that may never run, so the worker owes the session timeline too.
           emitTimeline: true,
-          drainRateLimits: true,
           budgetMs: orDefault(options.budgetMs, CHECKPOINT_BUDGET_MS),
           ...orDefault(extra, {}),
         },
@@ -794,6 +902,8 @@ export async function runWatchPass(deps = {}, options = {}) {
       return false;
     }
     result.checkpointed += 1;
+    captured.add(sessionId);
+    handOff = true;
     if (!checkpointSucceeded(outcome)) return false;
     result.succeeded += 1;
     // The observation taken BEFORE the run, never a fresh stat after it (see the header).
@@ -810,7 +920,7 @@ export async function runWatchPass(deps = {}, options = {}) {
 
   // ── Path A: established sessions ──────────────────────────────────────────────────────────
   if (live) {
-    const settleMs = plan.due.length > 0 ? await settleBeforeMs(sessions, trackingState, deps) : null;
+    const settleMs = plan.due.length > 0 ? settleBeforeMs(recipients, trackingState, deps) : null;
     for (const entry of plan.due) {
       if (shouldStop()) break;
       const kids = plan.childrenBySession.get(entry.sessionId);
@@ -826,7 +936,8 @@ export async function runWatchPass(deps = {}, options = {}) {
 
   // ── Path B: unestablished but still active — coverage decides the boundary ────────────────
   // A session last written before the cutoff is past: only the offer sends it.
-  const cutoffMs = live && plan.fresh.length > 0 ? liveCutoffMs(sessions, trackingState, liveAllowed, deps) : null;
+  // Establishing asks the server, so it needs an account with a token.
+  const cutoffMs = live && sessions.length > 0 && plan.fresh.length > 0 ? liveCutoffMs(sessions, trackingState, liveAllowed, deps) : null;
   const fresh = cutoffMs == null ? [] : plan.fresh.filter((entry) => entry.mtimeMs >= cutoffMs);
   if (fresh.length > 0 && !shouldStop()) {
     for (const entry of fresh.slice(0, orDefault(options.maxEstablish, MAX_ESTABLISH_PER_PASS))) {
@@ -883,7 +994,7 @@ export async function runWatchPass(deps = {}, options = {}) {
         }, sessionHandle);
         if (ok) result.established += 1;
         return { outcome: ok ? 'committed' : 'deferred' };
-      }, { flushQueue: deps.flushQueue, isLiveTrackingAllowed: liveAllowed });
+      }, { flushQueue: orDefault(deps.flushQueue, queueForWorker(entry.sessionId, queuedBefore, () => { handOff = true; })), isLiveTrackingAllowed: liveAllowed });
       if (reconciled.outcome !== 'committed') {
         if (reconciled.reason === DeferReason.GAP || reconciled.reason === DeferReason.SPLIT) result.deferredGap += 1;
         else result.deferredUnavailable += 1;
@@ -891,13 +1002,14 @@ export async function runWatchPass(deps = {}, options = {}) {
     }
   }
 
-  const historyAt = typeof record.historyAt === 'number' ? record.historyAt : null;
-  const historyDue = historyAt === null
-    || nowMs - historyAt >= orDefault(options.historyIntervalMs, HISTORY_INTERVAL_MS);
-  if (plan.quiet.length > 0 && historyDue && !shouldStop()) {
+  // The history audits below wait on what this pass just queued for a session they may reconcile.
+  waitOnCaptured(queuedBefore, captured);
+  if (sessions.length > 0 && plan.quiet.length > 0 && historyDue && !shouldStop()) {
     // runAudit takes runLock('backfill') at rank 1 itself — legal under our rank-0 election lock,
-    // and a concurrent the sync skill simply refuses this one as 'run-in-progress'. It drains the
-    // queue first, consults coverage and honours an audit-only tenant. None of that is reimplemented here.
+    // and a concurrent the sync skill simply refuses this one as 'run-in-progress'. With
+    // `drainQueue: false` it drains nothing: a queue that held a report before this pass defers it as
+    // 'upload-busy' and starts the worker. It consults coverage and honours an audit-only tenant. None of that is
+    // reimplemented here.
     //
     // ONE RUN PER ACCOUNT, and `history` is therefore a list. The repair pass uploads to the
     // account it was given (lib/session-audit.mjs auditSession), so a machine with two linked
@@ -914,9 +1026,9 @@ export async function runWatchPass(deps = {}, options = {}) {
         if (!isMultiTenant(session)) {
           if (usesRules(session)) {
             const excludedSessionIds = dontTrackSessionIds(planWorkspaceRuns(session));
-            histories.push(await runAudit({}, { scope: HistoryScope.LIVE, liveOnly: true, key: session.key, excludedSessionIds }));
+            histories.push(await runAudit({}, { scope: HistoryScope.LIVE, liveOnly: true, key: session.key, excludedSessionIds, drainQueue: false, queuedBefore }));
           } else {
-            histories.push(await runAudit({}, { scope: HistoryScope.LIVE, liveOnly: true, key: session.key }));
+            histories.push(await runAudit({}, { scope: HistoryScope.LIVE, liveOnly: true, key: session.key, drainQueue: false, queuedBefore }));
           }
           continue;
         }
@@ -924,7 +1036,7 @@ export async function runWatchPass(deps = {}, options = {}) {
         for (const tenantId of workspaces.tenantIds) {
           if (shouldStop()) break;
           histories.push(await runAudit({}, {
-            scope: HistoryScope.LIVE, liveOnly: true, key: session.key, tenantId, sessionRoutes: workspaces.routes,
+            scope: HistoryScope.LIVE, liveOnly: true, key: session.key, tenantId, sessionRoutes: workspaces.routes, drainQueue: false, queuedBefore,
           }));
         }
       }
@@ -933,13 +1045,23 @@ export async function runWatchPass(deps = {}, options = {}) {
       result.errors += 1;
       result.history = null;
     }
-    record.historyAt = nowFn();
+    // A run that waited for the worker comes round in minutes, not at the next long interval: the
+    // worker usually empties the queue within seconds of being started.
+    const waited = (result.history || []).some((h) => h && (h.reason === 'upload-busy' || h.reason === 'run-in-progress'));
+    record.historyAt = waited ? nowFn() - historyInterval + HISTORY_BUSY_RETRY_MS : nowFn();
     dirty = true;
   }
 
   // A rule that gained a workspace owes it its history: due accounts run here, after Path C let go of the run lock.
-  if (!shouldStop()) {
-    try { await runDuePendingHistory({ shouldStop }); } catch { result.errors += 1; }
+  // Its runs take the consented options unchanged, told only not to drain: the worker is the one drainer.
+  if (sessions.length > 0 && !shouldStop()) {
+    const noDrain = (auditDeps, auditOptions) => runAudit(auditDeps, { ...auditOptions, drainQueue: false, queuedBefore });
+    try { await orDefault(deps.runDuePendingHistory, runDuePendingHistory)({ shouldStop, runAudit: noDrain }); } catch { result.errors += 1; }
+  }
+
+  // ONE trigger per pass, after every capture: the worker sends what this pass saved or waited on.
+  if (handOff) {
+    try { startWorker(); } catch { /* the next hook or pass triggers */ }
   }
 
   if (dirty) {

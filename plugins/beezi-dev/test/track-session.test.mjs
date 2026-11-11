@@ -2,6 +2,7 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveTrackTarget, trackSession } from '../lib/track-session.mjs';
 import { UserError } from '../lib/friendly-error.mjs';
+import { heldLocks } from '../lib/single-instance-lock.mjs';
 import { accountSession, fakeKeyring, TEST_KEY } from '../tools/account-fixtures.mjs';
 
 // The credential store is NOT sandboxed by BEEZI_CODEX_HOME. Any bag below that lets trackSession
@@ -252,4 +253,90 @@ test('a refusal that belongs to no account still answers with one marked line', 
   });
   assert.equal(ok, false);
   assert.deepEqual(lines, [{ ok: false, text: message }]);
+});
+
+// ─── one drainer: the track drain holds the upload worker's lock ─────────────────────────────
+
+// A fake clock the poll sleep advances: the 60 s wait runs in no real time.
+function fakeWait(acquireLock) {
+  const state = { t: 0, sleeps: 0 };
+  return {
+    state,
+    uploadLock: {
+      acquireLock,
+      now: () => state.t,
+      sleep: async (ms) => { state.sleeps += 1; state.t += ms; },
+      maybeSpawnUploadWorker: () => 'disabled',
+    },
+  };
+}
+
+test('the track checkpoint and its drain run inside run-upload, which is released after', async () => {
+  const held = [];
+  const { lines } = await trackSession(SESSION, {
+    ...linked,
+    ...onBranch('dev'),
+    runCheckpoint: async () => {
+      held.push(heldLocks().map((l) => `${l.kind}:${l.name}`));
+      return { outcome: 'committed', enqueued: 1, flushes: [{ key: TEST_KEY, flushed: 1 }] };
+    },
+  });
+  assert.deepEqual(held, [['run:run-upload']]);
+  assert.deepEqual(heldLocks(), []);
+  assert.deepEqual(lines, [{ ok: true, text: 'Beezi: analytics saved for dev (1 segment).' }]);
+});
+
+test('a running upload worker: track waits 60 s, then saves on this machine only and says it is busy', async () => {
+  const wait = fakeWait(() => ({ ok: false, reason: 'held' }));
+  const runs = [];
+  const { ok, lines, pending } = await trackSession(SESSION, {
+    ...linked,
+    ...onBranch('dev'),
+    uploadLock: wait.uploadLock,
+    runCheckpoint: async (input, _deps, options) => {
+      runs.push(options);
+      return { outcome: 'committed', enqueued: 1, flushes: [] };
+    },
+  });
+  // Nothing sent: the only checkpoint is the local-only one, which reads no credential and posts nothing.
+  assert.deepEqual(runs, [{ localOnly: true }]);
+  assert.equal(wait.state.t, 60000);
+  assert.equal(ok, true);
+  assert.deepEqual(lines, [{
+    ok: true,
+    held: true,
+    text: 'Beezi: the background upload is sending right now, so nothing was sent from here. '
+      + 'The analytics for dev are saved on this machine and go up when it finishes.',
+  }]);
+  assert.deepEqual(pending, []);
+});
+
+test('a busy upload and a local checkpoint that could not commit is a refusal, not a save', async () => {
+  const wait = fakeWait(() => ({ ok: false, reason: 'held' }));
+  const { ok, lines } = await trackSession(SESSION, {
+    ...linked,
+    ...onBranch('dev'),
+    uploadLock: wait.uploadLock,
+    runCheckpoint: async () => ({ outcome: 'deferred', reason: 'session-busy' }),
+  });
+  assert.equal(ok, false);
+  assert.deepEqual(lines, [{ ok: false, text: 'Beezi: checkpoint deferred (session-busy); retry tracking.' }]);
+});
+
+test('a lock-order refusal on the upload lock is an error line, and no checkpoint runs', async () => {
+  const wait = fakeWait(() => ({ ok: false, reason: 'lock-order', detail: 'run lock "run-upload" (rank 1) may not be taken' }));
+  let ran = false;
+  const { ok, lines } = await trackSession(SESSION, {
+    ...linked,
+    ...onBranch('dev'),
+    uploadLock: wait.uploadLock,
+    runCheckpoint: async () => { ran = true; return { outcome: 'committed', enqueued: 0, flushes: [] }; },
+  });
+  assert.equal(ran, false);
+  assert.equal(wait.state.sleeps, 0);
+  assert.equal(ok, false);
+  assert.deepEqual(lines, [{
+    ok: false,
+    text: 'Beezi: could not take the upload lock (lock-order: run lock "run-upload" (rank 1) may not be taken). Nothing was sent; retry tracking.',
+  }]);
 });

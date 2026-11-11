@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
-import { queueDir, stateDir } from '../lib/paths.mjs';
+import { queueDir, stateDir, codexSessionsDir } from '../lib/paths.mjs';
 import { writeTrackingState } from '../lib/tracking.mjs';
 import { writeAgent } from '../lib/subagent-state.mjs';
 import { computeDelta as realComputeDelta } from '../lib/delta-codex.mjs';
@@ -1041,4 +1041,180 @@ test('a rollout with no prompt yet leaves the flag unset; the handoff is found o
   assert.equal(h2.lookups.length, 1);
   assert.equal(h2.posts.filter((p) => p.sessionId === 'old-id').length, 1);
   assert.equal(readState('s1').planHandoffPosted, true);
+});
+
+// ─── byte-offset resume of the parent rollout ────────────────────────────────
+// The real delta engine and a real rollout whose first line is padded past 4 KiB, so the head the
+// resume check hashes and the tail it reads never overlap.
+
+function resumeWorld(home) {
+  const file = path.join(home, 'rollout.jsonl');
+  const at = (s) => `2026-01-01T00:00:${String(s).padStart(2, '0')}.000Z`;
+  const tok = (s, input, output) => ({ timestamp: at(s), type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, cached_input_tokens: 0, output_tokens: output } } } });
+  const lines = (records) => records.map((r) => JSON.stringify(r)).join('\n') + '\n';
+  fs.writeFileSync(file, lines([
+    { timestamp: at(0), type: 'session_meta', payload: { id: 's1', session_id: 's1', cwd: home, base_instructions: 'b'.repeat(5000) } },
+    { timestamp: at(1), type: 'turn_context', payload: { cwd: home, model: 'gpt-5.4' } },
+    tok(2, 100, 10),
+  ]));
+  const append = (records) => fs.appendFileSync(file, lines(records));
+  return { file, tok, append };
+}
+
+const realDeps = (home, file, over = {}) => deps(home, [], {
+  resolveTranscript: () => ({ transcriptPath: file, sessionId: 's1' }),
+  resolveSessionName: () => 'a session',
+  computeDelta: realComputeDelta,
+  readAgents: () => ({}),
+  ...over,
+});
+
+// Bytes read from `file` while `fn` runs, through the real fs.
+async function bytesReadFrom(t, file, fn) {
+  const open = t.mock.method(fs, 'openSync');
+  const read = t.mock.method(fs, 'readSync');
+  await fn();
+  const fds = new Set(open.mock.calls.filter((c) => c.arguments[0] === file).map((c) => c.result));
+  const bytes = read.mock.calls.filter((c) => fds.has(c.arguments[0])).reduce((sum, c) => sum + c.result, 0);
+  open.mock.restore();
+  read.mock.restore();
+  return bytes;
+}
+
+test('a checkpoint saves a byte cursor beside the line cursor', async (t) => {
+  const home = tmpHome(t);
+  const { file } = resumeWorld(home);
+  await runCheckpoint({ session_id: 's1', cwd: home }, realDeps(home, file));
+  const state = readState('s1');
+  const size = fs.statSync(file).size;
+  assert.equal(state.cursor, 3);
+  assert.equal(state.cursorByte, size);
+  assert.equal(state.cursorSize, size);
+  assert.match(state.cursorHead, /^[0-9a-f]{64}$/);
+  assert.equal(state.cursorWalk.line, 3);
+  assert.equal(state.cursorWalk.activeModel, 'gpt-5.4');
+});
+
+test('a boundary checkpoint reads only the bytes after the saved cursor', async (t) => {
+  const home = tmpHome(t);
+  const { file, tok, append } = resumeWorld(home);
+  await runCheckpoint({ session_id: 's1', cwd: home }, realDeps(home, file));
+  const before = fs.statSync(file).size;
+  append([tok(3, 250, 30)]);
+  const added = fs.statSync(file).size - before;
+
+  const bytes = await bytesReadFrom(t, file, () => runCheckpoint({ session_id: 's1', cwd: home }, realDeps(home, file)));
+
+  // The 4 KiB head the resume check hashes, the byte before the cursor, and the appended line.
+  assert.equal(bytes, 4096 + 1 + added);
+  const second = queued().find((p) => p.segmentId === 's1:4-4');
+  assert.ok(second, 'the appended line was billed as its own window');
+  assert.equal(second.token_input, 150);
+  assert.equal(second.token_output, 20);
+  assert.equal(readState('s1').cursorByte, fs.statSync(file).size);
+});
+
+test('a turn-end checkpoint reads the rollout once and resumes the delta from memory', async (t) => {
+  const home = tmpHome(t);
+  const { file, tok, append } = resumeWorld(home);
+  await runCheckpoint({ session_id: 's1', cwd: home }, realDeps(home, file));
+  append([tok(3, 250, 30)]);
+  const size = fs.statSync(file).size;
+
+  const bytes = await bytesReadFrom(t, file, () =>
+    runCheckpoint({ session_id: 's1', cwd: home }, realDeps(home, file), { emitTimeline: true }));
+
+  assert.equal(bytes, size, 'one whole read, shared by the delta and the timeline');
+  assert.equal(queued().find((p) => p.segmentId === 's1:4-4').token_input, 150);
+});
+
+test('a coverage start cursor replaces the saved byte cursor instead of resuming from it', async (t) => {
+  const home = tmpHome(t);
+  const { file, tok, append } = resumeWorld(home);
+  await runCheckpoint({ session_id: 's1', cwd: home }, realDeps(home, file));
+  append([tok(3, 250, 30)]);
+  const size = fs.statSync(file).size;
+
+  const bytes = await bytesReadFrom(t, file, () =>
+    runCheckpoint({ session_id: 's1', cwd: home }, realDeps(home, file), { startCursor: 2 }));
+
+  assert.equal(bytes, size, 'read whole: the saved offset belongs to line 3, not line 2');
+  assert.ok(queued().some((p) => p.segmentId === 's1:3-4'));
+  assert.equal(readState('s1').cursorWalk.line, 4);
+});
+
+test('a delta that brings no byte cursor clears the saved one', async (t) => {
+  const home = tmpHome(t);
+  writeState('s1', {
+    cursor: 2, cursorByte: 10, cursorSize: 10, cursorHead: 'x',
+    cursorWalk: { line: 2, prev: { input: 0, cached: 0, cacheWrite: 0, output: 0 } },
+  });
+  await runCheckpoint({ session_id: 's1', cwd: home }, deps(home, [seg()]));
+  const state = readState('s1');
+  assert.equal(state.cursor, 4);
+  assert.deepEqual(
+    [state.cursorByte, state.cursorSize, state.cursorHead, state.cursorWalk],
+    [undefined, undefined, undefined, undefined],
+  );
+});
+
+// The session name, when Codex's index has no title for the session, comes from the first prompt
+// in the rollout — read off the copy the run already holds, never by a scan of its own.
+function namedWorld(home) {
+  const { file, tok, append } = resumeWorld(home);
+  append([{ timestamp: '2026-01-01T00:00:03.000Z', type: 'event_msg', payload: { type: 'user_message', message: 'Fix the flaky login test' } }]);
+  return { file, tok, append };
+}
+const unnamedDeps = (home, file) => {
+  const d = realDeps(home, file);
+  delete d.resolveSessionName;
+  return d;
+};
+
+test('with no index title, a boundary checkpoint names the session without reading the rollout again', async (t) => {
+  const home = tmpHome(t);
+  const { file, tok, append } = namedWorld(home);
+  await runCheckpoint({ session_id: 's1', cwd: home }, unnamedDeps(home, file));
+  assert.equal(queued()[0].session_name, 'Fix the flaky login test');
+  const before = fs.statSync(file).size;
+  append([tok(4, 250, 30)]);
+  const added = fs.statSync(file).size - before;
+
+  const bytes = await bytesReadFrom(t, file, () => runCheckpoint({ session_id: 's1', cwd: home }, unnamedDeps(home, file)));
+
+  assert.equal(bytes, 4096 + 1 + added, 'the tail read only: no session-name scan of the head');
+  assert.equal(queued().find((p) => p.segmentId === 's1:5-5').session_name, 'Fix the flaky login test');
+});
+
+test('with no index title, a turn-end checkpoint names the session from its one whole read', async (t) => {
+  const home = tmpHome(t);
+  const { file } = namedWorld(home);
+  const bytes = await bytesReadFrom(t, file, () =>
+    runCheckpoint({ session_id: 's1', cwd: home }, unnamedDeps(home, file), { emitTimeline: true }));
+  assert.equal(bytes, fs.statSync(file).size);
+  assert.equal(queued()[0].session_name, 'Fix the flaky login test');
+});
+
+// SessionStart marks a session before its rollout exists; the worker's checkpoint for it must defer,
+// never bill the newest other session in the same folder under the new id.
+test('a session whose rollout does not exist yet defers instead of reading another session in its folder', async (t) => {
+  const home = tmpHome(t);
+  const OLD = '019a0000-0000-7000-8000-000000000001';
+  const NEW = '019a0000-0000-7000-8000-000000000002';
+  const dir = path.join(codexSessionsDir(), '2026', '11', '05');
+  fs.mkdirSync(dir, { recursive: true });
+  const oldRollout = path.join(dir, `rollout-2026-11-05T10-00-00-${OLD}.jsonl`);
+  fs.writeFileSync(oldRollout, `${JSON.stringify({ type: 'session_meta', payload: { id: OLD, cwd: home } })}\n`);
+  writeState(OLD, { sessionId: OLD, cwd: home, transcriptPath: oldRollout, cursor: 0, updatedAt: '2026-11-05T10:00:00Z' });
+  let parsed = 0;
+  const r = await runCheckpoint(
+    { session_id: NEW, cwd: home, transcript_path: path.join(dir, `rollout-2026-11-05T11-00-00-${NEW}.jsonl`) },
+    deps(home, [seg()], {
+      resolveTranscript: undefined,
+      computeDelta: () => { parsed += 1; return { nextCursor: 4, segments: [seg()], apiErrorEvents: [] }; },
+    }),
+  );
+  assert.deepEqual([r.outcome, r.reason, r.enqueued], ['deferred', 'not-checkpointed', 0]);
+  assert.equal(parsed, 0);
+  assert.equal(fs.existsSync(queueDir(KEY)) ? fs.readdirSync(queueDir(KEY)).length : 0, 0);
 });

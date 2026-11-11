@@ -81,8 +81,14 @@ export const STAGING_OAUTH_ORIGIN = 'https://suitable-boxer-65.clerk.accounts.de
 //                              root look installed while pointing at the production build.
 //   environment.json,          the migration's own bookkeeping. The destination gets a freshly
 //   migration.json             written binding instead of a copy of the source's.
+//   upload-due,                the upload worker's hand-off: due markers a hook of THIS build wrote
+//   upload-worker.json         (SessionStart marks a session due on a root it cannot decide yet) and
+//                              the worker's status. They belong to this root's sessions, so they
+//                              stay with it — copied, a sibling environment's worker would run a
+//                              production session's network half under its own accounts.
 const NOT_COPIED = Object.freeze([
   'locks', 'token-refresh.lock', 'hooks', 'environment.json', 'migration.json', 'credential-control.json',
+  'upload-due', 'upload-worker.json',
 ]);
 
 // A root with any of these is a root that has been USED. Anything outside this list (an empty
@@ -612,37 +618,57 @@ export function ensureEnvironmentMigrated(deps = {}) {
   }
 }
 
-function ensureEnvironmentMigratedImpl(deps) {
+// The part of the guard that needs no credential: the environment name, the binding, the API
+// origin and whether the root holds data. Shared by the full guard below and by the credential-free
+// check, so the two can never disagree about anything but the credentials themselves. Returns a
+// refusal object when the environment name itself is invalid; throws on a malformed binding.
+function rootFacts(deps) {
   try {
     environment.assertEnvironment();
   } catch (err) {
     return {
-      status: 'blocked',
-      reason: 'environment-invalid',
-      message: err.message,
+      refusal: {
+        status: 'blocked',
+        reason: 'environment-invalid',
+        message: err.message,
+      },
     };
   }
-
-  const env = orDefault(deps.env, BEEZI_ENV);
-  const binding = readBinding(deps);
   const root = homeOf(deps);
+  return {
+    root,
+    env: orDefault(deps.env, BEEZI_ENV),
+    binding: readBinding(deps),
+    apiOrigin: orDefault(deps.apiOrigin, effectiveApiOrigin()),
+    hasData: rootHasData(root, deps),
+  };
+}
+
+function ensureEnvironmentMigratedImpl(deps) {
+  const local = rootFacts(deps);
+  if (local.refusal) return local.refusal;
+  const env = local.env;
+  const binding = local.binding;
+  const root = local.root;
   const credentialFile = strictRecord(path.join(root, 'credentials.json'), deps);
   const control = strictRecord(path.join(root, 'credential-control.json'), deps);
   if (credentialFile !== null && (!credentialFile || (typeof credentialFile.token !== 'string'
     && typeof credentialFile.enc !== 'string'))) throw new Error('Invalid credential file');
   if (control !== null && (!control || control.version !== 1 || typeof control.revision !== 'string'
     || (control.backend !== null && typeof control.backend !== 'string'))) throw new Error('Invalid credential authority');
-  const apiOrigin = orDefault(deps.apiOrigin, effectiveApiOrigin());
+  const apiOrigin = local.apiOrigin;
 
   const facts = {
     env,
     apiOrigin,
     binding,
-    hasData: rootHasData(root, deps),
+    hasData: local.hasData,
     issuer: 'unlinked',
   };
-  // Only read the credentials when the answer can change the verdict: a bound root and a fresh
-  // root both decide without them, and on Windows each read costs a PowerShell spawn.
+  // Only a fresh root — unbound AND empty — decides without the credentials. A bound root still
+  // reads one blob per account here (on Windows, one PowerShell spawn each): its verdict turns on
+  // the issuer (`clear-stale`, `conflicting-evidence`, a named variant's stamp). The hook paths
+  // that cannot afford that use checkRootWithoutCredentials() below and accept its limits.
   if (facts.hasData || binding) {
     const records = readSubjects(deps);
     const holder = records.find(record => record.raw) || null;
@@ -692,6 +718,55 @@ function ensureEnvironmentMigratedImpl(deps) {
   }
 
   return runMigration(facts, deps);
+}
+
+/**
+ * The credential-free half of ensureEnvironmentMigrated(), for hooks that only record local state.
+ *
+ * Reads the binding, the migration journal, the barrier lock file, accounts/data presence and the
+ * API origin — never the credential store, never credentials.json, and it writes nothing. It is
+ * NOT an authority before an upload: the full guard stays the only one, and every path that posts
+ * runs it.
+ *
+ * Because the issuer is unseen it is classified as 'unlinked', so this answers 'ok' ONLY for a root
+ * already bound to this environment under this API — and on such a root it cannot tell apart, and
+ * answers 'ok' for, every one of these states the full guard would not:
+ *   1. a bound production root whose sign-ins are all staging's ('clear-stale': the full guard
+ *      clears them, or blocks with 'stale-credential' if it cannot);
+ *   2. a bound root holding a sign-in from another environment's issuer, or accounts whose
+ *      sign-ins name different issuers ('conflicting-evidence');
+ *   3. a named variant whose stored credential carries another environment's stamp
+ *      ('conflicting-evidence');
+ *   4. a credential store that cannot be read while credentials.json exists, or a malformed
+ *      credentials.json / credential-control.json ('inspection-or-migration-failed');
+ *   5. a credential store Codex's sandbox hides ('credential-store-sandboxed').
+ * Every unbound root is refused instead of decided — fresh (the full guard would bind it), legacy
+ * (migrate or adopt) alike — as is an unfinished migration journal or a present barrier lock: those
+ * need the full guard's reads and writes, and refusing costs only this hook's record. The fresh
+ * case says so (reason 'unbound-empty-root', every other unbound root 'unverified-root'): a root
+ * with no data has no linked account, so a hook can answer it as unlinked without binding it.
+ *
+ * Returns the same shape as ensureEnvironmentMigrated(); throws on a malformed binding or journal
+ * (the env-guard.mjs wrapper turns that into a fail-closed 'blocked').
+ */
+export function checkRootWithoutCredentials(deps = {}) {
+  const local = rootFacts(deps);
+  if (local.refusal) return local.refusal;
+  const marker = readMarker(deps);
+  if (marker && marker.phase !== 'done') return { status: 'deferred', reason: 'migration-pending' };
+  const decision = classifyRoot({
+    env: local.env, apiOrigin: local.apiOrigin, binding: local.binding, hasData: local.hasData,
+    issuer: 'unlinked',
+  });
+  if (decision.verdict === 'blocked') {
+    return { status: 'blocked', reason: decision.reason, message: recoveryMessage(decision) };
+  }
+  if (decision.verdict === 'bind') return { status: 'deferred', reason: 'unbound-empty-root' };
+  if (decision.verdict !== 'ok') return { status: 'deferred', reason: 'unverified-root' };
+  if (orDefault(deps.fs, fs).existsSync(path.join(local.root, 'locks', 'migration-barrier.lock'))) {
+    return { status: 'deferred', reason: 'migration-barrier' };
+  }
+  return { status: 'ok' };
 }
 
 /**

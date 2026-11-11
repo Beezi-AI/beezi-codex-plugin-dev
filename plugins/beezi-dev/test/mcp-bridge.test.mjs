@@ -475,6 +475,53 @@ test('beezi_status reports the link, the API it checked, and the analytics half'
   assert.match(text, /\n\nPlugin: 0\.23\.0 \(could not check for updates\)$/);
 });
 
+// A stuck background upload is otherwise invisible: the hooks only capture, so this answer is the
+// one place the user learns that nothing has been sent, and what to do about it.
+test('beezi_status reports the background upload\'s last run and warns when it is stuck', async () => {
+  const out = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
+    url: URL_UNDER_TEST,
+    ...STATUS_LOCAL,
+    ...accountDeps(() => 'tok'),
+    readUploadStatus: () => ({ lastRunAt: Date.parse('2026-11-05T11:30:00.000Z'), outcome: 'crash', retryAfterAt: null }),
+    hasPostableWork: () => true,
+    fetchImpl: async () => { throw new Error('must not reach the network'); },
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    linkStatus: async () => ({ state: 'linked', account: 'Dev', apiBase: 'http://localhost:5001/api', hooks: { state: 'absent', registered: [] } }),
+  });
+
+  await bridge.handleMessage({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: STATUS_TOOL.name } });
+
+  const text = out[0].result.content[0].text;
+  assert.ok(text.endsWith([
+    '',
+    'Background upload: last run 2026-11-05 11:30 UTC, crashed.',
+    'Warning: the last background upload crashed. Beezi retries on its own; to send now and see the error, run the track skill.',
+    'Plugin: 0.23.0 (could not check for updates)',
+  ].join('\n')), text);
+});
+
+test('beezi_status keeps its answer when the upload status cannot be read', async () => {
+  const out = [];
+  const bridge = createBridge({ checkEnvironment: () => ({ status: 'ok' }),
+    probeHookTrust: async () => ({ verdict: 'unknown', untrusted: [], disabled: [], reason: 'test' }),
+    url: URL_UNDER_TEST,
+    ...STATUS_LOCAL,
+    ...accountDeps(() => 'tok'),
+    readUploadStatus: () => { throw new Error('unreadable'); },
+    fetchImpl: async () => { throw new Error('must not reach the network'); },
+    write: (line) => out.push(JSON.parse(line)),
+    logError: () => {},
+    linkStatus: async () => ({ state: 'linked', account: 'Dev', apiBase: 'http://localhost:5001/api', hooks: { state: 'absent', registered: [] } }),
+  });
+
+  await bridge.handleMessage({ jsonrpc: '2.0', id: 5, method: 'tools/call', params: { name: STATUS_TOOL.name } });
+
+  assert.match(out[0].result.content[0].text, /\n\nPlugin: 0\.23\.0 \(could not check for updates\)$/);
+});
+
 // ── the bridge repairs the hooks nobody else can ────────────────────────────
 //
 // A stale hook entry points at the previous plugin version's script, so Codex's spawn fails and

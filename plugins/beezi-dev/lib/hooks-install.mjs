@@ -55,13 +55,21 @@ export const BEEZI_HOOKS = Object.freeze([
 const BEEZI_EVENTS = BEEZI_HOOKS.map((h) => h.event);
 const SCRIPT_NAMES = BEEZI_HOOKS.map((h) => h.script);
 
-// Every tool, because the tool's *name* differs across Codex's two live tool surfaces
-// (`shell_command` on the legacy one, `exec` under unified exec) and has not been measured from a
-// real payload yet. `checkpoint.mjs` exits before loading the engine unless the payload carries a
-// git checkpoint command OR the mid-turn heartbeat's interval has elapsed for this session
-// (lib/timing.mjs) — so the common case is still a short-lived process that stats one marker file
-// and exits; guessing the name instead would fail silently by never firing.
+// Every event but PostToolUse matches everything. PostToolUse matches the shell tool only: Codex
+// treats a matcher made of letters, digits, `_` and `|` as an EXACT tool-name match (anything else
+// is a regex), and the alternation lists the shell tool's name across Codex versions (`Bash` on current builds; `shell`, `shell_command`, `exec_command`, `local_shell` on older ones, e.g. the VS Code extension's). A
+// `.*` there started node twice (production + staging variant) for every apply_patch, MCP call and
+// web search, none of which can carry a git checkpoint command. `checkpoint.mjs` still exits before
+// loading the engine unless the payload is a git checkpoint or the heartbeat interval has elapsed.
+// An existing `.*` entry is rewritten in place by mergeHooks (same index, so Codex's positional
+// trust key survives) and reads `stale` in hooksStatus until it is.
 const MATCH_ALL = '.*';
+const MATCH_SHELL = 'Bash|shell|shell_command|exec_command|local_shell';
+const MATCHERS = Object.freeze({ PostToolUse: MATCH_SHELL });
+
+function matcherFor(event) {
+  return Object.prototype.hasOwnProperty.call(MATCHERS, event) ? MATCHERS[event] : MATCH_ALL;
+}
 // The timeout Codex records for each Beezi hook. Exported because the hooks themselves have to
 // finish inside it — Codex kills what overruns and reports the kill as a failed hook — so the
 // checkpoint's own budget is derived from this number rather than guessed alongside it.
@@ -404,7 +412,7 @@ export function buildHookEntries({ launcherDir = hookLauncherDir(), owner = hook
     const { event, script } = entry;
     out[event] = [
       {
-        matcher: MATCH_ALL,
+        matcher: matcherFor(event),
         hooks: [
           {
             type: 'command',
@@ -882,8 +890,9 @@ export function hooksStatus({
       if (!group || !Array.isArray(group.hooks)) continue;
       for (const handler of group.hooks) {
         // Scoped to this owner: a sibling variant's complete install must not make ours read
-        // `installed`, and ours must not make the sibling's read `stale`.
-        if (isOwnedHandler(handler, owner, launcherDir)) handlers.push(handler);
+        // `installed`, and ours must not make the sibling's read `stale`. Ownership never looks at
+        // the matcher, so an old `.*` entry is still ours — it just fails `current` below.
+        if (isOwnedHandler(handler, owner, launcherDir)) handlers.push({ handler, matcher: group.matcher });
       }
     }
     if (!handlers.length) { missingEvents.push(event); continue; }
@@ -892,8 +901,9 @@ export function hooksStatus({
     // launcher or the broken node-plus-arguments form all fail this check, which is what routes an
     // old install through `stale` → "run install to repair" → migration, once.
     const expectedCommand = hookCommand(launcherPath(launcherDir), script, owner);
-    const current = handlers.some((h) => h.command === expectedCommand
+    const current = handlers.some(({ handler: h, matcher }) => h.command === expectedCommand
       && h.timeout === timeoutFor(entry)
+      && matcher === matcherFor(event)
       && !('arguments' in h));
     if (!current) staleEvents.push(event);
   }

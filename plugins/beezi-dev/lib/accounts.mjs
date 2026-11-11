@@ -709,15 +709,25 @@ function sessionFor(a, auth) {
  *
  * The concurrent first pass stays, because it is free in the common case and not in the rare one:
  * getAuthentication answers `ready` BEFORE acquiring any lock when the stored token is still
- * fresh, so an ordinary tick takes no locks at all and the credential read — a PowerShell spawn on
- * Windows, inside a hook budget with room for one — is not multiplied by the number of accounts.
- * Only simultaneous expiry serializes, and that path is network-bound anyway.
+ * fresh, so an ordinary tick takes no locks at all. Only simultaneous expiry serializes, and that
+ * path is network-bound anyway.
+ *
+ * THE GUARD RUNS ONCE, HERE. Each credential read is a PowerShell spawn on Windows (~1.1 s), and
+ * the environment guard itself reads every account's blob. Left to getAuthentication it ran once
+ * per account, so N accounts cost N·(N+1) reads (6 for two accounts); checked once and passed down
+ * as `guardChecked`, they cost N for the guard plus N for the tokens. A refusal drops every
+ * account, exactly as N refusals from getAuthentication did.
  */
 export async function linkedSessions(deps = {}) {
   const { getAuthentication } = await import('./token.mjs');
+  const { checkEnvironment, shouldCheckEnvironment } = await import('./env-guard.mjs');
+  if (shouldCheckEnvironment(deps, 'getCredentials', 'checkEnvironment')) {
+    const guard = (deps.checkEnvironment || checkEnvironment)();
+    if (guard.status !== 'ok' && guard.status !== 'migrated') return [];
+  }
   const linked = (await listAccounts(deps)).filter((a) => a.status === AccountStatus.LINKED);
   const authenticate = async (a) => {
-    try { return await getAuthentication(a.key, deps); } catch (error) { return null; }
+    try { return await getAuthentication(a.key, deps, { guardChecked: true }); } catch (error) { return null; }
   };
   const first = await Promise.all(linked.map(authenticate));
   const sessions = [];

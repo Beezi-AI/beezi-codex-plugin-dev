@@ -150,3 +150,27 @@ test('no renewal is attempted once the hook budget is spent', async (t) => {
   assert.equal(result.failed, 1);
   assert.equal(fs.readdirSync(queueDir(KEY)).length, 1);
 });
+
+// The upload worker ran the full environment guard before its run (N credential reads). A renewal
+// inside that run must not run it again once the guard's 30 s memo has lapsed.
+test('a drain told the guard already passed renews without re-running the guard', async (t) => {
+  tmpHome(t, 1);
+  const renewals = [];
+  const result = await flushQueue(KEY, SESSION, {
+    fetchImpl: async (url, init) => res(init.headers.Authorization === 'Bearer new' ? 200 : 401),
+    getAccessToken: async (key, deps, options) => { renewals.push([key, deps, options]); return 'new'; },
+    guardChecked: true,
+  });
+  assert.deepEqual(renewals, [[KEY, {}, { forceRefresh: true, guardChecked: true }]]);
+  assert.equal(result.flushed, 1);
+});
+
+test('a drain not told the guard passed renews through the guard as before', async (t) => {
+  tmpHome(t, 1);
+  const renewals = [];
+  await flushQueue(KEY, SESSION, {
+    fetchImpl: async (url, init) => res(init.headers.Authorization === 'Bearer new' ? 200 : 401),
+    getAccessToken: async (key, deps, options) => { renewals.push([key, deps, options]); return 'new'; },
+  });
+  assert.deepEqual(renewals, [[KEY, {}, { forceRefresh: true }]]);
+});

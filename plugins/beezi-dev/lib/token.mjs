@@ -75,13 +75,18 @@ async function markAccountRevoked(key, deps, recordIssue) {
 
 // Preserve the reason a token is unavailable for status/login callers. Analytics callers can
 // continue using getAccessToken, which projects this result onto token-or-null.
+//
+// `options.guardChecked: true` says the caller has just run the environment guard itself and it
+// allowed the work — linkedSessions does, once for every account, because the guard reads every
+// account's credential and running it per account made N accounts cost N·(N+1) reads. Only a
+// caller that holds a passing verdict may set it.
 export async function getAuthentication(key, deps = {}, options = {}) {
   environment.assertAccountKey(key);
   const settle = (verdict) => {
     settleAuthResult(key, verdict, { recordIssue: deps.recordIssue });
     return verdict;
   };
-  if (shouldCheckEnvironment(deps, 'getCredentials', 'checkEnvironment')) {
+  if (!options.guardChecked && shouldCheckEnvironment(deps, 'getCredentials', 'checkEnvironment')) {
     const guard = (deps.checkEnvironment || checkEnvironment)();
     if (guard.status !== 'ok' && guard.status !== 'migrated') return settle(result('unavailable', 'environment-blocked'));
   }

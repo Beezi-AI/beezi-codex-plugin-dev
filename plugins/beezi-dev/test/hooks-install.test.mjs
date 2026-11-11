@@ -608,3 +608,75 @@ test('ensureHooks on a five-entry install keeps every existing entry byte-identi
   assert.equal(after.hooks.PermissionRequest[0].hooks[0].timeout, 5);
   assert.equal(hooksStatus(opts).state, 'installed');
 });
+
+// ── PostToolUse matcher: the shell tool's names, exact match (Codex matches a letters-only matcher as an exact tool name) ──
+
+test('fresh install writes the literal PostToolUse matcher "Bash|shell|shell_command|exec_command|local_shell" and ".*" for the other events', () => {
+  const { opts } = bench();
+  installHooks(opts);
+  const raw = fs.readFileSync(opts.hooksFile, 'utf-8');
+  const reg = JSON.parse(raw);
+  assert.equal(reg.hooks.PostToolUse[0].matcher, 'Bash|shell|shell_command|exec_command|local_shell');
+  assert.match(raw, /"matcher": "Bash|shell|shell_command|exec_command|local_shell"/);
+  for (const event of ['SessionStart', 'SubagentStart', 'SubagentStop', 'Stop', 'PermissionRequest']) {
+    assert.equal(reg.hooks[event][0].matcher, '.*', event);
+  }
+  // Sync only: Codex before 0.148.0 skips `async` hooks.
+  for (const groups of Object.values(reg.hooks)) assert.equal('async' in groups[0].hooks[0], false);
+  assert.equal(hooksStatus(opts).state, 'installed');
+});
+
+test('upgrade from ".*" rewrites PostToolUse in place: same group and handler index, user groups untouched', () => {
+  const { opts } = bench();
+  installHooks(opts);
+  const reg = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  reg.hooks.PostToolUse[0].matcher = '.*';
+  reg.hooks.PostToolUse = [userGroup('before'), reg.hooks.PostToolUse[0], userGroup('after')];
+  fs.writeFileSync(opts.hooksFile, JSON.stringify(reg, null, 2));
+  assert.deepEqual(hooksStatus(opts).staleEvents, ['PostToolUse']);
+
+  const result = ensureHooks(opts);
+  assert.equal(result.repaired, true);
+  const after = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  assert.deepEqual(after.hooks.PostToolUse.map((g) => g.matcher), ['*', 'Bash|shell|shell_command|exec_command|local_shell', '*']);
+  assert.equal(JSON.stringify(after.hooks.PostToolUse[0]), JSON.stringify(userGroup('before')));
+  assert.equal(JSON.stringify(after.hooks.PostToolUse[2]), JSON.stringify(userGroup('after')));
+  assert.equal(after.hooks.PostToolUse[1].hooks.length, 1);
+  assert.equal(hooksStatus(opts).state, 'installed');
+  // Already current: a second pass must not rewrite (a rewrite would revoke trust again).
+  assert.equal(ensureHooks(opts).repaired, false);
+});
+
+test('variant install appends its own groups; uninstalling it keeps production and foreign indices', () => {
+  const root = tmpdir();
+  const hooksFile = path.join(root, 'codex', 'hooks.json');
+  const prod = { hooksFile, launcherDir: path.join(root, 'prod'), launcherSource: LAUNCHER_SOURCE, owner: 'beezi' };
+  const stg = { hooksFile, launcherDir: path.join(root, 'stg'), launcherSource: LAUNCHER_SOURCE, owner: 'beezi-staging' };
+  installHooks(prod);
+  const seeded = JSON.parse(fs.readFileSync(hooksFile, 'utf-8'));
+  seeded.hooks.PostToolUse.push(userGroup('foreign'));
+  fs.writeFileSync(hooksFile, JSON.stringify(seeded, null, 2));
+
+  installHooks(stg);
+  const both = JSON.parse(fs.readFileSync(hooksFile, 'utf-8'));
+  assert.equal(JSON.stringify(both.hooks.PostToolUse[0]), JSON.stringify(seeded.hooks.PostToolUse[0]));
+  assert.equal(JSON.stringify(both.hooks.PostToolUse[1]), JSON.stringify(seeded.hooks.PostToolUse[1]));
+  assert.equal(both.hooks.PostToolUse.length, 3);
+  assert.equal(both.hooks.PostToolUse[2].matcher, 'Bash|shell|shell_command|exec_command|local_shell');
+  assert.match(both.hooks.PostToolUse[2].hooks[0].command, /--beezi-owner=beezi-staging$/);
+
+  uninstallHooks(stg);
+  const gone = JSON.parse(fs.readFileSync(hooksFile, 'utf-8'));
+  assert.equal(JSON.stringify(gone.hooks.PostToolUse), JSON.stringify(seeded.hooks.PostToolUse));
+  assert.equal(hooksStatus(prod).state, 'installed');
+});
+
+test('an old ".*" PostToolUse entry is still recognised as ours: uninstall removes it', () => {
+  const { opts } = bench();
+  installHooks(opts);
+  const reg = JSON.parse(fs.readFileSync(opts.hooksFile, 'utf-8'));
+  reg.hooks.PostToolUse[0].matcher = '.*';
+  fs.writeFileSync(opts.hooksFile, JSON.stringify(reg));
+  assert.equal(uninstallHooks(opts).removed, true);
+  assert.equal(fs.existsSync(opts.hooksFile), false);
+});

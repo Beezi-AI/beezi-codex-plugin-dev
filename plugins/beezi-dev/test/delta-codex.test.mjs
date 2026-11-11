@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { computeDelta, lastUsageLine } from '../lib/delta-codex.mjs';
-import { readRolloutLines } from '../lib/transcript-reader-codex.mjs';
+import { readRolloutLines, readRolloutTail } from '../lib/transcript-reader-codex.mjs';
 
 function writeRollout(records) {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-codex-'));
@@ -1262,10 +1262,18 @@ const zstdRollout = () => writeRollout([
   tokens('2026-01-01T00:00:03.000Z', 150, 60, 30),
 ]);
 
+// `resume` and `source` describe the file on disk, not the delta, so they are compared apart.
+const deltaOnly = ({ resume, source, ...delta }) => delta;
+
 test('computeDelta on a .zst rollout equals the plain result', { skip: !zstdOk }, () => {
   const plain = zstdRollout();
   const zst = zstdCopy(plain);
-  assert.deepEqual(computeDelta(zst, 0, identityResolvers), computeDelta(plain, 0, identityResolvers));
+  assert.deepEqual(deltaOnly(computeDelta(zst, 0, identityResolvers)), deltaOnly(computeDelta(plain, 0, identityResolvers)));
+});
+
+test('a .zst rollout saves no byte cursor: its offsets are not on disk', { skip: !zstdOk }, () => {
+  const zst = zstdCopy(zstdRollout());
+  assert.equal(computeDelta(zst, 0, identityResolvers).resume, null);
 });
 
 test('a cursor saved on the plain file resumes on its compressed copy', { skip: !zstdOk }, () => {
@@ -1282,4 +1290,267 @@ test('a corrupt .zst frame throws ROLLOUT_UNREADABLE instead of yielding a junk 
   const bad = path.join(dir, 'rollout.jsonl.zst');
   fs.writeFileSync(bad, Buffer.concat([Buffer.from([0x28, 0xb5, 0x2f, 0xfd]), Buffer.from('not a real frame, just garbage\n'.repeat(5))]));
   assert.throws(() => computeDelta(bad, 0, identityResolvers), (e) => e.code === 'ROLLOUT_UNREADABLE');
+});
+
+// --- byte-offset resume -------------------------------------------------------------------
+// A checkpoint saves `resume` (the byte just past the cursor line, the file size, a head hash and
+// the walk state at the cursor) so the next one reads only what was appended. Every test here pins
+// the offset read to the whole-file read of the same file.
+
+const usageLimit = (ts) => errorRec(ts, "You've hit your usage limit.", 'usage_limit_exceeded');
+// An account-level reading: the codex window resets at 2026-01-01T05:00:00Z (unix 1767243600).
+const resetReading = (ts) => ({
+  timestamp: ts,
+  type: 'event_msg',
+  payload: { type: 'token_count', info: null, rate_limits: { limit_id: 'codex', primary: { used_percent: 99, resets_at: 1767243600 } } },
+});
+const RESUME_HEAD = [
+  meta('/repoA'),
+  turnEffort('/repoA', 'gpt-5.4', '2026-01-01T00:00:01.000Z', 'high'),
+  tokens('2026-01-01T00:00:02.000Z', 100, 0, 10),
+  resetReading('2026-01-01T00:00:03.000Z'),
+];
+const RESUME_TAIL = [
+  tokens('2026-01-01T00:00:04.000Z', 250, 50, 30),
+  usageLimit('2026-01-01T00:00:05.000Z'),
+  tokens('2026-01-01T00:00:06.000Z', 400, 50, 60),
+];
+const appendRecords = (file, records) => fs.appendFileSync(file, records.map((r) => JSON.stringify(r)).join('\n') + '\n');
+const refuseWholeRead = () => { throw new Error('whole-file read'); };
+
+test('an offset read returns the same delta as a full read', () => {
+  const file = writeRollout(RESUME_HEAD);
+  const first = computeDelta(file, 0, identityResolvers);
+  assert.equal(first.nextCursor, 4);
+  assert.equal(first.resume.line, 4);
+  assert.equal(first.resume.byte, fs.statSync(file).size, 'the cursor line ends the file');
+  appendRecords(file, RESUME_TAIL);
+
+  const tails = [];
+  const offset = computeDelta(file, 4, {
+    ...identityResolvers,
+    resume: first.resume,
+    readLines: refuseWholeRead,
+    readTail: (p, r) => { tails.push(r.byte); return readRolloutTail(p, r); },
+  });
+  const whole = computeDelta(file, 4, identityResolvers);
+
+  assert.deepEqual(tails, [first.resume.byte], 'read once, from the saved byte');
+  assert.deepEqual(offset, whole);
+  assert.equal(offset.nextCursor, 7);
+  assert.equal(offset.segments.length, 1);
+  assert.deepEqual([offset.segments[0].repoRoot, offset.segments[0].fromLine, offset.segments[0].toLine], ['/repoA', 5, 7]);
+  // Line 5 bills 150 input over the line-3 baseline, 50 of it cached; line 7 bills 150 more.
+  assert.deepEqual(offset.segments[0].stats.models['gpt-5.4'], {
+    token_input: 250, token_output: 50, token_cache_read: 50, token_cache_creation: 0, requests: 2,
+    by_effort: { high: { token_input: 250, token_output: 50, token_cache_read: 50, token_cache_creation: 0, requests: 2 } },
+  });
+  // The reset time comes from the line-4 reading, which sits before the cursor.
+  assert.equal(offset.apiErrorEvents.length, 1);
+  assert.equal(offset.apiErrorEvents[0].resetsAt, '2026-01-01T05:00:00.000Z');
+});
+
+test('a resume with nothing appended reads the tail, bills nothing and keeps the cursor', () => {
+  const file = writeRollout(RESUME_HEAD);
+  const first = computeDelta(file, 0, identityResolvers);
+  const again = computeDelta(file, 4, { ...identityResolvers, resume: first.resume, readLines: refuseWholeRead });
+  assert.equal(again.nextCursor, 4);
+  assert.deepEqual(again.segments, []);
+  assert.deepEqual(again.resume, first.resume);
+});
+
+test('a file that shrank below the saved size is read whole', () => {
+  const file = writeRollout(RESUME_HEAD);
+  const first = computeDelta(file, 0, identityResolvers);
+  // Rewritten shorter (no timestamps): line 4 is now a token count, so the baseline at the cursor
+  // moves to 120/12.
+  const bare = (input, output) => ({ type: 'event_msg', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: input, output_tokens: output } } } });
+  fs.writeFileSync(file, [
+    { type: 'session_meta', payload: { cwd: '/repoA' } },
+    { type: 'turn_context', payload: { cwd: '/repoA', model: 'gpt-5.4', effort: 'high' } },
+    bare(100, 10),
+    bare(120, 12),
+    bare(200, 20),
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+  assert.ok(fs.statSync(file).size < first.resume.size, 'precondition: the file is shorter');
+
+  let wholeReads = 0;
+  const delta = computeDelta(file, 4, {
+    ...identityResolvers,
+    resume: first.resume,
+    readLines: (p) => { wholeReads += 1; return readRolloutLines(p); },
+  });
+  assert.equal(wholeReads, 1);
+  // 80 over the line-4 baseline, not 100 over the stale line-3 one the saved walk state holds.
+  assert.equal(delta.segments[0].stats.models['gpt-5.4'].token_input, 80);
+  assert.equal(delta.segments[0].stats.models['gpt-5.4'].token_output, 8);
+});
+
+test('a head that no longer hashes the same is read whole', () => {
+  const file = writeRollout(RESUME_HEAD);
+  const first = computeDelta(file, 0, identityResolvers);
+  // Same length, different first bytes: another file under the same name.
+  fs.writeFileSync(file, [
+    meta('/repoB'),
+    turnEffort('/repoB', 'gpt-5.4', '2026-01-01T00:00:01.000Z', 'high'),
+    tokens('2026-01-01T00:00:02.000Z', 100, 0, 10),
+    resetReading('2026-01-01T00:00:03.000Z'),
+    tokens('2026-01-01T00:00:04.000Z', 250, 50, 30),
+  ].map((r) => JSON.stringify(r)).join('\n') + '\n');
+
+  let wholeReads = 0;
+  const delta = computeDelta(file, 4, {
+    ...identityResolvers,
+    resume: first.resume,
+    readLines: (p) => { wholeReads += 1; return readRolloutLines(p); },
+  });
+  assert.equal(wholeReads, 1);
+  assert.equal(delta.segments[0].repoRoot, '/repoB', 'not the /repoA the saved walk state carries');
+});
+
+test('a resume saved for another cursor line is not used', () => {
+  const file = writeRollout(RESUME_HEAD);
+  const first = computeDelta(file, 0, identityResolvers);
+  appendRecords(file, RESUME_TAIL);
+  let wholeReads = 0;
+  const delta = computeDelta(file, 3, {
+    ...identityResolvers,
+    resume: first.resume,
+    readLines: (p) => { wholeReads += 1; return readRolloutLines(p); },
+  });
+  assert.equal(wholeReads, 1);
+  assert.equal(delta.segments[0].fromLine, 4);
+});
+
+test('a torn last line advances neither cursor, and completing it bills it once from the offset', () => {
+  const last = tokens('2026-01-01T00:00:04.000Z', 300, 0, 30);
+  const fullLine = JSON.stringify(last);
+  const torn = fullLine.slice(0, Math.floor(fullLine.length / 2));
+  const head = jsonl(PRELUDE) + '\n';
+  const file = writeRaw(head + torn);
+
+  const first = computeDelta(file, 0, identityResolvers);
+  assert.equal(first.nextCursor, 3);
+  assert.equal(first.resume.line, 3);
+  assert.equal(first.resume.byte, Buffer.byteLength(head), 'the byte cursor stops before the torn line too');
+
+  fs.appendFileSync(file, fullLine.slice(torn.length) + '\n');
+  const second = computeDelta(file, 3, { ...identityResolvers, resume: first.resume, readLines: refuseWholeRead });
+  assert.equal(second.nextCursor, 4);
+  assert.deepEqual([second.segments[0].fromLine, second.segments[0].toLine], [4, 4]);
+  assert.equal(second.segments[0].stats.models['gpt-5.2-codex'].token_input, 200);
+  assert.equal(second.segments[0].stats.models['gpt-5.2-codex'].requests, 1);
+});
+
+test('a valid last line with no newline yet saves no byte cursor', () => {
+  const file = writeRaw(jsonl([...PRELUDE, tokens('2026-01-01T00:00:04.000Z', 300, 0, 30)]));
+  const delta = computeDelta(file, 0, identityResolvers);
+  assert.equal(delta.nextCursor, 4, 'the line cursor still passes it, as before');
+  assert.equal(delta.resume, null);
+});
+
+test('the repo root before the cursor is resolved from the last cwd only', () => {
+  const file = writeRollout([
+    meta('/a'),
+    turn('/b', 'gpt-5.2-codex', '2026-01-01T00:00:01.000Z'),
+    turn('/c', 'gpt-5.2-codex', '2026-01-01T00:00:02.000Z'),
+    tokens('2026-01-01T00:00:03.000Z', 100, 0, 10),
+    tokens('2026-01-01T00:00:04.000Z', 150, 0, 20),
+  ]);
+  const asked = [];
+  const delta = computeDelta(file, 4, { ...identityResolvers, repoRootOf: (dir) => { asked.push(dir); return dir; } });
+  assert.deepEqual(asked, ['/c']);
+  assert.equal(delta.segments[0].repoRoot, '/c');
+});
+
+test('an unresolvable last cwd before the cursor falls back to the newest one that resolves', () => {
+  const file = writeRollout([
+    meta('/a'),
+    turn('/b', 'gpt-5.2-codex', '2026-01-01T00:00:01.000Z'),
+    turn('/not-a-repo', 'gpt-5.2-codex', '2026-01-01T00:00:02.000Z'),
+    tokens('2026-01-01T00:00:03.000Z', 100, 0, 10),
+    tokens('2026-01-01T00:00:04.000Z', 150, 0, 20),
+  ]);
+  const asked = [];
+  const repoRootOf = (dir) => { asked.push(dir); return dir === '/not-a-repo' ? null : dir; };
+  const delta = computeDelta(file, 4, { ...identityResolvers, repoRootOf });
+  assert.deepEqual(asked, ['/not-a-repo', '/b']);
+  assert.equal(delta.segments[0].repoRoot, '/b');
+});
+
+test('a repo created between runs gives resumed lines the new root, exactly as a full read does', () => {
+  const file = writeRollout([
+    meta('/repoA'),
+    turn('/repoA', 'gpt-5.2-codex', '2026-01-01T00:00:01.000Z'),
+    tokens('2026-01-01T00:00:02.000Z', 100, 0, 10),
+  ]);
+  // First run: /repoA is not a repository yet.
+  const first = computeDelta(file, 0, { ...identityResolvers, repoRootOf: () => null });
+  assert.equal(first.segments[0].repoRoot, null);
+  appendRecords(file, [tokens('2026-01-01T00:00:03.000Z', 250, 0, 30)]);
+  // `git init` happened: the same directory now resolves.
+  const now = { repoRootOf: (dir) => `${dir}-root`, branchAt: (root) => (root ? 'main' : '(unknown)') };
+
+  const resumed = computeDelta(file, 3, { ...now, resume: first.resume, readLines: refuseWholeRead });
+  const whole = computeDelta(file, 3, now);
+
+  assert.deepEqual([resumed.segments[0].repoRoot, resumed.segments[0].branch], ['/repoA-root', 'main']);
+  assert.deepEqual(resumed, whole);
+});
+
+test('a saved cwd that no longer resolves falls back to the root the saving run carried', () => {
+  const file = writeRollout([
+    meta('/repoA'),
+    turn('/repoA', 'gpt-5.2-codex', '2026-01-01T00:00:01.000Z'),
+    tokens('2026-01-01T00:00:02.000Z', 100, 0, 10),
+  ]);
+  const first = computeDelta(file, 0, identityResolvers);
+  appendRecords(file, [tokens('2026-01-01T00:00:03.000Z', 250, 0, 30)]);
+  const resumed = computeDelta(file, 3, {
+    ...identityResolvers, repoRootOf: () => null, resume: first.resume, readLines: refuseWholeRead,
+  });
+  assert.equal(resumed.segments[0].repoRoot, '/repoA');
+});
+
+// Operations straddling the cursor: an MCP call before it whose completion lands after, a call and
+// completion both after, and a bare call (no server in its name) that holds the cursor back until
+// its completion names one.
+const fnCall = (ts, name, callId) => ({ timestamp: ts, type: 'response_item', payload: { type: 'function_call', name, arguments: '{}', call_id: callId } });
+const mcpEnd = (ts, callId, server) => ({ timestamp: ts, type: 'event_msg', payload: { type: 'mcp_tool_call_end', call_id: callId, invocation: { server, tool: 't' }, duration: { secs: 1, nanos: 0 } } });
+const fnOut = (ts, callId, output) => ({ timestamp: ts, type: 'response_item', payload: { type: 'function_call_output', call_id: callId, output } });
+
+test('operations across the cursor resume to the same delta as a full read', () => {
+  const ts = (s) => `2026-01-01T00:00:${String(s).padStart(2, '0')}.000Z`;
+  const file = writeRollout([
+    meta('/repoA'),
+    turnEffort('/repoA', 'gpt-5.4', ts(1), 'high'),
+    tokens(ts(2), 100, 0, 10),
+    fnCall(ts(3), 'mcp__docs__search', 'c1'),
+  ]);
+  const first = computeDelta(file, 0, identityResolvers);
+  assert.equal(first.nextCursor, 4, 'a server-named call does not hold the cursor');
+
+  appendRecords(file, [
+    mcpEnd(ts(4), 'c1', 'docs'),
+    fnOut(ts(5), 'c1', 'x'.repeat(400)),
+    fnCall(ts(6), 'mcp__docs__fetch', 'c2'),
+    mcpEnd(ts(7), 'c2', 'docs'),
+    fnOut(ts(8), 'c2', 'y'.repeat(800)),
+    tokens(ts(9), 300, 0, 40),
+    fnCall(ts(10), 'lookup', 'c3'),
+  ]);
+  const second = computeDelta(file, 4, { ...identityResolvers, resume: first.resume, readLines: refuseWholeRead });
+  assert.deepEqual(second, computeDelta(file, 4, identityResolvers));
+  assert.equal(second.nextCursor, 10, 'the bare call holds the cursor before it');
+
+  appendRecords(file, [
+    mcpEnd(ts(11), 'c3', 'docs'),
+    fnOut(ts(12), 'c3', 'z'.repeat(1200)),
+    { timestamp: ts(13), type: 'event_msg', payload: { type: 'task_complete' } },
+    tokens(ts(14), 400, 0, 60),
+  ]);
+  const third = computeDelta(file, 10, { ...identityResolvers, resume: second.resume, readLines: refuseWholeRead });
+  assert.deepEqual(third, computeDelta(file, 10, identityResolvers));
+  assert.equal(third.nextCursor, 15);
+  assert.deepEqual(third.segments[0].stats.operations.mcp, { count: 1, est_tokens: 300, by_server: { docs: { count: 1, est_tokens: 300, duration_calls: 1, duration_ms: 1000 } } });
 });

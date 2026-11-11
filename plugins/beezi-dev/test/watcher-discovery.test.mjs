@@ -16,6 +16,9 @@ import { accountSession, TEST_KEY } from '../tools/account-fixtures.mjs';
 // one delta out into each of their queues. `linkedSessions` is therefore the seam that says
 // whether this machine is linked at all.
 const SESSION = accountSession(TEST_KEY, 'token');
+// Path A's checkpoints are local-only and queue for the accounts in the index (no credential read),
+// so the pass also asks the index: this is its answer, the same account, linked and tokenless.
+const ROW = { key: SESSION.key, email: SESSION.email, name: SESSION.name, tenantName: SESSION.tenantName, clientId: SESSION.clientId, status: 'linked' };
 
 
 // R2's discovery traps, one test each, plus the observation watermark's contract.
@@ -53,6 +56,7 @@ function passDeps(overrides) {
   const deps = {
     now: () => 1_000_000,
     linkedSessions: async () => [SESSION],
+    listAccounts: async () => [ROW],
     runCheckpoint: async (input, _deps, options) => {
       calls.checkpoints.push({ input, options });
       return { outcome: 'committed', enqueued: 1, flush: null, sessionErrors: [], skipped: {}, rateLimits: null, agents: {} };
@@ -396,6 +400,8 @@ test('15. an unlinked machine does no work and reports it, rather than erroring 
   writeRollout(m, { id: uuid(95), records: [parentMeta(uuid(95))] });
   const { deps, calls } = passDeps({
     linkedSessions: async () => [],
+    // Nothing in the index either: an account that is linked but tokenless is still captured local-only.
+    listAccounts: async () => [],
     runCheckpoint: async () => { throw new Error('must not run unlinked'); },
   });
   const out = await runWatchPass(deps, { sessionsDir: m.sessionsDir });
@@ -542,4 +548,74 @@ test('scanPass skips .zst rollouts when this Node cannot decompress them', async
   // With a decompressor the same file is classified again.
   const withZstd = await scanPass({ sessionsDir: m.sessionsDir }, { readRolloutHead: head, decompress: () => Buffer.alloc(0) });
   assert.ok(withZstd.tops.has(zid));
+});
+
+test('17. an idle tick reads no credentials: no guard, no linkedSessions', async (t) => {
+  const m = makeMachine(t);
+  const reads = [];
+  const { deps } = passDeps({
+    pendingHistoryDue: async () => false,
+    runDuePendingHistory: async () => { reads.push('pendingHistory'); throw new Error('credential read'); },
+    hookMayProceed: () => { reads.push('guard'); throw new Error('credential read'); },
+    linkedSessions: async () => { reads.push('linkedSessions'); throw new Error('credential read'); },
+  });
+  const out = await runWatchPass(deps, { sessionsDir: m.sessionsDir });
+  assert.deepEqual(reads, []);
+  assert.equal(out.errors, 0);
+  assert.equal(out.checkpointed, 0);
+});
+
+test('18. a changed rollout triggers exactly one linkedSessions read', async (t) => {
+  const m = makeMachine(t);
+  writeRollout(m, { id: uuid(180), records: [parentMeta(uuid(180))] });
+  writeRollout(m, { id: uuid(181), records: [parentMeta(uuid(181))] });
+  let reads = 0;
+  const { deps } = passDeps({
+    linkedSessions: async () => { reads += 1; return [SESSION]; },
+  });
+  await runWatchPass(deps, { sessionsDir: m.sessionsDir });
+  assert.equal(reads, 1);
+});
+
+test('19. blocked environment + pending history due: no guard bypass, no runAudit, no runDuePendingHistory, no linkedSessions', async (t) => {
+  const m = makeMachine(t);
+  const seen = [];
+  const { deps, calls } = passDeps({
+    pendingHistoryDue: async () => true,
+    hookMayProceed: () => { seen.push('guard'); return false; },
+    linkedSessions: async () => { seen.push('linkedSessions'); return [SESSION]; },
+    runDuePendingHistory: async () => { seen.push('pendingHistory'); return []; },
+  });
+  const out = await runWatchPass(deps, { sessionsDir: m.sessionsDir });
+  assert.equal(out.reason, 'environment-blocked');
+  assert.deepEqual(seen, ['guard']);
+  assert.equal(calls.audits.length, 0);
+});
+
+test('20. pending history due and guard passes: the retry runs once, after the guard', async (t) => {
+  const m = makeMachine(t);
+  const seen = [];
+  const { deps } = passDeps({
+    pendingHistoryDue: async () => true,
+    hookMayProceed: () => { seen.push('guard'); return true; },
+    linkedSessions: async () => { seen.push('linkedSessions'); return [SESSION]; },
+    runDuePendingHistory: async () => { seen.push('pendingHistory'); return []; },
+  });
+  await runWatchPass(deps, { sessionsDir: m.sessionsDir });
+  assert.deepEqual(seen, ['guard', 'linkedSessions', 'pendingHistory']);
+});
+
+test('21. work present + guard blocked: environment-blocked, no checkpoint, no linkedSessions', async (t) => {
+  const m = makeMachine(t);
+  writeRollout(m, { id: uuid(210), records: [parentMeta(uuid(210))] });
+  let linked = 0;
+  const { deps, calls } = passDeps({
+    pendingHistoryDue: async () => false,
+    hookMayProceed: () => false,
+    linkedSessions: async () => { linked += 1; return [SESSION]; },
+  });
+  const out = await runWatchPass(deps, { sessionsDir: m.sessionsDir });
+  assert.equal(out.reason, 'environment-blocked');
+  assert.equal(linked, 0);
+  assert.equal(calls.checkpoints.length, 0);
 });

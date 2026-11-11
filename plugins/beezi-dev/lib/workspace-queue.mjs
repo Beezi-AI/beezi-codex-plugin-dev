@@ -47,6 +47,19 @@ export function isAskFile(name) {
   return name.endsWith(ASK_SUFFIX) || name.endsWith(LEGACY_ASK_SUFFIX);
 }
 
+// A report a drain could send: a queued payload (`.json`/`.qjson`), never a held workspace-ask file.
+export function isPostableQueueFile(name) {
+  return isQueueFile(name) && !isAskFile(name);
+}
+
+// The postable report names in `key`'s queue; an absent queue has none. Throws for any other
+// failure to read the directory (an unreadable queue is never mistaken for an empty one).
+export function postableQueueNames(key) {
+  let names;
+  try { names = fs.readdirSync(queueDir(key)); } catch (error) { if (error.code === 'ENOENT') return []; throw error; }
+  return names.filter(isPostableQueueFile);
+}
+
 // Multi-workspace copies are <seg>__<tenantTag>.qjson envelopes; everything else is the raw payload
 // at <seg>.json, byte for byte what origin/dev writes.
 export function enqueue(key, payload, tenantId = null, { multi = false } = {}) {

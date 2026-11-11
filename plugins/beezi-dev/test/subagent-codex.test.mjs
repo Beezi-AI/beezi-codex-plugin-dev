@@ -250,7 +250,9 @@ test('a zstd-compressed fork gives the same physical-line boundary and line coun
       const zst = plain + '.zst';
       fs.writeFileSync(zst, zlib.zstdCompressSync(fs.readFileSync(plain)));
       assert.equal(inspectSubagentRollout(zst).forkBoundaryLine, inspectSubagentRollout(plain).forkBoundaryLine, String(rawLine));
-      assert.deepEqual(readRolloutLines(zst), readRolloutLines(plain), String(rawLine));
+      // The lines, not the on-disk facts (size, offsets, head) that differ between the two files.
+      const lines = ({ lineCount, completeLines, records }) => ({ lineCount, completeLines, records });
+      assert.deepEqual(lines(readRolloutLines(zst)), lines(readRolloutLines(plain)), String(rawLine));
     }
   });
 
@@ -402,6 +404,40 @@ test('a rollout older than the session is not opened at all', () => {
   fs.utimesSync(stale, new Date(old), new Date(old));
   assert.deepEqual(findSubagentRollouts('root-session', { sessionsDir: root, sinceMs: Date.now() - 1000 }), [],
     'the mtime gate rejects a grandchild too — it is checked before any read');
+});
+
+test('the sweep does not list date directories that end before the session began', (t) => {
+  const root = sessionsTree();
+  const claim = (name) => ({
+    id: `agent-${name}`, session_id: 'root-session', parent_thread_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  const since = Date.parse('2026-11-05T01:00:00.000Z');
+  const fresh = new Date(since + 60 * 60 * 1000);
+  // Both files are fresh by mtime; only their directories say when they were created.
+  const old = rolloutIn(path.join(root, '2026', '01', '05'), 'old', claim('old'));
+  const dayBefore = rolloutIn(path.join(root, '2026', '11', '04'), 'eve', claim('eve'));
+  const today = rolloutIn(path.join(root, '2026', '11', '05'), 'today', claim('today'));
+  for (const file of [old, dayBefore, today]) fs.utimesSync(file, fresh, fresh);
+  const listed = t.mock.method(fs, 'readdirSync');
+
+  const found = findSubagentRollouts('root-session', { sessionsDir: root, sinceMs: since });
+
+  // The day before stays in: a directory is named by LOCAL date, and UTC-14 puts 01:00Z on the 4th.
+  assert.deepEqual(found.map((f) => f.agentId).sort(), ['agent-eve', 'agent-today']);
+  const dirs = listed.mock.calls.map((c) => path.relative(root, String(c.arguments[0])).split(path.sep).join('/'));
+  assert.deepEqual(dirs.sort(), ['', '2026', '2026/11', '2026/11/04', '2026/11/05']);
+});
+
+test('a directory that is not a date is still walked', () => {
+  const root = sessionsTree();
+  const file = rolloutIn(path.join(root, 'imported', '01', '05'), 'odd', {
+    id: 'agent-odd', session_id: 'root-session', parent_thread_id: 'root-session',
+    source: { subagent: { thread_spawn: { parent_thread_id: 'root-session', depth: 1 } } },
+  });
+  const since = Date.parse('2026-11-05T01:00:00.000Z');
+  fs.utimesSync(file, new Date(since + 1000), new Date(since + 1000));
+  assert.deepEqual(findSubagentRollouts('root-session', { sessionsDir: root, sinceMs: since }).map((f) => f.agentId), ['agent-odd']);
 });
 
 // ── G-7-3: the agent's role, from the rollout, when no hook ever ran ─────────────────────────

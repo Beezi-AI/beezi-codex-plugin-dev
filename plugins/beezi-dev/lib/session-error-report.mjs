@@ -24,6 +24,13 @@ function capErrorText(payload) {
   return out;
 }
 
+// The body one target receives: scrubbed of its free text for a workspace that hides sessions,
+// capped otherwise. Exported so a parked error can store each target's own body (lib/checkpoint.mjs);
+// both transforms are idempotent, so posting a stored body through postSessionError is safe.
+export function sessionErrorBody(payload, session) {
+  return hasKind(sessionAnonymization(session), Kind.SESSIONS) ? scrubSessionError(payload) : capErrorText(payload);
+}
+
 export async function postSessionError(payload, session, deps = {}) {
   const fetchImpl = deps.fetchImpl || fetchCompat;
   const recordIssueImpl = deps.recordIssue || recordIssue;
@@ -34,7 +41,7 @@ export async function postSessionError(payload, session, deps = {}) {
   // fire-and-forget contract. A per-workspace clone (tenantId set) reports to that workspace only;
   // the caller fans out and owns any retry bookkeeping.
   if (!session || !session.token) return { reported: false, reason: 'no-token' };
-  const body = hasKind(sessionAnonymization(session), Kind.SESSIONS) ? scrubSessionError(payload) : capErrorText(payload);
+  const body = sessionErrorBody(payload, session);
   try {
     const url = `${apiBase()}${ENDPOINTS.sessionErrors}`;
     // timeoutMs is undefined unless a caller shrinks it to its budget, so postJson keeps its 3s default.

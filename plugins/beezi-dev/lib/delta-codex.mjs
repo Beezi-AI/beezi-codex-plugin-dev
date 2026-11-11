@@ -4,7 +4,7 @@ import { computeCodeChanges } from './code-changes-codex.mjs';
 import { computeOperations, parseArgs, operationContext, operationWindowEnd } from './operations-codex.mjs';
 import { buildActiveIntervals, totalMs } from './active-time.mjs';
 import { rateLimitObservationFromRecord } from './rate-limits-codex.mjs';
-import { readRolloutLines } from './transcript-reader-codex.mjs';
+import { readRolloutLines, readRolloutTail, rolloutHeadHash } from './transcript-reader-codex.mjs';
 
 // Attribute new Codex rollout activity to (repoRoot, branch) and bill token usage per segment.
 //
@@ -212,37 +212,40 @@ function apiErrorFromRecord(rec) {
 // Codex says "try again at 6:25 PM" in prose, which the portal cannot turn into a reset time. The
 // exact instant is on the last account-level token_count before the error, as unix SECONDS.
 //
-// Scans the WHOLE-file records backward from the error rather than carrying state through the
-// window loop: a checkpoint window can begin between the token_count and the error, and the
-// pre-window records are exactly where the reading lives. Bounded so a huge rollout stays cheap.
+// The walk carries the newest such reading forward rather than scanning back from the error: a
+// checkpoint window can begin between the token_count and the error, and the pre-window records are
+// exactly where the reading lives — so the reading is part of the walk state a byte-offset resume
+// saves. Bounded to the same 2000 lines the backward scan looked through, so an hours-old reading is
+// not stamped on a fresh error.
 const RESETS_AT_SCAN_LIMIT = 2000;
 
-export function resetsAtBefore(records, index, occurredAtIso) {
+// The reset (unix seconds) an account-level token_count reports, or null when it reports none.
+function resetReadingFromRecord(rec) {
+  const p = rec && rec.type === 'event_msg' ? rec.payload : null;
+  if (!p || p.type !== 'token_count' || !p.rate_limits || typeof p.rate_limits !== 'object') return null;
+  const limits = p.rate_limits;
+  // Other limit families (e.g. `premium`) usually carry null windows and are not the quota that
+  // just ran out.
+  if (limits.limit_id !== undefined && limits.limit_id !== null && limits.limit_id !== 'codex') return null;
+  let best = null;
+  for (const w of [limits.primary, limits.secondary]) {
+    if (!w || typeof w !== 'object' || !Number.isFinite(w.resets_at)) continue;
+    const used = Number.isFinite(w.used_percent) ? w.used_percent : -Infinity;
+    // The exhausted window often reads 99, so highest used wins; a tie takes the later reset.
+    if (!best || used > best.used || (used === best.used && w.resets_at > best.resetsAt)) {
+      best = { used, resetsAt: w.resets_at };
+    }
+  }
+  return best ? best.resetsAt : null;
+}
+
+// The reset instant for an error on `lineNo`, from the newest reading `{ line, resetsAt }` before it.
+function resetsAtFrom(reading, lineNo, occurredAtIso) {
   const occurredMs = new Date(occurredAtIso).getTime();
   if (!Number.isFinite(occurredMs)) return null;
-  const stop = Math.max(0, index - RESETS_AT_SCAN_LIMIT);
-  for (let i = index - 1; i >= stop; i--) {
-    const rec = records[i];
-    const p = rec && rec.type === 'event_msg' ? rec.payload : null;
-    if (!p || p.type !== 'token_count' || !p.rate_limits || typeof p.rate_limits !== 'object') continue;
-    const limits = p.rate_limits;
-    // Other limit families (e.g. `premium`) usually carry null windows and are not the quota that
-    // just ran out.
-    if (limits.limit_id !== undefined && limits.limit_id !== null && limits.limit_id !== 'codex') continue;
-    let best = null;
-    for (const w of [limits.primary, limits.secondary]) {
-      if (!w || typeof w !== 'object' || !Number.isFinite(w.resets_at)) continue;
-      const used = Number.isFinite(w.used_percent) ? w.used_percent : -Infinity;
-      // The exhausted window often reads 99, so highest used wins; a tie takes the later reset.
-      if (!best || used > best.used || (used === best.used && w.resets_at > best.resetsAt)) {
-        best = { used, resetsAt: w.resets_at };
-      }
-    }
-    if (!best) continue;
-    const resetMs = best.resetsAt * 1000;
-    return resetMs > occurredMs ? new Date(resetMs).toISOString() : null;
-  }
-  return null;
+  if (!reading || reading.line < lineNo - RESETS_AT_SCAN_LIMIT) return null;
+  const resetMs = reading.resetsAt * 1000;
+  return resetMs > occurredMs ? new Date(resetMs).toISOString() : null;
 }
 
 // Second source: Codex stamps `rate_limits.rate_limit_reached_type` on token_count when a window
@@ -277,12 +280,97 @@ function dedupeErrors(events) {
   return out;
 }
 
+// The walk state at line 0: what every record before a cursor contributes to the window after it.
+function initialWalk() {
+  return {
+    prev: { input: 0, cached: 0, cacheWrite: 0, output: 0 },
+    activeRoot: null,
+    activeCwd: null,
+    activeModel: 'unknown',
+    activeEffort: 'unknown',
+    sawTokenCount: false,
+    sawTokenUsageRecord: false,
+    reading: null,
+  };
+}
+
+function finiteCount(n) {
+  return typeof n === 'number' && Number.isFinite(n);
+}
+
+// A saved walk state as it came off disk, or null when any field is not the shape initialWalk makes.
+function validWalk(walk) {
+  if (!walk || typeof walk !== 'object') return null;
+  const prev = walk.prev;
+  if (!prev || !finiteCount(prev.input) || !finiteCount(prev.cached)
+    || !finiteCount(prev.cacheWrite) || !finiteCount(prev.output)) return null;
+  if (walk.activeRoot !== null && typeof walk.activeRoot !== 'string') return null;
+  // Required: a walk saved before the cwd was carried would freeze the old root, so it reads whole.
+  if (walk.activeCwd !== null && typeof walk.activeCwd !== 'string') return null;
+  if (typeof walk.activeModel !== 'string' || typeof walk.activeEffort !== 'string') return null;
+  if (typeof walk.sawTokenCount !== 'boolean' || typeof walk.sawTokenUsageRecord !== 'boolean') return null;
+  const reading = walk.reading;
+  if (reading !== null && (!reading || !Number.isInteger(reading.line) || !finiteCount(reading.resetsAt))) return null;
+  return {
+    prev: { input: prev.input, cached: prev.cached, cacheWrite: prev.cacheWrite, output: prev.output },
+    activeRoot: walk.activeRoot,
+    activeCwd: walk.activeCwd,
+    activeModel: walk.activeModel,
+    activeEffort: walk.activeEffort,
+    sawTokenCount: walk.sawTokenCount,
+    sawTokenUsageRecord: walk.sawTokenUsageRecord,
+    reading: reading === null ? null : { line: reading.line, resetsAt: reading.resetsAt },
+  };
+}
+
+// The byte-offset resume a caller saved, or null when it is not for this cursor or not well formed.
+// `{ line, byte, size, head, walk }`: line is the cursor it was taken at, byte the offset just past
+// that line, size and head what lib/transcript-reader-codex.mjs checks the file against, walk the
+// state at the cursor.
+function usableResume(resume, fromLine) {
+  if (!resume || typeof resume !== 'object' || resume.line !== fromLine) return null;
+  if (!Number.isInteger(resume.byte) || resume.byte < 0 || !Number.isInteger(resume.size)) return null;
+  if (typeof resume.head !== 'string') return null;
+  const walk = validWalk(resume.walk);
+  return walk ? { line: resume.line, byte: resume.byte, size: resume.size, head: resume.head, walk } : null;
+}
+
+// Where the next checkpoint can resume: the byte just past line `nextCursor`, or null when there is
+// no such byte on disk — a compressed rollout, or a cursor line whose newline has not landed yet.
+// Saving an offset past an unterminated line would read its later newline as an extra blank line and
+// shift every line number after it.
+function resumeAt(data, base, nextCursor, startByte, walk) {
+  if (!Array.isArray(data.lineEnds) || !data.head) return null;
+  const at = nextCursor - base;
+  const byte = at === 0 ? startByte : data.lineEnds[at - 1];
+  if (!Number.isInteger(byte) || byte < 0) return null;
+  const head = rolloutHeadHash(data.head, byte);
+  if (head === null) return null;
+  return { line: nextCursor, byte, size: data.size, head, walk };
+}
+
+// `resolvers.resume` (optional) is a resume an earlier call returned for this file; when it holds,
+// only the bytes after it are read (`resolvers.readTail`, else readRolloutTail) and the walk state
+// it carries stands in for the lines before the cursor. When it does not — another cursor, a
+// shrunk or replaced file, a compressed one — the whole file is read (`resolvers.readLines`, else
+// readRolloutLines), exactly as without one. Either way the result is the same.
+//
+// The result carries `resume` for `nextCursor` (or null) and `source`, the `{ size, mtimeMs }` of the
+// file as read.
 export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   const repoRootOf = orDefault(resolvers.repoRootOf, (dir) => dir);
   const branchAt = orDefault(resolvers.branchAt, null);
 
+  const resume = usableResume(resolvers.resume, fromLine);
+  let data = null;
+  if (resume) data = orDefault(resolvers.readTail, readRolloutTail)(transcriptPath, resume);
+  const fromTail = data !== null;
   // records stop short of a torn trailing record, so the cursor never passes one.
-  const { lineCount, records } = orDefault(resolvers.readLines, readRolloutLines)(transcriptPath);
+  if (!fromTail) data = orDefault(resolvers.readLines, readRolloutLines)(transcriptPath);
+  // The line before records[0]: the cursor on a tail read, 0 on a whole one.
+  const base = fromTail ? fromLine : 0;
+  const { records } = data;
+  const lineCount = base + data.lineCount;
 
   // A restored/replaced file can be shorter than its durable cursor. Replaying from zero would
   // create overlapping windows with different segment IDs. Preserve the cursor and defer until
@@ -293,28 +381,28 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     throw error;
   }
 
+  // Both are equivalent over the tail: a call's server is named by a completion record AFTER it, and
+  // a boundary before the cursor never holds a window back.
   const operationServers = operationContext(records);
-  const windowEnd = operationWindowEnd(records, fromLine, operationServers);
+  const windowEnd = base + operationWindowEnd(records, fromLine - base, operationServers);
 
   const segments = [];
   const apiErrorEvents = [];
   const rateLimitObservations = [];
   let run = null;
-  let activeModel = 'unknown';
-  // 'unknown' is the server's own name for the effort-less bucket — `session-report.service.ts` in
-  // the hb-ai-agent-portal repo maps it to a NULL effort row with the legacy source_ref, so a
-  // pre-effort payload and an unknown bucket store identically. Do NOT invent a different sentinel.
-  let activeEffort = 'unknown';
-  let activeRoot = null;
-  // Cumulative baseline (the last token_count total we've seen, including pre-window history).
-  let prev = { input: 0, cached: 0, cacheWrite: 0, output: 0 };
-
-  // Canary, not a parser. `token_usage_record` is a second, per-request token source that appeared
-  // on CLI 0.153 (870 records across 16/201 local rollouts) and is entirely unread here. If a build
-  // ever stops emitting `token_count`, totalsFromRecord returns null for every line and the session
-  // reports ZERO tokens with nothing anywhere saying why — the same silent-data-loss class as audit
-  // findings #2 and #5. All 16 local files that carry token_usage_record ALSO carry token_count, so
-  // today this can never fire; it exists to make the day it changes loud instead of silent.
+  // The walk state. activeModel 'unknown' is the server's own name for the effort-less bucket —
+  // `session-report.service.ts` in the hb-ai-agent-portal repo maps it to a NULL effort row with the
+  // legacy source_ref, so a pre-effort payload and an unknown bucket store identically. Do NOT
+  // invent a different sentinel. `prev` is the cumulative baseline (the last token_count total
+  // seen, including pre-window history); `reading` the newest reset reading (resetsAtFrom).
+  //
+  // Canary, not a parser: `sawTokenUsageRecord`. `token_usage_record` is a second, per-request token
+  // source that appeared on CLI 0.153 (870 records across 16/201 local rollouts) and is entirely
+  // unread here. If a build ever stops emitting `token_count`, totalsFromRecord returns null for
+  // every line and the session reports ZERO tokens with nothing anywhere saying why — the same
+  // silent-data-loss class as audit findings #2 and #5. All 16 local files that carry
+  // token_usage_record ALSO carry token_count, so today this can never fire; it exists to make the
+  // day it changes loud instead of silent.
   //
   // Deliberately a boolean and never a parse: the two sources describe the SAME usage, so reading
   // token_usage_record alongside token_count would double-count every token on CLI 0.153+.
@@ -322,8 +410,25 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
   // `sawTokenCount` is driven by totalsFromRecord's own verdict rather than by the record type, so a
   // renamed/removed `total_token_usage` block trips it too — the failure being watched for is "the
   // parser found no totals anywhere", not "the record type vanished".
-  let sawTokenCount = false;
-  let sawTokenUsageRecord = false;
+  const walk = fromTail ? resume.walk : initialWalk();
+  let { prev, activeRoot, activeCwd, activeModel, activeEffort, sawTokenCount, sawTokenUsageRecord, reading } = walk;
+
+  // cwds seen before the cursor, newest last, not yet resolved. Only the root at the cursor matters
+  // there, and that is the newest cwd that resolves — so a resumed window costs one git call, not
+  // one per directory the session ever visited.
+  //
+  // A resume carries the newest cwd before the cursor and resolves it again here, through the same
+  // resolver as a full read: a repo created since (`git init`, `git worktree add`) must give the
+  // resumed lines the root a full read would. The carried root stands only when that cwd no longer
+  // resolves — which is where a full read would fall back to an older cwd's root too.
+  let pendingCwds = fromTail && activeCwd ? [activeCwd] : [];
+  const settleRoot = () => {
+    for (let k = pendingCwds.length - 1; k >= 0; k--) {
+      const root = repoRootOf(pendingCwds[k]);
+      if (root) { activeRoot = root; break; }
+    }
+    pendingCwds = [];
+  };
 
   const closeRun = () => {
     if (run) {
@@ -361,17 +466,23 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     }
   };
 
-  for (let i = 0; i < windowEnd; i++) {
+  for (let i = 0; i < windowEnd - base; i++) {
     const rec = records[i];
     if (!rec) continue;
-    const lineNo = i + 1;
+    const lineNo = base + i + 1;
 
     // Update the active root/model from this record BEFORE attributing it, so a turn's work
     // (and its trailing token_count) bills to the cwd the turn declared.
     const cwd = cwdFromRecord(rec);
-    if (cwd) {
-      const root = repoRootOf(cwd);
-      if (root) activeRoot = root; // last-touch-wins; unresolvable → carry forward
+    if (cwd) activeCwd = cwd;
+    if (lineNo <= fromLine) {
+      if (cwd && cwd !== pendingCwds[pendingCwds.length - 1]) pendingCwds.push(cwd);
+    } else {
+      if (pendingCwds.length) settleRoot();
+      if (cwd) {
+        const root = repoRootOf(cwd);
+        if (root) activeRoot = root; // last-touch-wins; unresolvable → carry forward
+      }
     }
     const model = modelFromRecord(rec);
     if (model) activeModel = model;
@@ -385,6 +496,10 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     // Whole-file facts, so they are collected across the pre-window prefix too.
     if (totals) sawTokenCount = true;
     if (rec.type === 'token_usage_record') sawTokenUsageRecord = true;
+    // A reading is a token_count and an error never is, so taking it before the error below cannot
+    // hand an error its own record.
+    const resetsAt = resetReadingFromRecord(rec);
+    if (resetsAt !== null) reading = { line: lineNo, resetsAt };
 
     if (lineNo <= fromLine) {
       // Pre-window: only advance the cumulative baseline; never emit.
@@ -395,7 +510,7 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     const apiError = orDefault(apiErrorFromRecord(rec), rateLimitFromRecord(rec));
     if (apiError) {
       if (apiError.info === 'usage_limit_exceeded') {
-        apiError.resetsAt = resetsAtBefore(records, i, apiError.occurredAt);
+        apiError.resetsAt = resetsAtFrom(reading, lineNo, apiError.occurredAt);
       }
       apiErrorEvents.push(apiError);
     }
@@ -471,8 +586,19 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     }
   }
   closeRun();
+  // The walk state at the cursor, for the next resume; the root needs settling when the window held
+  // no line of its own to settle it.
+  if (pendingCwds.length) settleRoot();
+  const nextCursor = Math.max(fromLine, windowEnd);
+  // The loop stopped at windowEnd, so the walk state is the one at nextCursor only when the window
+  // did not end before the cursor it started from.
+  const nextResume = windowEnd >= fromLine
+    ? resumeAt(data, base, nextCursor, fromTail ? resume.byte : 0, {
+      prev, activeRoot, activeCwd, activeModel, activeEffort, sawTokenCount, sawTokenUsageRecord, reading,
+    })
+    : null;
   return {
-    nextCursor: Math.max(fromLine, windowEnd),
+    nextCursor,
     segments,
     apiErrorEvents: dedupeErrors(apiErrorEvents),
     rateLimitObservations,
@@ -482,6 +608,8 @@ export function computeDelta(transcriptPath, fromLine, resolvers = {}) {
     // §8's crash/diagnostic telemetry when that exists; until then it sits here unconsumed, adds no
     // wire field, and costs nothing.
     tokenSourceMissing: sawTokenUsageRecord && !sawTokenCount,
+    resume: nextResume,
+    source: { size: orDefault(data.size, null), mtimeMs: orDefault(data.mtimeMs, null) },
   };
 }
 
@@ -506,4 +634,27 @@ function summarize(models, timestamps, lines, activeIntervals, operationServers)
     started_at: timestamps.length ? new Date(timestamps[0]).toISOString() : null,
     ended_at: timestamps.length ? new Date(timestamps[timestamps.length - 1]).toISOString() : null,
   };
+}
+
+// A resume as the flat fields a state file or subagent sidecar keeps beside its line `cursor`, or
+// every field null when there is none — null rather than absent, so a merge-writer (writeAgent)
+// clears a stale one. `cursorWalk.line` names the cursor the offset belongs to, so a byte cursor
+// paired with any other line cursor (a coverage override, a merged sidecar) is never used.
+export function resumeFields(resume) {
+  if (!resume) return { cursorByte: null, cursorSize: null, cursorHead: null, cursorWalk: null };
+  return {
+    cursorByte: resume.byte,
+    cursorSize: resume.size,
+    cursorHead: resume.head,
+    cursorWalk: { line: resume.line, ...resume.walk },
+  };
+}
+
+// The resume those fields describe, or null when any is missing (an older state file). computeDelta
+// still checks it against the cursor and the file before trusting it.
+export function resumeFromFields(record) {
+  if (!record || !record.cursorWalk || typeof record.cursorWalk !== 'object') return null;
+  const { line, ...walk } = record.cursorWalk;
+  if (!Number.isInteger(line) || !Number.isInteger(record.cursorByte)) return null;
+  return { line, byte: record.cursorByte, size: record.cursorSize, head: record.cursorHead, walk };
 }

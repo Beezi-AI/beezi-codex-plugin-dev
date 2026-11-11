@@ -19,8 +19,10 @@ if (!input.session_id || !input.agent_id) process.exit(0);
 (async () => {
   // Identity is written into the data root, so it waits on lib/env-guard.mjs like every other
   // writer. Imported dynamically, like the module below it, to keep this hook at bare node startup.
-  const { hookMayProceed } = await import('../lib/env-guard.mjs');
-  if (!hookMayProceed()) return exitClean(0);
+  // The credential-free form: this hook writes one local record and uploads nothing, so it needs
+  // only to know the root is bound to this environment — not a credential read per account.
+  const { hookMayProceedLocal } = await import('../lib/env-guard.mjs');
+  if (!hookMayProceedLocal()) return exitClean(0);
   const { runHook, importHookModule } = await import('../lib/hook-runner.mjs');
   const { DIAGNOSTIC_SOURCES } = await import('../lib/diagnostics.mjs');
   return runHook(DIAGNOSTIC_SOURCES.UNKNOWN, async () => {

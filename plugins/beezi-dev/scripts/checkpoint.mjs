@@ -35,39 +35,43 @@ if (input.agent_id) process.exit(0);
 const boundary = shellCommandsOf(input).some(isGitCheckpointCommand);
 const heartbeat = boundary ? false : shouldHeartbeat(input);
 if (!boundary && !heartbeat) process.exit(0);
-// Imported past the guard on purpose: this hook is registered against every tool call (Codex's
-// shell tool has a different name on each of its two surfaces, so the matcher cannot be narrowed
-// yet), and the checkpoint engine pulls in ~28 modules that all but a few invocations discard.
+// Imported past the guard on purpose: the hook's matcher lists the shell tool's names across Codex
+// versions (lib/hooks-install.mjs), and the gate above still filters to shell commands that are a
+// git checkpoint or a due heartbeat. The checkpoint engine pulls in ~28 modules that all but a few
+// invocations discard.
 //
 // Async IIFE, not top-level await: top-level await is Node 14.8+, past this plugin's 13.2 floor
 // and banned by the gate. The catch below is what a rejected top-level await did.
 (async () => {
   // R1's guard, imported HERE rather than at the top for the same reason the engine is: it reaches
-  // the lock primitive, the credential store and the data root, and this hook is registered against
-  // every tool call. Past the gates above, the process is already paying for the engine. R-numbers
-  // cite docs/plans/2026-09-10-sections/REVIEW.md.
-  const { hookMayProceed } = await import('../lib/env-guard.mjs');
-  if (!hookMayProceed()) return exitClean(0);
+  // the lock primitive and the data root, and this hook is registered against every tool call.
+  // Past the gates above, the process is already paying for the engine. The credential-free form:
+  // the hook reads no credentials, and the upload worker runs the full guard before it sends
+  // anything. R-numbers cite docs/plans/2026-09-10-sections/REVIEW.md.
+  const { hookMayProceedLocal } = await import('../lib/env-guard.mjs');
+  if (!hookMayProceedLocal()) return exitClean(0);
   const { runHook, importHookModule } = await import('../lib/hook-runner.mjs');
   const { DIAGNOSTIC_SOURCES } = await import('../lib/diagnostics.mjs');
   return runHook(DIAGNOSTIC_SOURCES.CHECKPOINT, async () => {
     const mod = await importHookModule('./checkpoint.mjs');
     if (!mod) return;
     const { runCheckpoint, HOOK_BUDGET_MS } = mod;
-    // Same budget as the Stop hook: this path flushes the queue too, and it is registered against
-    // every tool call, so an overrun here fails a hook in the middle of the user's work.
+    // CAPTURE ONLY (I-local), as the Stop hook: the checkpoint goes to disk, the session is marked
+    // due and the upload trigger starts the background worker, which does every POST. Same budget as
+    // the Stop hook: this hook is registered against every tool call, so an overrun here fails a hook
+    // in the middle of the user's work.
     //
     // emitTimeline on the HEARTBEAT path only, and it is the whole point of the heartbeat: it stands
     // in for a Stop that may never come, so it must ship what a turn end ships — the one flag drives
-    // the subagent sweep, the timeline POST and the rate-limit drain. Measured on this machine, Node
-    // v24.11.1, so the 17.5 s budget is a real bound rather than a hope: the sweep is 22 ms filtered
+    // the subagent sweep here and marks the timeline owed on the due marker, so the worker posts it
+    // (the worker drains the rate-limit rows on every run). Measured on this machine, Node v24.11.1,
+    // so the 17.5 s budget is a real bound rather than a hope: the sweep is 22 ms filtered
     // to the session start (456 ms over all 204 local rollouts unfiltered, and capped at
     // maxReads = 500 file opens), computeDelta over the largest local rollout — 12.2 MB, 1306 lines
-    // — is 231 ms, and computeSessionTimeline over the same file is 165 ms. Everything after that is
-    // network and already deadline-bounded inside runCheckpoint.
+    // — is 231 ms, and computeSessionTimeline over the same file is 165 ms (the worker's cost now).
     //
     // The boundary path keeps its existing behaviour exactly: no timeline, no drain, no sweep.
-    const result = await runCheckpoint(input, {}, { budgetMs: HOOK_BUDGET_MS, emitTimeline: heartbeat });
+    const result = await runCheckpoint(input, {}, { localOnly: true, budgetMs: HOOK_BUDGET_MS, emitTimeline: heartbeat });
     if (result.outcome === 'committed') touchHeartbeat(input.session_id);
   });
 })().catch(() => exitClean(0));

@@ -178,7 +178,13 @@ test('L2 — every root lib/paths.mjs resolves is inside the sandbox', () => {
   // can never write the reminder block into the developer's real global instructions file.
   // 32: ruleUndoFile() (lib/rule-undo.mjs's last routing change) joins beeziCodexHome(), so an
   // undo record a test writes lands in the sandbox, never in the developer's real data root.
-  assert.equal(roots.length, 32,`the path surface changed — add the new accessor's reasoning here`);
+  // 35: uploadWorkerStatusFile(), uploadDueDir() and uploadDueFile(sessionId) (lib/upload-worker.mjs
+  // and lib/upload-due.mjs) join beeziCodexHome(), so a worker status or due marker a test writes
+  // lands in the sandbox. uploadDueFile takes a session id; the probe key is a valid one.
+  // 36: sessionStartCacheFile(key) (lib/session-start-upload.mjs, the worker's cached whoami and
+  // repo answers SessionStart prints from) joins accountDir(key), so a cache a test writes lands in
+  // the sandbox's account directory.
+  assert.equal(roots.length, 36,`the path surface changed — add the new accessor's reasoning here`);
   // The two roots a run must never touch, named rather than the whole home: on Windows the temp
   // directory sits under %USERPROFILE%, so "not under the home" would also forbid the sandbox.
   const forbidden = [path.join(REAL_HOME, '.codex'), path.join(REAL_HOME, '.beezi-codex')];
@@ -201,6 +207,23 @@ test('L3 — OPENAI_API_KEY and friends are deleted from process.env', () => {
   for (const key of SCRUBBED_ENV) {
     assert.equal(key in process.env, false, `${key} survived the scrub`);
   }
+});
+
+// ── No real upload worker ─────────────────────────────────────────────────────────────────────
+// lib/upload-trigger.mjs starts a detached worker on every hook that saved work. The preload sets
+// BEEZI_TEST_NO_SPAWN=1 so neither the test process nor any hook it runs as a child (which
+// inherits the variable) can start one: a real worker would outlive the test and drain the sandbox.
+test('the preload sets BEEZI_TEST_NO_SPAWN so no test starts a real upload worker', () => {
+  assert.equal(process.env.BEEZI_TEST_NO_SPAWN, '1');
+});
+
+test('a child started under the preload sees BEEZI_TEST_NO_SPAWN even when the host cleared it', () => {
+  const res = run(
+    ['--import', PRELOAD, '-e', 'process.stdout.write(String(process.env.BEEZI_TEST_NO_SPAWN))'],
+    { BEEZI_TEST_NO_SPAWN: '' },
+  );
+  assert.equal(res.stdout, '1', `the variable did not reach the process:
+${out(res)}`);
 });
 
 test('L3 — an exported OPENAI_API_KEY does not survive the preload', () => {

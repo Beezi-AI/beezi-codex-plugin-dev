@@ -337,6 +337,15 @@ still carry an older version's script paths has them rewritten to the launcher f
 session afterwards, so that upgrade — and only that one — asks for trust again in `/hooks`. See
 "Analytics needs the hooks installed and trusted" above.
 
+**0.27.0 asks for trust once more, for `PostToolUse` only.** That entry now matches the shell tool
+by name (`Bash|shell|shell_command|exec_command|local_shell`) instead of every tool, so its hash
+changes. Trust it again in `/hooks`; the other entries are untouched.
+
+**Uploads run in the background.** From 0.27.0 the hooks only save to disk; one background process
+per data root (`node …/scripts/upload-worker.mjs`) signs in once and uploads. It writes its state
+to `~/.beezi-codex/upload-worker.json` (`outcome`, `lastRunAt`, `retryAfterAt`). A report waits on
+disk until the server confirms it, so a killed upload is sent again by the next run.
+
 ## Entry points
 
 Codex has no per-plugin slash commands ([openai/codex#13893](https://github.com/openai/codex/issues/13893)),

@@ -1,5 +1,5 @@
-import { recordLoginFailure } from './telemetry-auth.mjs';
-import { AUTH_REASONS } from './diagnostics.mjs';
+import { recordLoginFailure, recordLastAuthState } from './telemetry-auth.mjs';
+import { AUTH_REASONS, AUTH_STATES } from './diagnostics.mjs';
 import { currentSessionWorkspace, resolveTargets } from './workspace.mjs';
 // A DEFAULT import, not a named one: tools/hermetic-env.mjs patches the child_process object, and
 // a named binding is snapshotted at instantiation and bypasses that guard entirely.
@@ -15,6 +15,7 @@ import { startLoopback } from './loopback.mjs';
 import { whoami } from './whoami.mjs';
 import { getAuthentication } from './token.mjs';
 import { syncAccountIfNeeded } from './account-sync.mjs';
+import { writeSessionStartCache } from './session-start-upload.mjs';
 import { machineHeaders } from './machine-identity.mjs';
 import { fetchCompat, makeAbortController } from './fetch-compat.mjs';
 import {
@@ -332,6 +333,24 @@ async function checkInTargets(d, key, row, tenants, session, options) {
   }
 }
 
+// SessionStart prints a "link was rejected" line from the upload worker's last cached whoami verdict
+// (accounts/<key>/session-start.json). A sign-in that just proved the link good must not leave the
+// next start telling the user to sign in again, so both re-login branches set the verdict back to
+// ok, under the client the account now reports with. `checkedAt` is left alone: it is the worker's
+// record of when it last asked, and moving it would let the worker skip a session marked before
+// this login. Best-effort; never throws (writeSessionStartCache does not).
+function clearCachedRefusal(key, clientId) {
+  writeSessionStartCache(key, { verdict: 'ok', clientId: orDefault(clientId, null) });
+}
+
+// SessionStart reads the account's last recorded authentication BEFORE that cache: a dead grant
+// leaves `reauth_required` there (the worker's renewal, or this flow's own read of the old
+// credentials), and the stored credentials just replaced it. Recorded through the token module's
+// one writer of that file; best-effort, it never throws.
+function recordReady(key) {
+  try { recordLastAuthState(key, AUTH_STATES.READY, AUTH_REASONS.OK); } catch { /* best-effort */ }
+}
+
 /**
  * Link ONE more Beezi account to this machine, leaving every account already linked alone.
  *
@@ -427,6 +446,7 @@ async function performGuardedLogin(deps) {
       try { recordWhoami(existingByEmail.key, stillValid, existing.clientId); } catch { /* best-effort */ }
       // Stores the probe's workspace list so a join made since session start reaches joined and the upload.
       if (stillValid) {
+        clearCachedRefusal(existingByEmail.key, existing.clientId);
         try {
           await updateAccount(existingByEmail.key, {
             email: stillValid.email, name: stillValid.name,
@@ -456,6 +476,8 @@ async function performGuardedLogin(deps) {
     // The new client id is what the account's reports will carry from here, so the tracking state
     // has to bind to it — a state still naming the dead client reads as another login's.
     try { recordWhoami(existingByEmail.key, who, fresh.client_id); } catch { /* best-effort */ }
+    clearCachedRefusal(existingByEmail.key, fresh.client_id);
+    recordReady(existingByEmail.key);
     // FORCED: this account has been unable to report for as long as its grant was dead, so its
     // marker describes a check-in the server may never have seen.
     await checkInTargets(d, existingByEmail.key, existingByEmail, answer.tenants, withIdentity(newSession, existingByEmail, who), { force: true });
@@ -481,6 +503,7 @@ async function performGuardedLogin(deps) {
   // the key was minted three lines up, so the account directory the keyed layout gives it is
   // empty by construction and no previous login's ledger or policy can be in it.
   try { markLinked(key); } catch { /* best-effort */ }
+  recordReady(key);
   if (who) {
     try { recordWhoami(key, who, fresh.client_id); } catch { /* best-effort */ }
   }

@@ -1,5 +1,21 @@
 # Beezi plugin release notes
 
+## 0.28.1 (2026-11-11) — Faster hooks, background uploads
+
+### Improved
+- **Hooks no longer wait on the network** — session start, turn end and the shell-command hook now only save to disk. One background upload signs in once and sends everything, so Codex no longer waits several seconds for Beezi at the end of a turn.
+- **No sign-in reads in hooks** — hooks never read your saved sign-in, which on Windows started a PowerShell process for every read. Several linked accounts no longer multiply the wait.
+- **Batch upload** — when your Beezi server supports it, reports go up in batches of up to 50. Older servers get one report at a time, as before.
+- **Fewer hook runs** — the analytics hook after a tool call now runs only for shell commands, not for every file edit, MCP call or web search. Trust the updated `PostToolUse` entry once in `/hooks`.
+- **Less reading** — a checkpoint reads only the new part of a session file, and skips finished subagent files.
+- **Upload status** — `beezi_status` now says when the background upload last ran and what to do when it is stuck.
+- **Quiet background check** — between turns, Beezi no longer reads your saved sign-in every 20 seconds when nothing changed.
+
+### Fixed
+- **No lost reports when Beezi is busy** — a report the server asks to retry later (busy or rate-limited) is kept and sent again, instead of being dropped.
+- **Right session, right file** — a new session in a folder can no longer be matched to an older session’s file there.
+- **Sign in again, message gone** — after you sign in again, session start no longer says your link was rejected.
+
 ## 0.27.0 (2026-11-11) — One-question setup
 
 ### New

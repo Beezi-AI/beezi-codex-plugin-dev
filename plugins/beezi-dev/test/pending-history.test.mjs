@@ -154,6 +154,44 @@ test('settle: the third failure adds one retrying result; busy re-arms soon with
   assert.deepEqual(row.historyResults.map((r) => r.status), [HistoryStatus.RETRYING]);
 });
 
+// A busy run whose upload keeps failing (the worker's last run failed with this report on disk) is
+// retried at the busy delay but counted as a failure, so it reaches the retry notice and, at the
+// deadline, the give-up notice. A plain busy run is neither.
+test('settle: a busy run of a failing upload counts a failure but re-arms at the busy delay', () => {
+  const row = multi();
+  requestHistory(row, 'B', ['s1'], iso(T0));
+  settleHistory(row, 'B', { outcome: RunOutcome.BUSY, failing: true }, { plannedAtMs: T0, nowMs: T0 });
+  assert.equal(row.pendingHistory[0].attempts, 1);
+  assert.equal(historyDue(row, T0 + 1000), false);
+  assert.equal(historyDue(row, T0 + HISTORY_BUSY_RETRY_MS), true);
+  assert.equal(row.historyResults, undefined);
+  settleHistory(row, 'B', { outcome: RunOutcome.BUSY, failing: true }, { plannedAtMs: T0, nowMs: T0 + 1 });
+  settleHistory(row, 'B', { outcome: RunOutcome.BUSY, failing: true }, { plannedAtMs: T0, nowMs: T0 + 2 });
+  assert.equal(row.pendingHistory[0].attempts, 3);
+  assert.deepEqual(row.historyResults, [{ tenantId: 'B', status: 'retrying', sent: 0, skipped: 0 }]);
+});
+
+test('settle: a failing upload still busy at the deadline gives up with the failure notice', () => {
+  const row = multi();
+  requestHistory(row, 'B', ['s1'], iso(T0));
+  settleHistory(row, 'B', { outcome: RunOutcome.BUSY, failing: true }, { plannedAtMs: T0, nowMs: T0 + 1 });
+  const state = settleHistory(row, 'B', { outcome: RunOutcome.BUSY, failing: true }, { plannedAtMs: T0, nowMs: T0 + HISTORY_GIVE_UP_MS });
+  assert.equal(state, 'gave-up');
+  assert.equal(row.pendingHistory.length, 0);
+  assert.deepEqual(row.historyResults, [{ tenantId: 'B', status: 'gave-up', sent: 0, skipped: 0 }]);
+  const opts = { prefix: 'Beezi', nameOf: () => 'NewCo', syncName: '/beezi:sync' };
+  assert.equal(resultLine(row.historyResults[0], opts), "Beezi: couldn't send history to NewCo. Run /beezi:sync to try again.");
+});
+
+test('settle: a request only ever busy waiting for a worker clears at the deadline with no failure', () => {
+  const row = multi();
+  requestHistory(row, 'B', ['s1'], iso(T0));
+  settleHistory(row, 'B', { outcome: RunOutcome.BUSY }, { plannedAtMs: T0, nowMs: T0 + 1 });
+  const state = settleHistory(row, 'B', { outcome: RunOutcome.BUSY }, { plannedAtMs: T0, nowMs: T0 + HISTORY_GIVE_UP_MS });
+  assert.equal(state, 'cleared');
+  assert.equal(row.historyResults, undefined);
+});
+
 test('noteAttempt: a second stamp inside the watchdog window does not count', () => {
   const row = multi();
   requestHistory(row, 'B', ['s1'], iso(T0));

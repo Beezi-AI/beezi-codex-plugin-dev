@@ -92,6 +92,85 @@ test('resolveCodexTranscript falls back to the session id when no path is given'
   });
 });
 
+// Codex sends `transcript_path` on PostToolUse and Stop too, so a hook that names its session and
+// hands over that session's rollout needs no tree walk at all.
+const refuseWalk = () => { throw new Error('walked the sessions tree'); };
+
+test('a payload transcript_path whose session_meta names the session is used without walking', () => {
+  withCodexHome((home) => {
+    const file = writeRollout(home, SID, [{ type: 'session_meta', payload: { id: SID, cwd: '/repo' } }]);
+    const r = resolveCodexTranscript({ session_id: SID, transcript_path: file }, { findRolloutBySessionId: refuseWalk });
+    assert.deepEqual(r, { sessionId: SID, transcriptPath: file });
+  });
+});
+
+test('a payload transcript_path for another session falls back to the id lookup', () => {
+  withCodexHome((home) => {
+    const other = writeRollout(home, OTHER_SID, [{ type: 'session_meta', payload: { id: OTHER_SID, cwd: '/repo' } }]);
+    const asked = [];
+    const r = resolveCodexTranscript({ session_id: SID, transcript_path: other }, {
+      findRolloutBySessionId: (id) => { asked.push(id); return { sessionId: id, transcriptPath: '/own/rollout.jsonl' }; },
+    });
+    assert.deepEqual(asked, [SID]);
+    assert.deepEqual(r, { sessionId: SID, transcriptPath: '/own/rollout.jsonl' });
+  });
+});
+
+test('a payload path whose meta has no id but whose filename carries it is used without walking', () => {
+  withCodexHome((home) => {
+    const file = writeRollout(home, SID, [{ type: 'session_meta', payload: { cwd: '/repo' } }]);
+    const r = resolveCodexTranscript({ session_id: SID, transcript_path: file }, { findRolloutBySessionId: refuseWalk });
+    assert.deepEqual(r, { sessionId: SID, transcriptPath: file });
+  });
+});
+
+test('a null payload transcript_path walks for the id as before', () => {
+  withCodexHome(() => {
+    const asked = [];
+    const r = resolveCodexTranscript({ session_id: SID, transcript_path: null }, {
+      findRolloutBySessionId: (id) => { asked.push(id); return { sessionId: id, transcriptPath: '/own/rollout.jsonl' }; },
+    });
+    assert.deepEqual(asked, [SID]);
+    assert.equal(r.transcriptPath, '/own/rollout.jsonl');
+  });
+});
+
+test('a payload path whose filename carries the id is taken without opening it', (t) => {
+  withCodexHome((home) => {
+    const file = writeRollout(home, SID, [{ type: 'session_meta', payload: { id: SID, cwd: '/repo' } }]);
+    const open = t.mock.method(fs, 'openSync');
+    const r = resolveCodexTranscript({ session_id: SID, transcript_path: file }, { findRolloutBySessionId: refuseWalk });
+    assert.deepEqual(r, { sessionId: SID, transcriptPath: file });
+    assert.equal(open.mock.calls.filter((c) => c.arguments[0] === file).length, 0);
+  });
+});
+
+test('a payload path whose session_meta names another session is never used for this one', () => {
+  withCodexHome((home) => {
+    const other = writeUnnamedRollout(home, 'rollout-other.jsonl', [{ type: 'session_meta', payload: { id: OTHER_SID, cwd: '/repo' } }]);
+    const r = resolveCodexTranscript({ session_id: SID, transcript_path: other }, { findRolloutBySessionId: () => null });
+    assert.equal(r, null);
+  });
+});
+
+test('the payload-path id check reads one 64 KiB chunk, not the whole head window', (t) => {
+  withCodexHome((home) => {
+    // A name that does not carry the id, so only the session_meta can confirm it.
+    const file = writeUnnamedRollout(home, 'rollout-big-unnamed.jsonl', [
+      { type: 'session_meta', payload: { id: SID, cwd: '/repo' } },
+      ...Array.from({ length: 40 }, (_, i) => ({ type: 'event_msg', payload: { type: 'agent_message', message: `${i}`.padEnd(10000, 'x') } })),
+    ]);
+    let bytes = 0;
+    const open = t.mock.method(fs, 'openSync');
+    const read = t.mock.method(fs, 'readSync');
+    resolveCodexTranscript({ session_id: SID, transcript_path: file }, { findRolloutBySessionId: refuseWalk });
+    const fds = new Set(open.mock.calls.filter((c) => c.arguments[0] === file).map((c) => c.result));
+    for (const call of read.mock.calls) if (fds.has(call.arguments[0])) bytes += call.result;
+    // The 4-byte zstd magic check, then one 64 KiB chunk that holds the whole first record.
+    assert.equal(bytes, 4 + 64 * 1024);
+  });
+});
+
 test('resolveTranscriptByCwd matches on the rollout launch cwd', () => {
   withCodexHome((home) => {
     const file = writeRollout(home, SID, [{ type: 'session_meta', payload: { cwd: '/my/repo' } }]);
@@ -226,11 +305,9 @@ test('resolveCodexTranscript names a hook-provided path the hook did not name', 
       { type: 'session_meta', payload: { id: SID, cwd: '/my/repo' } },
     ]);
     assert.equal(resolveCodexTranscript({ transcript_path: file }).sessionId, SID);
-    // A usable id ON the payload still wins: the hook is authoritative for its own session.
-    assert.equal(
-      resolveCodexTranscript({ session_id: OTHER_SID, transcript_path: file }).sessionId,
-      OTHER_SID,
-    );
+    // A usable id on the payload whose rollout states ANOTHER id is never paired with it: with no
+    // rollout of its own found by id, the session resolves to nothing.
+    assert.equal(resolveCodexTranscript({ session_id: OTHER_SID, transcript_path: file }), null);
   });
 });
 
@@ -358,4 +435,59 @@ test('findRolloutBySessionState follows a recorded .jsonl path to its .zst', zst
     writeState(beezi, SID, { cwd: '/repo', sessionId: SID, transcriptPath: z.slice(0, -'.zst'.length), updatedAt: '2026-01-09T00:00:00Z' });
     assert.equal(resolveCodexTranscript({ cwd: '/repo' }).transcriptPath, z);
   }));
+});
+
+// ─── the cwd mapping never answers with ANOTHER session's rollout ─────────────
+//
+// SessionStart marks a session due before Codex has written its rollout. The worker's checkpoint
+// then reaches the cwd fallback, which matches on cwd alone: answering with the newest OTHER session
+// there would re-read that session's lines under the new id, with segment ids the server cannot
+// dedupe against the ones it already holds. A fallback answer must be the requested session's own.
+
+const OLD_SID = '019a0000-0000-7000-8000-000000000001';
+const NEW_SID = '019a0000-0000-7000-8000-000000000002';
+
+test('a new session id is not resolved to an older session found through the cwd mapping', () => {
+  withCodexHome((home) => {
+    withBeeziHome((beezi) => {
+      const old = writeRollout(home, OLD_SID, [{ type: 'session_meta', payload: { id: OLD_SID, cwd: 'C:/work/repo' } }]);
+      writeState(beezi, OLD_SID, { sessionId: OLD_SID, cwd: 'C:/work/repo', transcriptPath: old, updatedAt: '2026-11-05T10:00:00Z' });
+      const missing = path.join(path.dirname(old), `rollout-2026-11-05T11-00-00-${NEW_SID}.jsonl`);
+      assert.equal(resolveCodexTranscript({ session_id: NEW_SID, transcript_path: missing, cwd: 'C:/work/repo' }), null);
+      assert.equal(resolveCodexTranscript({ session_id: NEW_SID, cwd: 'C:/work/repo' }), null);
+    });
+  });
+});
+
+test('the cwd mapping still answers with the session\'s own rollout', () => {
+  withCodexHome((home) => {
+    withBeeziHome((beezi) => {
+      // Outside the sessions tree, so the walk cannot find it and only the mapping can.
+      const own = path.join(home, `moved-rollout-${NEW_SID}.jsonl`);
+      fs.writeFileSync(own, `${JSON.stringify({ type: 'session_meta', payload: { cwd: 'C:/work/repo' } })}\n`);
+      writeState(beezi, NEW_SID, { sessionId: NEW_SID, cwd: 'C:/work/repo', transcriptPath: own, updatedAt: '2026-11-05T11:00:00Z' });
+      assert.deepEqual(resolveCodexTranscript({ session_id: NEW_SID, cwd: 'C:/work/repo' }), { sessionId: NEW_SID, transcriptPath: own });
+    });
+  });
+});
+
+test('the cwd mapping accepts a rollout whose session_meta names the requested session', () => {
+  withCodexHome((home) => {
+    withBeeziHome((beezi) => {
+      const own = path.join(home, 'moved-rollout.jsonl');
+      fs.writeFileSync(own, `${JSON.stringify({ type: 'session_meta', payload: { id: NEW_SID, cwd: 'C:/work/repo' } })}\n`);
+      writeState(beezi, 'stale-name', { sessionId: OLD_SID, cwd: 'C:/work/repo', transcriptPath: own, updatedAt: '2026-11-05T11:00:00Z' });
+      assert.deepEqual(resolveCodexTranscript({ session_id: NEW_SID, cwd: 'C:/work/repo' }), { sessionId: NEW_SID, transcriptPath: own });
+    });
+  });
+});
+
+test('a caller with no usable session id still gets the cwd mapping as before', () => {
+  withCodexHome((home) => {
+    withBeeziHome((beezi) => {
+      const old = writeRollout(home, OLD_SID, [{ type: 'session_meta', payload: { id: OLD_SID, cwd: 'C:/work/repo' } }]);
+      writeState(beezi, OLD_SID, { sessionId: OLD_SID, cwd: 'C:/work/repo', transcriptPath: old, updatedAt: '2026-11-05T10:00:00Z' });
+      assert.deepEqual(resolveCodexTranscript({ cwd: 'C:/work/repo' }), { sessionId: OLD_SID, transcriptPath: old });
+    });
+  });
 });

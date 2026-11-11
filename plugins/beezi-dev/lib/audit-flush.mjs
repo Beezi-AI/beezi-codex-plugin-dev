@@ -448,7 +448,8 @@ export async function flushBackfillChunks(sessionGroups, key, session, deps = {}
       return sendChunk(second, depth + 1, plain);
     }
 
-    if (res.status < 500) {
+    // 408 and 429 are "not now", never a verdict on the payload: they fall through to the retryable path below.
+    if (res.status < 500 && res.status !== 408 && res.status !== 429) {
       // 400 single-session floor, 413, and the rest of the permanent 4xx family.
       // Nested orDefault mirrors the original `message ?? raw.slice(...) ?? HTTP` chain.
       markChunk(chunk, BackfillSessionStatus.REJECTED,

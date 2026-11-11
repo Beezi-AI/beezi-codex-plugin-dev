@@ -13,7 +13,8 @@ process.env.BEEZI_CODEX_HOME = TEST_HOME;
 process.on('exit', () => { try { fs.rmSync(TEST_HOME, { recursive: true, force: true }); } catch { /* best-effort */ } });
 
 const { performLogin, openBrowser } = await import('../lib/login.mjs');
-const { trackingStateFile, auditLedgerFile } = await import('../lib/paths.mjs');
+const { trackingStateFile, auditLedgerFile, sessionStartCacheFile } = await import('../lib/paths.mjs');
+const { runSessionStart } = await import('../lib/session-start.mjs');
 const { addAccount, listAccounts } = await import('../lib/accounts.mjs');
 const { TEST_KEY, fakeKeyring } = await import('../tools/account-fixtures.mjs');
 const { sessionAnonymization } = await import('../lib/anonymization.mjs');
@@ -353,6 +354,100 @@ test('a stored token the portal REFUSES still re-arms the account', async () => 
   assert.equal(result.outcome, 'relinked');
   assert.equal(result.key, KEY);
   assert.equal(result.account.clientId, 'client-123', 'the client just registered replaces the refused one');
+});
+
+// ─── the cached "link was rejected" verdict SessionStart prints from ─────────
+
+// What the upload worker leaves for an account whose token the portal refused (lib/session-start-upload.mjs).
+function cacheRefusal(key, clientId) {
+  fs.mkdirSync(path.dirname(sessionStartCacheFile(key)), { recursive: true });
+  fs.writeFileSync(sessionStartCacheFile(key), JSON.stringify({
+    version: 1, checkedAt: 1793872800000, verdict: 'rejected', clientId, who: null,
+  }));
+}
+const cachedVerdict = (key) => JSON.parse(fs.readFileSync(sessionStartCacheFile(key), 'utf-8'));
+
+// Everything SessionStart would otherwise reach for on its own: billing, git, the app-server probe.
+const quietStart = {
+  resolveSource: () => 'openai_api_key',
+  readBillingConfig: () => null,
+  writeBillingConfig: () => {},
+  isStale: () => false,
+  readChatgptAuth: () => null,
+  readAccountViaAppServer: async () => ({ ok: false, reason: 'unavailable' }),
+  gitImpl: () => { throw new Error('not a git repository'); },
+};
+
+test('a re-login of a refused account clears the cached refusal, so the next start says nothing of it', async () => {
+  const KEY = 'cccc3333';
+  await addAccount({ key: KEY, email: 'refused@example.com', name: 'Dev', clientId: 'old-client' });
+  cacheRefusal(KEY, 'old-client');
+
+  const result = await performLogin(loginDeps({
+    whoami: async (session) => (session.token === 'already-stored'
+      ? { valid: false }
+      : { valid: true, name: 'Dev', email: 'refused@example.com' }),
+    getCredentials: storedSession('old-client', 'already-stored', KEY),
+  }));
+
+  assert.equal(result.outcome, 'relinked');
+  assert.deepEqual([cachedVerdict(KEY).verdict, cachedVerdict(KEY).clientId, cachedVerdict(KEY).checkedAt], ['ok', 'client-123', 1793872800000]);
+  const message = await runSessionStart({ session_id: 'after-relink', cwd: null }, {
+    ...quietStart,
+    listAccounts: async () => (await listAccounts()).filter((row) => row.key === KEY),
+    markUploadDue: () => null,
+  });
+  assert.doesNotMatch(message, /rejected/);
+  assert.match(message, /^Beezi ✓ refused@example\.com/);
+});
+
+// A dead grant leaves `reauth_required` in auth-state.json (the worker's renewal, or login's own
+// read of the old credentials), and SessionStart reads that BEFORE the cache: the re-arm must
+// record the account ready again, or the next start still says the link was rejected.
+const authStateOf = (key) => JSON.parse(fs.readFileSync(path.join(path.dirname(sessionStartCacheFile(key)), 'auth-state.json'), 'utf-8'));
+
+test('re-arming a dead grant records the account ready, so the next start reports it', async () => {
+  const KEY = 'eeee5555';
+  await addAccount({ key: KEY, email: 'revoked@example.com', name: 'Dev', clientId: 'old-client' });
+  cacheRefusal(KEY, 'old-client');
+  fs.writeFileSync(path.join(path.dirname(sessionStartCacheFile(KEY)), 'auth-state.json'),
+    JSON.stringify({ lastState: 'reauth_required', lastReason: 'invalid_grant', at: 1 }));
+
+  const result = await performLogin(loginDeps({
+    getAuthentication: async () => ({ state: 'reauth_required', reason: 'invalid-grant' }),
+    whoami: async () => ({ valid: true, name: 'Dev', email: 'revoked@example.com' }),
+  }));
+
+  assert.equal(result.outcome, 'relinked');
+  assert.deepEqual([authStateOf(KEY).lastState, authStateOf(KEY).lastReason], ['ready', 'ok']);
+  const message = await runSessionStart({ session_id: 'after-relink', cwd: null }, {
+    ...quietStart,
+    listAccounts: async () => (await listAccounts()).filter((row) => row.key === KEY),
+    markUploadDue: () => null,
+  });
+  assert.doesNotMatch(message, /rejected/);
+  assert.doesNotMatch(message, /not linked/);
+  assert.match(message, /^Beezi ✓ revoked@example\.com/);
+});
+
+test('a new link records the account ready', async () => {
+  const result = await performLogin(loginDeps({ whoami: async () => ({ valid: true, name: 'New', email: 'brand-new@example.com' }) }));
+  assert.equal(result.outcome, 'linked');
+  assert.deepEqual([authStateOf(result.key).lastState, authStateOf(result.key).lastReason], ['ready', 'ok']);
+});
+
+test('an already-linked re-login the portal answers clears a cached refusal too', async () => {
+  const KEY = 'dddd4444';
+  await addAccount({ key: KEY, email: 'healthy@example.com', name: 'Dev', clientId: 'existing-client' });
+  cacheRefusal(KEY, 'existing-client');
+
+  const result = await performLogin(loginDeps({
+    whoami: async () => ({ valid: true, name: 'Dev', email: 'healthy@example.com' }),
+    getCredentials: storedSession('existing-client', 'already-stored', KEY),
+  }));
+
+  assert.equal(result.outcome, 'already-linked');
+  assert.deepEqual([cachedVerdict(KEY).verdict, cachedVerdict(KEY).clientId], ['ok', 'existing-client']);
 });
 
 test('a check-in that throws never strands a completed sign-in', async () => {

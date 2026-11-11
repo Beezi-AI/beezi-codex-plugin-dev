@@ -47,6 +47,9 @@ export const OAUTH_SCOPES = "email profile";
 // machine and its analytics are attributed to the Codex client.
 export const ENDPOINTS = Object.freeze({
   sessionsReport: "/sessions/report",
+  // Up to 50 reports in one POST ({ reports: [...] } in, { results: [...] } out, in input order);
+  // lib/batch-upload.mjs. Same X-Beezi-Agent attribution as the single route.
+  sessionsReportBatch: "/sessions/report-batch",
   sessionErrors: "/sessions/errors",
   sessionsTimeline: "/sessions/timeline",
   // History sync (lib/session-coverage.mjs, G-3-3/G-9-3): /sessions/sync is tracking-policy-aware,

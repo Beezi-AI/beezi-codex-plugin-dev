@@ -80,6 +80,9 @@ test('a resumed session does not re-report work it already billed', async (t) =>
     {
       ...store,
       linkedSessions: async () => [ACCOUNT],
+      // Linked in the index, which is all SessionStart reads now: without it the start would answer
+      // "not linked" before touching the session state this test is about.
+      listAccounts: async () => [{ ...ACCOUNT, token: undefined, status: 'linked' }],
       // whoami answers; the queue flush stays offline so the already-billed payloads remain on
       // disk and the totals below measure what was *reported*, not what survived the flush.
       fetchImpl: async (url) => {

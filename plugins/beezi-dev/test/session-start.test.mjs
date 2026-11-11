@@ -6,8 +6,12 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { runSessionStart, initSessionState } from '../lib/session-start.mjs';
-import { stateDir } from '../lib/paths.mjs';
+import { runSessionStart, initSessionState, takeMigrationNotice, usableSessions } from '../lib/session-start.mjs';
+import { readUploadStatus, writeUploadStatus } from '../lib/upload-worker.mjs';
+import { stateDir, accountDir, beeziCodexHome } from '../lib/paths.mjs';
+import { sessionStartDueHandler } from '../lib/session-start-upload.mjs';
+import { recordLastAuthState } from '../lib/telemetry-auth.mjs';
+import { listUploadDue } from '../lib/upload-due.mjs';
 import { CONSENT_VERSION, diagnosticsConsentFile, readConsent, isTelemetryGranted } from '../lib/diagnostics.mjs';
 import { ENDPOINTS } from '../lib/config.mjs';
 import { tmpHome as sandboxHome } from '../tools/suite-fixtures.mjs';
@@ -113,10 +117,66 @@ function syncSpy(impl) {
   return spy;
 }
 
+// SessionStart reads no credential and makes no request. What it used to ask the portal is asked
+// by the upload worker's `session-start` step, which caches the answers; the NEXT start prints
+// from them. So a test of what a start prints runs that step first, with the test's own seams (its
+// sessions, fetch, renewal and check-in fakes), and then the hook — with every credential and
+// network seam made to refuse, so the text can only come from what the step left on disk.
+function workerStep(input, deps) {
+  return async () => {
+    let sessions = [];
+    try { sessions = (await deps.linkedSessions(deps)) || []; } catch { sessions = []; }
+    // A linked account has its directory; the step's cache lives in it.
+    for (const session of sessions) fs.mkdirSync(accountDir(session.key), { recursive: true });
+    const now = Date.now();
+    return sessionStartDueHandler(
+      { sessionId: input.session_id == null ? null : input.session_id, cwd: input.cwd == null ? null : input.cwd,
+        transcriptPath: null, timeline: false, sessionStart: true, markedAt: now - 1000, attempts: 0, owedKeys: null },
+      { sessions, deadline: now + 60000, now: Date.now, fetchImpl: deps.fetchImpl, batch: true, status: {}, due: [], deps },
+    );
+  };
+}
+
+async function startWithoutNetwork(input, deps) {
+  const touched = [];
+  const refuse = (name) => async () => { touched.push(name); throw new Error(`SessionStart must not call ${name}`); };
+  const message = await runSessionStart(input, {
+    ...deps,
+    linkedSessions: refuse('linkedSessions'),
+    getAuthentication: refuse('getAuthentication'),
+    fetchImpl: refuse('fetch'),
+    syncAccount: refuse('syncAccount'),
+    checkForUpdate: refuse('checkForUpdate'),
+  });
+  assert.deepEqual(touched, [], 'SessionStart read a credential or made a request');
+  return message;
+}
+
+// The worker's step, then the start that prints its answers.
+async function startAfterWorker(input, deps) {
+  await workerStep(input, deps)();
+  return startWithoutNetwork(input, deps);
+}
+
+// The start first, then the worker's step: for what the step does with what the start wrote
+// (billing.json, which the account check-in reads).
+async function workerAfterStart(input, deps) {
+  const message = await startWithoutNetwork(input, deps);
+  await workerStep(input, deps)();
+  return message;
+}
+
+// What the token module records about an account's last authentication (lib/telemetry-auth.mjs) —
+// what the worker's credential read leaves behind for an account that produced no token.
+function lastAuth(key, state, reason) {
+  fs.mkdirSync(accountDir(key), { recursive: true });
+  recordLastAuthState(key, state, reason);
+}
+
 test('an unlinked machine says so and makes no network call', async (t) => {
   tmpHome(t);
   const { fetchImpl, calls } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...NOT_LINKED, fetchImpl, gitImpl: noGit, ...quietBilling },
   );
@@ -124,10 +184,106 @@ test('an unlinked machine says so and makes no network call', async (t) => {
   assert.equal(calls.length, 0);
 });
 
+// ─── no credential, no request: the worker gets the session ─────────────────────────────────────
+
+test('a start with every credential and network seam refusing prints the same context and marks the session due', async (t) => {
+  tmpHome(t);
+  const { fetchImpl } = router({ repos: () => ok({ connected: true, projectName: 'Apollo' }) });
+  const deps = { ...linked(), fetchImpl, gitImpl: () => 'https://host/org/repo.git', ...quietBilling };
+  await workerStep({ session_id: 's1', cwd: WORK }, deps)();
+  const message = await startWithoutNetwork({ session_id: 's1', cwd: WORK, transcript_path: 'C:/r/roll.jsonl' }, deps);
+  assert.equal(message, [banner('a@b.c'), 'Beezi: repo connected to "Apollo". Sessions here are tracked.'].join('\n'));
+  assert.deepEqual(listUploadDue().map(({ markedAt, ...rest }) => [typeof markedAt, rest]), [['number', {
+    sessionId: 's1', transcriptPath: 'C:/r/roll.jsonl', cwd: '/work/app', timeline: false, sessionStart: true, attempts: 0, owedKeys: null,
+  }]]);
+});
+
+test('an unlinked machine marks nothing for the worker', async (t) => {
+  tmpHome(t);
+  await startWithoutNetwork({ session_id: 's1', cwd: null }, { ...NOT_LINKED, gitImpl: noGit, ...quietBilling });
+  assert.deepEqual(listUploadDue(), []);
+});
+
+test('a single account whose last authentication needs a new sign-in is told its link was rejected', async (t) => {
+  tmpHome(t);
+  lastAuth(ROW.key, 'reauth_required', 'invalid_grant');
+  const message = await startWithoutNetwork({ session_id: 's1', cwd: null }, { ...linked(), gitImpl: noGit, ...quietBilling });
+  assert.equal(message, '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.');
+});
+
+test('a linked row whose credentials are gone reads as not linked', async (t) => {
+  tmpHome(t);
+  lastAuth(ROW.key, 'unlinked', 'no_credentials');
+  const message = await startWithoutNetwork({ session_id: 's1', cwd: null }, { ...linked(), gitImpl: noGit, ...quietBilling });
+  assert.equal(message, '⚠ Beezi: this machine is not linked — analytics are NOT being tracked. Ask Beezi to sign you in.');
+});
+
+// What the worker leaves for an account whose token it last saw refused, reached under `clientId`.
+function cachedRefusal(key, clientId, checkedAt = Date.parse('2026-11-05T10:00:00.000Z')) {
+  fs.mkdirSync(accountDir(key), { recursive: true });
+  fs.writeFileSync(path.join(accountDir(key), 'session-start.json'), JSON.stringify({ version: 1, checkedAt, verdict: 'rejected', clientId, who: null }));
+}
+
+test('a refusal cached under the client the account still reports with is told', async (t) => {
+  tmpHome(t);
+  cachedRefusal(ROW.key, ROW.clientId);
+  const message = await startWithoutNetwork({ session_id: 's1', cwd: null }, { ...linked(), gitImpl: noGit, ...quietBilling });
+  assert.equal(message, '⚠ Beezi: this machine’s link was rejected — analytics are NOT being tracked. Ask Beezi to sign you in again.');
+});
+
+test('a refusal cached under the client a re-login replaced is not told', async (t) => {
+  tmpHome(t);
+  cachedRefusal(ROW.key, 'c-dead-client');
+  const message = await startWithoutNetwork({ session_id: 's1', cwd: null }, { ...linked(), gitImpl: noGit, ...quietBilling });
+  assert.equal(message, banner(ACCOUNT.email));
+});
+
+test('a refusal cached before the account was linked is not told', async (t) => {
+  tmpHome(t);
+  cachedRefusal(ROW.key, null, Date.parse('2026-11-01T00:00:00.000Z'));
+  const deps = { ...linked(), listAccounts: async () => [{ ...ROW, linkedAt: '2026-11-02T00:00:00.000Z' }], gitImpl: noGit, ...quietBilling };
+  assert.equal(await startWithoutNetwork({ session_id: 's1', cwd: null }, deps), banner(ACCOUNT.email));
+});
+
+test('with no answer cached yet, an account reports under its index row identity', async (t) => {
+  tmpHome(t);
+  const message = await startWithoutNetwork({ session_id: 's1', cwd: null }, { ...linked(), gitImpl: noGit, ...quietBilling });
+  assert.equal(message, banner(ACCOUNT.email));
+});
+
+test('the update notice comes from the last check the worker cached, with no request', async (t) => {
+  tmpHome(t);
+  fs.writeFileSync(path.join(beeziCodexHome(), 'update-check.json'), JSON.stringify({ checkedAt: 1, latest: '99.0.0' }));
+  const deps = { ...linked(), gitImpl: noGit, ...quietBilling, readPluginJson: () => ({ name: 'beezi', version: '1.0.0' }) };
+  assert.equal(await startWithoutNetwork({ session_id: 's1', cwd: null }, deps), [
+    banner(ACCOUNT.email),
+    'Beezi: version 99.0.0 is published; this machine runs 1.0.0. Run `codex plugin marketplace upgrade`, then start a new Codex thread to apply it. (Installed from a local clone? Pull it instead: `marketplace upgrade` only refreshes Git marketplaces.)',
+  ].join('\n'));
+  const current = { ...deps, readPluginJson: () => ({ name: 'beezi', version: '99.0.0' }) };
+  assert.equal(await startWithoutNetwork({ session_id: 's2', cwd: null }, current), banner(ACCOUNT.email));
+});
+
+test('a migration the worker recorded is handed out once, then cleared', async (t) => {
+  tmpHome(t);
+  writeUploadStatus({ migrationNotice: 'Beezi now reports to the production API.' });
+  assert.equal(takeMigrationNotice(), 'Beezi now reports to the production API.');
+  assert.equal(takeMigrationNotice(), null);
+  assert.equal(readUploadStatus().migrationNotice, null);
+});
+
+test('the prompts get the linked accounts tokenless, minus one whose last authentication failed', async (t) => {
+  tmpHome(t);
+  lastAuth(SECOND.key, 'reauth_required', 'invalid_grant');
+  const rows = await usableSessions({ listAccounts: async () => [ROW, SECOND_ROW] });
+  assert.deepEqual(rows, [{ ...ROW, tenantId: null, token: null }]);
+});
+
 test('a throwing token accessor reports temporary authentication failure', async (t) => {
   tmpHome(t);
+  // The worker's getAuthentication threw on the credential store, and recorded so.
+  lastAuth(ROW.key, 'unavailable', 'storage_unavailable');
   const { fetchImpl } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...unresolved(async () => { throw new Error('keyring locked'); }), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
@@ -145,7 +301,7 @@ test('a valid whoami fills an anonymous account row in', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ whoami: () => ok({ email: 'filled@example.com', name: 'Dev', tenantId: 't-9', tenantName: 'Acme' }) });
   const patches = [];
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -170,7 +326,7 @@ test('a valid whoami refreshes an already-named account and its workspace member
   const tenants = [{ id: 't-9', name: 'Current workspace', role: 'User', type: 'analytics' }];
   const { fetchImpl } = router({ whoami: () => ok({ email: 'someone@example.com', name: 'Dev', tenants }) });
   const patches = [];
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...linked(), updateAccount: async (key, patch) => { patches.push({ key, patch }); },
       fetchImpl, gitImpl: noGit, ...quietBilling },
@@ -190,7 +346,7 @@ test('a rejected token is renewed once before the link is called bad', async (t)
   const { fetchImpl } = router({
     whoami: (init) => (init.headers.Authorization === 'Bearer fresh' ? ok({}) : status(401)),
   });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked('stale'),
@@ -210,7 +366,7 @@ test('a rejected token is renewed once before the link is called bad', async (t)
 test('a token still rejected after renewal reports a rejection, not a revocation', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ whoami: () => status(401) });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...linked('stale'), getAuthentication: async () => ({ accessToken: 'stale', state: 'ready' }),
       fetchImpl, gitImpl: noGit, ...quietBilling },
@@ -226,7 +382,7 @@ test('a 403 never deletes credentials', async (t) => {
   // store for it costs the user a full re-login. Regression guard.
   let deleted = false;
   const { fetchImpl } = router({ whoami: () => status(403) });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -244,7 +400,7 @@ test('a 403 never deletes credentials', async (t) => {
 test('an unreachable whoami is treated as valid and stays silent', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ whoami: () => { throw new Error('offline'); } });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
@@ -254,7 +410,7 @@ test('an unreachable whoami is treated as valid and stays silent', async (t) => 
 test('a connected repo is announced with its project name', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => ok({ connected: true, projectName: 'Apollo' }) });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: WORK },
     {
       ...linked(),
@@ -269,7 +425,7 @@ test('a connected repo is announced with its project name', async (t) => {
 test('a repo with no Beezi project is announced, without claiming it is untracked', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => ok({ connected: false }) });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: WORK },
     {
       ...linked(),
@@ -287,7 +443,7 @@ test('a repo with no Beezi project is announced, without claiming it is untracke
 test('a cwd outside any repo is not announced, while crash consent is offered only once', async (t) => {
   const home = tmpHome(t, { askConsent: true }); // no repo for discoverRepos to announce
   const { fetchImpl, calls } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: home },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
@@ -297,7 +453,7 @@ test('a cwd outside any repo is not announced, while crash consent is offered on
   assert.ok(readConsent().askedAt, 'showing the prompt records that it was offered');
   assert.equal(readConsent().consent, undefined, 'showing a prompt does not grant consent');
   assert.equal(isTelemetryGranted(), false);
-  const again = await runSessionStart(
+  const again = await startAfterWorker(
     { session_id: 's2', cwd: home },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
@@ -308,7 +464,7 @@ test('a cwd outside any repo is not announced, while crash consent is offered on
 test('a repo probe that fails adds no repo line', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => { throw new Error('offline'); } });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: WORK },
     {
       ...linked(),
@@ -334,7 +490,7 @@ test('an analytics workspace gets the banner and no /repos/status call', async (
     whoami: () => ok({ email: 'dev@acme.io', tenants: workspaceOf('analytics') }),
     repos: () => ok({ connected: true, projectName: 'Apollo' }),
   });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: home, source: 'startup' },
     { ...linked(), fetchImpl, gitImpl: () => 'https://host/org/repo.git', ...quietBilling },
   );
@@ -353,7 +509,7 @@ test('a platform workspace keeps its repo probe and line, after the banner', asy
     whoami: () => ok({ email: 'dev@acme.io', tenants: workspaceOf('platform') }),
     repos: () => ok({ connected: true, projectName: 'Apollo' }),
   });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: home, source: 'startup' },
     { ...linked(), fetchImpl, gitImpl: () => 'https://host/org/repo.git', ...quietBilling },
   );
@@ -375,7 +531,7 @@ async function startIn(t, tenants) {
     whoami: () => ok({ email: 'dev@acme.io', tenants }),
     repos: () => ok({ connected: true, projectName: 'Apollo' }),
   });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: home, source: 'startup' },
     { ...linked(), fetchImpl, gitImpl: () => 'https://host/org/repo.git', ...quietBilling },
   );
@@ -425,7 +581,7 @@ async function bannerAfterPrewarm(t, saveRepoMap) {
     if (args[0] === 'remote') return 'https://github.com/acme/labacus-suite.git';
     throw new Error('not a git repository');
   };
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: checkout, source: 'startup' },
     { ...linked(), fetchImpl, gitImpl, ...quietBilling, pruneRepoMap: () => 0, saveRepoMap },
   );
@@ -445,7 +601,7 @@ test('a repo-map save that fails still lets the banner name the repo', async (t)
 test('compact shows no banner', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null, source: 'compact' },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling },
   );
@@ -455,7 +611,7 @@ test('compact shows no banner', async (t) => {
 test('a stale subscription plan the account cannot name is nudged about', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -483,7 +639,7 @@ test('a stale plan is captured from auth.json without asking anyone', async (t) 
   tmpHome(t);
   const { fetchImpl } = router();
   const written = [];
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -515,7 +671,7 @@ test('the capture follows the session-start resolution, not a second one of its 
   tmpHome(t);
   const { fetchImpl } = router();
   const written = [];
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -540,7 +696,7 @@ test('ChatGPT Go is a real plan, not "unknown"', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
   const written = [];
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -561,7 +717,7 @@ test('auto-capture never overrides a plan the user reported by hand', async (t) 
   tmpHome(t);
   const { fetchImpl } = router();
   let read = 0;
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -589,7 +745,7 @@ test('auto-capture leaves an api-key machine alone', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
   let read = 0;
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -614,7 +770,7 @@ test('auto-capture does not re-read auth.json when the plan is fresh', async (t)
   tmpHome(t);
   const { fetchImpl } = router();
   let read = 0;
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -648,16 +804,18 @@ test('a newer auth.json refreshes the account before check-in even when the plan
     capturedAt: new Date().toISOString(),
     authFileMtimeMs: 100,
   };
+  // billing.json: the start captures into it, and the worker's check-in reads it afterwards.
+  let stored = existing;
 
-  await runSessionStart(
+  await workerAfterStart(
     { session_id: 'account-switch', cwd: null },
     {
       ...linked(),
       fetchImpl,
       gitImpl: noGit,
       resolveSource: () => 'subscription',
-      readBillingConfig: () => existing,
-      writeBillingConfig: () => {},
+      readBillingConfig: () => stored,
+      writeBillingConfig: (config) => { stored = config; },
       isStale: () => false,
       readAuthFileMtimeMs: () => 200,
       readAccountViaAppServer: async () => {
@@ -690,7 +848,7 @@ test('an already validated auth.json does not trigger account discovery', async 
   tmpHome(t);
   const { fetchImpl } = router();
   let probes = 0;
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 'unchanged-auth', cwd: null },
     {
       ...linked(),
@@ -729,7 +887,7 @@ test('the first mtime validation does not force a token-only account check-in', 
     capturedAt: new Date().toISOString(),
   };
 
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 'first-mtime-validation', cwd: null },
     {
       ...linked(),
@@ -796,9 +954,9 @@ test('a failed auth.json revalidation leaves its old marker so the next session 
     syncAccount: async () => ({ synced: false }),
   };
 
-  await runSessionStart({ session_id: 'retry-1', cwd: null }, deps);
+  await startAfterWorker({ session_id: 'retry-1', cwd: null }, deps);
   assert.equal(stored.authFileMtimeMs, 100, 'a failed validation must not seal the newer file');
-  await runSessionStart({ session_id: 'retry-2', cwd: null }, deps);
+  await startAfterWorker({ session_id: 'retry-2', cwd: null }, deps);
   assert.equal(probes, 2);
   assert.equal(stored.accountId, 'account-B');
   assert.equal(stored.authFileMtimeMs, 200);
@@ -807,7 +965,7 @@ test('a failed auth.json revalidation leaves its old marker so the next session 
 test('a throwing readChatgptAuth does not break session start', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -828,7 +986,7 @@ test('a throwing readChatgptAuth does not break session start', async (t) => {
 test('a machine with no billing signal is nudged, not silently guessed at', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -851,7 +1009,7 @@ test('billing.json is realigned to the resolved source at session start', async 
   tmpHome(t);
   const { fetchImpl } = router();
   let written = null;
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -873,7 +1031,7 @@ test('an already-correct billing.json is not rewritten', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
   let wrote = false;
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -921,7 +1079,7 @@ test('an expired plan claim records the expiry but not the stale plan label', as
   const { fetchImpl } = router();
   const written = [];
   const expiresAt = Date.now() - 42 * 24 * 60 * 60 * 1000;
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -951,7 +1109,7 @@ test('an expired claim stays stale, so the next session start re-reads auth.json
   // Codex refreshes auth.json on use and the real plan appears the moment it does.
   const afterExpired = { version: 1, source: 'subscription', plan: 'unknown', credentialsExpiresAt: Date.now() - 1000, capturedBy: 'session-start' };
   const written = [];
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -974,7 +1132,7 @@ test('a plan claim with no expiry at all is still captured', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
   const written = [];
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1003,7 +1161,7 @@ test('session start checks the account in, after billing, on the token it ended 
   tmpHome(t);
   const { fetchImpl } = router();
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling, syncAccount: sync },
   );
@@ -1017,7 +1175,7 @@ test('the check-in rides the RENEWED token, not the one the server just rejected
     whoami: (init) => (init.headers.Authorization === 'Bearer fresh' ? ok({}) : status(401)),
   });
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked('stale'),
@@ -1035,7 +1193,7 @@ test('an unlinked machine never checks in', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...NOT_LINKED, fetchImpl, gitImpl: noGit, ...quietBilling, syncAccount: sync },
   );
@@ -1047,7 +1205,7 @@ test('the check-in gets the hook OWN fetch and account reader, never the module 
   const { fetchImpl } = router();
   const readChatgptAuth = () => null;
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1070,7 +1228,7 @@ test('the check-in is bounded at 1500ms, well inside the hook budget', async (t)
   tmpHome(t);
   const { fetchImpl } = router();
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling, syncAccount: sync },
   );
@@ -1084,7 +1242,7 @@ test('the check-in reads the billing config the hook already resolved', async (t
   const { fetchImpl } = router();
   const sync = syncSpy();
   const stored = { version: 1, source: 'subscription', subscriptionType: 'pro', plan: 'pro' };
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1108,7 +1266,7 @@ test('a billing read that throws leaves the check-in with no config, not a stale
   tmpHome(t);
   const { fetchImpl } = router();
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1133,7 +1291,7 @@ test('a plan captured after an auth.json change relies on its changed payload ha
   tmpHome(t);
   const { fetchImpl } = router();
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1155,7 +1313,7 @@ test('an ordinary session start does NOT force — the payload hash is gate enou
   tmpHome(t);
   const { fetchImpl } = router();
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...linked(), fetchImpl, gitImpl: noGit, ...quietBilling, syncAccount: sync },
   );
@@ -1168,7 +1326,7 @@ test('realigning billing.json is not a capture, so it does not force', async (t)
   tmpHome(t);
   const { fetchImpl } = router();
   const sync = syncSpy();
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1191,7 +1349,7 @@ test('realigning billing.json is not a capture, so it does not force', async (t)
 test('a check-in that throws does not break session start', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router({ repos: () => ok({ connected: true, projectName: 'Apollo' }) });
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: WORK },
     {
       ...linked(),
@@ -1208,7 +1366,7 @@ test('a check-in that throws does not break session start', async (t) => {
 test('a check-in that throws does not swallow the billing nudge either', async (t) => {
   tmpHome(t);
   const { fetchImpl } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1247,7 +1405,7 @@ test('a machine with no auth.json captures its plan from the app server', async 
   tmpHome(t);
   const { fetchImpl } = router();
   const written = [];
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...linked(),
@@ -1285,7 +1443,7 @@ test('the plan captured on such a machine survives the next session', async (t) 
     capturedBy: 'session-start',
     authType: 'chatgpt',
   };
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's2', cwd: null },
     {
       ...linked(),
@@ -1308,7 +1466,7 @@ test('a machine that neither Codex nor auth.json can name is still nudged, not g
   withCodexAuth(t, null);
   tmpHome(t);
   const { fetchImpl } = router();
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's3', cwd: null },
     {
       ...linked(),
@@ -1348,7 +1506,7 @@ test('two linked accounts are each checked in, under their own client id', async
   });
   const sync = syncSpy();
 
-  await runSessionStart(
+  await startAfterWorker(
     { session_id: 's1', cwd: null },
     { ...both(), fetchImpl, gitImpl: noGit, ...quietBilling, syncAccount: sync },
   );
@@ -1368,7 +1526,7 @@ test('one rejected account is named and skipped; the other still reports', async
   });
   const sync = syncSpy();
 
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: 'C:/work/app' },
     {
       ...both(),
@@ -1393,8 +1551,9 @@ test('the warnings come first, then the banner, then the repo lines', async (t) 
     whoami: (init) => (init.headers.Authorization === 'Bearer tok' ? ok({}) : status(401)),
     repos: () => ok({ connected: true, projectName: 'App' }),
   });
-  const message = await runSessionStart(
-    { session_id: 's1', cwd: null },
+  // A cwd of its own: the worker resolves the remote in the session's recorded folder, never its own.
+  const message = await startAfterWorker(
+    { session_id: 's1', cwd: 'C:/work/app' },
     {
       ...both(),
       getAuthentication: async () => ({ accessToken: 'tok-b', state: 'ready' }),
@@ -1412,10 +1571,12 @@ test('the warnings come first, then the banner, then the repo lines', async (t) 
 
 test('an account that is linked but produced no session is explained, not reported as unlinked', async (t) => {
   tmpHome(t);
+  // The worker's read of the second account answered refreshing, and the token module recorded it.
+  lastAuth(SECOND.key, 'refreshing', 'refresh_in_progress');
   const { fetchImpl } = router();
   const sync = syncSpy();
 
-  const message = await runSessionStart(
+  const message = await startAfterWorker(
     { session_id: 's1', cwd: null },
     {
       ...both([ACCOUNT]),              // the second account could not produce a token this run

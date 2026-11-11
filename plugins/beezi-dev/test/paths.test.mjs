@@ -22,6 +22,9 @@ import {
   legacyCredentialsFile,
   billingConfigFile,
   hookLauncherDir,
+  uploadWorkerStatusFile,
+  uploadDueDir,
+  uploadDueFile,
   codexHome,
   codexSessionsDir,
   KNOWN_ENVIRONMENTS,
@@ -316,4 +319,24 @@ test('Codex\'s own roots are never namespaced', (t) => {
   withEnv(t, 'CODEX_HOME', undefined);
   assert.equal(codexHome(), path.join(os.homedir(), '.codex'));
   assert.equal(codexSessionsDir(), path.join(os.homedir(), '.codex', 'sessions'));
+});
+
+// ── the upload worker's files (lib/upload-worker.mjs, lib/upload-due.mjs) ─────────────────────
+// Root-level, NOT under state/: the checkpoint and the poisoned-state quarantine scan
+// state/<id>.json, so a due marker there would be read as a session's state, and pruneStale()
+// sweeps state/ at 14 days.
+
+test('the upload worker status and due markers live at the data root, outside state/', (t) => {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'beezi-upload-paths-'));
+  withEnv(t, 'BEEZI_CODEX_HOME', dir);
+  t.after(() => fs.rmSync(dir, { recursive: true, force: true }));
+  assert.equal(uploadWorkerStatusFile(), path.join(dir, 'upload-worker.json'));
+  assert.equal(uploadDueDir(), path.join(dir, 'upload-due'));
+  assert.equal(uploadDueFile('019a-session_1'), path.join(dir, 'upload-due', '019a-session_1.json'));
+});
+
+test('a due marker refuses a session id that could leave its directory', () => {
+  for (const bad of ['../escape', '', null, 'a/b', 'a\b']) {
+    assert.throws(() => uploadDueFile(bad), /invalid session id/);
+  }
 });

@@ -71,6 +71,7 @@ const AuditForm = Object.freeze({
   LIVE: 'live',
   CONSENTED: 'consented',
   FORWARDER: 'forwarder',
+  NO_DRAIN: 'noDrain',
 });
 
 function formOf({ name, text }) {
@@ -78,6 +79,8 @@ function formOf({ name, text }) {
   if (name === 'rollout-watcher.mjs' && setsLast(text, 'scope: HistoryScope.LIVE')) return AuditForm.LIVE;
   if (name === 'pending-history-run.mjs' && text === 'runAudit({ runCache }, { ...options, key })') return AuditForm.CONSENTED;
   if (name === 'history-cli.mjs' && text === 'runAudit({ ...auditDeps, onProgress: printProgress }, auditOptions)') return AuditForm.FORWARDER;
+  // The watcher's pending-history forwarder: the consented options unchanged, plus only the queue options after them.
+  if (name === 'rollout-watcher.mjs' && text === 'runAudit(auditDeps, { ...auditOptions, drainQueue: false, queuedBefore })') return AuditForm.NO_DRAIN;
   return null;
 }
 
@@ -87,8 +90,8 @@ test('PK6: every runAudit call in lib/ lists only, runs LIVE, or uploads a conse
   assert.deepEqual(forms.filter((c) => c.form == null), [], 'an unclassified runAudit call');
   const count = (form) => forms.filter((c) => c.form === form).length;
   assert.deepEqual(
-    { listOnly: count(AuditForm.LIST_ONLY), live: count(AuditForm.LIVE), consented: count(AuditForm.CONSENTED), forwarder: count(AuditForm.FORWARDER) },
-    { listOnly: 1, live: 3, consented: 1, forwarder: 1 },
+    { listOnly: count(AuditForm.LIST_ONLY), live: count(AuditForm.LIVE), consented: count(AuditForm.CONSENTED), forwarder: count(AuditForm.FORWARDER), noDrain: count(AuditForm.NO_DRAIN) },
+    { listOnly: 1, live: 3, consented: 1, forwarder: 1, noDrain: 1 },
   );
 });
 

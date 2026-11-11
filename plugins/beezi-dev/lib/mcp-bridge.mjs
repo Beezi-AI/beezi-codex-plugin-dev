@@ -33,6 +33,7 @@ import {
 import { createRouteContext } from './workspace-rules.mjs';
 import { readTrackingState } from './tracking.mjs';
 import { pluginInfo as _pluginInfo, statusExtraLines } from './status-extra.mjs';
+import { readUploadStatus as _readUploadStatus, hasPostableWork as _hasPostableWork } from './upload-worker.mjs';
 
 // Stdio ⇄ Streamable-HTTP bridge for the Beezi MCP server. Codex runs the
 // bridge as a local stdio MCP server, so it never sees the portal's OAuth
@@ -724,6 +725,20 @@ export function createBridge(deps = {}) {
     }
   }
 
+  // The background upload's record and whether anything is waiting for it (a due marker or a
+  // postable queue file): local reads only. null when either cannot be read, so the rest stands.
+  function uploadReading() {
+    try {
+      return {
+        status: (deps.readUploadStatus || _readUploadStatus)(),
+        now: Date.now(),
+        workWaiting: (deps.hasPostableWork || _hasPostableWork)(0) === true,
+      };
+    } catch {
+      return null;
+    }
+  }
+
   // Local reads only — the index, tracking state, repo map and the cached update check. Best-effort:
   // a failure here must not turn the link answer above into "status check failed".
   async function statusExtra() {
@@ -740,7 +755,7 @@ export function createBridge(deps = {}) {
       const dir = state != null && state.cwd != null ? state.cwd : null;
       const plugin = (deps.pluginInfo || _pluginInfo)();
       const ctx = deps.loadRepoMap == null ? createRouteContext() : createRouteContext({ loadRepoMapImpl: deps.loadRepoMap });
-      return statusExtraLines({ rows, dir, ctx, tracking, plugin });
+      return statusExtraLines({ rows, dir, ctx, tracking, plugin, upload: uploadReading() });
     } catch {
       return [];
     }
