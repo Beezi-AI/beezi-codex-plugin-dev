@@ -3,14 +3,11 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { FUN_LINES, finaleLines } from '../lib/setup-finale.mjs';
 import { NO_TERMINAL, SESSION_KEYS, STOPPED, setupMain } from '../lib/setup-main.mjs';
-import { createStyle, formatLine, paint } from '../lib/setup-style.mjs';
 
-const COLOR = createStyle({ enabled: true });
-const PLAIN = createStyle({ enabled: false });
 const ESC = /\x1b\[/;
-const block = (lines) => lines.map((line) => `${line}\n`).join('');
+const SGR = /\x1b\[[0-9;]*m/g;
+const INSTALLER = { PATH: '/bin', BEEZI_INSTALLER: '1' };
 
 function sink() {
   const chunks = [];
@@ -27,8 +24,7 @@ function harness(over) {
   const deps = {
     stdout,
     stderr,
-    env: { PATH: '/bin', CODEX_THREAD_ID: 'thread-1' },
-    random: () => 0,
+    env: { PATH: '/bin', BEEZI_INSTALLER: '1', CODEX_THREAD_ID: 'thread-1' },
     openTerminal: () => terminal,
     makeTempDir: () => '/tmp/beezi-setup-x1',
     removeDir: (dir) => { seen.removed.push(dir); },
@@ -62,10 +58,31 @@ test('SESSION_KEYS are the two variables Codex exports with the session id', () 
   assert.deepEqual(SESSION_KEYS, ['CODEX_THREAD_ID', 'CODEX_SESSION_ID']);
 });
 
+test('a standalone run starts with the header; under the installer it does not', async () => {
+  const standalone = harness({ env: { PATH: '/bin' } });
+  assert.equal(await setupMain('/plugin', standalone.deps), 0);
+  assert.equal(standalone.stdout.text(), 'Beezi for Codex\n\n');
+  const coloured = colourTerminal(harness({ env: { PATH: '/bin' } }), 80);
+  assert.equal(await setupMain('/plugin', coloured.deps), 0);
+  assert.equal(coloured.stdout.text().replace(SGR, ''), [
+    '',
+    '     ▄▄█      ',
+    '  ▄███▀▀ ▄▄██▄   beezi',
+    '  ▀▀ ▄▄███▀▀     for Codex',
+    '  ▄███▀▀ ▄▄███',
+    '        █▀▀▀  ',
+    '',
+    '',
+  ].join('\n'));
+  const installer = colourTerminal(harness({ env: INSTALLER }), 80);
+  assert.equal(await setupMain('/plugin', installer.deps), 0);
+  assert.equal(installer.stdout.text(), '');
+});
+
 test('without a terminal it says how to sign in instead and exits 1 before touching anything', async () => {
   const h = harness({ openTerminal: () => null });
   assert.equal(await setupMain('/plugin', h.deps), 1);
-  assert.equal(h.stderr.text(), `${NO_TERMINAL}\n`);
+  assert.equal(h.stderr.text(), `  ${NO_TERMINAL}\n`);
   assert.equal(NO_TERMINAL, '✗ Beezi setup needs a terminal. Ask "Sign me in to Beezi" in a new Codex thread instead.');
   assert.equal(h.seen.runner, null);
   assert.equal(h.seen.interrupt, null);
@@ -73,11 +90,10 @@ test('without a terminal it says how to sign in instead and exits 1 before touch
   assert.deepEqual(h.seen.removed, []);
 });
 
-test('on a colour terminal the no-terminal ✗ line is painted red', async () => {
+test('on a colour terminal the no-terminal ✗ is red and its line bold, at the margin', async () => {
   const h = colourTerminal(harness({ openTerminal: () => null }), 100);
   assert.equal(await setupMain('/plugin', h.deps), 1);
-  assert.equal(h.stderr.text(), `${paint(COLOR, NO_TERMINAL)}\n`);
-  assert.match(h.stderr.text(), ESC);
+  assert.equal(h.stderr.text(), '  \x1b[31m✗\x1b[0m\x1b[1m Beezi setup needs a terminal. Ask "Sign me in to Beezi" in a new Codex thread instead.\x1b[0m\n');
 });
 
 test('on process exit a TTY stdout gets the cursor shown again, and piped stdout registers nothing', async () => {
@@ -92,27 +108,39 @@ test('on process exit a TTY stdout gets the cursor shown again, and piped stdout
   assert.deepEqual(piped.seen.exitHandlers, []);
 });
 
-test('it runs the wizard from a fresh temp cwd with the session keys stripped, then cleans up', async () => {
+test('it runs the wizard from a fresh temp cwd with the session keys stripped, a margined spinner and the style, then cleans up', async () => {
   const h = harness({});
   assert.equal(await setupMain('/plugin', h.deps), 0);
-  const { paint: runnerPaint, ...runner } = h.seen.runner;
+  const { paint: runnerPaint, accent, ...runner } = h.seen.runner;
   assert.deepEqual(runner, {
     root: '/plugin', cwd: '/tmp/beezi-setup-x1', env: h.deps.env, sessionKeys: SESSION_KEYS,
-    stdout: h.stdout, stderr: h.stderr, output: h.stdout, activity: false,
+    stdout: h.stdout, stderr: h.stderr, output: h.stdout, activity: false, margin: '  ',
   });
-  assert.equal(runnerPaint('✓ done'), '✓ done');
+  assert.equal(runnerPaint('✓ done'), '  ✓ done');
+  assert.equal(accent('⠋'), '⠋');
   assert.equal(h.seen.prompt.input, h.terminal);
   assert.equal(h.seen.prompt.output, h.stdout);
+  assert.equal(h.seen.prompt.format('✓ done'), '  ✓ done');
   assert.equal(h.seen.ctx.run, h.seen.run);
+  assert.equal(h.seen.ctx.style.enabled, false);
   assert.equal(typeof h.seen.ctx.ask.close, 'function');
+  assert.equal(typeof h.seen.ctx.trust, 'function');
   h.stdout.chunks.length = 0;
   h.seen.ctx.print('✓ done');
-  assert.equal(h.stdout.text(), '✓ done\n');
+  h.seen.ctx.print('');
+  assert.equal(h.stdout.text(), '  ✓ done\n\n');
   assert.equal(h.seen.closed, 1);
   assert.deepEqual(h.seen.removed, ['/tmp/beezi-setup-x1']);
 });
 
-test("the wizard's exit code passes through with no finale, and a crash still closes the prompt and removes the temp dir", async () => {
+test('the wizard reads hook trust through the injected probe', async () => {
+  const verdict = { verdict: 'trusted', untrusted: [], disabled: [] };
+  const h = harness({ trust: () => Promise.resolve(verdict) });
+  assert.equal(await setupMain('/plugin', h.deps), 0);
+  assert.equal(await h.seen.ctx.trust(), verdict);
+});
+
+test("the wizard's exit code passes through with nothing printed after it, and a crash still closes the prompt and removes the temp dir", async () => {
   const signInFailed = harness({ runSetup: () => Promise.resolve(1) });
   assert.equal(await setupMain('/plugin', signInFailed.deps), 1);
   assert.deepEqual(signInFailed.seen.removed, ['/tmp/beezi-setup-x1']);
@@ -124,77 +152,76 @@ test("the wizard's exit code passes through with no finale, and a crash still cl
   assert.equal(crashed.stdout.text(), '');
 });
 
-test('Ctrl+C closes the prompt, removes the temp dir, says how to finish and exits 130', () => {
+test('Ctrl+C closes the prompt, removes the temp dir, says how to finish in a Codex thread and exits 130', () => {
   const h = harness({ runSetup: () => new Promise(() => {}) });
   setupMain('/plugin', h.deps);
   h.seen.interrupt();
-  assert.equal(h.stdout.text(), `\n${STOPPED}\n`);
-  assert.equal(STOPPED, 'Setup stopped. Run the installer again, or ask "Sign me in to Beezi" in a new Codex thread, to finish.');
+  assert.equal(h.stdout.text(), '\n  Setup stopped. Ask "Sign me in to Beezi" in a new Codex thread to finish.\n');
+  assert.equal(STOPPED, 'Setup stopped. Ask "Sign me in to Beezi" in a new Codex thread to finish.');
   assert.equal(h.seen.exit, 130);
   assert.equal(h.seen.closed, 1);
   assert.deepEqual(h.seen.removed, ['/tmp/beezi-setup-x1']);
 });
 
-test('Ctrl+C inside a menu takes the same stop path, with the stop line in red', () => {
+test('Ctrl+C inside a menu takes the same stop path, with the stop line plain', () => {
   const h = colourTerminal(harness({ runSetup: () => new Promise(() => {}) }), 100);
   setupMain('/plugin', h.deps);
   assert.equal(typeof h.seen.prompt.onInterrupt, 'function');
   assert.equal(h.seen.prompt.onInterrupt, h.seen.interrupt);
   h.seen.prompt.onInterrupt();
-  assert.equal(h.stdout.text(), `\n${formatLine(COLOR, STOPPED, 100)}\n`);
-  assert.match(h.stdout.text(), ESC);
+  assert.equal(h.stdout.text(), `\n  ${STOPPED}\n`);
   assert.equal(h.seen.exit, 130);
   assert.equal(h.seen.closed, 1);
   assert.deepEqual(h.seen.removed, ['/tmp/beezi-setup-x1']);
 });
 
-test('colour follows stdout and NO_COLOR, and arrow-key menus need raw key reading on a TTY', async () => {
+test('colour and truecolor follow stdout, COLORTERM and NO_COLOR; arrow-key menus need raw key reading on a TTY', async () => {
   const cases = [
-    { name: 'colour terminal', env: {}, color: true, interactive: true },
-    { name: 'NO_COLOR', env: { NO_COLOR: '1' }, color: false, interactive: true },
-    { name: 'TERM=dumb', env: { TERM: 'dumb' }, color: false, interactive: false },
-    { name: 'no raw mode', env: {}, raw: false, color: true, interactive: false },
-    { name: 'piped stdout', env: {}, tty: false, color: false, interactive: false },
+    { name: 'colour terminal', env: {}, accent: '\x1b[38;5;99m✓\x1b[0m', interactive: true },
+    { name: 'truecolor terminal', env: { COLORTERM: 'truecolor' }, accent: '\x1b[38;2;135;91;247m✓\x1b[0m', interactive: true },
+    { name: 'NO_COLOR', env: { NO_COLOR: '1', COLORTERM: 'truecolor' }, accent: '✓', interactive: true },
+    { name: 'TERM=dumb', env: { TERM: 'dumb' }, accent: '✓', interactive: false },
+    { name: 'no raw mode', env: {}, raw: false, accent: '\x1b[38;5;99m✓\x1b[0m', interactive: false },
+    { name: 'piped stdout', env: {}, tty: false, accent: '✓', interactive: false },
   ];
   for (const c of cases) {
-    const h = colourTerminal(harness({ env: { PATH: '/bin', ...c.env } }), 100);
+    const h = colourTerminal(harness({ env: { ...INSTALLER, ...c.env } }), 100);
     if (c.raw === false) delete h.terminal.setRawMode;
     if (c.tty === false) h.stdout.isTTY = false;
     assert.equal(await setupMain('/plugin', h.deps), 0, c.name);
-    assert.equal(h.seen.prompt.style.enabled, c.color, c.name);
+    assert.equal(h.seen.prompt.style.enabled, c.accent !== '✓', c.name);
     assert.equal(h.seen.prompt.interactive, c.interactive, c.name);
-    assert.equal(h.seen.runner.paint('✓ ok'), c.color ? paint(COLOR, '✓ ok') : '✓ ok', c.name);
+    assert.equal(h.seen.runner.paint('✓ ok'), `  ${c.accent} ok`, c.name);
   }
 });
 
-test('every printed line is painted by its leading mark, and stays plain under NO_COLOR', async () => {
-  const lines = ['✓ Beezi: uploaded 2 sessions.', '⚠ Beezi: 1 hook entry is broken.', '✗ Something went wrong.', '==> Checking your plan…', 'No plan was saved.'];
+test('every printed line starts at the margin, is painted by its leading mark, and stays plain under NO_COLOR', async () => {
+  const lines = ['✓ Tracking all 6 repos and folders', '⚠ Beezi: 1 hook entry is broken.', '✗ Something went wrong.', '', 'Ready. Restart Codex and keep working.'];
   const printAll = (ctx) => {
     lines.forEach((line) => ctx.print(line));
     return Promise.resolve(1);
   };
   const colour = colourTerminal(harness({ runSetup: printAll }), 100);
   assert.equal(await setupMain('/plugin', colour.deps), 1);
-  assert.equal(colour.stdout.text(), block(lines.map((line) => paint(COLOR, line))));
-  assert.notEqual(colour.stdout.text(), block(lines));
-  const plain = colourTerminal(harness({ env: { PATH: '/bin', NO_COLOR: '1' }, runSetup: printAll }), 100);
+  assert.equal(colour.stdout.text(), [
+    '  \x1b[38;5;99m✓\x1b[0m Tracking all 6 repos and folders',
+    '  \x1b[38;5;99m⚠\x1b[0m Beezi: 1 hook entry is broken.',
+    '  \x1b[31m✗\x1b[0m\x1b[1m Something went wrong.\x1b[0m',
+    '',
+    '  Ready. Restart Codex and keep working.',
+    '',
+  ].join('\n'));
+  const plain = colourTerminal(harness({ env: { ...INSTALLER, NO_COLOR: '1' }, runSetup: printAll }), 100);
   assert.equal(await setupMain('/plugin', plain.deps), 1);
-  assert.equal(plain.stdout.text(), block(lines));
+  assert.equal(plain.stdout.text(), `${lines.map((line) => (line === '' ? '' : `  ${line}`)).join('\n')}\n`);
   assert.doesNotMatch(plain.stdout.text(), ESC);
 });
 
-test('a finished setup ends with the Codex finale at the terminal width, its fun line picked by random', async () => {
-  const wide = colourTerminal(harness({ random: () => 0 }), 100);
-  assert.equal(await setupMain('/plugin', wide.deps), 0);
-  assert.equal(wide.stdout.text(), block(finaleLines({ agent: 'Codex', style: COLOR, columns: 100, random: () => 0 })));
-  assert.ok(wide.stdout.text().includes(FUN_LINES[0]));
-  const narrow = colourTerminal(harness({ random: () => 0.99 }), 60);
-  assert.equal(await setupMain('/plugin', narrow.deps), 0);
-  assert.equal(narrow.stdout.text(), block(finaleLines({ agent: 'Codex', style: COLOR, columns: 60, random: () => 0.99 })));
-  const unsized = harness({ env: { PATH: '/bin', NO_COLOR: '1' } });
-  assert.equal(await setupMain('/plugin', unsized.deps), 0);
-  assert.equal(unsized.stdout.text(), block(finaleLines({ agent: 'Codex', style: PLAIN, columns: 80, random: () => 0 })));
-  assert.doesNotMatch(unsized.stdout.text(), ESC);
+test('a checklist line shown above the question keeps its accent ✓ under the margin', async () => {
+  const h = colourTerminal(harness({}), 100);
+  assert.equal(await setupMain('/plugin', h.deps), 0);
+  assert.equal(h.seen.prompt.format('    ✓ dates, duration, models, tokens, cost'), '      \x1b[38;5;99m✓\x1b[0m dates, duration, models, tokens, cost');
+  assert.equal(h.seen.prompt.format('  Never sent'), '    \x1b[2mNever sent\x1b[0m');
 });
 
 test('by default the cwd is a new, empty beezi-setup- folder in the OS temp dir, deleted afterwards', async () => {
@@ -219,7 +246,8 @@ test('the runner gets the output and an activity line only on a TTY whose TERM i
   assert.equal(await setupMain('/plugin', tty.deps), 0);
   assert.equal(tty.seen.runner.output, tty.stdout);
   assert.equal(tty.seen.runner.activity, true);
-  const dumb = colourTerminal(harness({ env: { PATH: '/bin', TERM: 'dumb' } }), 100);
+  assert.equal(tty.seen.runner.accent('⠋'), '\x1b[38;5;99m⠋\x1b[0m');
+  const dumb = colourTerminal(harness({ env: { ...INSTALLER, TERM: 'dumb' } }), 100);
   assert.equal(await setupMain('/plugin', dumb.deps), 0);
   assert.equal(dumb.seen.runner.activity, false);
   const piped = harness();
@@ -229,18 +257,24 @@ test('the runner gets the output and an activity line only on a TTY whose TERM i
 });
 
 test('ctx.progress sets the runner label', async () => {
-  const h = colourTerminal(harness({ runSetup: (ctx) => { ctx.progress('Checking your plan…'); return Promise.resolve(1); } }), 100);
+  const h = colourTerminal(harness({ runSetup: (ctx) => { ctx.progress('Checking this machine'); return Promise.resolve(1); } }), 100);
   assert.equal(await setupMain('/plugin', h.deps), 1);
-  assert.deepEqual(h.seen.labels, ['Checking your plan…']);
+  assert.deepEqual(h.seen.labels, ['Checking this machine']);
 });
 
-test('print and streamed lines wrap to the terminal width with a hanging indent', async () => {
+test('print and streamed lines wrap within a 40-column terminal with a hanging indent under the margin', async () => {
   const long = '✓ History import is now closed for this account: past sessions on other machines can no longer be imported.';
-  const h = colourTerminal(harness({ env: { PATH: '/bin', NO_COLOR: '1' }, runSetup: (ctx) => { ctx.print(long); return Promise.resolve(1); } }), 40);
+  const h = colourTerminal(harness({ env: { ...INSTALLER, NO_COLOR: '1' }, runSetup: (ctx) => { ctx.print(long); return Promise.resolve(1); } }), 40);
   assert.equal(await setupMain('/plugin', h.deps), 1);
   h.stdout.text().split('\n').forEach((row) => assert.ok(Array.from(row).length <= 39, row));
-  assert.ok(h.stdout.text().startsWith('✓ History import is now closed for this\n  account:'));
+  assert.ok(h.stdout.text().startsWith('  ✓ History import is now closed for\n    this account:'));
   assert.equal(h.seen.runner.paint(long), h.stdout.text().replace(/\n$/, ''));
+});
+
+test('a bold Ready line fits one row at 44 columns: colour codes take no width', async () => {
+  const h = colourTerminal(harness({ runSetup: (ctx) => { ctx.print(`${ctx.style.bold('Ready.')} Restart Codex and keep working.`); return Promise.resolve(0); } }), 44);
+  assert.equal(await setupMain('/plugin', h.deps), 0);
+  assert.equal(h.stdout.text(), '  \x1b[1mReady.\x1b[0m Restart Codex and keep working.\n');
 });
 
 test('the stop path clears the activity line before printing the stop line', async () => {

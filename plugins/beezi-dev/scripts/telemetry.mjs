@@ -1,6 +1,8 @@
 // The crash-report switch the settings skill runs:
 //
-//   node scripts/telemetry.mjs [status|correlate|on|anonymous|off]
+//   node scripts/telemetry.mjs [status|correlate|on|anonymous|off|default]
+//
+// `default` (the setup) turns on Correlate only where the user never decided.
 //
 // Every decision — what each mode grants, what it deletes — is lib/diagnostics.mjs's setCrashMode;
 // this file only words the result. It must work on a machine that is NOT linked: consent to crash
@@ -8,7 +10,7 @@
 import path from 'path';
 import url from 'url';
 import { cliMayProceed } from '../lib/env-guard.mjs';
-import { CRASH_MODES, crashMode, isCrashMode, setCrashMode } from '../lib/diagnostics.mjs';
+import { CRASH_MODES, crashMode, hasDecided, isCrashMode, setCrashMode } from '../lib/diagnostics.mjs';
 
 const CORRELATION_ON = 'An installation ID is attached. When binding is needed, it uses the default '
   + 'usable Beezi account, otherwise the first usable account. Changing the default does not rebind an existing ID.';
@@ -74,6 +76,15 @@ function failureLine(mode, before, purged) {
     + 'Beezi home directory is writable.';
 }
 
+// Correlate on an undecided machine, one line saying so; nothing on a decided one. An undecided machine is off.
+function defaultMode() {
+  if (hasDecided()) return { ok: true, lines: [] };
+  if (!setCrashMode(CRASH_MODES.CORRELATE)) {
+    return { ok: false, lines: [failureLine(CRASH_MODES.CORRELATE, CRASH_MODES.OFF, { removed: 0, idRemoved: false })] };
+  }
+  return { ok: true, lines: ['✓ Crash reports are on.'] };
+}
+
 // `{ ok, lines }` — never throws, never prints. The CLI wrapper below owns stdout and the exit
 // status, so nothing that drives this has to spawn a process.
 export function telemetryCommand(argv) {
@@ -81,6 +92,7 @@ export function telemetryCommand(argv) {
   const first = args.length > 0 && args[0] != null ? String(args[0]).trim().toLowerCase() : '';
 
   if (first === '' || first === 'status') return { ok: true, lines: [statusLine()] };
+  if (first === 'default') return defaultMode();
   if (!isCrashMode(first)) {
     return {
       ok: false,
@@ -115,7 +127,7 @@ if (isDirectRun()) {
     const result = telemetryCommand(process.argv.slice(2));
     const text = result.lines.join('\n');
     if (result.ok) {
-      console.log(text);
+      if (text !== '') console.log(text);
     } else {
       console.error(text);
       // Set, not exited: process.exit can truncate stdout, and the message is the whole point.

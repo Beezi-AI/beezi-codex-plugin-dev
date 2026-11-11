@@ -6,7 +6,7 @@ import {
 import { BackfillHalt, isKeyMissing, KEY_MISSING_MESSAGE } from './audit-flush.mjs';
 import { oneLine, orDefault } from './compat.mjs';
 import {
-  AccountStatus, AcceptRefusal, describeAccount, getAccount, listAccounts, recordOffer, acceptOffer, owePastSessions,
+  AccountStatus, AcceptRefusal, describeAccount, getAccount, listAccounts, recordOffer, acceptOffer, owePastSessions, takeAnsweredListing,
 } from './accounts.mjs';
 import { isMultiTenant, tenantById, newFoldersOf, NEW_FOLDERS_SOURCE, joinTenantNames } from './workspace.mjs';
 import { usesRules, routeForDir, createRouteContext } from './workspace-rules.mjs';
@@ -24,6 +24,7 @@ import { readTrackingState as _readTrackingState, TrackingMode } from './trackin
 import { HISTORY_WORKER_SCRIPT, offerWorkspaceIds } from './history-trigger.mjs';
 import { spawnDetached } from './background-spawn.mjs';
 import { compressedSkippedLine } from './rollout-file.mjs';
+import { consentedIds } from './setup-places.mjs';
 
 // The sync command's three modes (offer, accept, decline) and the offer-scan worker. Past sessions go up only after a
 // yes: the offer lists them (runAudit listOnly) and records the shown ids, and accept uploads exactly those ids. A
@@ -622,6 +623,67 @@ export async function offerCommand({ key = null, past = false, tenantIds = [], d
   if (notices > 0) console.log(`notices=${notices}`);
   console.log(`offers=${offers}`);
   return { offers, status };
+}
+
+// ── setup ──────────────────────────────────────────────────────────────────────────────────
+
+// Each open run's --past list, printing nothing → { counted: [{ run, result, fresh }], stop: the first failure's { text, error } or null }.
+async function countRuns(row, runs, ctx) {
+  const counted = [];
+  for (const run of runs) {
+    if (QUIET_CHECKS.indexOf(checkOf(row, run, ctx.seam)) !== -1) continue;
+    const { result, fresh } = await listWorkspace(row, run, ctx);
+    let stop = stopLine(result, row.key);
+    if (stop == null && !Array.isArray(result.listed)) stop = { text: WRITER_BUSY_LINE, error: false };
+    if (stop != null) return { counted, stop };
+    if (result.trackingMode !== TrackingMode.DISABLED && result.listed.length > 0) counted.push({ run, result, fresh });
+  }
+  return { counted, stop: null };
+}
+
+// The setup listing's count over every offer workspace, unrouted and recording nothing → { counted: [{ tenantId, listed }], stop }.
+export async function setupCounts(row, deps = {}) {
+  const ctx = { past: true, save: async () => null, seam: seams(deps), runCache: createRunCache() };
+  const runs = offerWorkspaceIds(row).map((id) => ({ id, options: { tenantId: isMultiTenant(row) ? id : null } }));
+  const { counted, stop } = await countRuns(row, runs, ctx);
+  return { counted: counted.map((c) => ({ tenantId: c.run.id, listed: c.result.listed })), stop };
+}
+
+// The consented run's last line, with the distinct sessions owed; → status.
+function printUploading(owed, status) {
+  console.log(`uploading=${owed.reduce((all, ids) => union(all, ids), []).length} workspaces=${owed.length}`);
+  return status;
+}
+
+// Owes each counted workspace the answered listing's sessions among its consentedIds, then starts the worker once; no answered record or a failed count owes nothing → exit status.
+export async function consentedCommand({ key }, deps = {}) {
+  const seam = seams(deps);
+  const row = orDefault(await getAccount(key), { key });
+  const listing = await takeAnsweredListing(row.key);
+  if (listing === null) return printUploading([], 0);
+  const shownIds = offerIdsOf(listing.sessionIds);
+  const shownKinds = listing.kinds != null && typeof listing.kinds === 'object' ? listing.kinds : {};
+  const ctx = { past: true, save: (k, id, patch) => recordOffer(k, id, patch), seam, runCache: createRunCache() };
+  const { counted, stop } = await countRuns(row, workspaceRuns(row, [], seam.planRuns).runs, ctx);
+  if (stop != null) {
+    printStop(stop);
+    return printUploading([], 1);
+  }
+  const nowIso = new Date(seam.now()).toISOString();
+  const owed = [];
+  for (const { run, result, fresh } of counted) {
+    // A workspace the listing did not show is owed nothing.
+    if (!Array.isArray(shownKinds[run.id])) continue;
+    const freshBlock = fresh != null && fresh.valid === true ? anonymizationFor(fresh, run.id) : null;
+    const kinds = unionKinds(unionKinds(shownKinds[run.id], kindsOf(anonymizationFor(row, run.id))), kindsOf(freshBlock));
+    const changedAt = orDefault(pastSessionsOf(freshBlock).changedAt, null);
+    const listedIds = consentedIds(row, run.id, result.listed).filter((id) => shownIds.indexOf(id) !== -1);
+    const { ids } = await owePastSessions(row.key, run.id, listedIds, kinds, nowIso, changedAt);
+    if (ids.length > 0) owed.push(ids);
+  }
+  if (owed.length === 0) return printUploading([], 0);
+  if (!spawnDetached(HISTORY_WORKER_SCRIPT, deps, ['--account', row.key])) return printUploading([], 1);
+  return printUploading(owed, 0);
 }
 
 // The history worker's --offer pass: lists each workspace due a scan and records READY, or SETTLED when nothing is owed

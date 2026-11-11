@@ -1,8 +1,8 @@
 import os from 'os';
 import path from 'path';
 import {
-  AccountStatus, getDefaultKey, listAccounts, markTenantsReviewed, parseAccountFlag, removeWorkspaceRule, restoreRouting,
-  rowSessionFields, setNewFolders, setWorkspaceRule,
+  AccountStatus, getDefaultKey, listAccounts, markTenantsReviewed, markTrackingChosen, parseAccountFlag, removeWorkspaceRule, restoreRouting,
+  rowSessionFields, saveSetupListing, setNewFolders, setWorkspaceRule,
 } from './accounts.mjs';
 import { clearUndo, readUndo, recordUndo, routingOf, sameRouting } from './rule-undo.mjs';
 import { placeOfDir, routeOfDir, sameKey } from './route-describe.mjs';
@@ -40,6 +40,10 @@ import { syncAccountIfNeeded as _syncAccountIfNeeded } from './account-sync.mjs'
 import { sharedLock, withLock } from './single-instance-lock.mjs';
 import { orDefault } from './compat.mjs';
 import { takeDeferFlag } from './history-trigger.mjs';
+import { setupCounts } from './history-cli.mjs';
+import { combinedLines, hidesPhrase, offerLines } from './history-offer.mjs';
+import { anonymizationFor, kindsOf } from './anonymization.mjs';
+import { UNSAFE_LINE, setupPlaces } from './setup-places.mjs';
 
 // What scripts/workspace.mjs runs for the settings, login, sync and analytics skills: rules, New
 // folders, the past-session routes pass and the read workspace. Line 1 of each command is for the
@@ -55,7 +59,8 @@ const USAGE = 'Usage: workspace.mjs rules [--table] [--session <id>] [--account 
   + ' | new-folders [ask | send <id|name|n>… | none] [--history] [--session <id>] [--account <ref>]'
   + ' | read <id|name|n> [--session <id>] [--account <ref>]'
   + ' | undo [--session <id>]'
-  + ' | places [--account <ref>] [--session <id>]';
+  + ' | places [--account <ref>] [--session <id>]'
+  + ' | setup [everything [<id|name|n>…] | chosen] [--account <ref>]';
 const NOT_LINKED = 'Beezi: this machine is not linked. Use the login skill to link an account.';
 const TARGET_FLAGS = ['--current', '--repo', '--folder', '--outside'];
 // The ids sessionWorkspaceFile accepts; anything else could name a file outside state/.
@@ -72,6 +77,8 @@ function context(deps) {
     listAllRollouts: orDefault(deps.listAllRollouts, _listAllRollouts),
     getAuthentication: orDefault(deps.getAuthentication, _getAuthentication),
     syncAccountIfNeeded: orDefault(deps.syncAccountIfNeeded, _syncAccountIfNeeded),
+    platform: orDefault(deps.platform, process.platform),
+    deps,
     lines: [],
     stderr: [],
   };
@@ -528,9 +535,10 @@ async function rule(cx, argv) {
   throw new UserError(USAGE);
 }
 
-// The rule-add target flag for a place; single quotes keep $, backticks, " and \ in the match literal.
-function ruleTargetFlag(place) {
-  return place.kind === 'outside' ? '--outside' : `--${place.kind} '${place.match.replace(/'/g, "'\\''")}'`;
+// The rule-add target flag for a place; single quotes keep $, backticks, " and \ in the match literal (Windows PowerShell doubles quotes instead).
+function ruleTargetFlag(place, platform = process.platform) {
+  const quoted = platform === 'win32' ? place.match.replace(/['\u2018-\u201b]/g, '$&$&') : place.match.replace(/'/g, "'\\''");
+  return place.kind === 'outside' ? '--outside' : `--${place.kind} '${quoted}'`;
 }
 
 // Past sessions waiting under New folders = Ask me, grouped by repo or folder, for the planning questions.
@@ -556,26 +564,26 @@ async function routes(cx, argv) {
       for (const g of groups) {
         total += 1;
         cx.lines.push(`P${total}. ${labeled(g)}, ${sessionsCount(g.sessions)} account=${row.key} kind=${g.kind} match=${g.match}`);
-        const where = ruleTargetFlag(g);
+        const where = ruleTargetFlag(g, cx.platform);
         cx.lines.push(`P${total}-command=${script} rule add ${where} --account ${row.key}${deferText(cx)} <tenants>`);
       }
       cx.lines.push(`all-command=${script} rule add-all --account ${row.key}${deferText(cx)} <tenants>`);
     }
-    const lost = groups.noDirectory;
-    if (lost > 0) {
-      cx.lines.push(lost === 1
-        ? '1 other past session has no recorded folder and is not sent.'
-        : `${lost} other past sessions have no recorded folder and are not sent.`);
-    }
+    printNoFolder(cx, groups.noDirectory);
   }
   cx.lines.push(`routes=${total}`);
   return total;
 }
 
-// A match or label holding a control character could forge a machine line, so `joined` leaves such a place out.
-const UNSAFE_LINE = /[\u0000-\u001f\u007f-\u009f\u2028\u2029]/;
+function printNoFolder(cx, lost) {
+  if (lost > 0) {
+    cx.lines.push(lost === 1
+      ? '1 other past session has no recorded folder and is not sent.'
+      : `${lost} other past sessions have no recorded folder and are not sent.`);
+  }
+}
 
-// Accounts that joined a workspace since their last re-pick here: every place to re-pick, with where it sends now (login step 4a, sync step 1).
+// Accounts that joined a workspace since their last re-pick here: every place to re-pick, with where it sends now (sync step 1).
 async function joined(cx, argv) {
   const [sub, ...after] = argv;
   if (sub === 'add-all') { await joinedAddAll(cx, after); return; }
@@ -608,7 +616,7 @@ async function joined(cx, argv) {
       const now = placeNow(row, place, newIds);
       const where = now.pending ? 'no rule yet' : sendList(row, now.ids);
       cx.lines.push(`J${total}. ${labeled(place)}, ${sessionsCount(place.sessions)}, now: ${where} account=${row.key} kind=${place.kind} match=${place.match} now=${now.pending ? 'pending' : idList(now.ids)}`);
-      cx.lines.push(`J${total}-command=${script} joined pick ${ruleTargetFlag(place)} --account ${row.key}${deferText(cx)} <tenant>`);
+      cx.lines.push(`J${total}-command=${script} joined pick ${ruleTargetFlag(place, cx.platform)} --account ${row.key}${deferText(cx)} <tenant>`);
     }
     cx.lines.push(`add-all-command=${script} joined add-all --account ${row.key}${deferText(cx)}`);
     cx.lines.push(`done-command=${script} joined done --account ${row.key}${deferText(cx)}`);
@@ -831,6 +839,111 @@ async function places(cx, argv) {
   cx.lines.push(`places=${found.length}`);
 }
 
+// The setup's printed commands always defer the upload: it writes several, then uploads once.
+const SETUP_FLAGS = { deferUpload: true };
+
+async function linkedAccount(account) {
+  const row = await resolveAccount(account);
+  if (row.status !== AccountStatus.LINKED) throw new UserError(NOT_LINKED);
+  return row;
+}
+
+// The setup answered here, or (several workspaces) New folders was already set.
+function trackingChosen(row) {
+  return row.trackingChosenAt != null || (isMultiTenant(row) && newFoldersOf(row).set);
+}
+
+const hiddenKinds = (row, tenantId) => kindsOf(anonymizationFor(row, tenantId));
+
+// The past-sessions checklist: one workspace's offer lines, else the combined header and one line per workspace.
+function checklistLines(row, found) {
+  const tenants = tenantsOf(row);
+  if (tenants.length === 1) {
+    const folders = found.places.map(shortLabel);
+    return offerLines({ n: found.sessions, firstMs: found.firstMs, lastMs: found.lastMs, folders, kinds: hiddenKinds(row, tenants[0].id) });
+  }
+  return combinedLines([], found.firstMs, found.lastMs, found.sessions)
+    .concat(tenants.map((t) => `  ${tenantName(row, t.id)} · ${hidesPhrase(hiddenKinds(row, t.id))}`));
+}
+
+const NOTHING_LISTED = { places: [], sessions: 0, ids: [], noFolder: 0 };
+
+// The listing's consent record: the sessions listed and what each workspace's checklist said it hides.
+function listingRecord(row, found) {
+  const kinds = {};
+  tenantsOf(row).forEach((t) => { kinds[t.id] = hiddenKinds(row, t.id); });
+  return { listedAt: new Date().toISOString(), sessionIds: found.ids, kinds };
+}
+
+// The tracking question's listing, saved as the consent record when it asks; false, with only the line saying why, when a workspace could not count.
+async function setupListing(cx, argv) {
+  const { account, rest } = await parseAccountFlag(argv);
+  if (rest.length !== 0) throw new UserError(USAGE);
+  const row = await linkedAccount(account);
+  const tenants = orDefault(tenantsOf(row), []);
+  const chosen = trackingChosen(row);
+  let found = NOTHING_LISTED;
+  if (tenants.length > 0 && !chosen) {
+    const { counted, stop } = await setupCounts(row, cx.deps);
+    if (stop != null) {
+      if (stop.error) cx.stderr.push(`✗ ${stop.text}`);
+      else cx.lines.push(stop.text);
+      return false;
+    }
+    found = setupPlaces(row, counted);
+    await saveSetupListing(row.key, listingRecord(row, found));
+  }
+  if (found.places.length > 0) cx.lines.push('<checklist>', ...checklistLines(row, found), '</checklist>');
+  if (tenants.length > 0) {
+    const script = scriptCommand();
+    printWorkspaces(cx, row);
+    found.places.forEach((place, i) => {
+      const now = place.tracked == null ? 'default' : idList(place.tracked);
+      cx.lines.push(`T${i + 1}. ${labeled(place)}, ${sessionsCount(place.sessions)} account=${row.key} kind=${place.kind} now=${now} match=${place.match}`);
+      cx.lines.push(`T${i + 1}-command=${script} rule add ${ruleTargetFlag(place, cx.platform)} --account ${row.key}${deferText(SETUP_FLAGS)} <tenants>`);
+    });
+    cx.lines.push(`everything-command=${script} setup everything --account ${row.key}${deferText(SETUP_FLAGS)} <tenants>`);
+    cx.lines.push(`chosen-command=${script} setup chosen --account ${row.key}${deferText(SETUP_FLAGS)}`);
+  }
+  printNoFolder(cx, found.noFolder);
+  cx.lines.push(`setup=${found.places.length} sessions=${found.sessions} workspaces=${tenants.length} chosen=${chosen ? 'yes' : 'no'}`);
+  return true;
+}
+
+// The account's workspaces count as reviewed, so the join prompt skips them, and the setup won't ask again.
+async function recordTrackingChoice(row) {
+  await markTenantsReviewed(row.key, orDefault(tenantsOf(row), []).map((t) => t.id));
+  await markTrackingChosen(row.key, new Date().toISOString());
+}
+
+// Everything: several workspaces send new folders to <tenants>, existing rules stay; one workspace has nothing to route.
+async function setupEverything(cx, argv) {
+  const { account, rest } = await parseAccountFlag(argv);
+  const row = await linkedAccount(account);
+  if (isMultiTenant(row)) await newFolders(cx, ['send', ...rest, '--account', row.key]);
+  await recordTrackingChoice(row);
+  cx.lines.push('setup=everything');
+}
+
+// Let me choose, after the rule writes: several workspaces ask about new folders; one workspace has nothing to set.
+async function setupChosen(cx, argv) {
+  const { account, rest } = await parseAccountFlag(argv);
+  if (rest.length !== 0) throw new UserError(USAGE);
+  const row = await linkedAccount(account);
+  if (isMultiTenant(row)) await newFolders(cx, ['ask', '--account', row.key]);
+  await recordTrackingChoice(row);
+  cx.lines.push('setup=chosen');
+}
+
+// False when the listing could not count.
+async function setup(cx, argv) {
+  const [sub, ...rest] = argv;
+  if (sub === 'everything') await setupEverything(cx, rest);
+  else if (sub === 'chosen') await setupChosen(cx, rest);
+  else return setupListing(cx, argv);
+  return true;
+}
+
 async function read(cx, argv) {
   const { session, rest: afterSession } = parseSessionFlag(argv);
   const { account, rest } = await parseAccountFlag(afterSession);
@@ -854,6 +967,7 @@ export async function workspaceCommand(argv, deps = {}) {
   cx.deferUpload = taken.deferUpload;
   const [cmd, ...rest] = taken.argv;
   let count;
+  let ok = true;
   try {
     if (cmd === 'rules') await rules(cx, rest);
     else if (cmd === 'rule') await rule(cx, rest);
@@ -863,8 +977,9 @@ export async function workspaceCommand(argv, deps = {}) {
     else if (cmd === 'read') await read(cx, rest);
     else if (cmd === 'undo') await undo(cx, rest);
     else if (cmd === 'places') await places(cx, rest);
+    else if (cmd === 'setup') ok = await setup(cx, rest);
     else throw new UserError(cmd == null ? USAGE : `Unknown command "${cmd}". ${USAGE}`);
-    const result = { ok: true, lines: cx.lines, stderr: cx.stderr };
+    const result = { ok, lines: cx.lines, stderr: cx.stderr };
     if (count !== undefined) result.count = count;
     return result;
   } catch (error) {

@@ -3,8 +3,6 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
-import { NO_NEW_LINE, WRITER_BUSY_LINE, ACCEPT_BUSY_LINE, PENDING_UNREADABLE_TEXT } from '../lib/history-cli.mjs';
-import { CHANGED_LINE } from '../lib/history-offer.mjs';
 
 // The login surface's cross-file contract, in the shape test/sync-surface.test.mjs uses.
 //
@@ -67,91 +65,84 @@ test('login — the MCP tool prints its key only on a completed sign-in', () => 
 
 const flat = (text) => text.replace(/\s+/g, ' ');
 
-test('login skill — one script runs the steps, and the beezi_login path resumes it at setup', () => {
+test('login skill — one script runs the steps, and the beezi_login path starts it with the key', () => {
   const text = flat(skill);
   assert.match(skill, /^node "<plugin-root>\/scripts\/login-flow\.mjs"$/m);
-  assert.ok(text.includes('node "<plugin-root>/scripts/login-flow.mjs" --account <key> --from setup'));
-  assert.ok(text.includes('node "<plugin-root>/scripts/login-flow.mjs" --account <key> --from <step>'));
+  assert.match(skill, /^node "<plugin-root>\/scripts\/login-flow\.mjs" --account <key>$/m);
+  assert.match(skill, /^node "<plugin-root>\/scripts\/login-flow\.mjs" --account <key> --from finish$/m);
+  assert.ok(!text.includes('--from setup') && !text.includes('--from <step>'));
   // Every stop the script can print has a row in the skill's table, and the script still prints it.
   const flow = read('scripts', 'login-flow.mjs');
-  for (const step of ['stop', 'setup', 'here', 'tier', 'joined', 'routes', 'history', 'default']) {
+  for (const step of ['stop', 'track', 'done']) {
     assert.ok(flow.includes(`'${step}'`), `login-flow.mjs no longer prints next=${step}`);
     assert.match(skill, new RegExp(`^\\| \`${step}\` +\\|`, 'm'), `the skill has no row for next=${step}`);
   }
-  assert.doesNotMatch(skill, /^\| `backfill` +\|/m, 'login no longer runs a one-time import');
-  assert.ok(!text.includes('workspace.mjs" new-folders --account <key>'), 'the New folders listing is the script\'s now');
+  for (const step of ['setup', 'here', 'tier', 'joined', 'routes', 'history', 'default']) {
+    assert.doesNotMatch(skill, new RegExp(`^\\| \`${step}\` +\\|`, 'm'), `next=${step} is gone`);
+  }
 });
 
-test('login skill — the one setup question uses the tool for at most 2 workspaces without "Several workspaces…", else one numbered sentence', () => {
+test('login skill — the tracking question uses the spec words, by the number of workspaces', () => {
   const text = flat(skill);
-  assert.ok(text.includes('"Where should analytics from this machine go?"'));
-  assert.ok(!text.includes('<preview'), 'Codex options carry no previews (spec D5)');
-  assert.match(text, /`O<i>\. <label> — <description>`/);
-  assert.match(text, /\*\*`request_user_input`\*\* only when that tool is listed this turn \*\*and\*\* there are at most 2 `W\.` lines \(3 choices\)/);
-  assert.match(text, /split at the last ` — ` into the label and the description/);
-  assert.match(text, /3 or more `W\.` lines — one plain sentence with the `O` lines as a numbered list, never a 4-option `request_user_input` call/);
-  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders send <tenants> --account <key> --defer-upload'));
-  assert.ok(!text.includes('new-folders send <tenant> '));
-  assert.ok(text.includes('one choice per `O` line in order except the "Several workspaces…" line'));
-  assert.ok(text.includes('"Where should analytics from this machine go? Pick one, or name several under Other."'));
-  assert.ok(text.includes('"Which workspaces should get analytics from this machine: Acme (Owner), Beta (User), Gamma (User) — one or more?"'));
-  assert.ok(text.includes('node "<plugin-root>/scripts/workspace.mjs" new-folders ask --account <key> --defer-upload'));
-  assert.ok(!text.includes('"Ask me (recommended)"'), 'the old three-way New folders question is gone');
-  assert.ok(text.includes('Every `O` line is numbered, "Several workspaces…" included.'));
-  assert.ok(text.includes('Two or more numbers that include the "Several workspaces…" or the "Let me choose per repo" number are a dismissal'));
-  assert.ok(text.includes('and "both" or "all" is every `W.` line; one that names none, or names a workspace together with "per repo", is a dismissal.'));
-  assert.ok(text.includes('and so is an answer that names a workspace together with "per repo"'));
-});
-
-test('login skill — describes the here: line as workspace.mjs prints it', () => {
-  assert.ok(read('lib', 'workspace-cli.mjs').includes("now=${now.reason.kind === 'pending' ? 'pending' : idList(now.ids)}${where} account="));
-  assert.ok(flat(skill).includes('here: <short> (<label>) → <R<n> | no rule> now=<ids|none|pending> path=<path> account=<key> rule=<n|none> kind=<…> match=<…>'));
-});
-
-// Spec §4: this session's own folder is asked about as the one you're in, and Don't track says nothing is sent.
-test('login — the here question names the folder you\'re in, and the last choice sends nothing', () => {
-  const flat = skill.replace(/\s+/g, ' ');
   for (const phrase of [
-    '"Where should analytics for <short>, the repo you\'re in, go?"',
-    '"Where should analytics for <label>, the folder you\'re in (and everything inside it), go?"',
-    '"Where should analytics for sessions outside a project folder go?"',
-    '"Don\'t track <short>"',
-    '"Don\'t track these"',
-    '"Not tracked: nothing from <short> is sent"',
-    '"Not tracked: nothing from sessions outside a project folder is sent"',
+    '"What should it track?"',
+    '"Everything" ("all <M>, and new ones as you open them"), "Let me choose" ("tick the repos and folders")',
+    '"Let me choose" ("tick repos for each workspace")',
+    '"Where should they go?"',
+    '"Everything to <A>", "Everything to <B>", "Everything to both", "Let me choose"',
+    '"Everything to <A>", "Everything to <B>", "Several workspaces…", "Let me choose"',
+    '"Where should this machine\'s analytics go?"',
+    '"Ask me for each repo"',
+    '"Which repos and folders should Beezi track?"',
+    '"Which repos and folders go to <name>?"',
+    '"All of them" ("Every place in the list") and "None of them" ("Nothing in the list")',
+    '"Which workspaces should get analytics from this machine: Acme (Owner), Beta (User), Gamma (User) — one or more?"',
   ]) {
-    assert.ok(flat.includes(phrase), phrase);
+    assert.ok(text.includes(phrase), phrase);
   }
-  assert.ok(!flat.includes('without the "(i of N) " prefix'), 'the here question has its own wording, not step 4a\'s');
-  assert.ok(!flat.includes('Nothing from <short> is uploaded'));
-  assert.ok(!flat.includes('outside a project folder is uploaded'));
+  assert.ok(text.includes('First write the lines between `<checklist>` and `</checklist>` verbatim'));
+  assert.ok(text.includes('run nothing, tell the user nothing was set up and to ask Beezi to sign in again to choose what this machine tracks, and stop'));
+  assert.ok(text.includes('the ticked workspaces\' `tenant=` values joined by commas, or `none` when it is ticked nowhere'));
+  assert.ok(text.includes('With one workspace, run it only for the places left out, with `none`.'));
+  assert.ok(text.includes('a `T` line with `now=none` is not offered'));
+  assert.ok(text.includes('After those, run the `chosen-command=` text EXACTLY ONCE.'));
+  assert.ok(text.includes('With one workspace, drop the literal ` <tenants>` instead.'));
+  assert.ok(text.includes('A command that prints a `✗` line, or fails, stops this login: run no later command, do not run `--from finish`'));
 });
 
-test('login skill — step 4b asks each Q line and answers with accept or decline; no routing question uploads', () => {
+test('login skill — the listing lines it parses are the ones workspace.mjs setup prints', () => {
+  const cli = read('lib', 'workspace-cli.mjs');
+  for (const fragment of [
+    'T${i + 1}. ${labeled(place)}, ${sessionsCount(place.sessions)} account=${row.key} kind=${place.kind} now=${now} match=${place.match}',
+    'T${i + 1}-command=${script} rule add ${ruleTargetFlag(place, cx.platform)} --account ${row.key}${deferText(SETUP_FLAGS)} <tenants>',
+    'everything-command=${script} setup everything --account ${row.key}${deferText(SETUP_FLAGS)} <tenants>',
+    'chosen-command=${script} setup chosen --account ${row.key}${deferText(SETUP_FLAGS)}',
+  ]) assert.ok(cli.includes(fragment), fragment);
   const text = flat(skill);
-  assert.ok(text.includes('node "<plugin-root>/scripts/sync.mjs" --accept --account <key> --tenant <id> --token <token>'));
-  assert.ok(text.includes('`offer account=<key> tenant=<id> sessions=<n> audit=<yes|no> token=<token>`'));
-  assert.ok(text.includes('node "<plugin-root>/scripts/sync.mjs" --decline --account <key> --tenant <id>'));
-  assert.ok(text.includes('` Reply upload or not now.`'));
-  assert.ok(text.includes('No answer means no upload.'));
-  assert.ok(read('scripts', 'login-flow.mjs').includes("['--offer', '--past', '--account', key]"));
-  for (const name of ['login', 'sync']) {
-    assert.doesNotMatch(read('skills', name, 'SKILL.md'), /past sessions will be sent there too/, name);
-  }
+  assert.ok(text.includes('`T<i>. <short> (<label>), <k> sessions account=<key> kind=<…> now=<ids|none|default> match=<…>`'));
+  assert.ok(text.includes('`setup=<M> sessions=<N> workspaces=<W> chosen=no`'));
+});
+
+test('login skill — the removed questions are gone: plan tier, this folder, joined, routes, past-sessions offers, default account', () => {
+  const text = flat(skill);
+  for (const gone of [
+    'How does this machine pay for Codex',
+    'billing-capture.mjs" --plan',
+    'the repo you\'re in, go?',
+    'workspace.mjs" new-folders',
+    'J<i>-command=',
+    'P<i>-command=',
+    '` Reply upload or not now.`',
+    'scripts/accounts.mjs" use <key>',
+    'Make `<name>` (`<workspace>`) the account the analytics skill reads from?',
+    '"Where should analytics from this machine go?"',
+    '`O<i>. <label> — <description>`',
+    'no new past sessions to offer',
+  ]) assert.ok(!text.includes(gone), gone);
   assert.doesNotMatch(skill, /scripts\/backfill\.mjs|finalized/);
+  assert.ok(read('lib', 'setup-wizard.mjs').includes("['--offer', '--past', '--account', key, '--consented']"));
 });
 
-test('login skill — step 4b explains the no-new, busy-writer and changed-offer lines the scripts print', () => {
-  const text = flat(skill);
-  for (const [line, fragment] of [
-    [NO_NEW_LINE, 'no new past sessions to offer'],
-    [WRITER_BUSY_LINE, 'Codex is still saving analytics on this machine, so nothing was listed this time'],
-    [PENDING_UNREADABLE_TEXT, 'could not read Codex’s pending analytics on this machine'],
-    [ACCEPT_BUSY_LINE, 'your yes is saved, but this machine is busy, so nothing was uploaded yet'],
-    [CHANGED_LINE, 'these past sessions changed after the question was shown, so nothing was uploaded'],
-  ]) {
-    assert.ok(line.includes(fragment), fragment);
-    assert.ok(text.includes(fragment), `skills/login/SKILL.md should explain "${fragment}"`);
-  }
-  assert.ok(text.includes('Never retry `--accept`.'));
+test('login skill — the finish block is written verbatim', () => {
+  assert.ok(flat(skill).includes('Write its lines verbatim, blank lines included, and add nothing of your own.'));
 });

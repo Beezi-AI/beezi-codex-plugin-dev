@@ -181,7 +181,7 @@ export async function keysLines(deps = {}) {
   return keyLines({ rows: await listAccounts(deps), def: await getDefaultKey(deps) });
 }
 
-const PLAN_LABELS = {
+export const PLAN_LABELS = {
   free: 'Free', plus: 'Plus', pro_5x: 'Pro 5x', pro_20x: 'Pro 20x', go: 'Go', team: 'Team',
   business: 'Business', enterprise: 'Enterprise', edu: 'Edu',
 };

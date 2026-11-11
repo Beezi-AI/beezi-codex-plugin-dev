@@ -3,227 +3,292 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeHome, linkAccount } from '../tools/account-fixtures.mjs';
 import { loginFlow } from '../scripts/login-flow.mjs';
-import { UserError } from '../lib/friendly-error.mjs';
 
 const KEY = 'a1b2c3d4';
-const TENANTS = [{ id: 'A', name: 'Acme', role: 'Tenant Owner' }, { id: 'B', name: 'Northwind', role: 'User' }];
-const SOLO = [{ id: 'S', name: 'Solo' }];
 const PLUS = '✓ Beezi billing captured: source=subscription plan=plus via=app-server.\n';
-// A fixed non-existent path: routes as a folder, never as this worktree's repo.
-const CWD = '/work/labacus-suite';
-const OFFER = `sync.mjs --offer --past --account ${KEY}`;
+const TRUST = '  One step left — run /hooks in Codex, review the Beezi entries, and trust them.\n';
+const SIGNED_IN = `\n✓ Beezi analytics linked as u@x.io.\n\n  Analytics hooks installed for you.\n${TRUST}account=${KEY}\n`;
+const NO_TRUST_STEP = '✓ Beezi: analytics hooks updated to this plugin version.\n  The registry entries did not change, so there is NOTHING to re-trust — /hooks can stay closed.\n';
+const CAPTURE = `billing-capture.mjs --from-codex --via login --account ${KEY}`;
+const LIST = `workspace.mjs setup --account ${KEY}`;
+const DEFAULTS = ['telemetry.mjs default', 'settings.mjs keys'];
+const FINISH_CALLS = ['hooks.mjs install', `sync.mjs --offer --past --account ${KEY} --consented`].concat(DEFAULTS);
 
 afterEach(() => { process.exitCode = undefined; });
 
 const ok = (stdout) => ({ code: 0, stdout, stderr: '' });
-const listed = (lines, extra = {}) => ({ ok: true, lines, stderr: [], ...extra });
 
-// Collects console.log output while fn runs.
-async function capture(fn) {
+const W_SOLO = `W. Solo account=${KEY} tenant=S role=Owner`;
+const W_BETA = `W. Beta account=${KEY} tenant=B role=User`;
+const EVERYTHING = `everything-command=node "/p/scripts/workspace.mjs" setup everything --account ${KEY} --defer-upload <tenants>`;
+const CHOSEN = `chosen-command=node "/p/scripts/workspace.mjs" setup chosen --account ${KEY} --defer-upload`;
+const LISTING = [
+  '<checklist>',
+  'Beezi found 2 past Codex sessions (3 Sep – 11 Nov, 1 folder)',
+  '</checklist>',
+  W_SOLO,
+  `T1. web-app (github.com/acme/web-app), 2 sessions account=${KEY} kind=repo now=default match=github.com/acme/web-app`,
+  `T1-command=node "/p/scripts/workspace.mjs" rule add --repo github.com/acme/web-app --account ${KEY} --defer-upload <tenants>`,
+  EVERYTHING,
+  CHOSEN,
+  'setup=1 sessions=2 workspaces=1 chosen=no',
+].join('\n');
+const CHOSEN_LISTING = [W_SOLO, EVERYTHING, CHOSEN, 'setup=0 sessions=0 workspaces=1 chosen=yes'].join('\n');
+const EMPTY_SOLO = [W_SOLO, EVERYTHING, CHOSEN, 'setup=0 sessions=0 workspaces=1 chosen=no'].join('\n');
+const EMPTY_TWO = [W_SOLO, W_BETA, EVERYTHING, CHOSEN, 'setup=0 sessions=0 workspaces=2 chosen=no'].join('\n');
+
+const replies = (listing, extra = {}) => ({
+  'billing-capture.mjs': ok(PLUS),
+  'workspace.mjs': (args) => (args[1] === 'everything' ? ok('setup=everything\n') : ok(`${listing}\n`)),
+  'hooks.mjs': ok(`✓ Beezi: analytics hooks are already installed and current — nothing to change.\n  If analytics still are not arriving, run /hooks in Codex, review the Beezi entries, and trust them.\n`),
+  'sync.mjs': ok('uploading=0 workspaces=0\n'),
+  'telemetry.mjs': ok(''),
+  'settings.mjs': ok('crash=correlate\n'),
+  ...extra,
+});
+
+// Runs the flow with faked scripts and hook-trust probe, so no test spawns a child; `calls` records each script run.
+async function flow(argv, scripted, signIn = ok(SIGNED_IN), verdict = 'untrusted') {
+  const calls = [];
   const printed = [];
   const log = console.log;
   console.log = (text) => printed.push(String(text));
   try {
-    await fn();
+    const run = (script, args) => {
+      calls.push([script].concat(args).join(' '));
+      const r = scripted[script];
+      return typeof r === 'function' ? r(args) : r;
+    };
+    const live = async (script, args) => { calls.push([script].concat(args).join(' ')); return signIn; };
+    await loginFlow(argv, { run, live, trust: async () => ({ verdict, untrusted: [], disabled: [] }) });
   } finally {
     console.log = log;
   }
-  return printed.join('\n');
-}
-
-// Faked scripts and counts, so no test spawns a child or reads this machine's rollouts; `calls` records each script run.
-function fakes(calls, { signIn = ok(`\n✓ Beezi analytics linked as u@x.io.\naccount=${KEY}\n`), captured = PLUS, history = 'offers=0\n', ...extra } = {}) {
-  return {
-    run: (script, args) => { calls.push([script].concat(args).join(' ')); return ok(script === 'sync.mjs' ? history : captured); },
-    live: async (script, args) => { calls.push([script].concat(args).join(' ')); return signIn; },
-    pastSessions: () => ({ sessions: 37, places: 4 }),
-    cwd: CWD,
-    ...extra,
-  };
-}
-
-async function flow(argv, options = {}) {
-  const calls = [];
-  const out = await capture(() => loginFlow(argv, fakes(calls, options)));
+  const out = printed.join('\n');
   return { calls, out, next: out.split('\n').pop(), tags: out.split('\n').filter((l) => /^<[a-z-]+[ >]/.test(l)) };
 }
 
-const link = (t, over = {}) => linkAccount(makeHome(t), KEY, { tenants: TENANTS, ...over });
-const deps = fakes([]);
+const link = (t) => linkAccount(makeHome(t), KEY, { tenants: [{ id: 'S', name: 'Solo' }] });
 
-test('the setup question lists each workspace, several, and the per-repo choice, with the counts', async (t) => {
-  link(t);
-  const out = await capture(() => loginFlow(['--account', KEY, '--from', 'setup'], deps));
-  assert.match(out, /^<setup account="a1b2c3d4">\nW\. Acme account=a1b2c3d4 tenant=A role=Owner\nW\. Northwind .*\nsessions=37 places=4\n/m);
-  assert.match(out, /^O1\. Acme — Everything goes here: new repos and folders, and 4 with history \(37 past sessions\)$/m);
-  assert.match(out, /^O3\. Several workspaces… — Pick two or more; everything goes to each of them$/m);
-  assert.match(out, /^O4\. Let me choose per repo — Beezi asks about each repo and folder with history next, and new ones when a session starts there\n<\/setup>$/m);
-  assert.doesNotMatch(out, /<preview/);
-  assert.match(out, /^next=setup account=a1b2c3d4$/m);
-});
-
-test('a fresh sign-in of an account in several workspaces stops at the setup question, before the capture', async (t) => {
-  link(t);
-  const r = await flow([]);
-  assert.deepEqual(r.calls, ['login.mjs']);
-  assert.deepEqual(r.tags, ['<sign-in>', `<setup account="${KEY}">`]);
-  assert.ok(r.out.includes('W. Northwind account=a1b2c3d4 tenant=B role=User\nsessions=37 places=4\nO1. Acme — '));
-  assert.equal(r.next, `next=setup account=${KEY}`);
-});
-
-test('a failing count still asks, with its ✗ line and the options without counts', async (t) => {
-  link(t);
-  const r = await flow(['--account', KEY, '--from', 'setup'], { pastSessions: () => { throw new UserError('rollouts unreadable'); } });
-  assert.ok(r.out.includes('role=User\n✗ rollouts unreadable\nO1. Acme — Everything goes here, starting with new repos and folders\n'));
-  assert.ok(r.out.includes('O2. Northwind — Everything goes here, starting with new repos and folders\nO3. Several workspaces… — Pick two or more; everything goes to each of them\nO4. Let me choose per repo — '));
-  assert.ok(!r.out.includes('sessions='));
-  assert.equal(r.next, `next=setup account=${KEY}`);
-});
-
-test('a failed sign-in stops with exit code 1', async (t) => {
-  link(t);
-  const r = await flow([], { signIn: { code: 1, stdout: 'Opening your browser…\n' } });
+test('a failed sign-in stops with exit code 1', async () => {
+  const r = await flow([], replies(LISTING), { code: 1, stdout: 'Opening your browser…\n' });
   assert.deepEqual(r.calls, ['login.mjs']);
   assert.equal(r.next, 'next=stop');
   assert.equal(process.exitCode, 1);
 });
 
-test('a one-workspace account with a known plan runs every step in one call, up to the history offer', async (t) => {
-  link(t, { tenants: SOLO });
-  const r = await flow([]);
-  assert.deepEqual(r.calls, ['login.mjs', `billing-capture.mjs --from-codex --via login --account ${KEY}`, OFFER]);
-  assert.deepEqual(r.tags, ['<sign-in>', '<capture>', `<joined account="${KEY}">`, `<routes account="${KEY}">`, '<history>']);
-  assert.ok(r.out.includes(`<capture>\n${PLUS.trim()}\n</capture>`));
-  assert.equal(r.next, `next=default account=${KEY}`);
+test('tracking not chosen yet stops once with the listing in a <track> block', async () => {
+  const r = await flow([], replies(LISTING));
+  assert.deepEqual(r.calls, ['login.mjs', CAPTURE, LIST]);
+  assert.deepEqual(r.tags, ['<sign-in>', '<plan>', `<track account="${KEY}">`, '<checklist>']);
+  assert.ok(r.out.endsWith(`<track account="${KEY}">\n${LISTING}\n</track>\nnext=track account=${KEY}`));
 });
 
-test('--from setup goes straight to the capture for one workspace, or New folders already set', async (t) => {
-  const home = makeHome(t);
-  for (const over of [{ tenants: SOLO }, { tenants: TENANTS, newFolders: { mode: 'send', tenantIds: ['A'] } }]) {
-    linkAccount(home, KEY, over);
-    const r = await flow(['--account', KEY, '--from', 'setup']);
-    assert.ok(!r.out.includes('<setup'));
-    assert.equal(r.calls[0], `billing-capture.mjs --from-codex --via login --account ${KEY}`);
-    assert.equal(r.next, `next=default account=${KEY}`);
-  }
+test('the plan step prints the plan it found and no question', async () => {
+  const r = await flow([], replies(LISTING));
+  assert.ok(r.out.includes('<plan>\n✓ Plan found: Plus\n</plan>'));
+  assert.ok(!/next=tier|ChatGPT Free/.test(r.out));
 });
 
-test('--from here stops for this folder under Ask me when it has no rule', async (t) => {
-  link(t, { newFolders: { mode: 'ask', tenantIds: [] } });
-  const r = await flow(['--account', KEY, '--from', 'here']);
-  assert.deepEqual(r.calls, []);
-  assert.match(r.out, new RegExp(`^<rules account="${KEY}">\\n[\\s\\S]*\\nhere: .* account=${KEY} rule=none kind=\\S+ match=.*\\n</rules>\\nnext=here account=${KEY}$`));
+test('a plan the capture cannot settle prints the not-detected line and no question', async () => {
+  const capture = ok('Beezi: Codex named no ChatGPT account — nothing captured. Run `codex login` if you meant to be signed in.\n');
+  const r = await flow([], replies(LISTING, { 'billing-capture.mjs': capture }));
+  assert.ok(r.out.includes("<plan>\nBeezi couldn't detect this machine's plan. Set it in $beezi:settings.\n</plan>"));
+  assert.equal(r.next, `next=track account=${KEY}`);
 });
 
-test('--from here skips this folder when New folders sends somewhere, and shows no rules block', async (t) => {
-  link(t, { newFolders: { mode: 'send', tenantIds: ['B'] } });
-  const r = await flow(['--account', KEY, '--from', 'here']);
-  assert.ok(!r.out.includes('<rules'));
-  assert.equal(r.calls[0], `billing-capture.mjs --from-codex --via login --account ${KEY}`);
-  assert.equal(r.next, `next=default account=${KEY}`);
+test('an expired Codex sign-in keeps its notice in the <plan> block', async () => {
+  const expired = 'Beezi: your Codex sign-in expired on 2026-09-30, so its plan info is out of date — sign in to Codex again, or tell Beezi your plan.';
+  const r = await flow([], replies(LISTING, { 'billing-capture.mjs': ok(`${expired}\n`) }));
+  assert.ok(r.out.includes([
+    '<plan>',
+    expired,
+    "Beezi couldn't detect this machine's plan. Set it in $beezi:settings.",
+    '</plan>',
+  ].join('\n')));
 });
 
-test('--from here goes on when this folder already has a rule', async (t) => {
-  link(t, { newFolders: { mode: 'ask', tenantIds: [] } });
-  const here = `here: x → R1 now=A account=${KEY} rule=1 kind=folder match=/work/x`;
-  const r = await flow(['--account', KEY, '--from', 'here'], { workspace: async (argv) => listed(argv[0] === 'rules' ? [here] : []) });
-  assert.ok(!r.out.includes('<rules'));
-  assert.equal(r.next, `next=default account=${KEY}`);
+test('tracking already chosen runs to next=done with no stop and no upload', async () => {
+  const r = await flow([], replies(CHOSEN_LISTING));
+  assert.deepEqual(r.calls, ['login.mjs', CAPTURE, LIST].concat(DEFAULTS));
+  assert.ok(r.out.endsWith([
+    '<finish>',
+    '✓ Tracking is already set up ($beezi:settings)',
+    '',
+    'One step left. In Codex, run /hooks and trust Beezi.',
+    'Crash reports are on ($beezi:settings)',
+    '</finish>',
+    `next=done account=${KEY}`,
+  ].join('\n')));
 });
 
-test('a folder path holding " rule=" does not decide whether this folder is asked about', async (t) => {
-  link(t, { newFolders: { mode: 'ask', tenantIds: [] } });
-  const ruled = `here: a rule=none b (/work/a rule=none b) → R1 now=A path=/work/a rule=none b account=${KEY} rule=1 kind=folder match=/work/a rule=none b`;
-  const goes = await flow(['--account', KEY, '--from', 'here'], { workspace: async (argv) => listed(argv[0] === 'rules' ? [ruled] : []) });
-  assert.ok(!goes.out.includes('<rules'));
-  assert.equal(goes.next, `next=default account=${KEY}`);
-  const unruled = `here: a rule=1 b (/work/a rule=1 b) → no rule now=pending path=/work/a rule=1 b account=${KEY} rule=none kind=folder match=/work/a rule=1 b`;
-  const stops = await flow(['--account', KEY, '--from', 'here'], { workspace: async (argv) => listed(argv[0] === 'rules' ? [unruled] : []) });
-  assert.ok(stops.out.includes(`<rules account="${KEY}">\n${unruled}\n</rules>`));
-  assert.equal(stops.next, `next=here account=${KEY}`);
+test('an unknown workspace list asks nothing, writes nothing and uploads nothing', async () => {
+  const r = await flow([], replies('setup=0 sessions=0 workspaces=0 chosen=no'));
+  assert.deepEqual(r.calls, ['login.mjs', CAPTURE, LIST].concat(DEFAULTS));
+  assert.ok(r.out.endsWith([
+    '<finish>',
+    'One step left. In Codex, run /hooks and trust Beezi.',
+    'Crash reports are on ($beezi:settings)',
+    '</finish>',
+    `next=done account=${KEY}`,
+  ].join('\n')));
 });
 
-test('a rules listing that fails under Ask me shows its ✗ line and does not stop for this folder', async (t) => {
-  link(t, { newFolders: { mode: 'ask', tenantIds: [] } });
-  const workspace = async (argv) => (argv[0] === 'rules' ? listed([], { ok: false, stderr: ['\n✗ boom'] }) : listed([]));
-  const r = await flow(['--account', KEY, '--from', 'here'], { workspace });
-  assert.ok(r.out.includes(`<rules account="${KEY}">\n✗ boom\n</rules>\n<capture>`));
-  assert.equal(r.next, `next=default account=${KEY}`);
+const failedListings = [
+  ['a non-zero exit with a ✓ notice', { code: 1, stdout: '✓ Beezi: Codex is still saving analytics on this machine, so nothing was listed this time. Run `$beezi:sync` again in a minute.\n', stderr: '' },
+    '✓ Beezi: Codex is still saving analytics on this machine, so nothing was listed this time. Run `$beezi:sync` again in a minute.'],
+  ['a non-zero exit with a ✗ line', { code: 1, stdout: '', stderr: '\n✗ rollouts unreadable\n' }, '✗ rollouts unreadable'],
+  ['no setup= line', ok('Beezi: half a listing\n'), 'Beezi: half a listing'],
+];
+for (const [name, listing, line] of failedListings) {
+  test(`a failed listing (${name}) says past sessions could not be checked and finishes without the upload`, async () => {
+    const r = await flow([], replies('', { 'workspace.mjs': listing }));
+    assert.deepEqual(r.calls, ['login.mjs', CAPTURE, LIST].concat(DEFAULTS));
+    assert.ok(r.out.endsWith([
+      '<finish>',
+      line,
+      '',
+      'One step left. In Codex, run /hooks and trust Beezi.',
+      'Crash reports are on ($beezi:settings)',
+      'Beezi couldn\'t check past sessions. Ask "Sign me in to Beezi" in a new Codex thread to choose what to track.',
+      '</finish>',
+      `next=done account=${KEY}`,
+    ].join('\n')));
+  });
+}
+
+test('no past sessions in one workspace tracks everything and finishes without the upload', async () => {
+  const r = await flow([], replies(EMPTY_SOLO));
+  assert.deepEqual(r.calls, ['login.mjs', CAPTURE, LIST, `workspace.mjs setup everything --account ${KEY} --defer-upload`].concat(DEFAULTS));
+  assert.ok(r.out.includes('<finish>\n✓ Tracking every repo and folder you work in\n\nOne step left. In Codex, run /hooks and trust Beezi.\n'));
+  assert.equal(r.next, `next=done account=${KEY}`);
 });
 
-test('the plan step stops for the tier question unless the capture settled a plan', async (t) => {
-  link(t, { tenants: SOLO });
-  const cases = [
-    ['Beezi: Codex named no ChatGPT account — nothing captured. Run `codex login` if you meant to be signed in.\n', 'tier'],
-    ['Beezi: ChatGPT account info still does not name a plan — keeping the self-reported plan.\n', 'tier'],
-    ['Beezi: your Codex sign-in expired on 2026-09-01, so its plan info is out of date — sign in to Codex again, or tell Beezi your plan.\n', 'tier'],
-    ['✓ Beezi billing captured: source=subscription plan=unknown via=auth-json.\n', 'tier'],
-    [PLUS, 'default'],
-    ['✓ Beezi billing captured: source=openai_api_key plan=n/a.\n', 'default'],
-  ];
-  for (const [captured, step] of cases) {
-    const r = await flow(['--account', KEY, '--from', 'plan'], { captured });
-    assert.equal(r.next, `next=${step} account=${KEY}`, captured);
-  }
+test('no past sessions in one workspace: a failed setup everything shows its line and no tracking line', async () => {
+  const write = { code: 1, stdout: '', stderr: '\n✗ Accounts are being updated by another Beezi process. Try again.\n' };
+  const r = await flow([], replies(EMPTY_SOLO, { 'workspace.mjs': (args) => (args[1] === 'everything' ? write : ok(`${EMPTY_SOLO}\n`)) }));
+  assert.ok(r.out.includes('<finish>\n✗ Accounts are being updated by another Beezi process. Try again.\n\nOne step left. In Codex, run /hooks and trust Beezi.\n'));
+  assert.ok(!r.out.includes('✓ Tracking every repo and folder you work in'));
 });
 
-test('--from joined runs the listings in-process, then the history offer', async (t) => {
-  link(t, { tenants: SOLO });
-  const seen = [];
-  const workspace = async (argv, options) => { seen.push([argv, options]); return listed([`${argv[0]}=0`]); };
-  const r = await flow(['--account', KEY, '--from', 'joined'], { workspace });
-  assert.deepEqual(r.calls, [OFFER]);
-  assert.deepEqual(seen, [[['joined', '--account', KEY, '--defer-upload'], { cwd: CWD }], [['routes', '--account', KEY, '--defer-upload'], { cwd: CWD }]]);
-  assert.deepEqual(r.tags, [`<joined account="${KEY}">`, `<routes account="${KEY}">`, '<history>']);
-  assert.equal(r.next, `next=default account=${KEY}`);
+test('no past sessions in several workspaces stops for the question', async () => {
+  const r = await flow([], replies(EMPTY_TWO));
+  assert.deepEqual(r.calls, ['login.mjs', CAPTURE, LIST]);
+  assert.ok(r.out.endsWith(`<track account="${KEY}">\n${EMPTY_TWO}\n</track>\nnext=track account=${KEY}`));
 });
 
-test('a listing with something to ask stops there', async (t) => {
-  link(t, { tenants: SOLO });
-  const joined = await flow(['--account', KEY, '--from', 'joined'], { workspace: async () => listed(['J1. api (github.com/o/api), 2 sessions', 'joined=1']) });
-  assert.ok(!joined.out.includes('<routes'));
-  assert.equal(joined.next, `next=joined account=${KEY}`);
-  const routes = await flow(['--account', KEY, '--from', 'routes'], { workspace: async () => listed(['routes=2']) });
-  assert.equal(routes.next, `next=routes account=${KEY}`);
+test('--account alone, after the beezi_login tool signed in, starts at the plan', async (t) => {
+  link(t);
+  const r = await flow(['--account', KEY], replies(LISTING));
+  assert.deepEqual(r.calls, [CAPTURE, LIST]);
+  assert.deepEqual(r.tags, ['<plan>', `<track account="${KEY}">`, '<checklist>']);
+  assert.equal(r.next, `next=track account=${KEY}`);
 });
 
-test('a listing that fails shows its ✗ line in its block and the later steps still run', async (t) => {
-  link(t, { tenants: SOLO });
-  const workspace = async (argv) => (argv[0] === 'joined' ? listed([], { ok: false, stderr: ['\n✗ rollouts unreadable'] }) : listed(['routes=0']));
-  const r = await flow(['--account', KEY, '--from', 'joined'], { workspace });
-  assert.ok(r.out.includes(`<joined account="${KEY}">\n✗ rollouts unreadable\n</joined>\n<routes account="${KEY}">\nroutes=0\n</routes>`));
-  assert.equal(r.next, `next=default account=${KEY}`);
+const uploads = [
+  ['uploading=212 workspaces=1\n', ['✓ 212 past sessions are uploading in the background', '']],
+  ['uploading=1 workspaces=1\n', ['✓ 1 past session is uploading in the background', '']],
+  ['uploading=0 workspaces=0\n', []],
+];
+for (const [stdout, lines] of uploads) {
+  test(`--from finish after ${stdout.trim()} runs the consented upload and the defaults, then the closing lines`, async (t) => {
+    link(t);
+    const r = await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'sync.mjs': ok(stdout) }));
+    assert.deepEqual(r.calls, FINISH_CALLS);
+    assert.equal(r.out, ['<finish>'].concat(lines, [
+      'One step left. In Codex, run /hooks and trust Beezi.',
+      'Crash reports are on ($beezi:settings)',
+      '</finish>',
+      `next=done account=${KEY}`,
+    ]).join('\n'));
+  });
+}
+
+test('--from finish after a failed upload shows its line and still closes', async (t) => {
+  link(t);
+  const busy = { code: 1, stdout: 'uploading=0 workspaces=0\n', stderr: 'Beezi: another sync is running. Try again in a minute.\n' };
+  const r = await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'sync.mjs': busy }));
+  assert.equal(r.out, [
+    '<finish>',
+    'Beezi: another sync is running. Try again in a minute.',
+    '',
+    'One step left. In Codex, run /hooks and trust Beezi.',
+    'Crash reports are on ($beezi:settings)',
+    '</finish>',
+    `next=done account=${KEY}`,
+  ].join('\n'));
 });
 
-test('a past-sessions offer to ask stops at history, with the offer\'s block', async (t) => {
-  link(t, { tenants: SOLO });
-  const history = 'Beezi found 2 past Codex sessions (12 Aug, 1 folder)\n  in api\n  Sent\n    ✓ dates, duration, models, tokens, cost\nQ Upload 2 sessions to Solo?\n'
-    + `offer account=${KEY} tenant=S sessions=2 audit=no token=2a7d000b5e34\noffers=1\n`;
-  const r = await flow(['--account', KEY, '--from', 'routes'], { workspace: async () => listed(['routes=0']), history });
-  assert.deepEqual(r.calls, [OFFER]);
-  assert.ok(r.out.includes(`<history>\n${history.trim()}\n</history>`));
-  assert.equal(r.next, `next=history account=${KEY}`);
+const closings = [
+  ['crash=correlate', TRUST, ['One step left. In Codex, run /hooks and trust Beezi.', 'Crash reports are on ($beezi:settings)']],
+  ['crash=off', TRUST, ['One step left. In Codex, run /hooks and trust Beezi.']],
+  ['crash=anonymous', NO_TRUST_STEP, ['Ready. Restart Codex and keep working.', 'Crash reports are on ($beezi:settings)']],
+  ['crash=off', NO_TRUST_STEP, ['Ready. Restart Codex and keep working.']],
+];
+for (const [crash, hooks, closing] of closings) {
+  test(`--from finish with ${crash} and hooks ${hooks === TRUST ? 'to trust' : 'trusted'} closes with the matching lines`, async (t) => {
+    link(t);
+    const verdict = hooks === TRUST ? 'untrusted' : 'trusted';
+    const r = await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'hooks.mjs': ok(hooks), 'settings.mjs': ok(`${crash}\n`) }), ok(SIGNED_IN), verdict);
+    assert.deepEqual(r.calls, FINISH_CALLS);
+    assert.equal(r.out, ['<finish>'].concat(closing, ['</finish>', `next=done account=${KEY}`]).join('\n'));
+  });
+}
+
+test('a sign-in without the trust step closes with Ready', async () => {
+  const signIn = ok(`\n✓ Beezi analytics linked as u@x.io.\n  Another Beezi process is updating the hook registry; it will be current in a moment.\naccount=${KEY}\n`);
+  const r = await flow([], replies(CHOSEN_LISTING), signIn, 'trusted');
+  assert.ok(r.out.includes('\n\nReady. Restart Codex and keep working.\n'));
 });
 
-test('no offer to ask ends at default', async (t) => {
-  link(t, { tenants: SOLO });
-  const r = await flow(['--account', KEY, '--from', 'routes'], { workspace: async () => listed(['routes=0']) });
-  assert.ok(r.out.includes('<history>\noffers=0\n</history>'));
-  assert.equal(r.next, `next=default account=${KEY}`);
+test('a trusted machine that signs in again closes with Ready, though the sign-in printed the /hooks step', async () => {
+  const r = await flow([], replies(CHOSEN_LISTING), ok(SIGNED_IN), 'trusted');
+  assert.ok(r.out.endsWith([
+    '<finish>',
+    '✓ Tracking is already set up ($beezi:settings)',
+    '',
+    'Ready. Restart Codex and keep working.',
+    'Crash reports are on ($beezi:settings)',
+    '</finish>',
+    `next=done account=${KEY}`,
+  ].join('\n')));
 });
 
-test('an all-no-ask account ends at next=default with the notice in the <history> block', async (t) => {
-  link(t, { tenants: SOLO });
-  const history = 'Beezi found 2 past Codex sessions (12 Aug, 1 folder)\n  in api\n'
-    + 'Solo uploads past sessions without asking, so there\'s no question.\nUploading 2 sessions to Solo…\n✓ Uploaded 2 sessions to Solo.\nnotices=1\noffers=0\n';
-  const r = await flow(['--account', KEY, '--from', 'routes'], { workspace: async () => listed(['routes=0']), history });
-  assert.ok(r.out.includes(`<history>\n${history.trim()}\n</history>`));
-  assert.equal(r.next, `next=default account=${KEY}`);
+const failedHooks = [
+  ['trusted', []],
+  ['untrusted', ['One step left. In Codex, run /hooks and trust Beezi.']],
+];
+for (const [verdict, closing] of failedHooks) {
+  test(`--from finish after a failed hooks check, verdict ${verdict}: its ✗ line and never Ready`, async (t) => {
+    link(t);
+    const hooks = { code: 1, stdout: '', stderr: '\n✗ Something went wrong. Re-run with BEEZI_DEBUG=1 to see details.\n' };
+    const r = await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'hooks.mjs': hooks }), ok(SIGNED_IN), verdict);
+    assert.equal(r.out, ['<finish>', '✗ Something went wrong. Re-run with BEEZI_DEBUG=1 to see details.', ''].concat(closing, [
+      'Crash reports are on ($beezi:settings)',
+      '</finish>',
+      `next=done account=${KEY}`,
+    ]).join('\n'));
+  });
+}
+
+test('--from finish shows a ⚠ line from the hooks check and none of its ✓ lines', async (t) => {
+  link(t);
+  const hooks = ok('✓ Beezi: analytics hooks repaired in /home/dev/.codex/hooks.json (was stale).\n\n⚠ Beezi: 1 registered hook entry points at a file that no longer exists.\n');
+  const r = await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'hooks.mjs': hooks }), ok(SIGNED_IN), 'untrusted');
+  assert.equal(r.out, [
+    '<finish>',
+    '⚠ Beezi: 1 registered hook entry points at a file that no longer exists.',
+    '',
+    'One step left. In Codex, run /hooks and trust Beezi.',
+    'Crash reports are on ($beezi:settings)',
+    '</finish>',
+    `next=done account=${KEY}`,
+  ].join('\n'));
 });
 
-test('--from needs a known step and an account', async (t) => {
-  link(t, { tenants: SOLO });
-  for (const argv of [['--from', 'plan'], ['--account', KEY, '--from', 'backfill'], ['--account', KEY], ['--account', KEY, '--from']]) {
-    await assert.rejects(flow(argv), { message: /^Usage: login-flow\.mjs/ }, argv.join(' '));
+test('only --from finish resumes, and it needs an account', async (t) => {
+  link(t);
+  for (const argv of [['--from', 'finish'], ['--account', KEY, '--from', 'setup'], ['--account', KEY, '--from', 'plan'], ['--account', KEY, '--from', 'history'], ['--account', KEY, '--from'], ['--account', KEY, 'finish']]) {
+    await assert.rejects(flow(argv, replies(LISTING)), { message: /^Usage: login-flow\.mjs \[--account <ref> \[--from finish\]\]$/ }, argv.join(' '));
   }
 });

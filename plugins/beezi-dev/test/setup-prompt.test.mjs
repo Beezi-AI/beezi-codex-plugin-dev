@@ -1,8 +1,8 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { PassThrough } from 'node:stream';
-import { createPrompt, mixedExclusive, openTerminal, parseNumbers, renderOptions, togglePick } from '../lib/setup-prompt.mjs';
-import { uploadChoices } from '../lib/setup-wizard.mjs';
+import { createPrompt, openTerminal, parseNumbers, togglePick } from '../lib/setup-prompt.mjs';
+import { createStyle } from '../lib/setup-style.mjs';
 
 const OPTIONS = [
   { label: 'Ask me (recommended)', description: 'Beezi asks once' },
@@ -10,10 +10,10 @@ const OPTIONS = [
   { label: "Don't send", description: 'Nothing is uploaded' },
 ];
 
-function harness() {
+function harness(style) {
   const input = new PassThrough();
   const written = [];
-  const prompt = createPrompt({ input, output: { write: (s) => { written.push(s); } } });
+  const prompt = createPrompt({ input, output: { write: (s) => { written.push(s); } }, style, format: (line) => `> ${line}` });
   const type = (line) => new Promise((resolve) => {
     setImmediate(() => {
       input.write(`${line}\n`);
@@ -33,182 +33,85 @@ test('parseNumbers reads comma lists, drops duplicates and rejects out-of-range 
   assert.equal(parseNumbers('1.5', 3), null);
 });
 
-test('renderOptions numbers options, marks the default and appends descriptions', () => {
-  assert.deepEqual(renderOptions(OPTIONS, 0), [
-    '  1) Ask me (recommended) (default) — Beezi asks once',
-    '  2) Send to…',
-    "  3) Don't send — Nothing is uploaded",
-  ]);
-  assert.equal(renderOptions(OPTIONS, -1)[0], '  1) Ask me (recommended) — Beezi asks once');
+test('togglePick unticks a picked row, ticks any other, and leaves its input alone', () => {
+  assert.deepEqual(togglePick([0], 0), []);
+  assert.deepEqual(togglePick([0], 2), [0, 2]);
+  const before = [0];
+  togglePick(before, 1);
+  assert.deepEqual(before, [0]);
 });
 
-test('choose returns the picked index and shows the question with numbered options', async () => {
+test('typed choose prints the lead, ◆ question and numbered options, takes option 1 on Enter, and re-asks a bad answer', async () => {
   const h = harness();
-  const answer = h.prompt.choose('Where should analytics go?', OPTIONS);
-  await h.type('2');
-  assert.equal(await answer, 1);
-  assert.match(h.text(), /Where should analytics go\?\n {2}1\) Ask me/);
-  assert.match(h.text(), /Choose 1-3, or press Enter to skip: $/);
-  h.prompt.close();
-});
-
-test('choose takes the default on Enter and re-asks after an invalid answer', async () => {
-  const h = harness();
-  const first = h.prompt.choose('Q?', OPTIONS, { defaultIndex: 0 });
+  const first = h.prompt.choose('Where?', OPTIONS, { lead: ['Beezi found 2 sessions'] });
   await h.type('');
   assert.equal(await first, 0);
-  const second = h.prompt.choose('Q?', OPTIONS, { defaultIndex: 0 });
+  assert.equal(h.text(), [
+    '',
+    '> Beezi found 2 sessions',
+    '',
+    '  ◆ Where?',
+    '    1) Ask me (recommended)  Beezi asks once',
+    '    2) Send to…',
+    "    3) Don't send  Nothing is uploaded",
+    '  Choose 1-3 [1]: ',
+  ].join('\n'));
+  const second = h.prompt.choose('Q?', OPTIONS);
   await h.type('9');
   await h.type('1,2');
   await h.type('3');
   assert.equal(await second, 2);
-  assert.equal(h.text().split('Enter one number from 1 to 3.').length - 1, 2);
-  assert.match(h.text(), /Choose 1-3 \[1\]: /);
+  assert.equal(h.text().split('  Enter one number from 1 to 3.\n').length - 1, 2);
   h.prompt.close();
 });
 
-test('choose without a default skips on Enter and re-asks after an invalid answer', async () => {
+test('typed chooseMany keeps the preselected ticks on Enter, takes typed numbers, and re-asks bad input', async () => {
   const h = harness();
-  const skipped = h.prompt.choose('Q?', OPTIONS);
+  const kept = h.prompt.chooseMany('Which?', OPTIONS, { preselected: [0, 2] });
   await h.type('');
-  assert.equal(await skipped, null);
-  assert.match(h.text(), /Choose 1-3, or press Enter to skip: $/);
-  const retry = h.prompt.choose('Q?', OPTIONS);
-  await h.type('9');
-  await h.type('1');
-  assert.equal(await retry, 0);
-  assert.match(h.text(), /Enter one number from 1 to 3\./);
-  h.prompt.close();
-});
-
-test('chooseMany returns every picked index, [] on Enter, and re-asks on bad input', async () => {
-  const h = harness();
-  const many = h.prompt.chooseMany('Which workspaces?', OPTIONS);
-  await h.type('3, 1');
-  assert.deepEqual(await many, [2, 0]);
-  const none = h.prompt.chooseMany('Which workspaces?', OPTIONS);
+  assert.deepEqual(await kept, [0, 2]);
+  assert.match(h.text(), / {2}Choose one or more \(for example 1,2\), or none \[1,3\]: $/);
+  const none = h.prompt.chooseMany('Which?', OPTIONS);
   await h.type('');
   assert.deepEqual(await none, []);
-  const retry = h.prompt.chooseMany('Which workspaces?', OPTIONS);
+  assert.match(h.text(), / {2}Choose one or more \(for example 1,2\), or press Enter for none: $/);
+  const retry = h.prompt.chooseMany('Which?', OPTIONS);
   await h.type('7');
+  await h.type('3, 1');
+  assert.deepEqual(await retry, [2, 0]);
+  assert.match(h.text(), / {2}Enter numbers from 1 to 3, separated by commas\.\n/);
+  h.prompt.close();
+});
+
+test('typed chooseMany takes none for nothing ticked, even with preselected rows', async () => {
+  const h = harness();
+  const nothing = h.prompt.chooseMany('Which?', OPTIONS, { preselected: [0, 1, 2] });
+  await h.type(' None ');
+  assert.deepEqual(await nothing, []);
+  h.prompt.close();
+});
+
+test('typed prompts use the accent ◆ and bold queries, and no cyan or yellow', async () => {
+  const h = harness(createStyle({ enabled: true }));
+  const answer = h.prompt.choose('Where?', OPTIONS);
+  await h.type('9');
   await h.type('2');
-  assert.deepEqual(await retry, [1]);
-  assert.match(h.text(), /Enter numbers from 1 to 3, separated by commas\./);
+  assert.equal(await answer, 1);
+  assert.ok(h.text().includes('\n  \x1b[38;5;99m◆\x1b[0m \x1b[1mWhere?\x1b[0m\n'));
+  assert.ok(h.text().includes('    1) Ask me (recommended)\x1b[2m  Beezi asks once\x1b[0m\n'));
+  assert.ok(h.text().includes('  \x1b[1mChoose 1-3 [1]:\x1b[0m '));
+  assert.doesNotMatch(h.text(), /\x1b\[(?:1;)?3[2356]m/);
   h.prompt.close();
 });
 
-test('preselected starts ticked; Enter keeps them', async () => {
+test('EOF dismisses the pending question and every later one, writing nothing more', async () => {
   const h = harness();
-  const typed = h.prompt.chooseMany('Which workspaces?', OPTIONS, { preselected: [0, 2] });
-  await h.type('');
-  assert.deepEqual(await typed, [0, 2]);
-  assert.match(h.text(), /\(for example 1,2\) \[1,3\]: $/);
-  const replaced = h.prompt.chooseMany('Which workspaces?', OPTIONS, { preselected: [0, 2] });
-  await h.type('2');
-  assert.deepEqual(await replaced, [1]);
-  h.prompt.close();
-
-  const input = new PassThrough();
-  input.isTTY = true;
-  input.setRawMode = () => input;
-  const written = [];
-  const keys = createPrompt({ input, output: { columns: 80, write: (s) => { written.push(s); } }, interactive: true });
-  const ticked = keys.chooseMany('Which workspaces?', OPTIONS, { preselected: [0, 1] });
-  await new Promise((resolve) => setImmediate(resolve));
-  assert.equal((written.join('').match(/◉/g) || []).length, 2);
-  input.write(' ');
-  await new Promise((resolve) => setImmediate(resolve));
-  input.write('\r');
-  assert.deepEqual(await ticked, [1]);
-  keys.close();
-});
-
-test('togglePick unticks a picked row, ticks an exclusive row alone, and clears exclusive rows for any other', () => {
-  assert.deepEqual(togglePick([0], 0, [2]), []);
-  assert.deepEqual(togglePick([0, 1], 2, [2]), [2]);
-  assert.deepEqual(togglePick([2], 0, [2]), [0]);
-  assert.deepEqual(togglePick([0], 1, [2]), [0, 1]);
-  assert.deepEqual(togglePick([], 1, []), [1]);
-  const before = [0];
-  togglePick(before, 1, [2]);
-  assert.deepEqual(before, [0]);
-});
-
-test('mixedExclusive finds an exclusive row picked with others, else -1', () => {
-  assert.equal(mixedExclusive([0, 2], [2]), 2);
-  assert.equal(mixedExclusive([2, 0], [2]), 2);
-  assert.equal(mixedExclusive([2], [2]), -1);
-  assert.equal(mixedExclusive([0, 1], [2]), -1);
-  assert.equal(mixedExclusive([0, 1], []), -1);
-});
-
-test('typed chooseMany refuses an exclusive option mixed with others and asks again; a repeated number is not a mix', async () => {
-  const h = harness();
-  const mixed = h.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
-  await h.type('1,3');
-  await h.type('3');
-  assert.deepEqual(await mixed, [2]);
-  assert.match(h.text(), /"Don't send" can't be combined with other choices\.\n/);
-  const repeated = h.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
-  await h.type('3, 3');
-  assert.deepEqual(await repeated, [2]);
-  const plain = h.prompt.chooseMany('Which?', OPTIONS, { exclusive: [2] });
-  await h.type('2,1');
-  assert.deepEqual(await plain, [1, 0]);
-  assert.equal(h.text().split("can't be combined").length - 1, 1);
-  h.prompt.close();
-});
-
-test('confirm honours the default and accepts y/yes/n/no in any case', async () => {
-  const h = harness();
-  const enterYes = h.prompt.confirm('Upload?', true);
-  await h.type('');
-  assert.equal(await enterYes, true);
-  const enterNo = h.prompt.confirm('Switch?', false);
-  await h.type('');
-  assert.equal(await enterNo, false);
-  const typed = h.prompt.confirm('Switch?', false);
-  await h.type('maybe');
-  await h.type('YES');
-  assert.equal(await typed, true);
-  assert.match(h.text(), /Upload\? \[Y\/n\] /);
-  assert.match(h.text(), /Switch\? \[y\/N\] /);
-  assert.match(h.text(), /Answer y or n\./);
-  h.prompt.close();
-});
-
-test('text returns the trimmed answer and null for an empty one', async () => {
-  const h = harness();
-  const typed = h.prompt.text('Email or account id:');
-  await h.type('  dev@example.com ');
-  assert.equal(await typed, 'dev@example.com');
-  const empty = h.prompt.text('Email or account id:');
-  await h.type('');
-  assert.equal(await empty, null);
-  h.prompt.close();
-});
-
-test('EOF dismisses the pending question and every later one', async () => {
-  const h = harness();
-  const pending = h.prompt.choose('Q?', OPTIONS, { defaultIndex: 0 });
-  setImmediate(() => h.input.end());
-  assert.equal(await pending, null);
-  assert.equal(await h.prompt.chooseMany('Q?', OPTIONS), null);
-  assert.equal(await h.prompt.confirm('Q?', true), null);
-  assert.equal(await h.prompt.text('Q?'), null);
-});
-
-test('after EOF no later question writes its menu or query', async () => {
-  const h = harness();
-  const pending = h.prompt.confirm('Q?', true);
+  const pending = h.prompt.choose('Q?', OPTIONS);
   setImmediate(() => h.input.end());
   assert.equal(await pending, null);
   const before = h.text();
-  assert.equal(await h.prompt.choose('Later?', OPTIONS, { defaultIndex: 0 }), null);
-  assert.equal(await h.prompt.choose('Later?', OPTIONS), null);
-  assert.equal(await h.prompt.chooseMany('Later?', OPTIONS), null);
-  assert.equal(await h.prompt.confirm('Later?', false), null);
-  assert.equal(await h.prompt.text('Later?'), null);
+  assert.equal(await h.prompt.chooseMany('Q?', OPTIONS), null);
+  assert.equal(await h.prompt.choose('Q?', OPTIONS), null);
   assert.equal(h.text(), before);
 });
 
@@ -230,17 +133,4 @@ test('openTerminal prefers a TTY stdin, falls back to /dev/tty off Windows, else
   assert.equal(openTerminal({ stdin: piped, platform: 'linux', openTty: () => devTty }), devTty);
   assert.equal(openTerminal({ stdin: piped, platform: 'win32', openTty: () => devTty }), null);
   assert.equal(openTerminal({ stdin: piped, platform: 'linux', openTty: () => { throw new Error('ENXIO'); } }), null);
-});
-
-test('without keys the upload menu falls back to the numbered chooser, Upload now first and the default', async () => {
-  const h = harness();
-  assert.deepEqual(renderOptions(uploadChoices(), 0), ['  1) Upload now (default)', '  2) Not now — run $beezi:sync any time']);
-  const enter = h.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
-  await h.type('');
-  assert.equal(await enter, 0);
-  const notNow = h.prompt.choose('Upload 3 sessions to Acme?', uploadChoices(), { defaultIndex: 0, escape: true });
-  await h.type('2');
-  assert.equal(await notNow, 1);
-  assert.match(h.text(), /Choose 1-2 \[1\]: /);
-  h.prompt.close();
 });

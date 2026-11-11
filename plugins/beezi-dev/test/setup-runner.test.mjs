@@ -128,7 +128,6 @@ function manualTimers() {
 const HIDE = '\x1b[?25l';
 const SHOW = '\x1b[?25h';
 const CLEAR = '\r\x1b[2K';
-const LIVE = /^Beezi: (\d+)\/(\d+) sessions read…$/;
 
 test('with activity and a label, the line appears after the 150 ms delay, redraws every 80 ms, and is cleared before the run resolves', async () => {
   const timers = manualTimers();
@@ -174,35 +173,6 @@ test('streamed lines print above the activity line, which is redrawn after each'
   ].join(''));
 });
 
-test('live lines update the activity text instead of printing, and are still captured', async () => {
-  const timers = manualTimers();
-  const out = sink();
-  const h = setup((child) => {
-    timers.fireDelay();
-    child.stdout.write('Beezi: 1/4 sessions read…\nBeezi: 4/4 sessions read…\n✓ Beezi: uploaded 4 sessions.\n');
-    child.code = 0; child.stdout.end(); child.stderr.end();
-  }, { stdout: out, output: out, activity: true, timers, platform: 'darwin' });
-  const result = await h.run('backfill.mjs', [], { stream: true, label: 'Uploading past sessions…', live: LIVE });
-  assert.equal(out.text(), [
-    `${HIDE}${CLEAR}⠋ Uploading past sessions…`,
-    `${CLEAR}⠙ Uploading past sessions… 1/4`,
-    `${CLEAR}⠹ Uploading past sessions… 4/4`,
-    CLEAR, '✓ Beezi: uploaded 4 sessions.\n', `${CLEAR}⠸ Uploading past sessions… 4/4`,
-    `${CLEAR}${SHOW}`,
-  ].join(''));
-  assert.equal(result.stdout, 'Beezi: 1/4 sessions read…\nBeezi: 4/4 sessions read…\n✓ Beezi: uploaded 4 sessions.\n');
-});
-
-test('without activity, live lines print as before and nothing is drawn', async () => {
-  const out = sink();
-  const h = setup((child) => {
-    child.stdout.write('Beezi: 1/1 sessions read…\n');
-    child.code = 0; child.stdout.end(); child.stderr.end();
-  }, { stdout: out, output: out, activity: false });
-  await h.run('backfill.mjs', [], { stream: true, label: 'Uploading past sessions…', live: LIVE });
-  assert.equal(out.text(), 'Beezi: 1/1 sessions read…\n');
-});
-
 test('with activity but no label, nothing is drawn', async () => {
   const timers = manualTimers();
   const out = sink();
@@ -244,6 +214,18 @@ test('on Windows the frames are ASCII, and a long label is cut to the output wid
   h.run.setLabel('Looking at your past sessions…');
   await h.run('workspace.mjs', ['routes']);
   assert.equal(out.text(), `${HIDE}${CLEAR}| Looking at your …${CLEAR}${SHOW}`);
+});
+
+test('the activity line starts at the margin with the frame painted by accent, and a long label is cut to what is left', async () => {
+  const timers = manualTimers();
+  const out = sink();
+  out.columns = 24;
+  const h = setup((child) => { timers.fireDelay(); child.code = 0; child.stdout.end(); child.stderr.end(); }, {
+    output: out, activity: true, timers, platform: 'darwin', margin: '  ', accent: (frame) => `<${frame}>`,
+  });
+  h.run.setLabel('Checking past sessions');
+  await h.run('workspace.mjs', ['setup']);
+  assert.equal(out.text(), `${HIDE}${CLEAR}  <⠋> Checking past sess…${CLEAR}${SHOW}`);
 });
 
 test('a spawn error stops the activity line before resolving 127', async () => {

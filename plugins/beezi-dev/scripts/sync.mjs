@@ -5,7 +5,7 @@ import { fail } from '../lib/cli.mjs';
 import { AccountStatus, getAccount, listAccounts, parseAccountFlag } from '../lib/accounts.mjs';
 import { parseTenantFlags, resolveTenantRef } from '../lib/workspace.mjs';
 import { workspaceIdOf } from '../lib/pending-history.mjs';
-import { offerCommand, acceptCommand, declineCommand } from '../lib/history-cli.mjs';
+import { offerCommand, acceptCommand, declineCommand, consentedCommand } from '../lib/history-cli.mjs';
 import { CHANGED_LINE } from '../lib/history-offer.mjs';
 import { syncReview } from '../lib/workspace-cli.mjs';
 
@@ -23,6 +23,7 @@ import { syncReview } from '../lib/workspace-cli.mjs';
 // uploads its shown sessions (`--offer --background` hands that to the worker too); `--tenant` always asks.
 // `--past` is the session-start offer: past sessions only, skipping workspaces that chose skip, declined or settled.
 // `--dry-run` prints the summary without its question or upload and records nothing.
+// `--consented` (the setup's tracking answer, with --past and --account) owes the answered setup listing's sessions and starts the worker.
 //
 // The two refusals below are the mechanical enforcement of the flags it still does not take:
 //
@@ -51,7 +52,7 @@ const DECLINE = '--decline';
 const TOKEN = '--token';
 const MODES = [OFFER, ACCEPT, DECLINE];
 const REVIEW_FLAGS = ['--review', '--review-routes'];
-const FLAGS = MODES.concat(REVIEW_FLAGS, ['--past', '--background', '--dry-run']);
+const FLAGS = MODES.concat(REVIEW_FLAGS, ['--past', '--background', '--dry-run', '--consented']);
 
 function parseSyncArgs(argv) {
   for (const flag of argv) {
@@ -75,9 +76,13 @@ function parseSyncArgs(argv) {
   if (has('--dry-run') && mode !== OFFER) fail(`Beezi: --dry-run previews the offer only; it does not go with ${mode}.`);
   if (has('--background') && mode === DECLINE) fail(`Beezi: --background goes only with --offer or --accept, not with ${mode}.`);
   if (has(TOKEN) && mode !== ACCEPT) fail(`Beezi: --token goes only with --accept, not with ${mode}.`);
+  if (has('--consented') && mode !== OFFER) fail(`Beezi: --consented goes only with --offer, not with ${mode}.`);
+  for (const flag of ['--dry-run', '--tenant', '--background']) {
+    if (has('--consented') && has(flag)) fail(`Beezi: --consented uploads what the setup listed; it does not go with ${flag}.`);
+  }
   const at = argv.indexOf(TOKEN);
   const token = at === -1 || argv[at + 1] == null ? null : argv[at + 1];
-  return { mode, past: has('--past'), background: has('--background'), dryRun: has('--dry-run'), token };
+  return { mode, past: has('--past'), background: has('--background'), dryRun: has('--dry-run'), consented: has('--consented'), token };
 }
 
 // argv without the --token pair.
@@ -133,6 +138,11 @@ async function main() {
   const { account, rest } = await parseAccountFlag(withoutToken(argv).filter((arg) => FLAGS.indexOf(arg) === -1));
   if (flags.mode !== OFFER) {
     process.exitCode = await answer(flags, account, rest);
+    return;
+  }
+  if (flags.consented) {
+    if (account === null) fail('Beezi: --consented needs --account <account>.');
+    process.exitCode = await consentedCommand({ key: account });
     return;
   }
   if (reviewFlag !== null) {

@@ -387,6 +387,42 @@ export async function markTenantsReviewed(key, ids, deps = {}) {
   return addTenantIds(key, 'reviewedTenantIds', ids, deps);
 }
 
+// The setup's tracking question was answered for this account on this machine (workspace.mjs setup everything / chosen), and so was its listing record.
+export async function markTrackingChosen(key, nowIso, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) throw new UserError('No such linked account.');
+    found.trackingChosenAt = nowIso;
+    if (found.setupListing != null && typeof found.setupListing === 'object') found.setupListing = { ...found.setupListing, answeredAt: nowIso };
+    writeIndex(index);
+  });
+}
+
+// The setup listing's consent record, replacing any earlier one: { listedAt, sessionIds, kinds: { <tenantId>: [kind…] } }.
+export async function saveSetupListing(key, record, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    if (!found) throw new UserError('No such linked account.');
+    found.setupListing = record;
+    writeIndex(index);
+  });
+}
+
+// Removes and returns the account's answered setup listing record; null, removing nothing, when there is none or it is unanswered.
+export async function takeAnsweredListing(key, deps = {}) {
+  return mutate(deps, () => {
+    const index = readIndexForMutation();
+    const found = index.accounts.find((a) => a.key === key);
+    const record = found ? found.setupListing : null;
+    if (record == null || typeof record !== 'object' || typeof record.answeredAt !== 'string') return null;
+    delete found.setupListing;
+    writeIndex(index);
+    return record;
+  });
+}
+
 // The history worker stamps the start of its pass on the entries it is about to run.
 export async function notePendingAttempt(key, tenantIds, nowIso, deps = {}) {
   return mutate(deps, () => {
