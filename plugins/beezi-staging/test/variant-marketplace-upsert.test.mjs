@@ -249,7 +249,7 @@ test('the shell passes the upsert exactly the arguments it reads', () => {
   // The two halves of this module live in different languages in one file; nothing else checks
   // that the shell's call site and the script's destructuring still line up.
   const text = fs.readFileSync(SYNC_SCRIPT, 'utf-8');
-  assert.match(text, /"\$existing_marketplace" "\$source_marketplace" \\\n\s+"\$staging\/plugins\/\$variant_name\/\.codex-plugin\/plugin\.json" \\\n\s+"\$INTERNAL_MARKETPLACE_NAME" "\$INTERNAL_MARKETPLACE_DISPLAY_NAME" "\$SOURCE_PLUGIN_NAME"/);
+  assert.match(text, /"\$existing_marketplace" "\$source_marketplace" \\\n\s+"\$staging\/plugins\/\$variant_name\/\$variant_manifest" \\\n\s+"\$INTERNAL_MARKETPLACE_NAME" "\$INTERNAL_MARKETPLACE_DISPLAY_NAME" "\$variant_source_plugin"/);
   assert.match(upsertScript(), /existingFile, sourceFile, variantPluginJson, marketplaceName, marketplaceDisplayName, sourcePluginName,/);
   // Codex marketplaces live under .agents/plugins/; Claude's under .claude-plugin/. Getting this
   // wrong publishes a manifest no Codex install would ever find.

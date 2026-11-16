@@ -133,6 +133,13 @@ test('analytics skill is named analytics and has no argument-hint', () => {
   assert.equal(text.includes('argument-hint'), false);
 });
 
+test('analytics skill description is scoped to Beezi', () => {
+  assert.match(
+    read('skills/analytics/SKILL.md'),
+    /\ndescription: Show a short personal Beezi analytics summary \(spend, sessions, status, recommendations\) for the last 7 or 30 days\. Use when the user asks for their Beezi analytics, or for a usage or spend summary from Beezi\.\n/,
+  );
+});
+
 test('analytics skill does not call get_analytics_instructions', () => {
   assert.equal(read('skills/analytics/SKILL.md').includes('get_analytics_instructions'), false);
 });
@@ -252,4 +259,16 @@ test('about skill tells the user how to sign in', () => {
 
 test('README names the MCP URL', () => {
   assert.ok(read('README.md').includes('https://api.beezi.ai/api/mcp'));
+});
+
+test('package README does not tell the reviewer the plugin fails to connect', () => {
+  const readme = read('README.md');
+  assert.equal(readme.includes('0.167'), false);
+  assert.equal(readme.includes('does not connect'), false);
+});
+
+test('repo README carries the Codex 0.167 marketplace-install note', () => {
+  assert.ok(readFileSync(join(ROOT, 'README.md'), 'utf-8').includes(
+    'On Codex 0.167 a marketplace install of it does not connect yet',
+  ));
 });
