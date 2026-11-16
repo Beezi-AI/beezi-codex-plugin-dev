@@ -1,0 +1,44 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
+  "name": "beezi-analytics-staging",
+  "version": "0.1.0-staging.6356",
+  "description": "See your Beezi usage analytics: spend, sessions, status and recommendations for the last 7 or 30 days. Read-only; sign in with your Beezi account. — staging environment build.",
+  "author": {
+    "name": "Beezi",
+    "url": "https://beezi.ai"
+  },
+  "homepage": "https://beezi.ai",
+  "license": "Apache-2.0",
+  "keywords": [
+    "analytics",
+    "token-usage",
+    "beezi"
+  ],
+  "extensions": {
+    "com.openai": {
+      "interface": {
+        "displayName": "Beezi (staging)",
+        "shortDescription": "Your AI coding usage and cost",
+        "longDescription": "Shows your own Beezi usage summary from inside Codex: spend, sessions, status and recommendations for the last 7 or 30 days. It is for people who have a Beezi account; sign in with that account when Codex asks. The plugin is read-only. It records nothing, runs no local code and reads nothing from your conversations. The figures come from sessions that Beezi already tracks, so the summary has data only for an account whose sessions are recorded by the full Beezi plugin. The summary covers every coding agent linked to your Beezi account, not Codex alone. Ask for your Beezi analytics for the last 7 or 30 days, or ask what the plugin does.",
+        "developerName": "Beezi",
+        "category": "Productivity",
+        "capabilities": [
+          "Read"
+        ],
+        "websiteURL": "https://beezi.ai",
+        "supportURL": "https://beezi.ai/contact-us",
+        "privacyPolicyURL": "https://beezi.ai/privacy-policy",
+        "termsOfServiceURL": "https://beezi.ai/terms-and-conditions",
+        "defaultPrompt": [
+          "Show my Beezi analytics for the last 7 days",
+          "Show my Beezi analytics for the last 30 days",
+          "What does the Beezi analytics plugin do?"
+        ],
+        "brandColor": "#B8860B",
+        "brandColorDark": "#F5C518",
+        "composerIcon": "./assets/beezi_logo.svg",
+        "logo": "./assets/beezi_logo.svg"
+      }
+    }
+  }
+}

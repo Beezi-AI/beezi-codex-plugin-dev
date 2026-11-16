@@ -1,0 +1,9 @@
+{
+  "$schema": "https://agent-plugins.org/schemas/1.0.0/mcp.schema.json",
+  "mcpServers": {
+    "beezi_analytics_staging": {
+      "type": "streamable-http",
+      "url": "https://beezi-api-staging.azurewebsites.net/api/mcp"
+    }
+  }
+}
