@@ -42,6 +42,7 @@ The summary covers every coding agent linked to your Beezi account, not Codex al
 ## What it connects to
 
 The plugin declares one remote MCP server, `beezi_analytics_staging`, at `https://beezi-api-staging.azurewebsites.net/api/mcp`.
+Its requests carry the header `X-Beezi-Agent: codex`, so Beezi knows they come from Codex.
 The plugin runs no local code, has no hooks, and
 sends nothing from your conversations to Beezi.
 

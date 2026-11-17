@@ -3,7 +3,10 @@
   "mcpServers": {
     "beezi_analytics_staging": {
       "type": "streamable-http",
-      "url": "https://beezi-api-staging.azurewebsites.net/api/mcp"
+      "url": "https://beezi-api-staging.azurewebsites.net/api/mcp",
+      "headers": {
+        "X-Beezi-Agent": "codex"
+      }
     }
   }
 }

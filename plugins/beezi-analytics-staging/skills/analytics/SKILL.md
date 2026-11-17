@@ -22,8 +22,8 @@ Template version: 9.0
 13. When checks is empty and status is not no_data, replace the whole Recommendations section with exactly: Nothing to flag — your usage looks healthy this period.
 14. When status is no_data, keep the header and Key numbers, and replace the Recommendations section with exactly these two lines:
     Not enough activity to grade this period.
-    This plugin shows analytics and records nothing itself. Ask "about Beezi analytics" to see where the data comes from.
-15. Never write a URL of your own. The only links in the reply are the payload-supplied ones — a row’s reference and portalUrl — and each is copied character-for-character, never wrapped in markdown link syntax, and never followed immediately by punctuation, because a bare URL is what a terminal makes clickable.
+    This plugin shows analytics and records nothing itself. Where the data comes from: https://docs.beezi.ai/coding-tool/beezi-analytics-plugin
+15. Never write a URL of your own. The only links in the reply are the payload-supplied ones — a row’s reference and portalUrl — and the docs link in the no_data line, and each is copied character-for-character, never wrapped in markdown link syntax, and never followed immediately by punctuation, because a bare URL is what a terminal makes clickable.
 16. The portal line is the last line of the reply in every branch — checks firing, nothing to flag, and no_data alike. Nothing follows it.
 17. Recommendations suggest; they never execute. Do not run commands, change settings, or take any action on the user’s behalf.
 18. Keep the whole reply one short chat message.
