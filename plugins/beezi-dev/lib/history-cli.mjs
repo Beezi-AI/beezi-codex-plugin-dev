@@ -44,6 +44,9 @@ const NO_UPLOADS_TEXT = 'Beezi: this workspace does not accept history uploads o
 const UPLOAD_FAILED = { text: 'Beezi: the upload stopped with an error. Beezi tries it again at the next session start.', error: true };
 // Codex's own writer is busy (a live checkpoint, or its transactions unfinished), not another upload.
 const WRITER_REASONS = ['active-writer', 'pending-transaction'];
+export const SETUP_BUSY_WAIT_MS = 60000;
+export const SETUP_BUSY_POLL_MS = 2000;
+const SETUP_BUSY_SLEEPS = SETUP_BUSY_WAIT_MS / SETUP_BUSY_POLL_MS;
 
 const union = (a, b) => Array.from(new Set(a.concat(b)));
 
@@ -55,8 +58,28 @@ function seams(deps) {
     runPendingHistory: deps.runPendingHistory == null ? _runPendingHistory : deps.runPendingHistory,
     whoami: deps.whoamiImpl == null ? _whoami : deps.whoamiImpl,
     now: deps.now == null ? () => Date.now() : deps.now,
+    sleep: deps.sleep == null ? (ms) => new Promise((resolve) => setTimeout(resolve, ms)) : deps.sleep,
   };
 }
+
+// runAudit run again every SETUP_BUSY_POLL_MS while it answers busy; every call shares one deadline and one sleep count.
+export function retryWhileBusy(runAudit, { now, sleep }) {
+  let startMs = null;
+  let sleeps = 0;
+  return async (deps, options) => {
+    if (startMs === null) startMs = now();
+    for (;;) {
+      const result = await runAudit(deps, options);
+      const spent = now() - startMs >= SETUP_BUSY_WAIT_MS || sleeps >= SETUP_BUSY_SLEEPS;
+      if (spent || classifyRun(result, false) !== RunOutcome.BUSY) return result;
+      sleeps += 1;
+      await sleep(SETUP_BUSY_POLL_MS);
+    }
+  };
+}
+
+// The seams with runAudit waiting out a busy machine, for one command run.
+const waitingSeam = (seam) => ({ ...seam, runAudit: retryWhileBusy(seam.runAudit, seam) });
 
 // ── printing a run ─────────────────────────────────────────────────────────────────────────
 
@@ -649,7 +672,7 @@ async function countRuns(row, runs, ctx) {
 
 // The setup listing's count over every offer workspace, unrouted and recording nothing → { counted: [{ tenantId, listed }], stop }.
 export async function setupCounts(row, deps = {}) {
-  const ctx = { past: true, save: async () => null, seam: seams(deps), runCache: createRunCache() };
+  const ctx = { past: true, save: async () => null, seam: waitingSeam(seams(deps)), runCache: createRunCache() };
   const runs = offerWorkspaceIds(row).map((id) => ({ id, options: { tenantId: isMultiTenant(row) ? id : null } }));
   const { counted, stop } = await countRuns(row, runs, ctx);
   return { counted: counted.map((c) => ({ tenantId: c.run.id, listed: c.result.listed })), stop };
@@ -669,7 +692,7 @@ export async function consentedCommand({ key }, deps = {}) {
   if (listing === null) return printUploading([], 0);
   const shownIds = offerIdsOf(listing.sessionIds);
   const shownKinds = listing.kinds != null && typeof listing.kinds === 'object' ? listing.kinds : {};
-  const ctx = { past: true, save: (k, id, patch) => recordOffer(k, id, patch), seam, runCache: createRunCache() };
+  const ctx = { past: true, save: (k, id, patch) => recordOffer(k, id, patch), seam: waitingSeam(seam), runCache: createRunCache() };
   const { counted, stop } = await countRuns(row, workspaceRuns(row, [], seam.planRuns).runs, ctx);
   if (stop != null) {
     printStop(stop);

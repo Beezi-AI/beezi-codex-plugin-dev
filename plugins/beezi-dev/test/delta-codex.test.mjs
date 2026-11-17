@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { computeDelta, lastUsageLine } from '../lib/delta-codex.mjs';
+import { computeDelta, lastUsageLine, hasUsage, USAGE_HEAD_BYTES } from '../lib/delta-codex.mjs';
 import { readRolloutLines, readRolloutTail } from '../lib/transcript-reader-codex.mjs';
 
 function writeRollout(records) {
@@ -1247,6 +1247,51 @@ test('lastUsageLine of a fully stored rollout is a number its stored prefix reac
   assert.ok(stored >= last, `stored ${stored} reaches ${last}`);
 });
 
+// ─── hasUsage ───────────────────────────────────────────────────────────────────────────────
+
+test('hasUsage: a header-only rollout has none', () => {
+  assert.equal(hasUsage(writeRollout([meta('/r')])), false);
+});
+
+test('hasUsage: a token_count with totals means usage', () => {
+  assert.equal(hasUsage(writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5)])), true);
+});
+
+test('hasUsage: usage in the head never reads the whole file', () => {
+  const head = Buffer.from(`${jsonl([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5)])}\n`);
+  const lastCalls = [];
+  const lastLine = (p) => { lastCalls.push(p); return 0; };
+  assert.equal(hasUsage('rollout.jsonl', { readHead: () => head, lastLine }), true);
+  assert.deepEqual(lastCalls, []);
+});
+
+const fullReadCases = [
+  { lastLine: 7, expected: true },
+  { lastLine: 0, expected: false },
+  { lastLine: null, expected: null },
+];
+for (const { lastLine, expected } of fullReadCases) {
+  test(`hasUsage: a long file with no usage in its head answers ${expected} when the full read finds ${lastLine}`, () => {
+    const head = Buffer.alloc(USAGE_HEAD_BYTES, ' ');
+    assert.equal(hasUsage('rollout.jsonl', { readHead: () => head, lastLine: () => lastLine }), expected);
+  });
+}
+
+test('hasUsage: a token_count without totals in the head is not usage', () => {
+  const empty = { timestamp: '2026-01-01T00:00:04.000Z', type: 'event_msg', payload: { type: 'token_count', info: null } };
+  assert.equal(hasUsage(writeRollout([meta('/r'), empty])), false);
+});
+
+const unknownCases = [
+  { name: 'a missing path', call: () => hasUsage(path.join(os.tmpdir(), 'beezi-codex-missing', 'rollout.jsonl')) },
+  { name: 'a head that cannot be read', call: () => hasUsage('rollout.jsonl', { readHead: () => null }) },
+];
+for (const { name, call } of unknownCases) {
+  test(`hasUsage: ${name} is unknown`, () => {
+    assert.equal(call(), null);
+  });
+}
+
 // --- zstd-compressed rollouts ---
 import zlib from 'node:zlib';
 const zstdOk = typeof zlib.zstdCompressSync === 'function';
@@ -1261,6 +1306,14 @@ const zstdRollout = () => writeRollout([
   tokens('2026-01-01T00:00:02.000Z', 100, 40, 10),
   tokens('2026-01-01T00:00:03.000Z', 150, 60, 30),
 ]);
+
+test('hasUsage: a header-only .zst rollout has none', { skip: !zstdOk }, () => {
+  assert.equal(hasUsage(zstdCopy(writeRollout([meta('/r')]))), false);
+});
+
+test('hasUsage: a .zst rollout with a token_count means usage', { skip: !zstdOk }, () => {
+  assert.equal(hasUsage(zstdCopy(writeRollout([meta('/r'), tokens('2026-01-01T00:00:02.000Z', 10, 0, 5)]))), true);
+});
 
 // `resume` and `source` describe the file on disk, not the delta, so they are compared apart.
 const deltaOnly = ({ resume, source, ...delta }) => delta;

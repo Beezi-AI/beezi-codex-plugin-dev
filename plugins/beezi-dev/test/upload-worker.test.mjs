@@ -326,8 +326,43 @@ test('a step reporting a dark workspace ends tracking-disabled with a backoff', 
   makeHome(t, 'upload-worker-');
   const s = scriptedStep('queue', [{ progress: 1, remaining: 2, trackingDisabled: true }]);
   const { deps } = baseDeps({ steps: [s.step] });
-  assert.deepEqual(await runUploadWorker(deps), { outcome: 'tracking-disabled', passes: 1, progress: 1 });
+  assert.deepEqual(await runUploadWorker(deps), { outcome: 'tracking-disabled', passes: 2, progress: 2 });
   assert.equal(readUploadStatus().retryAfterAt, 1793873100000);
+});
+
+test('a first dark pass gets one more pass, and a live second pass ends with no back-off', async (t) => {
+  makeHome(t, 'upload-worker-');
+  const s = scriptedStep('queue', [{ progress: 0, remaining: 0, trackingDisabled: true }, { progress: 0, remaining: 0 }]);
+  const { deps } = baseDeps({ steps: [s.step] });
+  assert.deepEqual(await runUploadWorker(deps), { outcome: 'empty', passes: 2, progress: 0 });
+  assert.equal(readUploadStatus().retryAfterAt, null);
+});
+
+test('a pass that left only waiting work keeps the run going without counting it idle', async (t) => {
+  makeHome(t, 'upload-worker-');
+  const waiting = { progress: 0, remaining: 1, waiting: 1 };
+  const s = scriptedStep('queue', [waiting, waiting, waiting, { progress: 1, remaining: 0 }, { progress: 0, remaining: 0 }]);
+  const { deps, sleeps } = baseDeps({ steps: [s.step] });
+  assert.deepEqual(await runUploadWorker(deps), { outcome: 'empty', passes: 5, progress: 1 });
+  assert.deepEqual(sleeps, [5000, 5000, 5000]);
+  assert.equal(readUploadStatus().retryAfterAt, null);
+});
+
+test('waiting stops counting after 30 s: a lock refused for the whole run ends stalled', async (t) => {
+  makeHome(t, 'upload-worker-');
+  const s = scriptedStep('queue', [{ progress: 0, remaining: 1, waiting: 1 }]);
+  const { deps, sleeps } = baseDeps({ steps: [s.step] });
+  assert.deepEqual(await runUploadWorker(deps), { outcome: 'stalled', passes: 9, progress: 0 });
+  assert.deepEqual(sleeps, [5000, 5000, 5000, 5000, 5000, 5000, 5000, 5000]);
+  assert.equal(readUploadStatus().retryAfterAt, 1793873100000);
+});
+
+test('a pass with work left that is not all waiting counts idle as before', async (t) => {
+  makeHome(t, 'upload-worker-');
+  const s = scriptedStep('queue', [{ progress: 0, remaining: 2, waiting: 1 }]);
+  const { deps, sleeps } = baseDeps({ steps: [s.step] });
+  assert.deepEqual(await runUploadWorker(deps), { outcome: 'stalled', passes: 3, progress: 0 });
+  assert.deepEqual(sleeps, [5000, 5000]);
 });
 
 // ── heartbeat ───────────────────────────────────────────────────────────────────────────────
@@ -617,9 +652,28 @@ test('the due-sessions step keeps a marker whose session lock was busy, whose ch
   };
   const result = await stepNamed('due-sessions').run(ctxOf({ due: listUploadDue(), deps: { runCheckpoint } }));
   // s-none's `not-checkpointed` cannot change within this run: charged, but not work left.
-  assert.deepEqual(result, { progress: 0, remaining: 2 });
+  assert.deepEqual(result, { progress: 0, remaining: 2, waiting: 1 });
   // A busy session lock is someone else mid-checkpoint, not a failure of this marker.
   assert.deepEqual(listUploadDue().map((e) => [e.sessionId, e.attempts]), [['s-busy', 0], ['s-throw', 1], ['s-none', 1]]);
+});
+
+for (const lockReason of ['reconciliation', 'held', 'contended', 'migration']) {
+  test(`a marker whose session lock is refused as ${lockReason} is waiting`, async (t) => {
+    makeHome(t, 'upload-worker-');
+    markUploadDue('s-1', {}, { now: () => T0 - 1000 });
+    const runCheckpoint = async () => ({ lockSkipped: true, lockReason });
+    const result = await stepNamed('due-sessions').run(ctxOf({ due: listUploadDue(), deps: { runCheckpoint } }));
+    assert.deepEqual(result, { progress: 0, remaining: 1, waiting: 1 });
+    assert.deepEqual(listUploadDue().map((e) => [e.sessionId, e.attempts]), [['s-1', 0]]);
+  });
+}
+
+test('a marker refused for lock-order is not waiting', async (t) => {
+  makeHome(t, 'upload-worker-');
+  markUploadDue('s-1', {}, { now: () => T0 - 1000 });
+  const runCheckpoint = async () => ({ lockSkipped: true, lockReason: 'lock-order' });
+  const result = await stepNamed('due-sessions').run(ctxOf({ due: listUploadDue(), deps: { runCheckpoint } }));
+  assert.deepEqual(result, { progress: 0, remaining: 1 });
 });
 
 test('the due-sessions step leaves a session re-marked mid-checkpoint for the next pass', async (t) => {

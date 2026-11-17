@@ -50,7 +50,7 @@ import {
 import { computeSessionTimeline as _computeSessionTimeline } from './session-timeline-codex.mjs';
 import { postSessionError as _postSessionError } from './session-error-report.mjs';
 import { resolveTranscriptByCwd } from './transcript-codex.mjs';
-import { lastUsageLine as _lastUsageLine } from './delta-codex.mjs';
+import { lastUsageLine as _lastUsageLine, hasUsage as _hasUsage } from './delta-codex.mjs';
 import { whoami as _whoami } from './whoami.mjs';
 import { stateDir, beeziCodexHome, queueDir } from './paths.mjs';
 import { postableQueueNames } from './workspace-queue.mjs';
@@ -633,6 +633,7 @@ async function runAuditLocked(lockHandle, deps, options, prepared) {
   const now = orDefault(deps.now, () => Date.now());
   const fetchCoverage = orDefault(deps.fetchCoverageImpl, _fetchCoverage);
   const lastUsageLine = orDefault(deps.lastUsageLineImpl, _lastUsageLine);
+  const hasUsage = orDefault(deps.hasUsageImpl, _hasUsage);
   const loadCoverage = orDefault(deps.loadCoverageCheckpointsImpl, _loadCoverageCheckpoints);
   const saveCoverage = orDefault(deps.saveCoverageCheckpointsImpl, _saveCoverageCheckpoints);
   const postJson = orDefault(deps.postJsonImpl, _postJson);
@@ -813,7 +814,13 @@ async function runAuditLocked(lockHandle, deps, options, prepared) {
     result.ok = true;
     result.trackingMode = who && who.valid === true ? orDefault(who.trackingMode, null) : null;
     // A gap-deferred session is parsed only to classify its deferral and is never sent, so it is not listed.
-    result.listed = candidates.filter((entry) => !gapDeferred.has(entry.sessionId)).map((entry) => listedEntry(entry, rolloutStartedAtImpl));
+    // A session with no usage record can never report, so it is counted empty instead of offered.
+    result.listed = [];
+    for (const entry of candidates) {
+      if (gapDeferred.has(entry.sessionId)) continue;
+      if (hasUsage(entry.transcriptPath) === false) result.empty += 1;
+      else result.listed.push(listedEntry(entry, rolloutStartedAtImpl));
+    }
     return result;
   }
 

@@ -5,6 +5,7 @@ import { computeOperations, parseArgs, operationContext, operationWindowEnd } fr
 import { buildActiveIntervals, totalMs } from './active-time.mjs';
 import { rateLimitObservationFromRecord } from './rate-limits-codex.mjs';
 import { readRolloutLines, readRolloutTail, rolloutHeadHash } from './transcript-reader-codex.mjs';
+import { readRolloutHeadBuffer } from './rollout-file.mjs';
 
 // Attribute new Codex rollout activity to (repoRoot, branch) and bill token usage per segment.
 //
@@ -107,6 +108,32 @@ export function lastUsageLine(transcriptPath, readLines = readRolloutLines) {
     if (totalsFromRecord(records[i]) !== null) return i + 1;
   }
   return 0;
+}
+
+export const USAGE_HEAD_BYTES = 512 * 1024;
+
+function parsesAsUsage(line) {
+  if (!line.includes('token_count')) return false;
+  try {
+    return totalsFromRecord(JSON.parse(line)) !== null;
+  } catch {
+    return false;
+  }
+}
+
+// Whether the rollout holds a usage record: the head decides when it can, else the full read; null when unreadable.
+export function hasUsage(transcriptPath, { readHead = readRolloutHeadBuffer, lastLine = lastUsageLine } = {}) {
+  let head;
+  try {
+    head = readHead(transcriptPath, USAGE_HEAD_BYTES);
+  } catch {
+    return null;
+  }
+  if (head === null) return null;
+  if (head.toString('utf-8').split('\n').some(parsesAsUsage)) return true;
+  if (head.length < USAGE_HEAD_BYTES) return false;
+  const last = lastLine(transcriptPath);
+  return last === null ? null : last > 0;
 }
 
 // Context OCCUPANCY at this request, not the session's cumulative total. `last_token_usage`

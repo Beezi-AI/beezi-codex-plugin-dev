@@ -5,10 +5,10 @@ import fs from 'node:fs';
 import path from 'node:path';
 import zlib from 'node:zlib';
 import { runCheckpoint } from '../lib/checkpoint.mjs';
-import { runUploadWorker } from '../lib/upload-worker.mjs';
+import { runUploadWorker, readUploadStatus } from '../lib/upload-worker.mjs';
 import { listUploadDue } from '../lib/upload-due.mjs';
 import { queueDir } from '../lib/paths.mjs';
-import { forgetHeldLocks } from '../lib/single-instance-lock.mjs';
+import { acquireLock, runLock, forgetHeldLocks } from '../lib/single-instance-lock.mjs';
 import { makeHome, linkAccount } from '../tools/account-fixtures.mjs';
 
 // Hooks capture, the worker sends — end to end, with nothing between the two halves faked: a real
@@ -54,6 +54,13 @@ function server() {
 
 const listing = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } };
 
+const captureDeps = {
+  gitImpl: () => null,
+  readAgents: () => ({}),
+  findSubagentRollouts: () => [],
+  findPlanPredecessor: () => null,
+};
+
 test('a local-only capture is delivered by one worker run: one batch POST, then nothing queued or due', async (t) => {
   const home = makeHome(t, 'upload-e2e-');
   linkAccount(home, KEY);
@@ -61,12 +68,6 @@ test('a local-only capture is delivered by one worker run: one batch POST, then 
   fs.writeFileSync(path.join(home, 'accounts', KEY, 'tracking.json'),
     JSON.stringify({ version: 1, linkedAt: new Date(Date.now() - 3600000).toISOString() }));
   const transcriptPath = rollout(home);
-  const captureDeps = {
-    gitImpl: () => null,
-    readAgents: () => ({}),
-    findSubagentRollouts: () => [],
-    findPlanPredecessor: () => null,
-  };
 
   // ── the hook half ──
   const captured = await runCheckpoint(
@@ -100,4 +101,40 @@ test('a local-only capture is delivered by one worker run: one batch POST, then 
   assert.deepEqual(singles, [], 'nothing went by the single route');
   assert.deepEqual(listing(queueDir(KEY)), [], 'the queue is empty');
   assert.deepEqual(listing(path.join(home, 'upload-due')), [], 'no session is still due');
+});
+
+test('a history run holding the lock for three passes delays the turn, not five minutes', async (t) => {
+  const home = makeHome(t, 'upload-e2e-');
+  linkAccount(home, KEY);
+  fs.writeFileSync(path.join(home, 'accounts', KEY, 'tracking.json'),
+    JSON.stringify({ version: 1, linkedAt: new Date(Date.now() - 3600000).toISOString() }));
+  const transcriptPath = rollout(home);
+  const captured = await runCheckpoint(
+    { session_id: SESSION_ID, transcript_path: transcriptPath, cwd: home }, captureDeps,
+    { localOnly: true, emitTimeline: true, budgetMs: 17500 },
+  );
+  assert.equal(captured.uploadDue, true);
+
+  // Another process (a past-sessions scan, the installer's listing) holds the history run lock.
+  assert.equal(acquireLock(runLock('backfill'), { leaseMs: 600000 }, { pid: () => process.ppid }).ok, true);
+  forgetHeldLocks();
+
+  const srv = server();
+  let sleeps = 0;
+  const out = await runUploadWorker({
+    checkEnvironment: () => ({ status: 'ok' }),
+    linkedSessions: async () => [{ key: KEY, token: 'tk-a', clientId: `c-${KEY}`, tenantId: null }],
+    fetchImpl: srv.fetchImpl,
+    checkpointDeps: captureDeps,
+    setPriority: () => {},
+    sleep: async () => {
+      sleeps += 1;
+      if (sleeps === 3) fs.unlinkSync(path.join(home, 'locks', 'run-backfill.lock'));
+    },
+  });
+
+  assert.equal(out.outcome, 'empty');
+  assert.deepEqual(listUploadDue(), []);
+  assert.equal(readUploadStatus().retryAfterAt, null);
+  assert.equal(srv.calls.filter((c) => c.url.endsWith('/sessions/report-batch')).length, 1, JSON.stringify(srv.calls.map((c) => c.url)));
 });
