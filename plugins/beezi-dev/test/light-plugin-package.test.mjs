@@ -34,9 +34,9 @@ const ui = () => manifest().extensions['com.openai'].interface;
 
 // manifest
 
-test('manifest names the beezi-analytics plugin at 0.1.0', () => {
+test('manifest names the beezi-analytics plugin at 0.1.1', () => {
   assert.equal(manifest().name, 'beezi-analytics');
-  assert.equal(manifest().version, '0.1.0');
+  assert.equal(manifest().version, '0.1.1');
 });
 
 test('manifest registers no hooks with OpenAI', () => {
@@ -92,11 +92,12 @@ test('licence and notice are copies of the full plugin files', () => {
 
 // MCP file
 
-test('mcp.json declares the remote OAuth server under the key beezi_analytics', () => {
+test('mcp.json declares the remote OAuth server under the key beezi_analytics, tagged as Codex', () => {
   assert.deepEqual(json('mcp.json').mcpServers, {
     beezi_analytics: {
       type: 'streamable-http',
       url: 'https://api.beezi.ai/api/mcp',
+      headers: { 'X-Beezi-Agent': 'codex' },
       extensions: {
         'com.openai': {
           auth: {
@@ -182,11 +183,11 @@ test('analytics skill tells the user how to sign in', () => {
   ));
 });
 
-test('analytics skill no_data rule gives two lines: the grade line, then the pointer to about', () => {
+test('analytics skill no_data rule gives two lines: the grade line, then the docs link', () => {
   const text = read('skills/analytics/SKILL.md');
   const grade = text.indexOf('Not enough activity to grade this period.');
   const pointer = text.indexOf(
-    'This plugin shows analytics and records nothing itself. Ask "about Beezi analytics" to see where the data comes from.',
+    'This plugin shows analytics and records nothing itself. Where the data comes from: https://docs.beezi.ai/coding-tool/beezi-analytics-plugin',
   );
   assert.notEqual(grade, -1);
   assert.notEqual(pointer, -1);
@@ -271,4 +272,12 @@ test('repo README carries the Codex 0.167 marketplace-install note', () => {
   assert.ok(readFileSync(join(ROOT, 'README.md'), 'utf-8').includes(
     'On Codex 0.167 a marketplace install of it does not connect yet',
   ));
+});
+
+test('README says the server is tagged with the X-Beezi-Agent header', () => {
+  assert.ok(read('README.md').includes('Its requests carry the header `X-Beezi-Agent: codex`, so Beezi knows they come from Codex.'));
+});
+
+test('analytics skill allows the no_data docs link as its only URL of its own', () => {
+  assert.ok(read('skills/analytics/SKILL.md').includes('\n15. Never write a URL of your own. The only links in the reply are the payload-supplied ones — a row’s reference and portalUrl — and the docs link in the no_data line, and each is copied character-for-character, never wrapped in markdown link syntax, and never followed immediately by punctuation, because a bare URL is what a terminal makes clickable.\n'));
 });
