@@ -79,6 +79,8 @@ function formOf({ name, text }) {
   if (name === 'rollout-watcher.mjs' && setsLast(text, 'scope: HistoryScope.LIVE')) return AuditForm.LIVE;
   if (name === 'pending-history-run.mjs' && text === 'runAudit({ runCache }, { ...options, key })') return AuditForm.CONSENTED;
   if (name === 'history-cli.mjs' && text === 'runAudit({ ...auditDeps, onProgress: printProgress }, auditOptions)') return AuditForm.FORWARDER;
+  // The busy-retry wrapper's call: its caller's arguments unchanged, and it is wrapped only around seam.runAudit.
+  if (name === 'history-cli.mjs' && text === 'runAudit(deps, options)') return AuditForm.FORWARDER;
   // The watcher's pending-history forwarder: the consented options unchanged, plus only the queue options after them.
   if (name === 'rollout-watcher.mjs' && text === 'runAudit(auditDeps, { ...auditOptions, drainQueue: false, queuedBefore })') return AuditForm.NO_DRAIN;
   return null;
@@ -91,8 +93,15 @@ test('PK6: every runAudit call in lib/ lists only, runs LIVE, or uploads a conse
   const count = (form) => forms.filter((c) => c.form === form).length;
   assert.deepEqual(
     { listOnly: count(AuditForm.LIST_ONLY), live: count(AuditForm.LIVE), consented: count(AuditForm.CONSENTED), forwarder: count(AuditForm.FORWARDER), noDrain: count(AuditForm.NO_DRAIN) },
-    { listOnly: 1, live: 3, consented: 1, forwarder: 1, noDrain: 1 },
+    { listOnly: 1, live: 3, consented: 1, forwarder: 2, noDrain: 1 },
   );
+});
+
+test('PK6: the busy-retry wrapper only forwards its caller\'s arguments, and wraps only seam.runAudit', () => {
+  const src = readLib('history-cli.mjs');
+  assert.ok(src.includes('export function retryWhileBusy(runAudit, { now, sleep }) {'));
+  assert.ok(src.includes('  return async (deps, options) => {'));
+  assert.ok(src.includes('const waitingSeam = (seam) => ({ ...seam, runAudit: retryWhileBusy(seam.runAudit, seam) });'));
 });
 
 test('PK6: the accept forwarder only hands its options to runPendingHistory', () => {

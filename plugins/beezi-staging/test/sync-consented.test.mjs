@@ -50,15 +50,20 @@ function routedHere(options, id) {
   return route != null && route.tenantIds.indexOf(options.tenantId) !== -1;
 }
 
-// `disk` is every past session on the machine; `over(options)` overrides fields of a run's result.
+// `disk` is every past session on the machine; `over(options)` overrides fields of a run's result. `sleep` records each
+// wait in `sleeps` and moves `now` on by it.
 function engine({ disk = [session('A'), session('D')], over = () => ({}), whoamiImpl = null, spawned = true } = {}) {
   const audits = [];
   const spawns = [];
+  const sleeps = [];
+  let clock = T0;
   return {
     audits,
     spawns,
+    sleeps,
     deps: {
-      now: () => T0,
+      now: () => clock,
+      sleep: async (ms) => { sleeps.push(ms); clock += ms; },
       readTrackingState: () => null,
       planWorkspaceRuns: (row) => planWorkspaceRuns(row, { listRollouts: () => disk.map((s) => ({ sessionId: s.sessionId, cwd: s.cwd, mtimeMs: s.mtimeMs })) }),
       whoamiImpl: whoamiImpl != null ? whoamiImpl : async () => ({ valid: true, tenants: (await getAccount(TEST_KEY)).tenants }),
@@ -177,24 +182,38 @@ const failures = [
     name: 'another history run is using the machine',
     result: { reason: 'run-in-progress' },
     io: { out: ['✓ Beezi: another Beezi history run is using this machine right now — letting it finish.', NOTHING], err: [] },
+    sleeps: 30,
   },
   {
     name: 'the account cannot sign in',
     result: { reason: 'no-token' },
     io: { out: [NOTHING], err: ['✗ Beezi: could not use the saved credentials for that account. Sign in to Beezi again as it (the login skill).'] },
+    sleeps: 0,
   },
 ];
 for (const c of failures) {
   test(`when ${c.name}: today's line, nothing owed, no worker, exit 1`, async (t) => {
     link(t, answered(['A', 'D']));
     const io = capture(t);
-    const { spawns, deps } = engine({ over: () => c.result });
+    const { spawns, sleeps, deps } = engine({ over: () => c.result });
     assert.equal(await consented(deps), 1);
     assert.deepEqual(io, c.io);
     assert.deepEqual(spawns, []);
     assert.deepEqual(await owed(), []);
+    assert.equal(sleeps.length, c.sleeps);
   });
 }
+
+test('a busy count is retried and the counted sessions are owed once it is free', async (t) => {
+  link(t, answered(['A', 'D']));
+  capture(t);
+  let runs = 0;
+  const { spawns, sleeps, deps } = engine({ over: () => { runs += 1; return runs === 1 ? { reason: 'run-in-progress' } : {}; } });
+  assert.equal(await consented(deps), 0);
+  assert.deepEqual(spawns, WORKER);
+  assert.deepEqual(sleeps, [2000]);
+  assert.deepEqual(await owed(), [['t1', ['A', 'D'], ['repos']]]);
+});
 
 test('one workspace failing its count owes nothing to the other either', async (t) => {
   link(t, { ...BOTH, ...answered(['A', 'D'], { t1: ['repos'], t2: ['repos'] }) });

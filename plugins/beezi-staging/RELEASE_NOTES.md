@@ -1,5 +1,12 @@
 # Beezi plugin release notes
 
+## 0.28.2 (2026-11-17) — Setup and uploads wait out a busy moment
+
+### Fixed
+- **Setup waits for a busy Beezi job** — setup no longer gives up on your past sessions when another Beezi job is briefly busy. It tries again for up to a minute.
+- **A new session no longer waits five minutes** — when another Beezi job briefly holds the machine, uploads wait it out for up to 30 seconds instead of pausing for five minutes.
+- **Empty past sessions are not offered again** — a past session with no recorded usage is no longer offered again and again.
+
 ## 0.28.1 (2026-11-11) — Faster hooks, background uploads
 
 ### Improved

@@ -47,6 +47,10 @@ export const HEARTBEAT_MS = 60000;
 // Passes in a row that moved nothing, with work left, before the run gives up as `stalled`.
 export const MAX_IDLE_PASSES = 3;
 export const IDLE_PASS_SLEEP_MS = 5000;
+// Total sleep a run spends on passes whose only work left is waiting on another writer's lock.
+export const WAIT_BUDGET_MS = 30000;
+// Session-lock refusals that clear on their own once another writer (a history run included) lets go.
+const WAITING_LOCK_REASONS = ['held', 'contended', 'reconciliation', 'migration'];
 // After a stalled, crashed, watchdog-cut, no-account or blocked run the trigger does not respawn
 // for this long: an offline machine must not pay a worker start and a credential read every 30 s.
 export const RETRY_AFTER_MS = 5 * 60 * 1000;
@@ -226,6 +230,7 @@ export function workerExitStatus(outcome, at, hasWork) {
 //   { progress, remaining, trackingDisabled?, batchUnsupported? }
 //   progress          things this pass settled for good (posted, rejected, expired, cleared)
 //   remaining         things still owed that a later pass could settle (failed, deferred, busy)
+//   waiting           the part of `remaining` held up only by another writer's lock
 //   trackingDisabled  the server says every account is dark — the run ends `tracking-disabled`
 //   batchUnsupported  the batch route fell back to the single route — batching stops for 24 h
 // A missing or malformed answer reads as zeros; a throw reads as `remaining: 1`, never as a crash.
@@ -244,6 +249,7 @@ function stepResult(value) {
   return {
     progress: count(v.progress),
     remaining: count(v.remaining),
+    waiting: count(v.waiting),
     trackingDisabled: v.trackingDisabled === true,
     batchUnsupported: v.batchUnsupported === true,
   };
@@ -509,6 +515,7 @@ const dueSessionsStep = {
       }
       if (pastDeadline(ctx)) { out.remaining += 1; continue; }
       let shortfall;
+      let lockReason = null;
       try {
         const r = await runCheckpoint(
           { session_id: entry.sessionId, transcript_path: entry.transcriptPath, cwd: entry.cwd },
@@ -523,6 +530,7 @@ const dueSessionsStep = {
           },
         );
         shortfall = checkpointShortfall(r, entry);
+        if (shortfall === 'session-busy') lockReason = r.lockReason;
       } catch {
         shortfall = 'checkpoint-threw';
       }
@@ -536,7 +544,11 @@ const dueSessionsStep = {
       const reason = shortfall === null ? 'handler-unsettled' : shortfall;
       // A busy session lock is another writer mid-checkpoint, not a failure of this marker: the
       // checkpoint never ran, so the next pass may run it.
-      if (reason === 'session-busy') { out.remaining += 1; continue; }
+      if (reason === 'session-busy') {
+        out.remaining += 1;
+        if (WAITING_LOCK_REASONS.indexOf(lockReason) !== -1) out.waiting = (out.waiting || 0) + 1;
+        continue;
+      }
       const parked = PARKED_SHORTFALLS[reason] || null;
       const left = parked ? 0 : 1;
       state.handled.set(key, left);
@@ -689,6 +701,8 @@ export async function runUploadWorker(deps = {}) {
   let batch = true;
   let outcome = null;
   let rounds = 0;
+  let waited = 0;
+  let darkSeen = false;
 
   for (;;) {
     rounds += 1;
@@ -730,13 +744,14 @@ export async function runUploadWorker(deps = {}) {
         run.passes += 1;
         lastPassStart = passStart;
         const ctx = { sessions, deadline, now, fetchImpl: orDefault(deps.fetchImpl, null), batch, status, deps, due: listDue() };
-        const pass = { progress: 0, remaining: 0, trackingDisabled: false, batchUnsupported: false };
+        const pass = { progress: 0, remaining: 0, waiting: 0, trackingDisabled: false, batchUnsupported: false };
         for (const step of steps) {
           if (lockLost) break;
           let r;
           try { r = stepResult(await step.run(ctx)); } catch { r = stepResult({ remaining: 1 }); }
           pass.progress += r.progress;
           pass.remaining += r.remaining;
+          pass.waiting += r.waiting;
           if (r.trackingDisabled) pass.trackingDisabled = true;
           if (r.batchUnsupported) pass.batchUnsupported = true;
         }
@@ -746,11 +761,22 @@ export async function runUploadWorker(deps = {}) {
           batch = false;
         }
         if (lockLost) { roundOutcome = 'lock-lost'; break; }
-        if (pass.trackingDisabled) { roundOutcome = 'tracking-disabled'; break; }
+        if (pass.trackingDisabled) {
+          // The first dark pass may be a stale history-only cache that this pass refreshed: one more pass.
+          if (darkSeen) { roundOutcome = 'tracking-disabled'; break; }
+          darkSeen = true;
+          continue;
+        }
         // Passes repeat until one makes no progress: what this pass sent may have unblocked more.
         if (pass.progress > 0) { idle = 0; continue; }
         // Nothing left that this pass saw: re-scan for what a hook added meanwhile before leaving.
         if (pass.remaining === 0 && !hasWork(passStart)) { roundOutcome = 'empty'; break; }
+        // Everything left waits on another writer's lock: wait it out, up to WAIT_BUDGET_MS per run.
+        if (pass.remaining > 0 && pass.remaining === pass.waiting && waited < WAIT_BUDGET_MS) {
+          waited += IDLE_PASS_SLEEP_MS;
+          await sleep(IDLE_PASS_SLEEP_MS);
+          continue;
+        }
         // Moved nothing: offline, 401, a busy lock. Back off, and give up rather than poll forever.
         idle += 1;
         if (idle >= MAX_IDLE_PASSES) { roundOutcome = 'stalled'; break; }

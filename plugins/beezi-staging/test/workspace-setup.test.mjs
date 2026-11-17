@@ -41,13 +41,17 @@ function link(t, over = {}) {
 }
 
 // The engine boundary: `listedBy[tenantId]` ('null' for a one-workspace run) is what each list run returns; `over`
-// overrides fields of every run's result.
+// overrides fields of every run's result. `sleep` records each wait in `sleeps` and moves `now` on by it.
 function engine(listedBy, over = {}, seams = {}) {
   const audits = [];
+  const sleeps = [];
+  let clock = NOV_11;
   return {
     audits,
+    sleeps,
     deps: {
-      now: () => NOV_11,
+      now: () => clock,
+      sleep: async (ms) => { sleeps.push(ms); clock += ms; },
       readTrackingState: () => null,
       whoamiImpl: async () => ({ valid: true, tenants: (await getAccount(TEST_KEY)).tenants }),
       runAudit: async (d, options) => {
@@ -71,7 +75,7 @@ const tLines = (lines) => lines.filter((l) => /^T\d+\. /.test(l));
 test('one workspace lists its places by sessions with outside last, under the full checklist', async (t) => {
   link(t);
   const home = os.homedir();
-  const { deps } = engine({
+  const { sleeps, deps } = engine({
     null: [
       session('w1', WEB, SEP_3), session('w2', WEB), session('w3', WEB), session('a1', API), session('a2', API, NOV_11),
       session('o1', home), session('o2', home), session('o3', home), session('o4', home), session('n1', null),
@@ -104,6 +108,7 @@ test('one workspace lists its places by sessions with outside last, under the fu
       'setup=3 sessions=9 workspaces=1 chosen=no',
     ],
   });
+  assert.deepEqual(sleeps, []);
 });
 
 test('two workspaces list unrouted, under the combined checklist, with one W line each and a shared session once', async (t) => {
@@ -204,6 +209,67 @@ for (const c of failedCounts) {
     assert.deepEqual(await listing(deps), { ok: false, ...c.out });
   });
 }
+
+// The engine's deps with `tenantId`'s first run answering busy with `reason`; every run is in audits.
+function busyOnce({ audits, deps }, reason, tenantId = null) {
+  let busy = true;
+  return {
+    ...deps,
+    runAudit: async (d, options) => {
+      if (!busy || options.tenantId !== tenantId) return deps.runAudit(d, options);
+      busy = false;
+      audits.push(options);
+      return { ok: false, reason, halt: null };
+    },
+  };
+}
+
+const BUSY_FAILED = { ok: false, lines: ['✓ Beezi: another Beezi history run is using this machine right now — letting it finish.'], stderr: [] };
+
+test('a busy history run is retried every 2 s and the listing goes on once it is free', async (t) => {
+  link(t);
+  const world = engine({ null: [session('w1', WEB)] });
+  const out = await listing(busyOnce(world, 'run-in-progress'));
+  assert.equal(out.ok, true);
+  assert.equal(last(out.lines), 'setup=1 sessions=1 workspaces=1 chosen=no');
+  assert.deepEqual(world.sleeps, [2000]);
+});
+
+for (const reason of ['run-in-progress', 'upload-busy', 'active-writer', 'pending-transaction']) {
+  test(`a listing busy with ${reason} once is retried`, async (t) => {
+    link(t);
+    const world = engine({ null: [session('w1', WEB)] });
+    const out = await listing(busyOnce(world, reason));
+    assert.deepEqual(tLines(out.lines), ['T1. web (/beezi-setup-x/web), 1 session account=a1b2c3d4 kind=folder now=default match=/beezi-setup-x/web']);
+    assert.deepEqual(world.sleeps, [2000]);
+  });
+}
+
+test('a history run still busy after 60 s prints today\'s line and fails', async (t) => {
+  link(t);
+  const { sleeps, deps } = engine({ null: [session('w1', WEB)] }, { reason: 'run-in-progress' });
+  assert.deepEqual(await listing(deps), BUSY_FAILED);
+  assert.equal(sleeps.length, 30);
+});
+
+test('a clock that never moves still stops after 30 sleeps', async (t) => {
+  link(t);
+  const { sleeps, deps } = engine({ null: [session('w1', WEB)] }, { reason: 'run-in-progress' }, { now: () => NOV_11 });
+  assert.deepEqual(await listing(deps), BUSY_FAILED);
+  assert.equal(sleeps.length, 30);
+});
+
+test('of two workspaces only the busy one runs again', async (t) => {
+  link(t, { tenants: [ACME, SIDE] });
+  const world = engine({ t1: [session('w1', WEB)], t2: [session('a1', API)] });
+  const out = await listing(busyOnce(world, 'run-in-progress', 't2'));
+  assert.deepEqual(world.audits.map((a) => a.tenantId), ['t1', 't2', 't2']);
+  assert.deepEqual(tLines(out.lines).map((l) => l.slice(0, l.indexOf(' account='))), [
+    'T1. api (/beezi-setup-x/api), 1 session',
+    'T2. web (/beezi-setup-x/web), 1 session',
+  ]);
+  assert.equal(last(out.lines), 'setup=2 sessions=2 workspaces=2 chosen=no');
+});
 
 test('a workspace with analytics off lists nothing, quietly', async (t) => {
   link(t);

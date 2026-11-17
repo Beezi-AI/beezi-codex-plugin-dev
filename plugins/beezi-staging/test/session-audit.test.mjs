@@ -1071,6 +1071,24 @@ test('listOnly stops after coverage: no registration, no parse, no chunk, and li
   assert.deepEqual(sentIds(flush), ['after', 'before']);
 });
 
+const listWithUsage = (hasUsageImpl) => runAudit(scopeDeps({
+  readTrackingStateImpl: () => ({ trackingMode: 'live', backfillCompleted: false }),
+  hasUsageImpl,
+}).deps, { scope: HistoryScope.PAST, listOnly: true });
+
+test('listOnly leaves out a session with no usage and counts it empty', async () => {
+  const listed = await listWithUsage((p) => (p !== BOUNDARY[1].transcriptPath));
+  assert.deepEqual(listedIds(listed), ['before', 'after']);
+  assert.equal(listed.empty, 1);
+  assert.equal(listed.candidates, 3);
+});
+
+test('listOnly keeps a session whose usage cannot be read', async () => {
+  const listed = await listWithUsage(() => null);
+  assert.deepEqual(listedIds(listed), ['before', 'at', 'after']);
+  assert.equal(listed.empty, 0);
+});
+
 test('listOnly leaves out a gap-deferred session that split bookkeeping would still parse', async () => {
   const { deps } = scopeDeps({
     loadCoverageCheckpointsImpl: () => ({ version: 1, identity: null, environment: '', apiBase: null, sessions: { at: { line: 5 } }, updatedAt: null }),

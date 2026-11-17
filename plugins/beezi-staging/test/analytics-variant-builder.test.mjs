@@ -37,6 +37,7 @@ const MCP_JSON = {
     beezi_analytics: {
       type: 'streamable-http',
       url: 'https://api.beezi.ai/api/mcp',
+      headers: { 'X-Beezi-Agent': 'codex' },
       extensions: { 'com.openai': { auth: { type: 'oauth', client: { mode: 'dcr' } } } },
     },
   },
@@ -129,13 +130,14 @@ test('renames the manifest to beezi-analytics-staging and marks it as the stagin
   });
 });
 
-test('moves the MCP server to its own key, points it at the environment API and drops its extensions', (t) => {
+test('moves the MCP server to its own key, points it at the environment API, keeps its header and drops its extensions', (t) => {
   assert.deepEqual(build(t).mcp, {
     $schema: 'https://agent-plugins.org/schemas/1.0.0/mcp.schema.json',
     mcpServers: {
       beezi_analytics_staging: {
         type: 'streamable-http',
         url: 'https://beezi-api-staging.azurewebsites.net/api/mcp',
+        headers: { 'X-Beezi-Agent': 'codex' },
       },
     },
   });
