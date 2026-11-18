@@ -1,5 +1,11 @@
 # Beezi plugin release notes
 
+## 0.28.4 (2026-11-18) — Past sessions follow the workspace owner
+
+### Improved
+- **Audit workspaces follow the owner's choice** — an audit workspace whose owner chose to upload past sessions without asking now uploads them with a notice, like any other workspace. One that asks first still asks, and the `--tenant` override always asks.
+- **Uploads follow the current settings** — a past-session upload hides the kinds the workspace hides when it is sent. A kind the owner turned off after you said yes, or after the summary was shown, goes up as it is. An upload that cannot reach Beezi to check the settings sends nothing and retries later.
+
 ## 0.28.3 (2026-11-18) — Upload progress
 
 ### New

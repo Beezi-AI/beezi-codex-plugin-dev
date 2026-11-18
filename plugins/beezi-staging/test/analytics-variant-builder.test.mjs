@@ -171,6 +171,10 @@ test('leaves no prod server key, URL, Clerk host, install line or plugin name in
   const dir = tempDir(t, 'beezi-analytics-real-');
   fs.cpSync(path.join(repoRoot, 'plugins', 'beezi-analytics'), dir, { recursive: true });
   runHeredoc(dir);
+  assert.deepEqual(JSON.parse(fs.readFileSync(path.join(dir, 'mcp.json'), 'utf-8')).mcpServers.beezi_analytics_staging.headers, {
+    'X-Beezi-Agent': 'codex',
+    'X-Beezi-Plugin': 'light',
+  });
   for (const rel of ['README.md', 'skills/analytics/SKILL.md', 'skills/about/SKILL.md']) {
     const text = fs.readFileSync(path.join(dir, rel), 'utf-8');
     for (const prod of ['api.beezi.ai', 'clerk.beezi.ai', '`beezi` in this repository']) {

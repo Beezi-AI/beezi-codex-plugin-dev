@@ -203,28 +203,28 @@ test('a rule add narrows a declined offer to its place, and a second place adds 
 });
 
 
-test('the kinds the question showed as hidden are kept although every kind is off at the yes', async (t) => {
+test('a yes made after the owner turned a shown kind off owes the upload without it (R5)', async (t) => {
   const tenants = [{ id: 't1', name: 'Acme', anonymization: hiding([]) }, { id: 't2', name: 'NewCo' }];
   setup(t, { tenants, historyOffers: { t1: { state: OfferState.DECLINED, changedAt: null, offeredIds: ['s1'], shownKinds: ['branches'] } } });
   assert.deepEqual(await accept('t1', ['s1'], { kinds: ['branches'] }), accepted(['s1']));
-  assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, ['branches']);
+  assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, []);
 });
 
-test('the shown kinds and the kinds at the yes are unioned in KINDS order', async (t) => {
+test('a yes owes the kinds hidden at the yes, not the shown ones', async (t) => {
   const tenants = [{ id: 't1', name: 'Acme', anonymization: hiding(['hosts', 'repos']) }, { id: 't2', name: 'NewCo' }];
   setup(t, { tenants, historyOffers: { t1: { state: OfferState.DECLINED, changedAt: null, offeredIds: ['s1'], shownKinds: ['accounts', 'branches'] } } });
   await accept('t1', ['s1'], { kinds: ['accounts', 'branches'] });
-  assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, ['repos', 'branches', 'hosts', 'accounts']);
+  assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, ['repos', 'hosts']);
 });
 
-test('a record without valid shown kinds counts as all five hidden (CR2)', async (t) => {
+test('a record without valid shown kinds takes the all-five token, and owes the kinds hidden now (CR2, R5)', async (t) => {
   for (const shown of [{}, { shownKinds: null }, { shownKinds: 'branches' }, { shownKinds: ['branches', 'bogus'] }]) {
     await t.test(JSON.stringify(shown), async (tt) => {
       const tenants = [{ id: 't1', name: 'Acme', anonymization: hiding([]) }, { id: 't2', name: 'NewCo' }];
       setup(tt, { tenants, historyOffers: { t1: { state: OfferState.DECLINED, changedAt: null, offeredIds: ['s1'], ...shown } } });
       assert.deepEqual(await accept('t1', ['s1'], { kinds: [] }), CHANGED);
       assert.deepEqual(await accept('t1', ['s1']), accepted(['s1']));
-      assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, ['repos', 'branches', 'sessions', 'hosts', 'accounts']);
+      assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, []);
     });
   }
 });

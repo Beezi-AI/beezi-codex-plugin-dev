@@ -157,9 +157,8 @@ export function questionText(n, workspace) {
   return n === 1 ? `Upload this session to ${workspace}?` : `Upload ${n} sessions to ${workspace}?`;
 }
 
-// Audit workspaces always ask, whatever the server sends (R15).
-export function asksFirst(block, audit = false) {
-  return audit || pastSessionsOf(block).choice !== PastSessionsChoice.UPLOAD;
+export function asksFirst(block) {
+  return pastSessionsOf(block).choice !== PastSessionsChoice.UPLOAD;
 }
 
 export function hidesPhrase(kinds) {

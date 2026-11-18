@@ -593,14 +593,14 @@ test('F3: a no-ask upload hides what the fresh answer hides, though the cached r
   assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, ['repos']);
 });
 
-test('F3: the combined layout shows the union of the cached and fresh hidden kinds for a no-ask workspace', async (t) => {
+test('F3: a no-ask workspace shows and owes the fresh hidden kinds, though the cached row hid more (R5)', async (t) => {
   workspaces(t, [['t1', 'Acme', UPLOAD, ['branches']], ['t2', 'Beta', OFFER]]);
   const io = capture(t);
   const whoamiImpl = async () => ({ valid: true, tenants: [tenant('t1', 'Acme', ['repos'], UPLOAD), tenant('t2', 'Beta', [], OFFER)] });
   const up = uploads({ t1: 1 });
   await offerCommand({ key: TEST_KEY, past: true }, deps({ t1: listed([session('s1')]), t2: listed([session('s2')]) }, { whoamiImpl, runPendingHistory: up.runPendingHistory }).deps);
-  assert.ok(io.out.includes('    ✓ Acme · 1 session · made-up names for repos and branches'));
-  assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, ['repos', 'branches']);
+  assert.ok(io.out.includes('    ✓ Acme · 1 session · made-up names for repos'));
+  assert.deepEqual((await getAccount(TEST_KEY)).pendingHistory[0].kinds, ['repos']);
 });
 
 test('F4: a no-ask owe settles under the fresh whoami\'s changedAt', async (t) => {
@@ -900,6 +900,17 @@ test('accept with nothing offered exits 1 and says how to see what would be sent
   assert.equal((await getAccount(TEST_KEY)).pendingHistory, undefined);
 });
 
+test('an Audit workspace whose whoami answers upload uploads without asking (R6)', async (t) => {
+  one(t, { past: UPLOAD });
+  const io = capture(t);
+  const up = uploads({ t1: 1 });
+  await offerCommand({ key: TEST_KEY }, deps({ null: listed([session('s1')], { trackingMode: 'backfill_only' }) }, { runPendingHistory: up.runPendingHistory }).deps);
+  assert.deepEqual(up.calls, [['t1']]);
+  assert.ok(!io.out.some((line) => line.startsWith('Q ') || line.startsWith('offer ')));
+  assert.ok(io.out.includes('✓ Uploaded 1 session to Acme.'));
+  assert.deepEqual(await pendingIds(), [['t1', ['s1']]]);
+});
+
 test('decline on an Audit workspace prints the DA line and keeps the shown ids declined', async (t) => {
   one(t);
   const io = capture(t);
@@ -1102,18 +1113,18 @@ test('M2: a scan or a --past offer that lists nothing keeps a question printed w
   }
 });
 
-// The anonymization vectors' key, remote and branch (test/fixtures/anonymization-vectors.json).
+// The anonymization vectors' key (test/fixtures/anonymization-vectors.json).
 const VECTOR_KEY = '000102030405060708090a0b0c0d0e0f101112131415161718191a1b1c1d1e1f';
-const VECTOR_BRANCH = 'anon:branch:49ed152043496c368ff991f9c951620d';
 const keyed = (on) => ({ ...block('t1', on), key: VECTOR_KEY });
 
-// runAudit's seams as session-audit.test.mjs stubs them; the real flush hashes and hands each chunk to `posted`.
-function uploadSeams(sessionBlock, posted) {
+// runAudit's seams as session-audit.test.mjs stubs them; the real flush hashes and hands each chunk to `posted`. `who` is
+// the run's own whoami answer, by default agreeing with the cached block.
+function uploadSeams(sessionBlock, posted, who = { valid: true, trackingMode: 'live', anonymization: sessionBlock }) {
   return {
     now: () => 10 * 60 * 60 * 1000,
     linkedSessions: async () => [{ ...accountSession(TEST_KEY, 'tok'), anonymization: sessionBlock }],
     getDefaultKey: async () => TEST_KEY,
-    whoamiImpl: async () => ({ valid: true, trackingMode: 'live' }),
+    whoamiImpl: async () => who,
     recordWhoamiImpl: () => {},
     listRollouts: () => [{
       sessionId: 's1', transcriptPath: 'C:/sessions/2026/01/01/rollout-2026-01-01T00-00-00-s1.jsonl', cwd: 'C:/work/app', mtimeMs: 1_000, size: 1024,
@@ -1148,7 +1159,7 @@ function uploadSeams(sessionBlock, posted) {
   };
 }
 
-test('a kind the question showed as hidden is hashed in the upload, though every kind was off at the yes', async (t) => {
+test('a kind the question showed as hidden goes up raw when the owner turned it off before the yes (R5)', async (t) => {
   linkAccount(makeHome(t), TEST_KEY, { tenantId: 't1', tenants: [{ id: 't1', name: 'Acme', anonymization: keyed(['branches']) }] });
   capture(t);
   await offerCommand({ key: TEST_KEY }, deps({ null: listed([session('s1')]) }).deps);
@@ -1156,15 +1167,46 @@ test('a kind the question showed as hidden is hashed in the upload, though every
   await updateAccount(TEST_KEY, { tenants: [{ id: 't1', name: 'Acme', anonymization: keyed([]) }] });
   const allOff = { ...keyed([]), tenantId: null };
   const posted = [];
-  const acceptedKinds = [];
-  const runAudit = (d, options) => {
-    acceptedKinds.push(options.acceptedKinds);
-    return realRunAudit({ ...d, ...uploadSeams(allOff, posted) }, options);
-  };
+  const runAudit = (d, options) => realRunAudit({ ...d, ...uploadSeams(allOff, posted) }, options);
   await acceptCommand({ key: TEST_KEY, tenantId: 't1', token: offerToken(['s1'], ['branches']) }, { now: () => T0, runAudit });
-  assert.deepEqual(acceptedKinds, [['branches']]);
-  assert.deepEqual(posted.map((report) => report.branch), [VECTOR_BRANCH]);
+  assert.deepEqual(posted.map((report) => report.branch), ['feature/ABC-123']);
   assert.equal(posted[0].remote, 'git@github.com:Acme/Payments.git');
+});
+
+test('an owed upload hashes with the run\'s own whoami block: a kind the owner turned on since the cache goes up made-up (R5)', async (t) => {
+  linkAccount(makeHome(t), TEST_KEY, { tenantId: 't1', tenants: [{ id: 't1', name: 'Acme', anonymization: keyed([]) }] });
+  capture(t);
+  await offerCommand({ key: TEST_KEY }, deps({ null: listed([session('s1')]) }).deps);
+  const cached = { ...keyed([]), tenantId: null };
+  const fresh = { valid: true, trackingMode: 'live', anonymization: { ...keyed(['repos']), tenantId: null } };
+  const posted = [];
+  const runAudit = (d, options) => realRunAudit({ ...d, ...uploadSeams(cached, posted, fresh) }, options);
+  await acceptCommand({ key: TEST_KEY, tenantId: 't1', token: offerToken(['s1'], []) }, { now: () => T0, runAudit });
+  assert.deepEqual(posted.map((report) => report.remote), ['anon:repo:5c565a8dd7e9ae8c634d8776d5892e65']);
+  assert.equal(posted[0].branch, 'feature/ABC-123');
+});
+
+test('an owed upload whose run gets no whoami answer sends nothing and stays owed (R5, fail closed)', async (t) => {
+  linkAccount(makeHome(t), TEST_KEY, { tenantId: 't1', tenants: [{ id: 't1', name: 'Acme', anonymization: keyed([]) }] });
+  const io = capture(t);
+  await offerCommand({ key: TEST_KEY }, deps({ null: listed([session('s1')]) }).deps);
+  const posted = [];
+  const runAudit = (d, options) => realRunAudit({ ...d, ...uploadSeams({ ...keyed([]), tenantId: null }, posted, null) }, options);
+  await acceptCommand({ key: TEST_KEY, tenantId: 't1', token: offerToken(['s1'], []) }, { now: () => T0, runAudit });
+  assert.deepEqual(posted, []);
+  assert.deepEqual(await pendingIds(), [['t1', ['s1']]]);
+  assert.ok(io.out.includes('✓ Beezi: could not reach Beezi to check what this workspace hides, so nothing was uploaded. '
+    + 'The sessions stay waiting and upload on a later retry.'));
+});
+
+test('an ask-first offer shows and binds the kinds the run\'s own whoami hides, though the cached row hides nothing', async (t) => {
+  one(t);
+  const io = capture(t);
+  const whoamiImpl = async () => ({ valid: true, tenants: [tenant('t1', 'Acme', ['repos'], OFFER)] });
+  await offerCommand({ key: TEST_KEY }, deps({ null: listed([session('s1')]) }, { whoamiImpl, runPendingHistory: async () => { throw new Error('no upload'); } }).deps);
+  assert.ok(io.out.includes('    ◆ folder and repository names'));
+  assert.deepEqual(io.out.slice(-3), ['Q Upload this session to Acme?', offerLine('t1', ['s1'], 'no', ['repos']), 'offers=1']);
+  assert.deepEqual((await offers()).t1.shownKinds, ['repos']);
 });
 
 test('a rule added before a never-shown full offer was printed keeps the next offer full', async (t) => {

@@ -3,7 +3,7 @@ import { BackfillHalt } from './audit-flush.mjs';
 import { isMultiTenant, tenantById } from './workspace.mjs';
 import { usesRules } from './workspace-rules.mjs';
 import { rolloutStartedAt as _rolloutStartedAt } from './subagent-codex.mjs';
-import { pendingHistoryOf, historyDue, waitingOnRecent, acceptedKindsOf, RunOutcome, SettleState } from './pending-history.mjs';
+import { pendingHistoryOf, historyDue, waitingOnRecent, RunOutcome, SettleState } from './pending-history.mjs';
 import { createProgressWriter as _createProgressWriter } from './upload-progress.mjs';
 
 // A live checkpoint transaction or a run that took the lock over is busy, not a failure.
@@ -54,10 +54,10 @@ function startedAtMs(recent, startedAt) {
   }
 }
 
-// Each pending workspace's runAudit options, limited to the sessions the developer accepted and the kinds hidden at
-// that yes: a --tenant override runs unrouted, the rest as sync plans them; null when no route reaches it.
+// Each pending workspace's runAudit options, limited to the sessions the developer accepted and hashed with the run's own
+// whoami block (history): a --tenant override runs unrouted, the rest as sync plans them; null when no route reaches it.
 function plannedRuns(row, entries, planRuns) {
-  const accepted = (entry) => ({ onlySessionIds: entry.sessionIds, acceptedKinds: acceptedKindsOf(entry) });
+  const accepted = (entry) => ({ onlySessionIds: entry.sessionIds, history: true });
   if (!isMultiTenant(row)) {
     const options = { tenantId: null };
     if (usesRules(row)) options.excludedSessionIds = dontTrackSessionIds(planRuns(row));

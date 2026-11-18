@@ -34,9 +34,9 @@ const ui = () => manifest().extensions['com.openai'].interface;
 
 // manifest
 
-test('manifest names the beezi-analytics plugin at 0.1.1', () => {
+test('manifest names the beezi-analytics plugin at 0.1.2', () => {
   assert.equal(manifest().name, 'beezi-analytics');
-  assert.equal(manifest().version, '0.1.1');
+  assert.equal(manifest().version, '0.1.2');
 });
 
 test('manifest registers no hooks with OpenAI', () => {
@@ -92,12 +92,12 @@ test('licence and notice are copies of the full plugin files', () => {
 
 // MCP file
 
-test('mcp.json declares the remote OAuth server under the key beezi_analytics, tagged as Codex', () => {
+test('mcp.json declares the remote OAuth server under the key beezi_analytics, tagged as Codex and as a light plugin', () => {
   assert.deepEqual(json('mcp.json').mcpServers, {
     beezi_analytics: {
       type: 'streamable-http',
       url: 'https://api.beezi.ai/api/mcp',
-      headers: { 'X-Beezi-Agent': 'codex' },
+      headers: { 'X-Beezi-Agent': 'codex', 'X-Beezi-Plugin': 'light' },
       extensions: {
         'com.openai': {
           auth: {
@@ -141,8 +141,11 @@ test('analytics skill description is scoped to Beezi', () => {
   );
 });
 
-test('analytics skill does not call get_analytics_instructions', () => {
-  assert.equal(read('skills/analytics/SKILL.md').includes('get_analytics_instructions'), false);
+test('analytics skill and README never mention get_analytics_instructions or other read-only tools', () => {
+  for (const file of ['skills/analytics/SKILL.md', 'README.md']) {
+    assert.equal(read(file).includes('get_analytics_instructions'), false, file);
+    assert.equal(read(file).includes('other read-only tools'), false, file);
+  }
 });
 
 test('analytics skill always asks for every coding agent', () => {
@@ -156,8 +159,8 @@ test('analytics skill calls the beezi_analytics server', () => {
   assert.ok(read('skills/analytics/SKILL.md').includes('`beezi_analytics` MCP server'));
 });
 
-test('analytics skill carries template version 9.0', () => {
-  assert.ok(read('skills/analytics/SKILL.md').includes('Template version: 9.0'));
+test('analytics skill carries template version 9.1', () => {
+  assert.ok(read('skills/analytics/SKILL.md').includes('Template version: 9.1'));
 });
 
 test('analytics skill never names Claude', () => {
@@ -168,13 +171,19 @@ test('analytics skill gives the Codex example for agent-labelled checks', () => 
   assert.ok(read('skills/analytics/SKILL.md').includes('"Plan limit reached (Codex): "'));
 });
 
-test('analytics skill numbers its rules 1 to 20 in order', () => {
+test('analytics skill numbers its rules 1 to 21 in order', () => {
   const numbers = read('skills/analytics/SKILL.md')
     .split('\n')
     .filter((line) => /^\d+\. /.test(line))
-    .slice(0, 20)
+    .slice(0, 21)
     .map((line) => Number(line.split('.')[0]));
-  assert.deepEqual(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20]);
+  assert.deepEqual(numbers, [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17, 18, 19, 20, 21]);
+});
+
+test('analytics skill refuses requests about other people with a fixed line and no tool call', () => {
+  assert.ok(read('skills/analytics/SKILL.md').includes(
+    '\n21. The summary covers only the signed-in user. When the argument or the request names any other person or group (an email, a name, a team), reply exactly: This plugin shows only your own Beezi analytics. To see other people, open the Beezi portal. — and stop, with no tool call.\n',
+  ));
 });
 
 test('analytics skill tells the user how to sign in', () => {
@@ -197,9 +206,10 @@ test('analytics skill no_data rule gives two lines: the grade line, then the doc
 
 test('analytics skill workflow defaults to 7d and asks for every coding agent', () => {
   const workflow = read('skills/analytics/SKILL.md').split('\nWorkflow:\n')[1].split('\n\nTemplate')[0];
-  assert.ok(workflow.includes('1. Pick the period from the user\'s request: "7d" (7 days) or "30d" (30 days). Anything else, or no period named, means "7d".'));
-  assert.ok(workflow.includes('2. Call `get_my_usage_summary` on the `beezi_analytics` MCP server with `{ period, agents: "all" }`.'));
-  assert.ok(workflow.includes('3. Render the payload with the template below, and stop'));
+  assert.ok(workflow.includes('1. Pick the period from the user\'s request: the first "7d" (7 days) or "30d" (30 days) named. Anything else, or no period named, means "7d".'));
+  assert.ok(workflow.includes('2. If the argument or the request names any other person or group, follow rule 21 and stop before calling the tool.'));
+  assert.ok(workflow.includes('3. Call `get_my_usage_summary` on the `beezi_analytics` MCP server with `{ period, agents: "all" }`.'));
+  assert.ok(workflow.includes('4. Render the payload with the template below, and stop'));
 });
 
 // marketplace
@@ -274,8 +284,10 @@ test('repo README carries the Codex 0.167 marketplace-install note', () => {
   ));
 });
 
-test('README says the server is tagged with the X-Beezi-Agent header', () => {
-  assert.ok(read('README.md').includes('Its requests carry the header `X-Beezi-Agent: codex`, so Beezi knows they come from Codex.'));
+test('README says the server is tagged with the X-Beezi-Agent and X-Beezi-Plugin headers', () => {
+  const readme = read('README.md');
+  assert.ok(readme.includes('Its requests carry the header `X-Beezi-Agent: codex`, so Beezi knows they come from Codex.'));
+  assert.ok(readme.includes('They\nalso carry `X-Beezi-Plugin: light`, so Beezi offers them only your personal summary. The plugin\ndeclines questions about other people.'));
 });
 
 test('analytics skill allows the no_data docs link as its only URL of its own', () => {

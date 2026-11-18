@@ -313,11 +313,11 @@ test('a routed yes merged into a --tenant override entry runs routed, with the s
   assert.deepEqual(h.audits.map((o) => [o.tenantId, o.onlySessionIds, o.sessionRoutes]), [['B', ['s1', 's2'], routes]]);
 });
 
-test('each run applies the kinds hidden when the developer said yes', async () => {
+test('each run is a history run, hashed with its own whoami block whatever kinds the entry recorded (R5)', async () => {
   const row = multiRow([{ tenantId: 'A', sessionIds: ['s1'], kinds: ['repos', 'hosts'], requestedAt: REQ }, { tenantId: 'B', sessionIds: ['s2'], requestedAt: REQ }]);
   const h = harness({ row, results: [clean(), clean()], plan: { tenantIds: ['A', 'B'], routes: new Map() } });
   await runPendingHistory('k1', h.deps);
-  assert.deepEqual(h.audits.map((o) => o.acceptedKinds), [['repos', 'hosts'], []]);
+  assert.deepEqual(h.audits.map((o) => o.history), [true, true]);
 });
 
 function patientHarness(results) {
