@@ -188,12 +188,14 @@ test('an anonymized account without its key stops before registering or uploadin
   assert.deepEqual(events, []);
 });
 
-test('an accepted upload hides at least the kinds hidden when the developer said yes', async () => {
+test('a history run hashes with its own whoami block, not the cached one (R5)', async () => {
   const OFF = { ...ANON_BLOCK, kinds: { repos: false, branches: false, sessions: false, hosts: false, accounts: false } };
+  const FRESH = { ...ANON_BLOCK, kinds: { repos: true, branches: false, sessions: false, hosts: false, accounts: true } };
   const registrations = [];
   const flushed = [];
   const { deps } = makeDeps({
     linkedSessions: async () => [{ ...SESSION, anonymization: OFF }],
+    whoamiImpl: async () => ({ valid: true, trackingMode: 'live', anonymization: FRESH }),
     readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'current', email: 'dev@example.com', expiresAt: 99_000_000 }),
     postJsonImpl: async (_url, _session, body) => {
       registrations.push(body);
@@ -205,9 +207,34 @@ test('an accepted upload hides at least the kinds hidden when the developer said
       return flushResult({ stored: groups.length, bySession });
     },
   });
-  await runAudit(deps, { acceptedKinds: ['accounts', 'repos'] });
+  await runAudit(deps, { history: true });
   assert.equal(registrations[0].email, anonAccount(ANON_KEY, 'dev@example.com'));
   assert.deepEqual(flushed, [['repos', 'accounts']]);
+});
+
+test('a history run without a whoami block for its workspace registers and uploads nothing (R5, fail closed)', async (t) => {
+  const answers = [
+    ['no answer', async () => null],
+    ['a failed request', async () => { throw new Error('offline'); }],
+    ['a refused token', async () => ({ valid: false })],
+    ['an answer without a block', async () => ({ valid: true, trackingMode: 'live' })],
+  ];
+  for (const [name, whoamiImpl] of answers) {
+    await t.test(name, async () => {
+      const events = [];
+      const { deps } = makeDeps({
+        linkedSessions: async () => [{ ...SESSION, anonymization: ANON_BLOCK }],
+        whoamiImpl,
+        readChatgptAuthImpl: () => ({ authMode: 'chatgpt', accountId: 'current', email: 'dev@example.com', expiresAt: 99_000_000 }),
+        postJsonImpl: async () => { events.push('register'); return { ok: true, status: 200, json: async () => ({ accountLinked: true }) }; },
+        flushBackfillChunksImpl: async () => { events.push('flush'); return flushResult(); },
+      });
+      const result = await runAudit(deps, { history: true });
+      assert.equal(result.ok, false);
+      assert.equal(result.reason, 'anonymization-unknown');
+      assert.deepEqual(events, []);
+    });
+  }
 });
 
 test('account registration failure leaves history untouched and a later run retries it', async () => {

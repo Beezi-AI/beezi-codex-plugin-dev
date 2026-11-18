@@ -195,7 +195,7 @@ test('PK6: noAsk is set only from the run\'s own whoami answering upload', () =>
   }
   assert.deepEqual(sets.sort(), [
     'const entries = offers.map((o) => ({ name: o.name, n: o.summary.n, kinds: o.kinds, noAsk: o.noAsk }));',
-    'noAsk: run.override !== true && !asksFirst(freshBlock, summary.audit) && !declined,',
+    'noAsk: run.override !== true && !asksFirst(freshBlock) && !declined,',
   ].sort());
   const src = readLib('history-cli.mjs');
   assert.ok(src.includes('const freshBlock = fresh != null && fresh.valid === true ? anonymizationFor(fresh, run.id) : null;'));

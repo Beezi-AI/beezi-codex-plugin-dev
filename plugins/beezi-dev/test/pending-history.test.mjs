@@ -1,7 +1,7 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  ruleRequestIds, gainedIds, requestHistory, acceptedKindsOf, pendingHistoryOf, workspaceIdOf, historyDue, noteAttempt,
+  ruleRequestIds, gainedIds, requestHistory, pendingHistoryOf, workspaceIdOf, historyDue, noteAttempt,
   settleHistory, takeResults, resultLine, waitingOnRecent, RunOutcome, SettleState, HistoryStatus,
   HISTORY_RETRY_MS, HISTORY_GIVE_UP_MS, HISTORY_BUSY_RETRY_MS, HISTORY_PASS_MAX_MS,
 } from '../lib/pending-history.mjs';
@@ -43,18 +43,17 @@ test('requestHistory merges new ids into the workspace entry, due now with its c
   assert.equal(row.pendingHistory[0].sent, 4);
 });
 
-test('requestHistory records a --tenant override, and the kinds hidden at each yes merge on a later yes', () => {
+test('requestHistory records a --tenant override, and a later owe\'s kinds replace the earlier ones (R5)', () => {
   const row = multi();
   requestHistory(row, 'A', ['s1'], iso(T0), { override: true, kinds: ['repos'] });
   assert.equal(row.pendingHistory[0].override, true);
-  assert.deepEqual(acceptedKindsOf(row.pendingHistory[0]), ['repos']);
+  assert.deepEqual(row.pendingHistory[0].kinds, ['repos']);
   requestHistory(row, 'A', ['s2'], iso(T0 + 1000), { kinds: ['hosts', 'repos'] });
   assert.equal(row.pendingHistory[0].override, false, 'a later routed yes ends the override');
-  assert.deepEqual(acceptedKindsOf(row.pendingHistory[0]), ['repos', 'hosts']);
+  assert.deepEqual(row.pendingHistory[0].kinds, ['hosts', 'repos']);
   requestHistory(row, 'B', ['s3'], iso(T0));
   assert.equal(row.pendingHistory[1].override, false);
-  assert.deepEqual(acceptedKindsOf(row.pendingHistory[1]), []);
-  assert.deepEqual(acceptedKindsOf({ tenantId: 'A', sessionIds: ['s1'] }), [], 'an entry from before kinds were recorded');
+  assert.deepEqual(row.pendingHistory[1].kinds, []);
 });
 
 test('requestHistory with a null override (a no-ask owe) keeps the entry\'s flag; a new entry gets false', () => {

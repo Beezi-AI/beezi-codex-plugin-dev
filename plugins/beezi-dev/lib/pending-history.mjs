@@ -67,11 +67,6 @@ export function gainedIds(before, after) {
 
 const unique = (list) => list.filter((item, i) => isId(item) && list.indexOf(item) === i);
 
-// The kinds an entry was accepted under; none for an entry from before they were recorded.
-export function acceptedKindsOf(entry) {
-  return Array.isArray(entry.kinds) ? unique(entry.kinds) : [];
-}
-
 // An entry runs only for the session ids the developer accepted; one without them is dropped.
 export function hasSessionIds(entry) {
   return Array.isArray(entry.sessionIds) && entry.sessionIds.length > 0;
@@ -79,7 +74,7 @@ export function hasSessionIds(entry) {
 
 // Adds the workspace's entry for the accepted ids, or merges them into it (due now, counts kept);
 // drops entries without ids and workspaces the account left. `override` (a --tenant offer) sends the ids unrouted, and the latest yes decides it;
-// null (a no-ask owe) keeps the entry's flag. `kinds` are the kinds hidden at the yes, which the upload keeps hiding.
+// null (a no-ask owe) keeps the entry's flag. `kinds` record the kinds hidden at the latest owe; the upload hashes with its own run's whoami block.
 export function requestHistory(row, tenantId, sessionIds, nowIso, { override = false, kinds = [] } = {}) {
   const entries = pendingHistoryOf(row);
   const ids = sessionIds.filter((id, i) => isId(id) && sessionIds.indexOf(id) === i);
@@ -88,7 +83,7 @@ export function requestHistory(row, tenantId, sessionIds, nowIso, { override = f
     if (found != null) {
       found.sessionIds = found.sessionIds.concat(ids.filter((id) => found.sessionIds.indexOf(id) === -1));
       if (override != null) found.override = override === true;
-      found.kinds = unique(acceptedKindsOf(found).concat(kinds));
+      found.kinds = unique(kinds);
       found.requestedAt = nowIso;
       found.lastAttemptAt = null;
     } else {

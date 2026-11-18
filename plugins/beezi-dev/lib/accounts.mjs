@@ -21,7 +21,7 @@ import {
   pendingHistoryOf,
 } from './pending-history.mjs';
 import { OfferState, offerToken, offerMapOf, offerRecordOf, offerIdsOf, changedAtOf } from './history-offer.mjs';
-import { anonymizationFor, kindsOf, unionKinds } from './anonymization.mjs';
+import { anonymizationFor, kindsOf } from './anonymization.mjs';
 import { KINDS } from './anonymize.mjs';
 import { NEW_FOLDERS_SOURCE } from './workspace.mjs';
 import { SAFE_TENANT_ID } from './whoami.mjs';
@@ -528,8 +528,8 @@ function shownKindsOf(record) {
   return Array.isArray(shown) && shown.every((kind) => KINDS.indexOf(kind) !== -1) ? shown : KINDS;
 }
 
-// A yes to the printed question whose token is `token`: owes exactly its shown ids, hiding the kinds it showed as hidden
-// plus those hidden now, and settles the offer. → { ids, refused: AcceptRefusal value | null }; a refusal writes nothing.
+// A yes to the printed question whose token is `token`: owes exactly its shown ids, hiding the kinds hidden now, and
+// settles the offer. → { ids, refused: AcceptRefusal value | null }; a refusal writes nothing.
 export async function acceptOffer(key, tenantId, token, nowIso, deps = {}) {
   return mutate(deps, () => {
     const index = readIndexForMutation();
@@ -540,16 +540,16 @@ export async function acceptOffer(key, tenantId, token, nowIso, deps = {}) {
     const shown = shownKindsOf(record);
     // Only printing the question records DECLINED; its token binds the shown ids and the kinds it showed as hidden.
     if (record.state !== OfferState.DECLINED || token !== offerToken(ids, shown)) return { ids: [], refused: AcceptRefusal.CHANGED };
-    if (!owe(found, tenantId, ids, shown, nowIso, record.override === true, changedAtOf(found, tenantId))) return { ids: [], refused: AcceptRefusal.NONE };
+    const kinds = kindsOf(anonymizationFor(found, tenantId));
+    if (!owe(found, tenantId, ids, kinds, nowIso, record.override === true, changedAtOf(found, tenantId))) return { ids: [], refused: AcceptRefusal.NONE };
     writeIndex(index);
     return { ids, refused: null };
   });
 }
 
-// Owes `ids` to the workspace, hiding `shownKinds` plus those hidden now, and settles its offer under `changedAt`.
+// Owes `ids` to the workspace, hiding `kinds`, and settles its offer under `changedAt`.
 // `override` null keeps an existing entry's flag. → false when the account no longer has the workspace, which gets no entry.
-function owe(found, tenantId, ids, shownKinds, nowIso, override, changedAt) {
-  const kinds = unionKinds(shownKinds, kindsOf(anonymizationFor(found, tenantId)));
+function owe(found, tenantId, ids, kinds, nowIso, override, changedAt) {
   if (!requestHistory(found, tenantId, ids, nowIso, { override, kinds }).some((e) => e.tenantId === tenantId)) return false;
   const record = offerRecordOf(found, tenantId);
   applyOffer(found, tenantId, {
@@ -562,13 +562,13 @@ function owe(found, tenantId, ids, shownKinds, nowIso, override, changedAt) {
 
 // A no-ask workspace's shown ids, owed and settled without a question (R4) under the fresh whoami's `changedAt`; only a
 // yes decides an entry's override. → { ids }, empty when nothing was owed.
-export async function owePastSessions(key, tenantId, ids, shownKinds, nowIso, changedAt, deps = {}) {
+export async function owePastSessions(key, tenantId, ids, kinds, nowIso, changedAt, deps = {}) {
   return mutate(deps, () => {
     const index = readIndexForMutation();
     const found = index.accounts.find((a) => a.key === key);
     // A pending --tenant entry uploads unrouted, so new ids wait, unsettled, until it settles.
     const overridden = found && pendingHistoryOf(found).some((e) => e.tenantId === tenantId && e.override === true);
-    if (!found || overridden || !owe(found, tenantId, ids, shownKinds, nowIso, null, changedAt)) return { ids: [] };
+    if (!found || overridden || !owe(found, tenantId, ids, kinds, nowIso, null, changedAt)) return { ids: [] };
     writeIndex(index);
     return { ids };
   });

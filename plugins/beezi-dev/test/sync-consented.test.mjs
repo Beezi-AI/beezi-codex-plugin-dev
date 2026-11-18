@@ -108,7 +108,7 @@ test('an ask-first workspace is owed its counted sessions and the worker starts 
   assert.deepEqual([record.state, record.declinedIds], ['settled', []]);
 });
 
-test('a no-ask workspace is owed the same with no notice, under the kinds it hid when counted and hides now', async (t) => {
+test('a no-ask workspace is owed the same with no notice, under the kinds it hides now (R5)', async (t) => {
   link(t, { tenants: [tenant('t1', 'Acme', ['repos'], UPLOAD)], ...answered(['A', 'D']) });
   const io = capture(t);
   const whoamiImpl = async () => ({ valid: true, tenants: [tenant('t1', 'Acme', ['branches'], UPLOAD)] });
@@ -116,7 +116,7 @@ test('a no-ask workspace is owed the same with no notice, under the kinds it hid
   assert.equal(await consented(deps), 0);
   assert.deepEqual(io, { out: ['uploading=2 workspaces=1 tenants=t1'], err: [] });
   assert.deepEqual(spawns, WORKER);
-  assert.deepEqual(await owed(), [['t1', ['A', 'D'], ['repos', 'branches']]]);
+  assert.deepEqual(await owed(), [['t1', ['A', 'D'], ['branches']]]);
 });
 
 test('an audit workspace is included', async (t) => {
@@ -338,7 +338,7 @@ test('a session that became eligible after the listing is not owed', async (t) =
   assert.deepEqual((await owed()).map(([id, ids]) => [id, ids]), [['t1', ['W1']]]);
 });
 
-test('a kind the listing showed as hidden stays hidden though the workspace stopped hiding it', async (t) => {
+test('a kind the listing showed as hidden is owed raw once the workspace stopped hiding it (R5)', async (t) => {
   link(t);
   capture(t);
   const { deps } = engine({ disk: [session('W1', WEB)] });
@@ -346,7 +346,7 @@ test('a kind the listing showed as hidden stays hidden though the workspace stop
   await updateAccount(TEST_KEY, { tenants: [tenant('t1', 'Acme', [])] });
   await write(['setup', 'everything'], deps);
   assert.equal(await consented(deps), 0);
-  assert.deepEqual(await owed(), [['t1', ['W1'], ['repos']]]);
+  assert.deepEqual(await owed(), [['t1', ['W1'], []]]);
 });
 
 test('a second consented run after a successful one owes nothing more', async (t) => {

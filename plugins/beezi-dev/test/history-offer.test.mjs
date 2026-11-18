@@ -85,9 +85,8 @@ test('declinedNow: declines under the current changedAt count, older ones and no
   assert.equal(declinedNow(past(A), null), false);
 });
 
-test('asksFirst is false only for upload, and an audit workspace always asks', () => {
+test('asksFirst is false only for upload', () => {
   assert.equal(asksFirst(block(A, 'upload')), false);
-  assert.equal(asksFirst(block(A, 'upload'), true), true);
   assert.equal(asksFirst(block(A, 'offer')), true);
   assert.equal(asksFirst(block(A, 'skip')), true);
   assert.equal(asksFirst(null), true);

@@ -10,7 +10,7 @@ import {
 } from './accounts.mjs';
 import { isMultiTenant, newFoldersOf, NEW_FOLDERS_SOURCE, joinTenantNames } from './workspace.mjs';
 import { usesRules, routeForDir, createRouteContext } from './workspace-rules.mjs';
-import { anonymizationFor, kindsOf, pastSessionsOf, unionKinds } from './anonymization.mjs';
+import { ANONYMIZATION_UNKNOWN, anonymizationFor, kindsOf, pastSessionsOf } from './anonymization.mjs';
 import { whoami as _whoami } from './whoami.mjs';
 import {
   OfferState, OfferCheck, offerCheck, offerLines, questionText, declineLine, plural, CHANGED_LINE,
@@ -147,6 +147,13 @@ function stopLine(result, key) {
   }
   if (isKeyMissing(result)) {
     return refusal(KEY_MISSING_MESSAGE);
+  }
+  // Fail closed: without the workspace's current settings nothing is sent, and the owed sessions wait for the retry.
+  if (result.reason === ANONYMIZATION_UNKNOWN) {
+    return notice(
+      '✓ Beezi: could not reach Beezi to check what this workspace hides, so nothing was uploaded. '
+      + 'The sessions stay waiting and upload on a later retry.',
+    );
   }
   // The tri-state, surfaced verbatim: "could not ask" must never be printed as "nothing to do".
   if (result.coverageKnown === false) {
@@ -423,8 +430,8 @@ function printHeading(row, run) {
   if (run.heading) console.log(`\n— ${describeAccount(row)} · ${workspaceName(row, run.id)} —`);
 }
 
-// One workspace's shown sessions. Only the run's own whoami answering upload skips the question (R17); audit workspaces
-// (R15), the --tenant override (R6) and, in sync, a listed session declined under the fresh choice (R18) always ask.
+// One workspace's shown sessions. Only the run's own whoami answering upload skips the question (R17); the --tenant
+// override (R6) and, in sync, a listed session declined under the fresh choice (R18) always ask.
 function shownOffer(row, run, result, changedAt, fresh, sync) {
   const summary = summaryOf(result);
   const freshBlock = fresh != null && fresh.valid === true ? anonymizationFor(fresh, run.id) : null;
@@ -432,17 +439,15 @@ function shownOffer(row, run, result, changedAt, fresh, sync) {
   const record = offerRecordOf(row, run.id);
   const ids = result.listed.map((s) => s.sessionId);
   const declined = sync && declinedNow(freshPast, record) && ids.some((id) => offerIdsOf(record.declinedIds).indexOf(id) !== -1);
-  const cachedKinds = kindsOf(anonymizationFor(row, run.id));
   const offer = {
     run, changedAt, summary, ids,
     compressed: orDefault(result.compressedUnsupported, 0),
     name: workspaceName(row, run.id),
-    kinds: cachedKinds,
-    noAsk: run.override !== true && !asksFirst(freshBlock, summary.audit) && !declined,
+    // What the fresh answer hides, which the upload will hash with; the cached row only when the run got no answer.
+    kinds: kindsOf(freshBlock != null ? freshBlock : anonymizationFor(row, run.id)),
+    noAsk: run.override !== true && !asksFirst(freshBlock) && !declined,
     freshChangedAt: orDefault(freshPast.changedAt, null),
   };
-  // A no-ask upload hides what the cached or the fresh answer hides.
-  if (offer.noAsk) offer.kinds = unionKinds(cachedKinds, kindsOf(freshBlock));
   return offer;
 }
 
@@ -713,7 +718,7 @@ export async function consentedCommand({ key }, deps = {}) {
     // A workspace the listing did not show is owed nothing.
     if (!Array.isArray(shownKinds[run.id])) continue;
     const freshBlock = fresh != null && fresh.valid === true ? anonymizationFor(fresh, run.id) : null;
-    const kinds = unionKinds(unionKinds(shownKinds[run.id], kindsOf(anonymizationFor(row, run.id))), kindsOf(freshBlock));
+    const kinds = kindsOf(freshBlock != null ? freshBlock : anonymizationFor(row, run.id));
     const changedAt = orDefault(pastSessionsOf(freshBlock).changedAt, null);
     const listedIds = consentedIds(row, run.id, result.listed).filter((id) => shownIds.indexOf(id) !== -1);
     const { ids } = await owePastSessions(row.key, run.id, listedIds, kinds, nowIso, changedAt);

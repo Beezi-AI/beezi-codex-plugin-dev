@@ -194,7 +194,8 @@ captured ChatGPT plan.
 the outcome for each. With only one account linked, it logs that one out in a single step.
 
 Each account and workspace has its own history upload. Login and sync ask where past sessions with
-no rule should go, then show what an upload would send and ask before uploading anything.
+no rule should go, then show what an upload would send. Each workspace's owner chooses whether past
+sessions ask first, upload without asking, or start from today.
 Two users of the same workspace can both link the machine; if both send to that workspace, it
 counts the same sessions twice.
 
@@ -285,11 +286,14 @@ With Session titles on, session titles, error messages and subagent names are no
 Without the workspace's key on this machine, a hidden kind is never sent raw: live reports for that
 workspace are dropped, and sync stops with a line asking you to sign in again.
 
-Past sessions need a yes. Login, sync and the setup wizard show what an upload would send — which
-kinds are sent as they are and which the workspace hides — and ask. In sync nothing goes up without
-"Upload now"; at login and in the setup wizard the answer to the tracking question is the yes, for
-the repos and folders you track. The kinds the summary showed as hidden stay hidden for that upload,
-even if the workspace turns them off before it runs.
+Past sessions follow the workspace owner's choice. Login, sync and the setup wizard show what an
+upload would send — which kinds are sent as they are and which the workspace hides. A workspace that
+asks first uploads nothing until you say yes: in sync that is "Upload now"; at login and in the setup
+wizard the answer to the tracking question is the yes, for the repos and folders you track. A
+workspace that uploads without asking shows the summary as a notice and uploads, audit workspaces
+too. An upload hides the kinds the workspace hides when it is sent, so a kind the owner turned off
+after the summary goes up as it is. An upload that cannot reach Beezi to check those settings sends
+nothing; the sessions wait and upload on a later retry.
 
 ## Updating
 

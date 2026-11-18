@@ -4,6 +4,8 @@ import { KINDS, Kind, PRIVATE_MARK, anonymizeReport } from './anonymize.mjs';
 export { PRIVATE_MARK };
 
 export const ANONYMIZATION_KEY_MISSING = 'anonymization-key-missing';
+// A history run whose own whoami gave no block for its workspace: it sends nothing, and the owed entry stays owed.
+export const ANONYMIZATION_UNKNOWN = 'anonymization-unknown';
 export const PastSessionsChoice = Object.freeze({ OFFER: 'offer', UPLOAD: 'upload', SKIP: 'skip' });
 
 const KEY_PATTERN = /^[0-9a-f]{64}$/;
@@ -166,22 +168,12 @@ export function reportForWire(payload, session, tenantId) {
   return block != null && block.key != null ? anonymizeReport(payload, block.key, kinds) : null;
 }
 
-// `session` with `kinds` also hidden for its workspace; a history upload keeps hiding what was hidden at the yes (K4).
-export function withKinds(session, kinds) {
-  const block = sessionAnonymization(session);
-  const current = kindsOf(block);
-  const merged = unionKinds(current, Array.isArray(kinds) ? kinds : []);
-  if (merged.length === current.length) return session;
+// `session` hashing with `block` for its own workspace: a history upload takes the run's fresh whoami block (R5).
+export function withBlock(session, block) {
   const tenantId = isId(session.tenantId) ? session.tenantId : null;
   const tenants = Array.isArray(session.tenants) ? session.tenants : [];
   const entry = tenantId != null ? tenants.find((t) => t != null && t.id === tenantId) : (tenants.length === 1 ? tenants[0] : null);
-  const next = {
-    tenantId: entry == null ? tenantId : entry.id,
-    key: null,
-    machineName: null,
-    ...(block == null ? {} : block),
-    kinds: KINDS.reduce((out, kind) => ({ ...out, [kind]: merged.indexOf(kind) !== -1 }), {}),
-  };
+  const next = { ...block, tenantId: entry != null ? entry.id : (tenantId != null ? tenantId : block.tenantId) };
   // Where anonymizationFor looks first: the workspace's own entry, else the top-level block.
   if (entry == null) return { ...session, anonymization: next };
   return { ...session, tenants: tenants.map((t) => (t === entry ? { ...t, anonymization: next } : t)) };

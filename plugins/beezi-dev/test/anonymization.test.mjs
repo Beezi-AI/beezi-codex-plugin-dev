@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import {
   ANONYMIZATION_KEY_MISSING, PastSessionsChoice, isId, PRIVATE_MARK, parseAnonymization, anonymizationFor, sessionAnonymization, kindsOf, hasKind, pastSessionsOf,
-  isLaterChange, privateKinds, hidesSessions, markPrivate, wireKinds, reportForWire, withoutMarker, withKinds,
+  isLaterChange, privateKinds, hidesSessions, markPrivate, wireKinds, reportForWire, withoutMarker, withBlock,
 } from '../lib/anonymization.mjs';
 import { KINDS, Kind, PRIVATE_MARK as DEFINED_MARK, anonymizeReport } from '../lib/anonymize.mjs';
 import { whoami } from '../lib/whoami.mjs';
@@ -335,28 +335,27 @@ test('reportForWire sends the payload unchanged without the marker when no kind 
   assert.equal(JSON.stringify(reportForWire(other, pair(block('A', KINDS), block('B', NONE)), 'B')), JSON.stringify(REPORT));
 });
 
-test('withKinds adds the accepted kinds to the session\'s own workspace block, keeping its key', () => {
+test('withBlock replaces the session\'s own workspace block with the given one, key included, leaving the others (R5)', () => {
   const session = { key: 'k', tenantId: 't2', tenants: [{ id: 't1', anonymization: block('t1', ['hosts']) }, { id: 't2', anonymization: block('t2', ['repos']) }] };
-  const out = withKinds(session, ['accounts', 'repos']);
-  assert.deepEqual(kindsOf(sessionAnonymization(out)), ['repos', 'accounts']);
-  assert.equal(sessionAnonymization(out).key, KEY);
+  const out = withBlock(session, block('t2', ['accounts'], OTHER_KEY));
+  assert.deepEqual(kindsOf(sessionAnonymization(out)), ['accounts']);
+  assert.equal(sessionAnonymization(out).key, OTHER_KEY);
   assert.deepEqual(kindsOf(anonymizationFor(out, 't1')), ['hosts']);
   assert.deepEqual(kindsOf(sessionAnonymization(session)), ['repos'], 'the input is not mutated');
 });
 
-test('withKinds on a session with no block hides the kinds with no key, so nothing goes up raw', () => {
-  const out = withKinds({ key: 'k', tenants: [{ id: 't1' }] }, ['sessions']);
-  const applied = sessionAnonymization(out);
-  assert.deepEqual(kindsOf(applied), ['sessions']);
-  assert.equal(applied.key, null);
-  assert.equal(applied.tenantId, 't1');
+test('withBlock on a one-workspace session sets the block where it is read: the only entry, else the top level', () => {
+  const entry = sessionAnonymization(withBlock({ key: 'k', tenants: [{ id: 't1' }] }, block(null, ['sessions'])));
+  assert.deepEqual(kindsOf(entry), ['sessions']);
+  assert.equal(entry.tenantId, 't1');
+  const top = withBlock({ key: 'k', anonymization: block('t1', ['repos']) }, block('t1', []));
+  assert.deepEqual(kindsOf(sessionAnonymization(top)), []);
+  assert.equal(top.anonymization.tenantId, 't1');
 });
 
-test('withKinds keeps the session as it is when nothing is added', () => {
-  const session = { key: 'k', anonymization: block(null, ['repos']) };
-  assert.equal(withKinds(session, undefined), session);
-  assert.equal(withKinds(session, []), session);
-  assert.equal(withKinds(session, ['repos']), session);
-  assert.deepEqual(kindsOf(sessionAnonymization(withKinds(session, ['hosts']))), ['repos', 'hosts']);
+test('withBlock on a headed session with no entry for its workspace sets a top-level block for that workspace', () => {
+  const out = withBlock({ key: 'k', tenantId: 't2', tenants: [{ id: 't1' }] }, block(null, ['repos']));
+  assert.equal(out.anonymization.tenantId, 't2');
+  assert.deepEqual(kindsOf(sessionAnonymization(out)), ['repos']);
 });
 

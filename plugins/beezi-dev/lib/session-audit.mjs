@@ -70,7 +70,7 @@ import {
   TrackingMode,
 } from './tracking.mjs';
 import { orDefault } from './compat.mjs';
-import { withKinds } from './anonymization.mjs';
+import { ANONYMIZATION_UNKNOWN, anonymizationFor, withBlock } from './anonymization.mjs';
 import { zstdSupported, isCompressedRolloutName } from './rollout-file.mjs';
 import { createTranscriptMemo } from './transcript-memo-codex.mjs';
 
@@ -642,8 +642,6 @@ async function runAuditLocked(lockHandle, deps, options, prepared) {
 
   const { result, key, multi, tenantId, identity, tracking, trackingValid } = prepared;
   let session = prepared.session;
-  // After the drain, so queued live reports keep their own kinds: an accepted upload hides at least what was hidden at the yes.
-  session = withKinds(session, options.acceptedKinds);
 
   // This workspace's tracking verdict, which the local cache may predate. Offline/old servers answer null and the run proceeds.
   const who = await whoamiImpl(session, { fetchImpl }).catch(() => null);
@@ -659,6 +657,16 @@ async function runAuditLocked(lockHandle, deps, options, prepared) {
       result.reason = 'audit-only';
       return result;
     }
+  }
+  // After the drain, so queued live reports keep their own kinds: an owed upload hashes with this run's own whoami
+  // block for its workspace, never the cached one (R5). Without one it sends nothing and the entry stays owed.
+  if (options.history === true) {
+    const fresh = who && who.valid === true ? anonymizationFor(who, tenantId) : null;
+    if (fresh == null) {
+      result.reason = ANONYMIZATION_UNKNOWN;
+      return result;
+    }
+    session = withBlock(session, fresh);
   }
 
   // Each workspace of a multi-workspace account keeps its own ledger.
