@@ -1,7 +1,7 @@
 {
   "$schema": "https://agent-plugins.org/schemas/1.0.0/plugin.schema.json",
   "name": "beezi-analytics-staging",
-  "version": "0.1.1-staging.6374",
+  "version": "0.1.1-staging.6395",
   "description": "See your Beezi usage analytics: spend, sessions, status and recommendations for the last 7 or 30 days. Read-only; sign in with your Beezi account. — staging environment build.",
   "author": {
     "name": "Beezi",
