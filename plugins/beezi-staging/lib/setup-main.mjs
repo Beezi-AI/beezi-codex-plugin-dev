@@ -22,7 +22,7 @@ function makeTempDir() {
 }
 
 function onSigint(handler) {
-  process.once('SIGINT', handler);
+  process.on('SIGINT', handler);
 }
 
 function onProcessExit(handler) {
@@ -50,7 +50,8 @@ export function setupMain(root, deps) {
   // Shows the cursor again on process exit.
   if (stdout.isTTY) (d.onExit || onProcessExit)(() => { stdout.write(SHOW_CURSOR); });
   // Wrapped to the width left of the margin on a terminal, so the offer shapes still match; a log keeps each line whole.
-  const format = (line) => indent(stdout.isTTY ? formatLine(style, line, (stdout.columns || 80) - MARGIN.length) : paint(style, line));
+  const columns = () => (stdout.columns || 80) - MARGIN.length;
+  const format = (line) => indent(stdout.isTTY ? formatLine(style, line, columns()) : paint(style, line));
   const print = (line) => { stdout.write(`${format(line)}\n`); };
   const removeDir = d.removeDir || removeDirSync;
   const exit = d.exit || ((code) => process.exit(code));
@@ -61,8 +62,14 @@ export function setupMain(root, deps) {
     removeDir(cwd);
   };
   let run = null;
+  // Set while catchInterrupt runs its task: Ctrl+C then stops only that task.
+  let caught = null;
   // Shared by SIGINT and Ctrl+C inside an arrow-key menu; a drawn activity line is cleared first.
   const stop = () => {
+    if (caught !== null) {
+      caught.hit = true;
+      return;
+    }
     if (run !== null) run.clearActivity();
     cleanup();
     print('');
@@ -73,11 +80,20 @@ export function setupMain(root, deps) {
     input, output: stdout, style, interactive: canReadKeys({ input, output: stdout, env }), onInterrupt: stop, format,
   });
   (d.onInterrupt || onSigint)(stop);
+  const activity = stdout.isTTY === true && env.TERM !== 'dumb';
   run = (d.createRunner || createRunner)({
     root, cwd, env, sessionKeys: SESSION_KEYS, paint: format, stdout, stderr,
-    output: stdout, activity: stdout.isTTY === true && env.TERM !== 'dumb', margin: MARGIN, accent: style.accent,
+    output: stdout, activity, margin: MARGIN, accent: style.accent,
   });
   const progress = (label) => { run.setLabel(label); };
   const trust = d.trust || (() => probeHookTrust());
-  return (d.runSetup || runSetup)({ run, ask: prompt, print, progress, style, trust }).finally(cleanup);
+  // Runs task(interrupted) with Ctrl+C ending only the task: interrupted() turns true and setup carries on.
+  const catchInterrupt = (task) => {
+    const mine = { hit: false };
+    caught = mine;
+    return task(() => mine.hit).finally(() => { caught = null; });
+  };
+  return (d.runSetup || runSetup)({
+    run, ask: prompt, print, progress, style, trust, output: stdout, activity, format, columns, catchInterrupt,
+  }).finally(cleanup);
 }

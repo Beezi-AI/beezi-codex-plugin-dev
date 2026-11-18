@@ -8,7 +8,7 @@ import { oneLine, orDefault } from './compat.mjs';
 import {
   AccountStatus, AcceptRefusal, describeAccount, getAccount, listAccounts, recordOffer, acceptOffer, owePastSessions, takeAnsweredListing,
 } from './accounts.mjs';
-import { isMultiTenant, tenantById, newFoldersOf, NEW_FOLDERS_SOURCE, joinTenantNames } from './workspace.mjs';
+import { isMultiTenant, newFoldersOf, NEW_FOLDERS_SOURCE, joinTenantNames } from './workspace.mjs';
 import { usesRules, routeForDir, createRouteContext } from './workspace-rules.mjs';
 import { anonymizationFor, kindsOf, pastSessionsOf, unionKinds } from './anonymization.mjs';
 import { whoami as _whoami } from './whoami.mjs';
@@ -19,12 +19,14 @@ import {
 } from './history-offer.mjs';
 import { naming } from './paths.mjs';
 import { workspaceIdOf, RunOutcome } from './pending-history.mjs';
-import { runPendingHistory as _runPendingHistory, classifyRun } from './pending-history-run.mjs';
+import { runPendingHistory as _runPendingHistory, classifyRun, workspaceName } from './pending-history-run.mjs';
 import { readTrackingState as _readTrackingState, TrackingMode } from './tracking.mjs';
 import { HISTORY_WORKER_SCRIPT, offerWorkspaceIds } from './history-trigger.mjs';
 import { spawnDetached } from './background-spawn.mjs';
 import { compressedSkippedLine } from './rollout-file.mjs';
 import { consentedIds } from './setup-places.mjs';
+import { markReported } from './upload-progress.mjs';
+import { followUploads, plainLine, doneLine, REST_LINE } from './upload-progress-view.mjs';
 
 // The sync command's three modes (offer, accept, decline) and the offer-scan worker. Past sessions go up only after a
 // yes: the offer lists them (runAudit listOnly) and records the shown ids, and accept uploads exactly those ids. A
@@ -44,6 +46,7 @@ const NO_UPLOADS_TEXT = 'Beezi: this workspace does not accept history uploads o
 const UPLOAD_FAILED = { text: 'Beezi: the upload stopped with an error. Beezi tries it again at the next session start.', error: true };
 // Codex's own writer is busy (a live checkpoint, or its transactions unfinished), not another upload.
 const WRITER_REASONS = ['active-writer', 'pending-transaction'];
+const ACCEPT_FOLLOW_CAP_MS = 100000;
 export const SETUP_BUSY_WAIT_MS = 60000;
 export const SETUP_BUSY_POLL_MS = 2000;
 const SETUP_BUSY_SLEEPS = SETUP_BUSY_WAIT_MS / SETUP_BUSY_POLL_MS;
@@ -57,6 +60,7 @@ function seams(deps) {
     readTrackingState: deps.readTrackingState == null ? _readTrackingState : deps.readTrackingState,
     runPendingHistory: deps.runPendingHistory == null ? _runPendingHistory : deps.runPendingHistory,
     whoami: deps.whoamiImpl == null ? _whoami : deps.whoamiImpl,
+    follow: deps.follow == null ? followUploads : deps.follow,
     now: deps.now == null ? () => Date.now() : deps.now,
     sleep: deps.sleep == null ? (ms) => new Promise((resolve) => setTimeout(resolve, ms)) : deps.sleep,
   };
@@ -172,7 +176,10 @@ function nothingLeftLine(result) {
     : '✓ Beezi: everything is already uploaded.';
 }
 
-// One upload run's outcome; options: { key, splitByRules } (a one-workspace account with rules). → exit status.
+const PLAN_NOTE = '  Plan and billing details reflect your current setup, not the plan you were on at the time.';
+
+// One upload run's outcome; options: { key, splitByRules (a one-workspace account with rules), noteFirst (the plan
+// note before the result line instead of last) }. → exit status.
 function printRunResult(result, options) {
   const stop = stopLine(result, options.key);
   if (stop != null) return printStop(stop);
@@ -181,6 +188,7 @@ function printRunResult(result, options) {
     console.log('✓ Beezi: no past Codex sessions found on this machine.');
     return 0;
   }
+  if (options.noteFirst === true) console.log(PLAN_NOTE);
 
   // The success phrase is gated on there being nothing left to come back for. A run that deferred history has to say
   // so first, or the surface tells the user to stop precisely when a later retry is the whole point.
@@ -260,17 +268,11 @@ function printRunResult(result, options) {
   if (result.compressedUnsupported > 0) {
     console.log(`  ${compressedSkippedLine(result.compressedUnsupported)}`);
   }
-  console.log('  Plan and billing details reflect your current setup, not the plan you were on at the time.');
+  if (options.noteFirst !== true) console.log(PLAN_NOTE);
   return 0;
 }
 
 // ── which workspaces ───────────────────────────────────────────────────────────────────────
-
-function workspaceName(row, tenantId) {
-  const t = tenantById(row, tenantId);
-  if (t != null && t.name) return t.name;
-  return !isMultiTenant(row) && row.tenantName ? row.tenantName : tenantId;
-}
 
 // Sessions a rule routes, then the rest by New folders; a zero clause is dropped and null means print nothing.
 function routeSummary(row, plan) {
@@ -507,9 +509,15 @@ function printProgress({ processed, total }) {
   console.log(`Beezi: ${processed}/${total} sessions read…`);
 }
 
+// Prints each session read, then hands it to `next` (the progress record's writer) when there is one.
+const printThen = (next) => (p) => {
+  printProgress(p);
+  if (next != null) next(p);
+};
+
 // `deps` with runAudit printing each session read.
 function withProgress(seam, deps) {
-  const runAudit = (auditDeps, auditOptions) => seam.runAudit({ ...auditDeps, onProgress: printProgress }, auditOptions);
+  const runAudit = (auditDeps, auditOptions) => seam.runAudit({ ...auditDeps, onProgress: printThen(auditDeps.onProgress) }, auditOptions);
   return { ...deps, runAudit };
 }
 
@@ -678,9 +686,10 @@ export async function setupCounts(row, deps = {}) {
   return { counted: counted.map((c) => ({ tenantId: c.run.id, listed: c.result.listed })), stop };
 }
 
-// The consented run's last line, with the distinct sessions owed; → status.
+// The consented run's last line, with the distinct sessions owed and the owed workspaces in order; → status.
 function printUploading(owed, status) {
-  console.log(`uploading=${owed.reduce((all, ids) => union(all, ids), []).length} workspaces=${owed.length}`);
+  const sessions = owed.reduce((all, o) => union(all, o.ids), []).length;
+  console.log(`uploading=${sessions} workspaces=${owed.length} tenants=${owed.map((o) => o.tenantId).join(',')}`);
   return status;
 }
 
@@ -708,7 +717,7 @@ export async function consentedCommand({ key }, deps = {}) {
     const changedAt = orDefault(pastSessionsOf(freshBlock).changedAt, null);
     const listedIds = consentedIds(row, run.id, result.listed).filter((id) => shownIds.indexOf(id) !== -1);
     const { ids } = await owePastSessions(row.key, run.id, listedIds, kinds, nowIso, changedAt);
-    if (ids.length > 0) owed.push(ids);
+    if (ids.length > 0) owed.push({ tenantId: run.id, ids });
   }
   if (owed.length === 0) return printUploading([], 0);
   if (!spawnDetached(HISTORY_WORKER_SCRIPT, deps, ['--account', row.key])) return printUploading([], 1);
@@ -753,6 +762,34 @@ export async function scanOffers(key, deps = {}) {
 
 // ── accept and decline ─────────────────────────────────────────────────────────────────────
 
+// Follows the worker's record for `tenantId` until its done line or the cap; the last line printed closes the follow.
+async function followAccepted(row, tenantId, sinceMs, seam) {
+  let last = null;
+  const { timedOut, stopped } = await seam.follow({
+    key: row.key,
+    tenantIds: [tenantId],
+    sinceMs,
+    capMs: ACCEPT_FOLLOW_CAP_MS,
+    onUpdate: (record) => {
+      last = record;
+      console.log(plainLine(record));
+    },
+    onDone: (record) => {
+      console.log(doneLine(record));
+      // A failed mark only risks the next session start repeating this line.
+      try { markReported(row.key, tenantId); } catch { /* best effort */ }
+    },
+    now: seam.now,
+    sleep: seam.sleep,
+  });
+  // A stopped follow (a failed or stale record) left no done line, so the last line says the rest is the worker's.
+  if (stopped) console.log(REST_LINE);
+  if (!timedOut) return;
+  console.log(last === null
+    ? REST_LINE
+    : `✓ ${last.processed} of ${last.total} past sessions uploaded to ${workspaceName(row, tenantId)}; the rest keeps uploading in the background`);
+}
+
 // A yes to the question whose `offer` line carried `token`: owes exactly its ids, then uploads them in the background
 // or here. → exit status.
 export async function acceptCommand({ key, tenantId, token = null, background = false }, deps = {}) {
@@ -767,12 +804,14 @@ export async function acceptCommand({ key, tenantId, token = null, background = 
     return 1;
   }
   const row = await getAccount(key);
+  const sinceMs = seam.now();
   // A failed spawn uploads here instead, so the yes is never left waiting on a worker that did not start.
   if (background && spawnDetached(HISTORY_WORKER_SCRIPT, deps, ['--account', key])) {
-    console.log(backgroundLine(ids.length, workspaceName(row, tenantId)));
+    await followAccepted(row, tenantId, sinceMs, seam);
     return 0;
   }
-  const options = { key, splitByRules: !isMultiTenant(row) && usesRules(row) };
+  // The skill shows only the last line, so the plan note goes before the result line here.
+  const options = { key, splitByRules: !isMultiTenant(row) && usesRules(row), noteFirst: true };
   let status = 0;
   let ran = false;
   const onResult = (entry, result) => {

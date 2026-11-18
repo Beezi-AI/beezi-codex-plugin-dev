@@ -12,6 +12,8 @@ import { runAudit as realRunAudit } from '../lib/session-audit.mjs';
 import { flushBackfillChunks } from '../lib/audit-flush.mjs';
 import { HISTORY_WORKER_SCRIPT } from '../lib/history-trigger.mjs';
 import { naming } from '../lib/paths.mjs';
+import { createProgressWriter, readProgress } from '../lib/upload-progress.mjs';
+import { followUploads } from '../lib/upload-progress-view.mjs';
 import { KINDS } from '../lib/anonymize.mjs';
 import { compressedSkippedLine } from '../lib/rollout-file.mjs';
 
@@ -40,7 +42,9 @@ const listed = (sessions, over = {}) => ({
 const offers = async () => (await getAccount(TEST_KEY)).historyOffers;
 const pendingIds = async () => (await getAccount(TEST_KEY)).pendingHistory.map((e) => [e.tenantId, e.sessionIds]);
 const offerLine = (tenant, ids, audit = 'no', kinds = []) => `offer account=${TEST_KEY} tenant=${tenant} sessions=${ids.length} audit=${audit} token=${offerToken(ids, kinds)}`;
-const inBackground = (spawns) => ({ spawnImpl: (cmd, args) => { spawns.push(args); return { unref() {} }; } });
+const NOT_FOLLOWED = { finished: [], timedOut: false, stopped: false };
+// A spawn that works, and a follower that returns at once: the worker's record is not what these tests are about.
+const inBackground = (spawns) => ({ spawnImpl: (cmd, args) => { spawns.push(args); return { unref() {} }; }, follow: async () => NOT_FOLLOWED });
 
 function one(t, { past = OFFER, on = [], historyOffers } = {}) {
   linkAccount(makeHome(t), TEST_KEY, { tenantId: 't1', tenants: [tenant('t1', 'Acme', on, past)], historyOffers });
@@ -772,18 +776,119 @@ test('accept owes exactly the shown ids and uploads only that workspace, with pr
   assert.ok(io.out.includes('✓ Beezi: uploaded 2 sessions (2 reports stored).'));
 });
 
-test('accept --background hands the upload to the history worker', async (t) => {
+const ACME_PROGRESS = { key: TEST_KEY, tenantId: 't1', workspace: 'Acme', processed: 1, total: 3, sent: 1 };
+
+// Accepts s1 and s2 with --background; `scripted` stands in for the follower (the real one when omitted).
+async function acceptInBackground(t, scripted, over = {}) {
   one(t);
   const io = capture(t);
   const spawns = [];
-  const spawnImpl = (cmd, args) => { spawns.push(args); return { unref() {} }; };
+  const follows = [];
   await offerCommand({ key: TEST_KEY }, deps({ null: listed([session('s1'), session('s2')]) }).deps);
+  const follow = scripted == null ? undefined : async (options) => { follows.push(options); return scripted(options); };
   const code = await acceptCommand({ key: TEST_KEY, tenantId: 't1', token: offerToken(['s1', 's2'], []), background: true }, {
-    spawnImpl, runPendingHistory: async () => { throw new Error('must not upload here'); },
+    ...inBackground(spawns),
+    now: () => T0,
+    runPendingHistory: async () => { throw new Error('must not upload here'); },
+    follow,
+    ...over,
+  });
+  return { code, io, spawns, follows };
+}
+
+test('accept --background starts the history worker and follows its record for the accepted workspace', async (t) => {
+  const run = await acceptInBackground(t, async () => NOT_FOLLOWED);
+  assert.equal(run.code, 0);
+  assert.deepEqual(run.spawns, [[HISTORY_WORKER_SCRIPT, '--account', TEST_KEY]]);
+  assert.equal(run.follows.length, 1);
+  assert.equal(run.follows[0].key, TEST_KEY);
+  assert.deepEqual(run.follows[0].tenantIds, ['t1']);
+  assert.equal(run.follows[0].sinceMs, T0);
+  assert.equal(run.follows[0].capMs, 100000);
+});
+
+test('accept --background prints a line per change, then the done line, and marks the record reported', async (t) => {
+  const record = { ...ACME_PROGRESS, processed: 2, total: 2, sent: 2 };
+  const run = await acceptInBackground(t, async (options) => {
+    // Written here, once the test's home exists, as the worker would have.
+    createProgressWriter({ key: TEST_KEY, tenantId: 't1', workspace: 'Acme', now: () => T0 }).finish({ processed: 2, total: 2, sent: 2 });
+    options.onUpdate({ ...ACME_PROGRESS, total: 2 });
+    options.onUpdate(record);
+    options.onDone(record);
+    return { finished: [record], timedOut: false, stopped: false };
+  });
+  assert.equal(run.code, 0);
+  assert.deepEqual(run.io.out.slice(-3), ['Beezi: 1/2 sessions read…', 'Beezi: 2/2 sessions read…', '✓ 2 past sessions uploaded to Acme']);
+  assert.equal(readProgress(TEST_KEY, 't1').reported, true);
+});
+
+test('accept --background at the cap says how far it got and that the rest keeps uploading', async (t) => {
+  const run = await acceptInBackground(t, async (options) => {
+    options.onUpdate(ACME_PROGRESS);
+    return { finished: [], timedOut: true, stopped: false };
+  });
+  assert.equal(run.code, 0);
+  assert.deepEqual(run.io.out.slice(-2), ['Beezi: 1/3 sessions read…', '✓ 1 of 3 past sessions uploaded to Acme; the rest keeps uploading in the background']);
+});
+
+test('accept --background with no record ever written says the rest keeps uploading', async (t) => {
+  const run = await acceptInBackground(t, async () => ({ finished: [], timedOut: true, stopped: false }));
+  assert.equal(run.io.out[run.io.out.length - 1], 'Beezi: the rest keeps uploading in the background');
+});
+
+test('accept --background follows through the real follower on the injected clock, never sleeping for real', async (t) => {
+  let nowMs = T0;
+  const sleeps = [];
+  const run = await acceptInBackground(t, null, {
+    now: () => nowMs,
+    sleep: async (ms) => { sleeps.push(ms); nowMs += ms; },
+  });
+  assert.equal(run.code, 0);
+  assert.equal(sleeps.length, 100);
+  assert.equal(run.io.out[run.io.out.length - 1], 'Beezi: the rest keeps uploading in the background');
+});
+
+test('accept --background follows nothing when the worker did not start, and uploads here instead', async (t) => {
+  one(t);
+  const io = capture(t);
+  await offerCommand({ key: TEST_KEY }, deps({ null: listed([session('s1'), session('s2')]) }).deps);
+  const ran = [];
+  const code = await acceptCommand({ key: TEST_KEY, tenantId: 't1', token: offerToken(['s1', 's2'], []), background: true }, {
+    spawnImpl: () => { throw new Error('no node'); },
+    follow: async () => { throw new Error('must not follow'); },
+    runPendingHistory: async (key, d, options) => {
+      ran.push(options.tenantIds);
+      options.onResult({ tenantId: 't1' }, imported(2));
+      return [];
+    },
   });
   assert.equal(code, 0);
-  assert.deepEqual(spawns, [[HISTORY_WORKER_SCRIPT, '--account', TEST_KEY]]);
-  assert.equal(io.out[io.out.length - 1], '✓ Beezi: uploading 2 past sessions to Acme in the background.');
+  assert.deepEqual(ran, [['t1']]);
+  // The skill shows only the last line, so the result line comes after the plan note.
+  assert.equal(io.out[io.out.length - 2], '  Plan and billing details reflect your current setup, not the plan you were on at the time.');
+  assert.equal(io.out[io.out.length - 1], '✓ Beezi: uploaded 2 sessions (2 reports stored).');
+});
+
+test('accept --background whose run stopped without a done line ends on the rest-keeps-uploading line', async (t) => {
+  const run = await acceptInBackground(t, async (options) => {
+    options.onUpdate(ACME_PROGRESS);
+    return { finished: [], timedOut: false, stopped: true };
+  });
+  assert.equal(run.code, 0);
+  assert.deepEqual(run.io.out.slice(-2), ['Beezi: 1/3 sessions read…', 'Beezi: the rest keeps uploading in the background']);
+});
+
+test('accept --background through the real follower: a failed record prints no done line and is not marked reported', async (t) => {
+  const run = await acceptInBackground(t, null, {
+    follow: async (options) => {
+      createProgressWriter({ key: TEST_KEY, tenantId: 't1', workspace: 'Acme', now: () => T0 }).finish({ processed: 1, total: 40, sent: 1 }, true);
+      return followUploads(options);
+    },
+  });
+  assert.equal(run.code, 0);
+  assert.equal(run.io.out[run.io.out.length - 1], 'Beezi: the rest keeps uploading in the background');
+  assert.equal(run.io.out.indexOf('✓ 1 past session uploaded to Acme'), -1);
+  assert.equal(readProgress(TEST_KEY, 't1').reported, false);
 });
 
 test('accept with nothing offered exits 1 and says how to see what would be sent', async (t) => {

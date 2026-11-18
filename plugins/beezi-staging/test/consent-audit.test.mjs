@@ -77,8 +77,9 @@ const AuditForm = Object.freeze({
 function formOf({ name, text }) {
   if (name === 'history-cli.mjs' && setsLast(text, 'listOnly: true')) return AuditForm.LIST_ONLY;
   if (name === 'rollout-watcher.mjs' && setsLast(text, 'scope: HistoryScope.LIVE')) return AuditForm.LIVE;
-  if (name === 'pending-history-run.mjs' && text === 'runAudit({ runCache }, { ...options, key })') return AuditForm.CONSENTED;
-  if (name === 'history-cli.mjs' && text === 'runAudit({ ...auditDeps, onProgress: printProgress }, auditOptions)') return AuditForm.FORWARDER;
+  // The progress wrapper's call: runPendingHistory's consented options unchanged, plus only the record's onProgress.
+  if (name === 'pending-history-run.mjs' && text === 'runAudit({ ...runDeps, onProgress }, options)') return AuditForm.CONSENTED;
+  if (name === 'history-cli.mjs' && text === 'runAudit({ ...auditDeps, onProgress: printThen(auditDeps.onProgress) }, auditOptions)') return AuditForm.FORWARDER;
   // The busy-retry wrapper's call: its caller's arguments unchanged, and it is wrapped only around seam.runAudit.
   if (name === 'history-cli.mjs' && text === 'runAudit(deps, options)') return AuditForm.FORWARDER;
   // The watcher's pending-history forwarder: the consented options unchanged, plus only the queue options after them.
@@ -106,7 +107,7 @@ test('PK6: the busy-retry wrapper only forwards its caller\'s arguments, and wra
 
 test('PK6: the accept forwarder only hands its options to runPendingHistory', () => {
   const src = readLib('history-cli.mjs');
-  assert.ok(src.includes('const runAudit = (auditDeps, auditOptions) => seam.runAudit({ ...auditDeps, onProgress: printProgress }, auditOptions);'));
+  assert.ok(src.includes('const runAudit = (auditDeps, auditOptions) => seam.runAudit({ ...auditDeps, onProgress: printThen(auditDeps.onProgress) }, auditOptions);'));
   assert.ok(src.includes('  return { ...deps, runAudit };\n}'));
   assert.ok(src.includes('await seam.runPendingHistory(key, withProgress(seam, deps), { tenantIds: [tenantId], onResult });'));
 });
@@ -158,6 +159,16 @@ const enclosingFn = (src, at) => {
   }
   return name;
 };
+
+test('PK6: the progress wrapper gets the consented options of runPendingHistory and nothing else', () => {
+  const src = readLib('pending-history-run.mjs');
+  assert.ok(src.includes('async function runWithProgress(runAudit, runDeps, options, writer) {'));
+  const calls = callsOf('runWithProgress');
+  assert.deepEqual(calls.map((c) => c.name), ['pending-history-run.mjs']);
+  const call = 'runWithProgress(runAudit, { runCache }, { ...options, key }, writer);';
+  assert.equal(calls[0].src.slice(calls[0].at, calls[0].at + call.length), call);
+  assert.equal(enclosingFn(calls[0].src, calls[0].at), 'runPendingHistory');
+});
 
 test('PK6: requestHistory is called only from owe, and owe only from acceptOffer and owePastSessions', () => {
   const where = (fn) => callsOf(fn).map((c) => `${c.name}:${enclosingFn(c.src, c.at)}`).sort();

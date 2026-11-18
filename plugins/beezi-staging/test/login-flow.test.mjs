@@ -3,6 +3,7 @@ import { test, afterEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { makeHome, linkAccount } from '../tools/account-fixtures.mjs';
 import { loginFlow } from '../scripts/login-flow.mjs';
+import { createProgressWriter, readProgress } from '../lib/upload-progress.mjs';
 
 const KEY = 'a1b2c3d4';
 const PLUS = '✓ Beezi billing captured: source=subscription plan=plus via=app-server.\n';
@@ -48,7 +49,7 @@ const replies = (listing, extra = {}) => ({
 });
 
 // Runs the flow with faked scripts and hook-trust probe, so no test spawns a child; `calls` records each script run.
-async function flow(argv, scripted, signIn = ok(SIGNED_IN), verdict = 'untrusted') {
+async function flow(argv, scripted, signIn = ok(SIGNED_IN), verdict = 'untrusted', clock = {}) {
   const calls = [];
   const printed = [];
   const log = console.log;
@@ -60,7 +61,7 @@ async function flow(argv, scripted, signIn = ok(SIGNED_IN), verdict = 'untrusted
       return typeof r === 'function' ? r(args) : r;
     };
     const live = async (script, args) => { calls.push([script].concat(args).join(' ')); return signIn; };
-    await loginFlow(argv, { run, live, trust: async () => ({ verdict, untrusted: [], disabled: [] }) });
+    await loginFlow(argv, { run, live, trust: async () => ({ verdict, untrusted: [], disabled: [] }), ...clock });
   } finally {
     console.log = log;
   }
@@ -185,14 +186,18 @@ test('--account alone, after the beezi_login tool signed in, starts at the plan'
   assert.equal(r.next, `next=track account=${KEY}`);
 });
 
+// The worker's finished record for Solo, started now, so the follow counts it as this upload's.
+const finished = (sent) => createProgressWriter({ key: KEY, tenantId: 'S', workspace: 'Solo' }).finish({ processed: sent, total: sent, sent });
+
 const uploads = [
-  ['uploading=212 workspaces=1\n', ['✓ 212 past sessions are uploading in the background', '']],
-  ['uploading=1 workspaces=1\n', ['✓ 1 past session is uploading in the background', '']],
-  ['uploading=0 workspaces=0\n', []],
+  ['uploading=212 workspaces=1 tenants=S\n', 212, ['✓ 212 past sessions uploaded to Solo', '']],
+  ['uploading=1 workspaces=1 tenants=S\n', 1, ['✓ 1 past session uploaded to Solo', '']],
+  ['uploading=0 workspaces=0 tenants=\n', null, []],
 ];
-for (const [stdout, lines] of uploads) {
+for (const [stdout, sent, lines] of uploads) {
   test(`--from finish after ${stdout.trim()} runs the consented upload and the defaults, then the closing lines`, async (t) => {
     link(t);
+    if (sent !== null) finished(sent);
     const r = await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'sync.mjs': ok(stdout) }));
     assert.deepEqual(r.calls, FINISH_CALLS);
     assert.equal(r.out, ['<finish>'].concat(lines, [
@@ -203,6 +208,31 @@ for (const [stdout, lines] of uploads) {
     ]).join('\n'));
   });
 }
+
+test('--from finish marks the workspace whose done line it showed as reported', async (t) => {
+  link(t);
+  finished(3);
+  await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'sync.mjs': ok('uploading=3 workspaces=1 tenants=S\n') }));
+  assert.equal(readProgress(KEY, 'S').reported, true);
+});
+
+test('--from finish with no record from the worker stops following at 100 s and says the rest keeps uploading', async (t) => {
+  link(t);
+  let nowMs = Date.parse('2026-11-18T10:00:00.000Z');
+  const slept = [];
+  const clock = { now: () => nowMs, sleep: async (ms) => { slept.push(ms); nowMs += ms; } };
+  const r = await flow(['--account', KEY, '--from', 'finish'], replies(LISTING, { 'sync.mjs': ok('uploading=3 workspaces=1 tenants=S\n') }), ok(SIGNED_IN), 'untrusted', clock);
+  assert.equal(slept.length, 100);
+  assert.equal(r.out, [
+    '<finish>',
+    'Beezi: the rest keeps uploading in the background',
+    '',
+    'One step left. In Codex, run /hooks and trust Beezi.',
+    'Crash reports are on ($beezi:settings)',
+    '</finish>',
+    `next=done account=${KEY}`,
+  ].join('\n'));
+});
 
 test('--from finish after a failed upload shows its line and still closes', async (t) => {
   link(t);

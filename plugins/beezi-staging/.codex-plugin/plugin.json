@@ -1,6 +1,6 @@
 {
   "name": "beezi-staging",
-  "version": "0.28.2-staging.6374",
+  "version": "0.28.3-staging.6395",
   "description": "Reports Codex session token analytics for Beezi task branches, and drafts tickets to create on your board (Jira / Azure DevOps) or in Beezi. — staging environment build.",
   "author": {
     "name": "Beezi"
