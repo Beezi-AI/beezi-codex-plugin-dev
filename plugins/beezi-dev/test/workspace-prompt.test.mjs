@@ -3,7 +3,8 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { buildJoinedPrompt, buildWorkspacePrompt } from '../lib/workspace-prompt.mjs';
+import { buildHistoryNotice, buildJoinedPrompt, buildWorkspacePrompt } from '../lib/workspace-prompt.mjs';
+import { createProgressWriter, markReported } from '../lib/upload-progress.mjs';
 import { loadRepoMap, saveRepoMap, upsertRoot } from '../lib/repo-map.mjs';
 import { tmpHome } from '../tools/suite-fixtures.mjs';
 
@@ -80,4 +81,61 @@ test('a Don\'t track answer mixed with a workspace is asked again, never resolve
   assert.ok(text.includes('starting with: `"Don\'t track" can\'t be combined with a workspace — pick one or the other.` A second'), text);
   assert.ok(text.includes('A second mixed answer counts as declining that question.'), text);
   assert.doesNotMatch(text, /wins over the others/);
+});
+
+test('the offer answer steps show the user the last line of the accept output, and keep the Upload now description', async () => {
+  const { context: text } = await buildJoinedPrompt({ session_id: 'session-1', source: 'startup' }, {
+    pluginRoot: '/plugin',
+    listAccounts: async () => [JOINED_ROW],
+    linkedSessions: async () => [{ key: KEY }],
+  });
+  assert.ok(text.includes('Show the user only the last line of the accept command\'s output, and nothing from the decline command.'), text);
+  assert.ok(!text.includes('only the first line of the accept command'), text);
+  assert.ok(text.includes('"Upload now" (description "Send these sessions now")'), text);
+});
+
+// A progress record per workspace; `reported` ones had their done line shown in a session.
+function finishedRecord(tenantId, reported) {
+  createProgressWriter({ key: KEY, tenantId, workspace: tenantId, now: () => 0 }).finish({ processed: 2, total: 2, sent: 2 });
+  if (reported) markReported(KEY, tenantId);
+}
+
+const noticeDeps = (results) => ({
+  listAccounts: async () => [{ ...JOINED_ROW, historyResults: results }],
+  linkedSessions: async () => [{ key: KEY }],
+  takeHistoryResults: async () => results,
+});
+const notice = (results) => buildHistoryNotice({ source: 'startup' }, noticeDeps(results));
+
+test('the history notice skips a sent result whose done line was already shown, and keeps one that was not', async (t) => {
+  tmpHome(t, 'workspace-prompt-');
+  finishedRecord('A', true);
+  finishedRecord('B', false);
+  const text = await notice([
+    { tenantId: 'A', status: 'sent', sent: 2, skipped: 0 },
+    { tenantId: 'B', status: 'sent', sent: 2, skipped: 0 },
+  ]);
+  assert.equal(text, 'Beezi: sent 2 past sessions to NewCo.');
+});
+
+test('the history notice is empty when every sent result was already shown', async (t) => {
+  tmpHome(t, 'workspace-prompt-');
+  finishedRecord('B', true);
+  assert.equal(await notice([{ tenantId: 'B', status: 'sent', sent: 2, skipped: 0 }]), null);
+});
+
+test('the history notice never hides a retrying or gave-up result, even beside a reported record', async (t) => {
+  tmpHome(t, 'workspace-prompt-');
+  finishedRecord('A', true);
+  finishedRecord('B', true);
+  const text = await notice([
+    { tenantId: 'A', status: 'retrying', sent: 0, skipped: 0 },
+    { tenantId: 'B', status: 'gave-up', sent: 0, skipped: 0 },
+  ]);
+  assert.equal(text, "Beezi: couldn't send history to Acme yet, will retry.\nBeezi: couldn't send history to NewCo. Run `$beezi:sync` to try again.");
+});
+
+test('the history notice keeps a sent result that has no progress record', async (t) => {
+  tmpHome(t, 'workspace-prompt-');
+  assert.equal(await notice([{ tenantId: 'B', status: 'sent', sent: 2, skipped: 0 }]), 'Beezi: sent 2 past sessions to NewCo.');
 });

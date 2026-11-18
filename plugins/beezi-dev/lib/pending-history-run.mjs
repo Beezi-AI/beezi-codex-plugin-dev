@@ -1,9 +1,10 @@
 import { runAudit as _runAudit, planWorkspaceRuns as _planWorkspaceRuns, createRunCache as _createRunCache, dontTrackSessionIds } from './session-audit.mjs';
 import { BackfillHalt } from './audit-flush.mjs';
-import { isMultiTenant } from './workspace.mjs';
+import { isMultiTenant, tenantById } from './workspace.mjs';
 import { usesRules } from './workspace-rules.mjs';
 import { rolloutStartedAt as _rolloutStartedAt } from './subagent-codex.mjs';
 import { pendingHistoryOf, historyDue, waitingOnRecent, acceptedKindsOf, RunOutcome, SettleState } from './pending-history.mjs';
+import { createProgressWriter as _createProgressWriter } from './upload-progress.mjs';
 
 // A live checkpoint transaction or a run that took the lock over is busy, not a failure.
 const BUSY_REASONS = ['run-in-progress', 'upload-busy', 'active-writer', 'pending-transaction'];
@@ -22,6 +23,26 @@ export function classifyRun(result, waiting) {
   if (result.reportsFailed > 0 || result.deferredUnavailable > 0) return RunOutcome.FAILED;
   if (result.coverageKnown === false && result.candidates > 0) return RunOutcome.FAILED;
   return waiting ? RunOutcome.WAITING : RunOutcome.CLEAN;
+}
+
+export function workspaceName(row, tenantId) {
+  const t = tenantById(row, tenantId);
+  if (t != null && t.name) return t.name;
+  return !isMultiTenant(row) && row.tenantName ? row.tenantName : tenantId;
+}
+
+// runAudit also writing the run's progress record through `writer`, marked failed unless the run ended clean; a busy run
+// leaves the record to the run that owns it.
+async function runWithProgress(runAudit, runDeps, options, writer) {
+  let counts = { processed: 0, total: 0, sent: 0 };
+  const onProgress = (p) => {
+    counts = { processed: p.processed, total: p.total, sent: p.sessionsImported };
+    writer.update(counts);
+  };
+  const result = await runAudit({ ...runDeps, onProgress }, options).catch(() => null);
+  const outcome = classifyRun(result, false);
+  if (outcome !== RunOutcome.BUSY) writer.finish(counts, outcome !== RunOutcome.CLEAN);
+  return result;
 }
 
 function startedAtMs(recent, startedAt) {
@@ -60,6 +81,7 @@ export async function runPendingHistory(key, deps = {}, { tenantIds = null, onRe
   const runAudit = deps.runAudit == null ? _runAudit : deps.runAudit;
   const planRuns = deps.planWorkspaceRuns == null ? _planWorkspaceRuns : deps.planWorkspaceRuns;
   const startedAt = deps.rolloutStartedAt == null ? _rolloutStartedAt : deps.rolloutStartedAt;
+  const createWriter = deps.createProgressWriter == null ? _createProgressWriter : deps.createProgressWriter;
   const now = deps.now == null ? () => Date.now() : deps.now;
   // Before the read: a rule landing after it must not count as covered by this plan.
   const plannedAtMs = now();
@@ -76,7 +98,8 @@ export async function runPendingHistory(key, deps = {}, { tenantIds = null, onRe
     let run = { outcome: busy ? RunOutcome.BUSY : RunOutcome.CLEAN, sent: 0, skipped: 0 };
     if (!busy && options != null) {
       // A throwing run settles as failed (classifyRun(null)) rather than leaving later entries unsettled.
-      const result = await runAudit({ runCache }, { ...options, key }).catch(() => null);
+      const writer = createWriter({ key, tenantId: entry.tenantId, workspace: workspaceName(row, entry.tenantId) });
+      const result = await runWithProgress(runAudit, { runCache }, { ...options, key }, writer);
       if (onResult != null) onResult(entry, result);
       const ran = result == null ? {} : result;
       const recent = Array.isArray(ran.recent) ? ran.recent.map((r) => startedAtMs(r, startedAt)) : [];

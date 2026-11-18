@@ -48,7 +48,7 @@ function next(step, key) {
 
 // A ctx for the setup helpers that collects what they print; `io` holds the `run` and `trust` deps.
 function collector(io, lines) {
-  return { run: io.run, trust: io.trust, print: (line) => { lines.push(line); } };
+  return { run: io.run, trust: io.trust, now: io.now, sleep: io.sleep, print: (line) => { lines.push(line); } };
 }
 
 // The silent capture: the plan found, or the line saying it was not, plus any notice the capture printed.

@@ -10,10 +10,11 @@ import {
   tenantById,
 } from './workspace.mjs';
 import { bindSessionRoutes, createRouteContext, routeKeyForDir, shortLabel, usesRules } from './workspace-rules.mjs';
-import { resultLine } from './pending-history.mjs';
+import { HistoryStatus, resultLine } from './pending-history.mjs';
 import { OfferCheck } from './history-offer.mjs';
 import { offerChecksFor } from './history-trigger.mjs';
 import { naming } from './paths.mjs';
+import { readProgress } from './upload-progress.mjs';
 
 // Only a new session or a clear asks; resume and compact never do.
 export const ASK_SOURCES = ['startup', 'clear'];
@@ -234,6 +235,12 @@ export async function buildJoinedPrompt(input, deps = {}) {
   return rows.length === 0 ? null : { context: joinedPromptText(rows, pluginRoot(deps), sessionId), keys: rows.map((row) => row.key) };
 }
 
+// A sent result whose workspace's done line was already shown in a session.
+function reportedLive(key, result) {
+  const record = result.status === HistoryStatus.SENT ? readProgress(key, result.tenantId) : null;
+  return record !== null && record.reported === true;
+}
+
 // SessionStart: one user-only line per finished history upload, shown once on startup or clear.
 export async function buildHistoryNotice(input, deps = {}) {
   if (input == null) return null;
@@ -247,7 +254,7 @@ export async function buildHistoryNotice(input, deps = {}) {
     let taken = [];
     try { taken = await take(row.key); } catch { continue; }
     const prefix = rows.length > 1 ? `Beezi (${emailOf(row)})` : 'Beezi';
-    for (const result of taken) lines.push(resultLine(result, { prefix, nameOf: (id) => nameOf(row, id), syncName: `\`${naming.syncCommand()}\`` }));
+    for (const result of taken.filter((r) => !reportedLive(row.key, r))) lines.push(resultLine(result, { prefix, nameOf: (id) => nameOf(row, id), syncName: `\`${naming.syncCommand()}\`` }));
   }
   return lines.length === 0 ? null : lines.join('\n');
 }
@@ -269,7 +276,7 @@ function offerAnswerSteps(root) {
     'Otherwise, after the user\'s request, end your reply with one plain sentence per offer: the question, then " Reply upload or not now."',
     `On "Upload now", run \`${sync} --accept --background --account <key> --tenant <id> --token <token>\`. On "Not now", an Other answer or a dismissed question, run \`${sync} --decline --account <key> --tenant <id>\`.`,
     '`<key>` and `<id>` are the `account=` and `tenant=` values of that question\'s `offer` line, `<token>` is the `token=` value of that `offer` line, and `<i>` is that line\'s position, from 1.',
-    'Run both commands with escalated permissions too. Show the user only the first line of the accept command\'s output, and nothing from the decline command.',
+    'Run both commands with escalated permissions too. Show the user only the last line of the accept command\'s output, and nothing from the decline command.',
   ].join(' ');
 }
 

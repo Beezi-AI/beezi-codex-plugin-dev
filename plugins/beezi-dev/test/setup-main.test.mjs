@@ -297,3 +297,55 @@ test('the stop path clears the activity line before printing the stop line', asy
   assert.ok(stop > clear, 'prints the stop line after the clear');
   assert.equal(h.seen.exit, 130);
 });
+
+test('Ctrl+C while an upload is followed ends only the following; afterwards it stops the setup again', async () => {
+  const h = harness();
+  assert.equal(await setupMain('/plugin', h.deps), 0);
+  h.seen.closed = 0;
+  h.seen.removed.length = 0;
+  let shouldStop = null;
+  let finish = null;
+  const following = h.seen.ctx.catchInterrupt((stop) => {
+    shouldStop = stop;
+    return new Promise((resolve) => { finish = resolve; });
+  });
+  assert.equal(shouldStop(), false);
+  h.seen.interrupt();
+  assert.equal(shouldStop(), true);
+  assert.equal(h.seen.exit, null);
+  assert.equal(h.stdout.text(), '');
+  assert.equal(h.seen.closed, 0);
+  finish('done');
+  assert.equal(await following, 'done');
+  h.seen.interrupt();
+  assert.equal(h.seen.exit, 130);
+  assert.equal(h.stdout.text(), `\n  ${STOPPED}\n`);
+});
+
+test('by default every SIGINT reaches the stop path, so a second Ctrl+C after a followed upload still exits', async (t) => {
+  // Raw listeners, called as an emit would: a once() wrapper removes itself on its first call.
+  const before = process.rawListeners('SIGINT');
+  const h = harness({ onInterrupt: undefined });
+  assert.equal(await setupMain('/plugin', h.deps), 0);
+  const added = process.rawListeners('SIGINT').filter((l) => before.indexOf(l) === -1);
+  t.after(() => added.forEach((l) => process.removeListener('SIGINT', l)));
+  assert.equal(added.length, 1);
+  await h.seen.ctx.catchInterrupt((stop) => {
+    added[0]();
+    assert.equal(stop(), true);
+    return Promise.resolve();
+  });
+  assert.equal(h.seen.exit, null);
+  assert.equal(process.rawListeners('SIGINT').indexOf(added[0]) !== -1, true);
+  added[0]();
+  assert.equal(h.seen.exit, 130);
+});
+
+test('ctx.columns is the stdout width less the margin, 80 when the width is unknown', async () => {
+  const wide = colourTerminal(harness(), 120);
+  assert.equal(await setupMain('/plugin', wide.deps), 0);
+  assert.equal(wide.seen.ctx.columns(), 118);
+  const unknown = harness();
+  assert.equal(await setupMain('/plugin', unknown.deps), 0);
+  assert.equal(unknown.seen.ctx.columns(), 78);
+});

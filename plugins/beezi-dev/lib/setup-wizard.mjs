@@ -3,6 +3,8 @@ import { TrustVerdict } from './hook-trust.mjs';
 import { PLAN_LABELS } from './settings-cli.mjs';
 import { closingLines } from './setup-finale.mjs';
 import { askTracking, lastLine, outputLines, report, token } from './setup-routing.mjs';
+import { markReported } from './upload-progress.mjs';
+import { followUploads, barLine, plainLine, doneLine, REST_LINE } from './upload-progress-view.mjs';
 
 // One `accounts.mjs list` row: "  <n>. <description> [<key>]", then "  (default, revoked)" marks when any.
 const LISTED_ACCOUNT = /^ {2}\d+\. (.+) \[([0-9a-f]{8})\](?: {2}\(([a-z, ]+)\))?$/;
@@ -17,6 +19,10 @@ const WORKSPACE_AFTER_EMAIL = '> - ';
 const WORKSPACE_SEPARATOR = ' - ';
 const CAPTURED = / source=(\S+) plan=([^\s.]+)/;
 export const PLAN_EXPIRED = /Codex sign-in expired/;
+const CLEAR_LINE = '\r\x1b[2K';
+// An agent's tool times out, so off a terminal the follow stops here and the worker carries on.
+const NO_TERMINAL_CAP_MS = 100000;
+const MAX_ROW = 100;
 const SOURCE_LABELS = { [BillingSource.OPENAI_API_KEY]: 'API key', [BillingSource.THIRD_PARTY]: 'Third-party provider' };
 
 export function parseLinkedAccounts(text) {
@@ -111,17 +117,60 @@ export async function trustPending(ctx) {
   return trust != null && trust.verdict === TrustVerdict.UNTRUSTED;
 }
 
-// Queues the consented upload and says how many sessions are on their way; a failure prints its own lines.
+const sleepMs = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+const uncaught = (task) => task(() => false);
+const clockOf = (ctx) => (ctx.now == null ? Date.now : ctx.now);
+
+// A done line is shown once: a failed mark only risks showing it again.
+function reported(key, tenantId) {
+  try { markReported(key, tenantId); } catch { /* best effort */ }
+}
+
+// Follows the worker's records for `tenantIds`: a bar redrawn in place on a terminal, plain lines otherwise,
+// one done line per workspace; Ctrl+C, a stale record or the cap leaves the rest to the worker.
+async function followPast(ctx, key, tenantIds, sinceMs) {
+  const terminal = ctx.activity === true;
+  const ascii = (ctx.platform == null ? process.platform : ctx.platform) === 'win32';
+  // One row, or `\r\x1b[2K` leaves the wrapped rows above it: setup-style wraps past columns - 1, and past 100.
+  const width = () => (ctx.columns == null ? Infinity : Math.min(ctx.columns() - 1, MAX_ROW));
+  const clear = () => { if (terminal) ctx.output.write(CLEAR_LINE); };
+  const catchInterrupt = ctx.catchInterrupt == null ? uncaught : ctx.catchInterrupt;
+  const done = await catchInterrupt((interrupted) => followUploads({
+    key,
+    tenantIds,
+    sinceMs,
+    capMs: terminal ? Infinity : NO_TERMINAL_CAP_MS,
+    shouldStop: interrupted,
+    onUpdate: (record) => {
+      if (terminal) ctx.output.write(`${CLEAR_LINE}${ctx.format(barLine(record, { ascii, width: width() }))}`);
+      else ctx.print(plainLine(record));
+    },
+    onDone: (record) => {
+      clear();
+      ctx.print(doneLine(record));
+      reported(key, record.tenantId);
+    },
+    now: clockOf(ctx),
+    sleep: ctx.sleep == null ? sleepMs : ctx.sleep,
+  }));
+  if (done.stopped || done.timedOut) {
+    clear();
+    ctx.print(REST_LINE);
+  }
+}
+
+// Queues the consented upload and follows the worker's progress; a failure prints its own lines.
 export async function uploadPast(ctx, key) {
+  const sinceMs = clockOf(ctx)();
   const result = await ctx.run('sync.mjs', ['--offer', '--past', '--account', key, '--consented']);
   if (result.code !== 0) {
     report(ctx, result);
     return;
   }
   const line = lastLine(result.stdout, /^uploading=\d+ /);
-  const n = line === null ? 0 : Number(token(line, 'uploading'));
-  if (n === 1) ctx.print('✓ 1 past session is uploading in the background');
-  if (n > 1) ctx.print(`✓ ${n} past sessions are uploading in the background`);
+  if (line === null || Number(token(line, 'uploading')) === 0) return;
+  const tenants = token(line, 'tenants');
+  await followPast(ctx, key, tenants === null || tenants === '' ? [] : tenants.split(','), sinceMs);
 }
 
 export function crashModeOf(text) {

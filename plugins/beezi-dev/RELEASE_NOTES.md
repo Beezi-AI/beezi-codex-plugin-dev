@@ -1,5 +1,14 @@
 # Beezi plugin release notes
 
+## 0.28.3 (2026-11-18) — Upload progress
+
+### New
+- **Upload progress in setup** — terminal setup and the one-line installers show a bar that fills in place while your past sessions upload, `Uploading past sessions to Acme  ▓▓▓▓░░░░░░░░░░  30/100`, then `✓ 100 past sessions uploaded to Acme`. Off a terminal you get plain `Beezi: 30/100 sessions read…` lines instead. Press Ctrl+C, or wait 100 seconds off a terminal, to stop following; an upload that is stopped or fails ends on `Beezi: the rest keeps uploading in the background`, and the rest keeps uploading.
+- **Upload now shows its progress** — `Upload now` in a session follows the upload for up to 100 seconds with the same plain lines and ends on the done line, or on `✓ 30 of 100 past sessions uploaded to Acme; the rest keeps uploading in the background`.
+
+### Improved
+- **A finished upload is not announced twice** — once you have seen the done line, the next session start no longer repeats the result. Uploads that start by themselves still report their result at the next session start.
+
 ## 0.28.2 (2026-11-17) — Setup and uploads wait out a busy moment
 
 ### Fixed

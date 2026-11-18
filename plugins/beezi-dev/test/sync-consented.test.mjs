@@ -15,7 +15,7 @@ const C = '2026-10-01T00:00:00.000Z';
 const OFFER = { choice: 'offer', changedAt: C };
 const UPLOAD = { choice: 'upload', changedAt: C };
 const SKIP = { choice: 'skip', changedAt: C };
-const NOTHING = 'uploading=0 workspaces=0';
+const NOTHING = 'uploading=0 workspaces=0 tenants=';
 // Never created and outside home and temp, so each keys as a folder place.
 const APP = '/beezi-consented/app';
 const WEB = '/beezi-consented/web';
@@ -101,7 +101,7 @@ test('an ask-first workspace is owed its counted sessions and the worker starts 
   const io = capture(t);
   const { spawns, deps } = engine();
   assert.equal(await consented(deps), 0);
-  assert.deepEqual(io, { out: ['uploading=2 workspaces=1'], err: [] });
+  assert.deepEqual(io, { out: ['uploading=2 workspaces=1 tenants=t1'], err: [] });
   assert.deepEqual(spawns, WORKER);
   assert.deepEqual(await owed(), [['t1', ['A', 'D'], ['repos']]]);
   const record = (await getAccount(TEST_KEY)).historyOffers.t1;
@@ -114,7 +114,7 @@ test('a no-ask workspace is owed the same with no notice, under the kinds it hid
   const whoamiImpl = async () => ({ valid: true, tenants: [tenant('t1', 'Acme', ['branches'], UPLOAD)] });
   const { spawns, deps } = engine({ whoamiImpl });
   assert.equal(await consented(deps), 0);
-  assert.deepEqual(io, { out: ['uploading=2 workspaces=1'], err: [] });
+  assert.deepEqual(io, { out: ['uploading=2 workspaces=1 tenants=t1'], err: [] });
   assert.deepEqual(spawns, WORKER);
   assert.deepEqual(await owed(), [['t1', ['A', 'D'], ['repos', 'branches']]]);
 });
@@ -124,7 +124,7 @@ test('an audit workspace is included', async (t) => {
   const io = capture(t);
   const { spawns, deps } = engine({ over: () => ({ trackingMode: 'backfill_only' }) });
   assert.equal(await consented(deps), 0);
-  assert.deepEqual(io.out, ['uploading=2 workspaces=1']);
+  assert.deepEqual(io.out, ['uploading=2 workspaces=1 tenants=t1']);
   assert.deepEqual(spawns, WORKER);
   assert.deepEqual(await owed(), [['t1', ['A', 'D'], ['repos']]]);
 });
@@ -163,12 +163,12 @@ test('two workspaces owed the same sessions print the distinct count and start t
   const io = capture(t);
   const { spawns, deps } = engine();
   assert.equal(await consented(deps), 0);
-  assert.deepEqual(io, { out: ['uploading=2 workspaces=2'], err: [] });
+  assert.deepEqual(io, { out: ['uploading=2 workspaces=2 tenants=t1,t2'], err: [] });
   assert.deepEqual(spawns, WORKER);
   assert.deepEqual((await owed()).map(([id, ids]) => [id, ids]), [['t1', ['A', 'D']], ['t2', ['A', 'D']]]);
 });
 
-test('nothing to upload prints uploading=0 workspaces=0 and starts no worker', async (t) => {
+test('nothing to upload prints uploading=0 workspaces=0 tenants= and starts no worker', async (t) => {
   link(t, answered([]));
   const io = capture(t);
   const { spawns, deps } = engine({ disk: [] });
@@ -259,7 +259,7 @@ test('one workspace, Everything: the consented run owes exactly the sessions the
   });
   await write(['setup', 'everything', 't1'], deps);
   assert.equal(await consented(deps), 0);
-  assert.equal(io.out[io.out.length - 1], 'uploading=3 workspaces=1');
+  assert.equal(io.out[io.out.length - 1], 'uploading=3 workspaces=1 tenants=t1');
   assert.deepEqual((await owed()).map(([id, ids]) => [id, ids]), [['t1', ['W1', 'W2', 'P1']]]);
 });
 
@@ -271,7 +271,7 @@ test('one workspace, Let me choose: the consented run owes exactly the listed pl
   await write(['rule', 'add', '--folder', API, 'none'], deps);
   await write(['setup', 'chosen'], deps);
   assert.equal(await consented(deps), 0);
-  assert.equal(io.out[io.out.length - 1], 'uploading=2 workspaces=1');
+  assert.equal(io.out[io.out.length - 1], 'uploading=2 workspaces=1 tenants=t1');
   assert.deepEqual((await owed()).map(([id, ids]) => [id, ids]), [['t1', ['W1', 'W2']]]);
 });
 
@@ -289,7 +289,7 @@ test("several workspaces, Everything to both: the consented run owes the listed 
   });
   await write(['setup', 'everything', 't1,t2'], deps);
   assert.equal(await consented(deps), 0);
-  assert.equal(io.out[io.out.length - 1], 'uploading=2 workspaces=2');
+  assert.equal(io.out[io.out.length - 1], 'uploading=2 workspaces=2 tenants=t1,t2');
   assert.deepEqual((await owed()).map(([id, ids]) => [id, ids]), [['t1', ['W1', 'P1']], ['t2', ['W1', 'P1']]]);
 });
 
@@ -302,7 +302,7 @@ test('several workspaces, Let me choose: each workspace is owed only the places 
   await write(['rule', 'add', '--folder', API, 't2'], deps);
   await write(['setup', 'chosen'], deps);
   assert.equal(await consented(deps), 0);
-  assert.equal(io.out[io.out.length - 1], 'uploading=2 workspaces=2');
+  assert.equal(io.out[io.out.length - 1], 'uploading=2 workspaces=2 tenants=t1,t2');
   assert.deepEqual((await owed()).map(([id, ids]) => [id, ids]), [['t1', ['W1']], ['t2', ['W1', 'P1']]]);
 });
 
@@ -334,7 +334,7 @@ test('a session that became eligible after the listing is not owed', async (t) =
   disk.push(session('W2', WEB));
   await write(['setup', 'everything'], deps);
   assert.equal(await consented(deps), 0);
-  assert.equal(io.out[io.out.length - 1], 'uploading=1 workspaces=1');
+  assert.equal(io.out[io.out.length - 1], 'uploading=1 workspaces=1 tenants=t1');
   assert.deepEqual((await owed()).map(([id, ids]) => [id, ids]), [['t1', ['W1']]]);
 });
 
@@ -357,7 +357,7 @@ test('a second consented run after a successful one owes nothing more', async (t
   await write(['setup', 'everything'], deps);
   assert.equal(await consented(deps), 0);
   assert.equal(await consented(deps), 0);
-  assert.deepEqual(io.out.slice(-2), ['uploading=2 workspaces=1', NOTHING]);
+  assert.deepEqual(io.out.slice(-2), ['uploading=2 workspaces=1 tenants=t1', NOTHING]);
   assert.deepEqual(spawns, WORKER);
   assert.equal((await getAccount(TEST_KEY)).setupListing, undefined);
 });

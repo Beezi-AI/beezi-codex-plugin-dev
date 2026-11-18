@@ -10,6 +10,7 @@ import { parseListing, token } from '../lib/setup-routing.mjs';
 import {
   ACCOUNT_LINE, PLAN_EXPIRED, crashModeOf, parseLinkedAccounts, planSettled, uploadPast,
 } from '../lib/setup-wizard.mjs';
+import { createProgressWriter } from '../lib/upload-progress.mjs';
 import { linkAccount, makeHome } from '../tools/account-fixtures.mjs';
 
 // The terminal setup branches on other scripts' output text. Each row is two-sided: the script still prints the fragment, and the setup still reads a line of that shape.
@@ -138,9 +139,12 @@ test('settings.mjs keys still carries the crash= line the setup reads', async (t
   assert.equal(crashModeOf((await keysLines({})).join('\n')), CRASH_MODES.OFF);
 });
 
-test('sync.mjs --consented still ends with uploading=, and the setup reads its count', async () => {
-  assert.ok(read('lib', 'history-cli.mjs').includes('console.log(`uploading=${owed.reduce((all, ids) => union(all, ids), []).length} workspaces=${owed.length}`);'));
+test('sync.mjs --consented still ends with uploading= and tenants=, and the setup follows those workspaces in order', async (t) => {
+  assert.ok(read('lib', 'history-cli.mjs').includes('console.log(`uploading=${sessions} workspaces=${owed.length} tenants=${owed.map((o) => o.tenantId).join(\',\')}`);'));
+  makeHome(t);
+  createProgressWriter({ key: KEY, tenantId: 't1', workspace: 'Acme' }).finish({ processed: 20, total: 20, sent: 20 });
+  createProgressWriter({ key: KEY, tenantId: 't2', workspace: 'Side' }).finish({ processed: 17, total: 17, sent: 17 });
   const printed = [];
-  await uploadPast({ run: async () => ({ code: 0, stdout: 'uploading=37 workspaces=2\n', stderr: '' }), print: (line) => printed.push(line) }, KEY);
-  assert.deepEqual(printed, ['✓ 37 past sessions are uploading in the background']);
+  await uploadPast({ run: async () => ({ code: 0, stdout: 'uploading=37 workspaces=2 tenants=t1,t2\n', stderr: '' }), print: (line) => printed.push(line) }, KEY);
+  assert.deepEqual(printed, ['✓ 20 past sessions uploaded to Acme', '✓ 17 past sessions uploaded to Side']);
 });

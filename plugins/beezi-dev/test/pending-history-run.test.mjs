@@ -365,3 +365,80 @@ test('M4: a retry reruns only the busy workspace, so a failed one is not counted
   assert.deepEqual(h.settled.map((s) => [s.tenantId, s.outcome]), [['A', RunOutcome.FAILED], ['B', RunOutcome.BUSY], ['B', RunOutcome.CLEAN]]);
   assert.deepEqual(done.map((d) => [d.tenantId, d.outcome]), [['A', RunOutcome.FAILED], ['B', RunOutcome.CLEAN]]);
 });
+
+// ── progress record ────────────────────────────────────────────────────────────────────────
+
+// Every writer the run creates, and each update and finish it gets, in order.
+function recordWrites(h) {
+  const writes = [];
+  h.deps.createProgressWriter = ({ key, tenantId, workspace }) => ({
+    update: (counts) => writes.push({ call: 'update', key, tenantId, workspace, ...counts }),
+    finish: (counts, failed) => writes.push({ call: 'finish', key, tenantId, workspace, ...counts, failed }),
+  });
+  return writes;
+}
+
+const acmeRow = (pending) => ({ key: 'k1', status: 'linked', tenants: [{ id: 'A', name: 'Acme' }, { id: 'B', name: 'Side' }], pendingHistory: pending });
+
+test('a clean run writes its progress record, then finishes it with the final counts', async () => {
+  const h = harness({ row: acmeRow([{ tenantId: 'B', sessionIds: ['s1'], requestedAt: REQ }]), results: [], plan: { tenantIds: ['A', 'B'], routes: new Map() } });
+  const writes = recordWrites(h);
+  h.deps.runAudit = async (d) => {
+    d.onProgress({ processed: 1, total: 3, sessionsImported: 1 });
+    d.onProgress({ processed: 3, total: 3, sessionsImported: 2 });
+    return clean({ sessionsImported: 2 });
+  };
+  await runPendingHistory('k1', h.deps);
+  assert.deepEqual(writes, [
+    { call: 'update', key: 'k1', tenantId: 'B', workspace: 'Side', processed: 1, total: 3, sent: 1 },
+    { call: 'update', key: 'k1', tenantId: 'B', workspace: 'Side', processed: 3, total: 3, sent: 2 },
+    { call: 'finish', key: 'k1', tenantId: 'B', workspace: 'Side', processed: 3, total: 3, sent: 2, failed: false },
+  ]);
+});
+
+test('a one-workspace account keys its record by the entry\'s workspace id and names it after the account\'s workspace', async () => {
+  const row = { key: 'k1', status: 'linked', tenantId: 'T1', tenantName: 'Acme', pendingHistory: [{ tenantId: 'T1', sessionIds: ['s1'], requestedAt: REQ }] };
+  const h = harness({ row, results: [clean()], plan: { tenantIds: [], routes: new Map() } });
+  const writes = recordWrites(h);
+  await runPendingHistory('k1', h.deps);
+  assert.deepEqual(writes, [{ call: 'finish', key: 'k1', tenantId: 'T1', workspace: 'Acme', processed: 0, total: 0, sent: 0, failed: false }]);
+});
+
+test('a busy run leaves the record to the run that holds the lock', async () => {
+  const h = harness({ row: acmeRow([{ tenantId: 'B', sessionIds: ['s1'], requestedAt: REQ }]), results: [{ ok: true, reason: 'run-in-progress' }], plan: { tenantIds: ['B'], routes: new Map() } });
+  const writes = recordWrites(h);
+  await runPendingHistory('k1', h.deps);
+  assert.deepEqual(writes, []);
+});
+
+test('a throwing run still finishes its record and settles as failed', async () => {
+  const h = harness({ row: acmeRow([{ tenantId: 'A', sessionIds: ['s1'], requestedAt: REQ }]), results: [], plan: { tenantIds: ['A'], routes: new Map() } });
+  const writes = recordWrites(h);
+  h.deps.runAudit = async (d) => {
+    d.onProgress({ processed: 1, total: 2, sessionsImported: 1 });
+    throw new Error('boom');
+  };
+  await runPendingHistory('k1', h.deps);
+  assert.deepEqual(writes.map((w) => [w.call, w.processed, w.total, w.sent, w.failed]), [['update', 1, 2, 1, undefined], ['finish', 1, 2, 1, true]]);
+  assert.deepEqual(h.settled, [{ tenantId: 'A', outcome: RunOutcome.FAILED, sent: 0, skipped: 0 }]);
+});
+
+const endedCases = [
+  { name: 'a run that failed to deliver reports', result: clean({ reportsFailed: 2, sessionsImported: 1 }), failed: true },
+  { name: 'a run that halted', result: clean({ ok: false, halt: 'server-error' }), failed: true },
+  { name: 'a refused run', result: { ok: true, reason: 'workspace-required' }, failed: true },
+  { name: 'a clean run', result: clean({ sessionsImported: 1 }), failed: false },
+  { name: 'a clean run waiting on a recent session', result: clean({ sessionsImported: 1, recent: [{ sessionId: 's-old', path: '/t/old.jsonl' }] }), failed: false },
+];
+for (const c of endedCases) {
+  test(`${c.name} finishes its record with failed: ${c.failed}`, async () => {
+    const h = harness({ row: acmeRow([{ tenantId: 'A', sessionIds: ['s1'], requestedAt: REQ }]), results: [], plan: { tenantIds: ['A'], routes: new Map() }, starts: { '/t/old.jsonl': T0 - 3600 * 1000 } });
+    const writes = recordWrites(h);
+    h.deps.runAudit = async (d) => {
+      d.onProgress({ processed: 1, total: 40, sessionsImported: 1 });
+      return c.result;
+    };
+    await runPendingHistory('k1', h.deps);
+    assert.deepEqual(writes[writes.length - 1], { call: 'finish', key: 'k1', tenantId: 'A', workspace: 'Acme', processed: 1, total: 40, sent: 1, failed: c.failed });
+  });
+}
