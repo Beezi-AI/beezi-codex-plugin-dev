@@ -2,7 +2,7 @@ import '../tools/hermetic-env.mjs';
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import {
-  progressBar, barLine, plainLine, doneLine, REST_LINE, followUploads,
+  progressBar, barLine, liveLine, plainLine, doneLine, REST_LINE, followUploads,
 } from '../lib/upload-progress-view.mjs';
 
 const T0 = Date.parse('2026-11-18T10:00:00.000Z');
@@ -68,6 +68,41 @@ test('plainLine shows sessions read', () => {
   assert.equal(plainLine(record()), 'Beezi: 30/100 sessions read…');
 });
 
+test('liveLine shows the spinner and the bar while reading', () => {
+  const line = liveLine(record({ workspace: 'AndriiTest', processed: 120, total: 225 }), { tick: 1 });
+  assert.equal(line, '⠙ Uploading past sessions to AndriiTest  ▓▓▓▓▓▓▓░░░░░░░  120/225');
+});
+
+test('liveLine says finishing once every session is read', () => {
+  const line = liveLine(record({ workspace: 'AndriiTest', processed: 225, total: 225 }), { tick: 0 });
+  assert.equal(line, '⠋ Finishing upload to AndriiTest…');
+});
+
+test('liveLine uses ASCII frames on request', () => {
+  const line = liveLine(record({ workspace: 'AndriiTest', processed: 225, total: 225 }), { ascii: true, tick: 2 });
+  assert.equal(line, '- Finishing upload to AndriiTest…');
+});
+
+test('liveLine wraps the spinner frames around', () => {
+  assert.equal(liveLine(record(), { tick: 10 }), '⠋ Uploading past sessions to Acme  ▓▓▓▓░░░░░░░░░░  30/100');
+  assert.equal(liveLine(record(), { ascii: true, tick: 4 }), '| Uploading past sessions to Acme  ####----------  30/100');
+});
+
+test('liveLine keeps the whole line, spinner included, inside the width', () => {
+  const reading = liveLine(record({ workspace: 'Acme Corporation Platform Team' }), { width: 61 });
+  assert.equal(reading, '⠋ Uploading past sessions to Acme Co…  ▓▓▓▓░░░░░░░░░░  30/100');
+  const finishing = liveLine(record({ workspace: 'Acme Corporation Platform Team', processed: 100 }), { width: 30 });
+  assert.equal(finishing, '⠋ Finishing upload to Acme Co…');
+});
+
+test('plainLine says all sessions read once processed reaches total', () => {
+  assert.equal(plainLine(record({ processed: 225, total: 225 })), 'Beezi: all sessions read, finishing upload…');
+});
+
+test('plainLine with no sessions to read is not finishing', () => {
+  assert.equal(plainLine(record({ processed: 0, total: 0 })), 'Beezi: 0/0 sessions read…');
+});
+
 test('doneLine uses the singular for one session sent', () => {
   assert.equal(doneLine(record({ sent: 1 })), '✓ 1 past session uploaded to Acme');
 });
@@ -100,6 +135,18 @@ test('calls onUpdate only when processed changes', async () => {
   };
   const { updates } = await follow(script);
   assert.deepEqual(updates.map((r) => r.processed), [30, 40]);
+});
+
+test('ticks on every poll of a live record, though processed stays the same', async () => {
+  const script = (tenantId, nowMs) => {
+    if (nowMs >= T0 + 3000) return record({ processed: 225, total: 225, updatedAt: iso(nowMs), finishedAt: iso(nowMs) });
+    return record({ processed: 225, total: 225, updatedAt: iso(nowMs) });
+  };
+  const ticks = [];
+  const { updates, dones } = await follow(script, { onTick: (r, tick) => ticks.push(tick) });
+  assert.deepEqual(ticks, [0, 1, 2]);
+  assert.equal(updates.length, 1);
+  assert.equal(dones.length, 1);
 });
 
 test('ignores a finished record that started before sinceMs - 5000', async () => {

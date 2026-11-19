@@ -1297,6 +1297,8 @@ async function runAuditLocked(lockHandle, deps, options, prepared) {
     // A throw from the loop itself still waits for every flight (drain without its rethrow), so none writes after the lock is released.
     await Promise.all(flights);
   }
+  // Every session is read: report it now, since the batch path reports only once a batch lands.
+  onProgress({ processed, total: candidates.length, ...result });
   await dispatch({ alone: true });
   await drain();
 

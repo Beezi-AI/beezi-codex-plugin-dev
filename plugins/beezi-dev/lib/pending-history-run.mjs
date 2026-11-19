@@ -13,6 +13,8 @@ const REFUSED_REASONS = ['workspace-required', 'audit-only'];
 const REFUSED_HALTS = [BackfillHalt.NOT_ALLOWED, BackfillHalt.FORBIDDEN, BackfillHalt.UNSUPPORTED_SERVER];
 const BUSY_WAIT_MS = 30_000;
 const BUSY_RETRIES = 6;
+// Well under the follower's 120 s stale limit, so a long final upload keeps its record live.
+const HEARTBEAT_MS = 15000;
 
 // One history run's meaning for the marker; `waiting` = a recent session predates the request.
 export function classifyRun(result, waiting) {
@@ -35,11 +37,16 @@ export function workspaceName(row, tenantId) {
 // leaves the record to the run that owns it.
 async function runWithProgress(runAudit, runDeps, options, writer) {
   let counts = { processed: 0, total: 0, sent: 0 };
+  let reported = false;
   const onProgress = (p) => {
+    reported = true;
     counts = { processed: p.processed, total: p.total, sent: p.sessionsImported };
     writer.update(counts);
   };
-  const result = await runAudit({ ...runDeps, onProgress }, options).catch(() => null);
+  // Silent until the run reports: one waiting on another run's lock must not overwrite that run's record with 0/0.
+  const heartbeat = setInterval(() => { if (reported) writer.update(counts); }, HEARTBEAT_MS);
+  heartbeat.unref();
+  const result = await runAudit({ ...runDeps, onProgress }, options).catch(() => null).finally(() => clearInterval(heartbeat));
   const outcome = classifyRun(result, false);
   if (outcome !== RunOutcome.BUSY) writer.finish(counts, outcome !== RunOutcome.CLEAN);
   return result;
