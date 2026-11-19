@@ -594,15 +594,51 @@ test('on a terminal the upload redraws one bar line in place, then ends on the d
   const written = [];
   const ctx = followCtx({ platform: 'darwin', activity: true, output: { write: (text) => written.push(text) }, format: (line) => `  ${line}` });
   assert.equal(await runSetup(ctx), 0);
-  assert.deepEqual(written, ['\r\x1b[2K  Uploading past sessions to Acme  ▓▓▓▓▓░░░░░░░░░  1/3', '\r\x1b[2K']);
+  assert.deepEqual(written, ['\r\x1b[2K  ⠋ Uploading past sessions to Acme  ▓▓▓▓▓░░░░░░░░░  1/3', '\r\x1b[2K']);
   assert.deepEqual(ctx.printed.slice(2), [TRACKED, '✓ 3 past sessions uploaded to Acme'].concat(CLOSING));
+});
+
+// The worker has read all 3 sessions; its record is finished on the second sleep.
+function finishingCtx(over) {
+  const writer = record();
+  writer.update({ processed: 3, total: 3, sent: 1 });
+  let polls = 0;
+  const sleep = async () => {
+    polls += 1;
+    if (polls === 2) writer.finish({ processed: 3, total: 3, sent: 3 });
+  };
+  return { ...setupCtx(outputs(THREE), [0]), sleep, ...over };
+}
+
+test('on a terminal the spinner moves every poll while the count stays at the total', async () => {
+  const written = [];
+  const ctx = finishingCtx({ platform: 'darwin', activity: true, output: { write: (text) => written.push(text) }, format: (line) => line });
+  assert.equal(await runSetup(ctx), 0);
+  assert.deepEqual(written, ['\r\x1b[2K⠋ Finishing upload to Acme…', '\r\x1b[2K⠙ Finishing upload to Acme…', '\r\x1b[2K']);
+  assert.deepEqual(ctx.printed.slice(2), [TRACKED, '✓ 3 past sessions uploaded to Acme'].concat(CLOSING));
+});
+
+test('off a terminal the finishing line prints once however many polls follow', async () => {
+  const writer = record();
+  writer.update({ processed: 1, total: 3, sent: 1 });
+  let polls = 0;
+  const sleep = async () => {
+    polls += 1;
+    if (polls === 1) writer.update({ processed: 3, total: 3, sent: 1 });
+    if (polls === 3) writer.finish({ processed: 3, total: 3, sent: 3 });
+  };
+  const ctx = { ...setupCtx(outputs(THREE), [0]), sleep };
+  assert.equal(await runSetup(ctx), 0);
+  assert.deepEqual(ctx.printed.slice(2), [
+    TRACKED, 'Beezi: 1/3 sessions read…', 'Beezi: all sessions read, finishing upload…', '✓ 3 past sessions uploaded to Acme',
+  ].concat(CLOSING));
 });
 
 test('on a Windows terminal the bar is drawn in ASCII', async () => {
   const written = [];
   const ctx = followCtx({ platform: 'win32', activity: true, output: { write: (text) => written.push(text) }, format: (line) => `  ${line}` });
   assert.equal(await runSetup(ctx), 0);
-  assert.deepEqual(written, ['\r\x1b[2K  Uploading past sessions to Acme  #####---------  1/3', '\r\x1b[2K']);
+  assert.deepEqual(written, ['\r\x1b[2K  | Uploading past sessions to Acme  #####---------  1/3', '\r\x1b[2K']);
 });
 
 const widthCases = [
@@ -610,19 +646,19 @@ const widthCases = [
     name: 'a long workspace name is cut with … to the columns left after the margin, less one',
     workspace: 'Acme Corporation Platform Team',
     columns: 60,
-    bar: 'Uploading past sessions to Acme Corpo…  ▓▓▓▓▓░░░░░░░░░  1/3',
+    bar: '⠋ Uploading past sessions to Acme Cor…  ▓▓▓▓▓░░░░░░░░░  1/3',
   },
   {
     name: 'on a wide terminal the bar line is cut at 100 characters, where lines wrap',
     workspace: 'X'.repeat(80),
     columns: 200,
-    bar: `Uploading past sessions to ${'X'.repeat(51)}…  ▓▓▓▓▓░░░░░░░░░  1/3`,
+    bar: `⠋ Uploading past sessions to ${'X'.repeat(49)}…  ▓▓▓▓▓░░░░░░░░░  1/3`,
   },
   {
     name: 'a name that fits is drawn whole',
     workspace: 'Acme',
     columns: 60,
-    bar: 'Uploading past sessions to Acme  ▓▓▓▓▓░░░░░░░░░  1/3',
+    bar: '⠋ Uploading past sessions to Acme  ▓▓▓▓▓░░░░░░░░░  1/3',
   },
 ];
 for (const c of widthCases) {

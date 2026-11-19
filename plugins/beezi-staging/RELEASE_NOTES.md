@@ -1,5 +1,11 @@
 # Beezi plugin release notes
 
+## 0.28.5 (2026-11-19) — A long upload shows it is still working
+
+### Improved
+- **Spinner and "Finishing upload"** — while your past sessions upload, setup and the one-line installers show a spinner that moves every second. Once every session is read, the bar gives way to `Finishing upload to Acme…` until the last batches are sent, then `✓ 100 past sessions uploaded to Acme`. Off a terminal you get one `Beezi: all sessions read, finishing upload…` line instead.
+- **Long uploads stay followed** — a big last batch no longer looks stalled: the upload keeps its progress fresh every 15 seconds, so setup keeps following it instead of giving up.
+
 ## 0.28.4 (2026-11-18) — Past sessions follow the workspace owner
 
 ### Improved

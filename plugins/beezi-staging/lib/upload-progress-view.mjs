@@ -6,8 +6,24 @@ const ASCII_GLYPHS = { done: '#', left: '-' };
 const POLL_MS = 1000;
 const STALE_MS = 120000;
 const FRESH_SLACK_MS = 5000;
+const FRAMES = ['⠋', '⠙', '⠹', '⠸', '⠼', '⠴', '⠦', '⠧', '⠇', '⠏'];
+const ASCII_FRAMES = ['|', '/', '-', '\\'];
+const FINISHING_HEAD = 'Finishing upload to ';
 
 export const REST_LINE = 'Beezi: the rest keeps uploading in the background';
+const FINISHING_PLAIN = 'Beezi: all sessions read, finishing upload…';
+
+function spinnerFrame(tick, { ascii = false } = {}) {
+  const frames = ascii ? ASCII_FRAMES : FRAMES;
+  return frames[tick % frames.length];
+}
+
+// Every session is read; what is left is the last batches going up.
+function isFinishing({ processed, total }) {
+  return total > 0 && processed >= total;
+}
+
+const fitName = (name, room) => (name.length <= room ? name : `${name.slice(0, Math.max(0, room - 1))}…`);
 
 export function progressBar(processed, total, { ascii = false } = {}) {
   const glyphs = ascii ? ASCII_GLYPHS : GLYPHS;
@@ -21,11 +37,19 @@ export function barLine(record, options = {}) {
   const head = 'Uploading past sessions to ';
   const tail = `  ${progressBar(processed, total, options)}  ${processed}/${total}`;
   const room = options.width == null ? Infinity : options.width - head.length - tail.length;
-  const name = workspace.length <= room ? workspace : `${workspace.slice(0, Math.max(0, room - 1))}…`;
-  return head + name + tail;
+  return head + fitName(workspace, room) + tail;
+}
+
+// The bar while sessions are read, then the finishing text; options.width counts the spinner.
+export function liveLine(record, { ascii = false, width = Infinity, tick = 0 } = {}) {
+  const frame = `${spinnerFrame(tick, { ascii })} `;
+  const room = width - frame.length;
+  if (!isFinishing(record)) return frame + barLine(record, { ascii, width: room });
+  return frame + FINISHING_HEAD + fitName(`${record.workspace}…`, room - FINISHING_HEAD.length);
 }
 
 export function plainLine(record) {
+  if (isFinishing(record)) return FINISHING_PLAIN;
   return `Beezi: ${record.processed}/${record.total} sessions read…`;
 }
 
@@ -40,12 +64,13 @@ function isFresh(record, sinceMs) {
 
 export async function followUploads({
   key, tenantIds, sinceMs, capMs = Infinity, shouldStop = () => false,
-  onUpdate, onDone, read = readProgress, now = Date.now, sleep,
+  onUpdate, onTick = () => {}, onDone, read = readProgress, now = Date.now, sleep,
 }) {
   const startMs = now();
   const finished = [];
   const result = (timedOut, stopped) => ({ finished, timedOut, stopped });
   let index = 0;
+  let tick = 0;
   let lastProcessed = null;
   let lastSeenMs = startMs;
   while (index < tenantIds.length) {
@@ -67,6 +92,8 @@ export async function followUploads({
       lastSeenMs = nowMs;
       if (record.processed !== lastProcessed) onUpdate(record);
       lastProcessed = record.processed;
+      onTick(record, tick);
+      tick += 1;
     }
     if (nowMs - lastSeenMs >= STALE_MS) return result(false, true);
     await sleep(POLL_MS);

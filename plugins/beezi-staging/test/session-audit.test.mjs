@@ -719,6 +719,28 @@ test('20b. parsing continues while a dispatched batch is in flight', async () =>
   assert.ok(overlapped, 'no session was parsed while the first batch was in flight');
 });
 
+test('20c. every session read is reported before a last batch that uploads alone', async () => {
+  const order = [];
+  const sessions = Array.from({ length: 55 }, (_u, i) => rollout(`s${i}`));
+  const { deps } = makeDeps({
+    listRollouts: () => sessions,
+    onProgress: ({ processed, total }) => order.push(`progress:${processed}/${total}`),
+    flushBackfillChunksImpl: async (groups) => {
+      order.push(`flush:${groups.length}`);
+      const bySession = new Map(
+        groups.map((g) => [g.sessionId, { status: BackfillSessionStatus.ACCEPTED, reason: null }]),
+      );
+      return flushResult({ stored: groups.length, bySession });
+    },
+  });
+
+  const result = await runAudit(deps, {});
+
+  assert.equal(result.sessionsImported, 55);
+  // The first batch lands at 51/55, while sessions are still being read; 55/55 comes before the last batch goes up.
+  assert.deepEqual(order, ['flush:50', 'progress:51/55', 'progress:55/55', 'flush:5', 'progress:55/55']);
+});
+
 test('21. drives runCheckpoint with the audit seams and the discovered cwd', async () => {
   let seen = null;
   const { deps } = makeDeps({

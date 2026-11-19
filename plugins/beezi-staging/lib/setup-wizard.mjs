@@ -4,7 +4,7 @@ import { PLAN_LABELS } from './settings-cli.mjs';
 import { closingLines } from './setup-finale.mjs';
 import { askTracking, lastLine, outputLines, report, token } from './setup-routing.mjs';
 import { markReported } from './upload-progress.mjs';
-import { followUploads, barLine, plainLine, doneLine, REST_LINE } from './upload-progress-view.mjs';
+import { followUploads, liveLine, plainLine, doneLine, REST_LINE } from './upload-progress-view.mjs';
 
 // One `accounts.mjs list` row: "  <n>. <description> [<key>]", then "  (default, revoked)" marks when any.
 const LISTED_ACCOUNT = /^ {2}\d+\. (.+) \[([0-9a-f]{8})\](?: {2}\(([a-z, ]+)\))?$/;
@@ -142,8 +142,11 @@ async function followPast(ctx, key, tenantIds, sinceMs) {
     capMs: terminal ? Infinity : NO_TERMINAL_CAP_MS,
     shouldStop: interrupted,
     onUpdate: (record) => {
-      if (terminal) ctx.output.write(`${CLEAR_LINE}${ctx.format(barLine(record, { ascii, width: width() }))}`);
-      else ctx.print(plainLine(record));
+      if (!terminal) ctx.print(plainLine(record));
+    },
+    // Redrawn every poll so the spinner moves while the last batches upload.
+    onTick: (record, tick) => {
+      if (terminal) ctx.output.write(`${CLEAR_LINE}${ctx.format(liveLine(record, { ascii, width: width(), tick }))}`);
     },
     onDone: (record) => {
       clear();

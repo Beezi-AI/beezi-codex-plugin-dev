@@ -423,6 +423,81 @@ test('a throwing run still finishes its record and settles as failed', async () 
   assert.deepEqual(h.settled, [{ tenantId: 'A', outcome: RunOutcome.FAILED, sent: 0, skipped: 0 }]);
 });
 
+// A run that has read all 3 sessions (2 sent) and stays in flight until gate.resolve / gate.reject.
+function heldRun() {
+  const gate = {};
+  const held = new Promise((resolve, reject) => { gate.resolve = resolve; gate.reject = reject; });
+  let begun;
+  const started = new Promise((resolve) => { begun = resolve; });
+  const runAudit = async (d) => {
+    d.onProgress({ processed: 3, total: 3, sessionsImported: 2 });
+    begun();
+    return held;
+  };
+  return { gate, started, runAudit };
+}
+
+const HEARTBEAT = { call: 'update', key: 'k1', tenantId: 'A', workspace: 'Acme', processed: 3, total: 3, sent: 2 };
+
+test('refreshes the progress record every 15 s while a run is in flight', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const h = harness({ row: acmeRow([{ tenantId: 'A', sessionIds: ['s1'], requestedAt: REQ }]), results: [], plan: { tenantIds: ['A'], routes: new Map() } });
+  const writes = recordWrites(h);
+  const { gate, started, runAudit } = heldRun();
+  h.deps.runAudit = runAudit;
+  const pass = runPendingHistory('k1', h.deps);
+  await started;
+  assert.deepEqual(writes, [HEARTBEAT]);
+  t.mock.timers.tick(15000);
+  assert.deepEqual(writes, [HEARTBEAT, HEARTBEAT]);
+  gate.resolve(clean({ sessionsImported: 2 }));
+  await pass;
+  assert.deepEqual(writes.map((w) => w.call), ['update', 'update', 'finish']);
+  t.mock.timers.tick(15000);
+  assert.equal(writes.length, 3);
+});
+
+test('does not refresh the record before the run reports progress', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const h = harness({ row: acmeRow([{ tenantId: 'A', sessionIds: ['s1'], requestedAt: REQ }]), results: [], plan: { tenantIds: ['A'], routes: new Map() } });
+  const writes = recordWrites(h);
+  const gate = {};
+  const held = new Promise((resolve) => { gate.resolve = resolve; });
+  let begun;
+  const started = new Promise((resolve) => { begun = resolve; });
+  let report;
+  h.deps.runAudit = async (d) => {
+    report = d.onProgress;
+    begun();
+    return held;
+  };
+  const pass = runPendingHistory('k1', h.deps);
+  await started;
+  t.mock.timers.tick(15000);
+  assert.deepEqual(writes, []);
+  report({ processed: 3, total: 3, sessionsImported: 2 });
+  assert.deepEqual(writes, [HEARTBEAT]);
+  t.mock.timers.tick(15000);
+  assert.deepEqual(writes, [HEARTBEAT, HEARTBEAT]);
+  gate.resolve(clean({ sessionsImported: 2 }));
+  await pass;
+});
+
+test('stops the heartbeat when the run throws', async (t) => {
+  t.mock.timers.enable({ apis: ['setInterval'] });
+  const h = harness({ row: acmeRow([{ tenantId: 'A', sessionIds: ['s1'], requestedAt: REQ }]), results: [], plan: { tenantIds: ['A'], routes: new Map() } });
+  const writes = recordWrites(h);
+  const { gate, started, runAudit } = heldRun();
+  h.deps.runAudit = runAudit;
+  const pass = runPendingHistory('k1', h.deps);
+  await started;
+  gate.reject(new Error('boom'));
+  await pass;
+  assert.deepEqual(writes.map((w) => w.call), ['update', 'finish']);
+  t.mock.timers.tick(15000);
+  assert.equal(writes.length, 2);
+});
+
 const endedCases = [
   { name: 'a run that failed to deliver reports', result: clean({ reportsFailed: 2, sessionsImported: 1 }), failed: true },
   { name: 'a run that halted', result: clean({ ok: false, halt: 'server-error' }), failed: true },

@@ -818,7 +818,7 @@ test('accept --background prints a line per change, then the done line, and mark
     return { finished: [record], timedOut: false, stopped: false };
   });
   assert.equal(run.code, 0);
-  assert.deepEqual(run.io.out.slice(-3), ['Beezi: 1/2 sessions read…', 'Beezi: 2/2 sessions read…', '✓ 2 past sessions uploaded to Acme']);
+  assert.deepEqual(run.io.out.slice(-3), ['Beezi: 1/2 sessions read…', 'Beezi: all sessions read, finishing upload…', '✓ 2 past sessions uploaded to Acme']);
   assert.equal(readProgress(TEST_KEY, 't1').reported, true);
 });
 
