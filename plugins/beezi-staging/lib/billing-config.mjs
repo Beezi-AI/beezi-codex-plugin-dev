@@ -47,7 +47,13 @@ export function shouldProbeAccount(config, source, now = Date.now(), deps = {}) 
   const staleMs = orDefault(deps.staleMs, STALE_MS);
   // A plan the user answered by hand always wins; we do not even look.
   if ((config || {}).selfReported === true) return false;
-  if (source === BillingSource.SUBSCRIPTION) return staleImpl(config, now, staleMs);
+  // Written before the seat id existed: probe once, or a keychain machine (no auth.json to decode)
+  // keeps reporting the shared Business workspace for up to a week. Not part of isStale, which also
+  // drives the "could not read your plan" nudge — the plan here is known. A capture always writes
+  // the key, null when no seat could be read, so this fires until one capture succeeds.
+  if (source === BillingSource.SUBSCRIPTION) {
+    return staleImpl(config, now, staleMs) || !Object.prototype.hasOwnProperty.call(config || {}, 'userId');
+  }
   // An api-key or third-party machine bills no subscription: there is no plan to go and find.
   if (source !== BillingSource.UNKNOWN) return false;
   const capturedAt = parseTimestampMs((config || {}).capturedAt);

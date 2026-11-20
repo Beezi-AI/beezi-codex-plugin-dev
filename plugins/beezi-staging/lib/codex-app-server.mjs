@@ -17,6 +17,8 @@ const _spawn = (file, args, options) => childProcess.spawn(file, args, options);
 //
 //   account/read              → { account: { type, email, planType }, requiresOpenaiAuth }
 //   account/rateLimits/read   → { accountId, rateLimits: { planType, primary, secondary, … }, … }
+//   accountSession/list       → { activeSessionId, sessions: [{ userId, selectedWorkspaceAccountId, … }] }
+//                               (experimental; the seat — see seatUserId)
 //
 // MEASURED against codex-cli 0.154.0 on 2026-09-14: `account/read` carries NO accountId. The id
 // lives only on the rate-limit answer, which is why both calls are made and the second is not
@@ -62,6 +64,7 @@ const FAILURE_FIELDS = Object.freeze({
   plan: null,
   subscriptionType: null,
   accountId: null,
+  userId: null,
   email: null,
 });
 
@@ -146,7 +149,7 @@ function readPlan(account) {
 //
 // `stopEarly(index, response)` lets a reader give up the moment one answer makes the rest moot;
 // returning a reason string fails the session with it.
-function runAppServer(requests, deps, stopEarly) {
+function runAppServer(requests, deps, stopEarly, capabilities) {
   const env = orDefault(deps.env, process.env);
   const timeoutMs = orDefault(deps.timeoutMs, DEFAULT_TIMEOUT_MS);
   const spawn = orDefault(deps.spawn, _spawn);
@@ -260,12 +263,24 @@ function runAppServer(requests, deps, stopEarly) {
     // the child; the protocol stream is stdout and must stay separate from it.
     child.stderr.on('data', () => {});
 
-    send({
-      id: ID_INITIALIZE,
-      method: 'initialize',
-      params: { clientInfo: { name: 'beezi_codex_plugin', version: '1.0.0' } },
-    });
+    const initParams = { clientInfo: { name: 'beezi_codex_plugin', version: '1.0.0' } };
+    if (capabilities) initParams.capabilities = capabilities;
+    send({ id: ID_INITIALIZE, method: 'initialize', params: initParams });
   });
+}
+
+// The seat of the active sign-in, from `accountSession/list`. A Business/Team workspace id is shared
+// by every seat, so this user id is the only live answer that tells two seats apart, and the only
+// one on a machine whose credentials sit in the OS keychain (no ~/.codex/auth.json to decode).
+// MEASURED against codex-cli 0.167.0 on 2026-11-20: `{ activeSessionId, sessions: [{ sessionId,
+// userId, email, isActive, selectedWorkspaceAccountId, workspaces }] }`, experimental-only, and no
+// token in it. Taken only when the session's workspace IS the rate-limit account id, so the seat and
+// the workspace always come from the same sign-in.
+function seatUserId(result, accountId) {
+  const sessions = result && Array.isArray(result.sessions) ? result.sessions : [];
+  const active = sessions.filter((s) => s && (s.isActive === true || s.sessionId === result.activeSessionId))[0];
+  if (!active || accountId === null || active.selectedWorkspaceAccountId !== accountId) return null;
+  return readString(active.userId);
 }
 
 // Read the account Codex is actually signed in as, by asking Codex.
@@ -276,18 +291,22 @@ export function readAccountViaAppServer(deps = {}) {
     // `refreshToken: false` — this is a read, not a credential operation.
     { method: 'account/read', params: { refreshToken: false } },
     { method: 'account/rateLimits/read' },
+    // An older Codex, or one that drops the method, answers with an error: that costs the seat id
+    // and nothing else (measured: unknown methods get -32600, never silence).
+    { method: 'accountSession/list', params: {} },
   ];
   // An error on account/read is terminal: there is nothing left to learn without it, and waiting
   // for the rate-limit answer would only delay the fallback tier.
   const stopEarly = (index, response) => (index === 0 && response.error ? APP_SERVER_REASON.ERROR : null);
 
-  return runAppServer(requests, deps, stopEarly).then((session) => {
+  return runAppServer(requests, deps, stopEarly, { experimentalApi: true }).then((session) => {
     if (!session.ok) return failure(session.reason);
     const account = session.responses[0].result.account;
     if (!account || typeof account !== 'object') return failure(APP_SERVER_REASON.NO_CREDENTIALS);
     // The plan is the point; the account id rides along, so a rate-limit call that failed on its
     // own costs the id and nothing else.
     const limits = session.responses[1].error ? {} : session.responses[1].result;
+    const accountId = readString(limits.accountId);
     const plan = readPlan(account);
     return {
       ok: true,
@@ -295,7 +314,8 @@ export function readAccountViaAppServer(deps = {}) {
       authType: normalizeAuthType(account.type),
       plan: plan.plan,
       subscriptionType: plan.subscriptionType,
-      accountId: readString(limits.accountId),
+      accountId,
+      userId: session.responses[2].error ? null : seatUserId(session.responses[2].result, accountId),
       email: readString(account.email),
     };
   });
@@ -351,6 +371,7 @@ export function mergeAccounts(appServer, fileAccount) {
     orDefault(appServer.authType, null),
     fileAccount ? fileAccount.authMode : null,
   );
+  const accountId = orDefault(appServer.accountId, fileAccount ? fileAccount.accountId : null);
   return {
     authMode: authMode,
     // With no auth.json to read, an api-key sign-in is the only evidence that a key is in play —
@@ -361,7 +382,13 @@ export function mergeAccounts(appServer, fileAccount) {
     subscriptionType: orDefault(appServer.subscriptionType, null),
     plan: orDefault(appServer.plan, null),
     expiresAt: null,
-    accountId: orDefault(appServer.accountId, fileAccount ? fileAccount.accountId : null),
+    accountId,
+    // auth.json's seat only for the workspace it was decoded with: a seat paired with another
+    // sign-in's workspace would name a subscription that does not exist.
+    userId: orDefault(
+      orDefault(appServer.userId, null),
+      fileAccount && fileAccount.accountId === accountId ? orDefault(fileAccount.userId, null) : null,
+    ),
     email: orDefault(appServer.email, fileAccount ? fileAccount.email : null),
     live: true,
   };

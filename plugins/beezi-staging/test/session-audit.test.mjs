@@ -156,6 +156,30 @@ test('backfill stamps every historical report with one current subscription acco
   for (const payload of reports) assert.equal(payload.account_uuid, 'current-1');
 });
 
+test('backfill registers a Business seat and stamps history with the same seat and workspace', async () => {
+  const flush = fakeFlush();
+  const registrations = [];
+  const { deps } = makeDeps({
+    listRollouts: () => [rollout('s1')],
+    readChatgptAuthImpl: () => ({
+      authMode: 'chatgpt', accountId: 'ws-business', userId: 'user-seat-a', subscriptionType: 'team', expiresAt: 99_000_000,
+    }),
+    postJsonImpl: async (_url, _token, body) => {
+      registrations.push(body);
+      return { ok: true, status: 200, json: async () => ({ status: 'stored', accountLinked: true }) };
+    },
+    flushBackfillChunksImpl: flush.impl,
+  });
+  await runAudit(deps);
+  const reports = flush.calls.flatMap((call) => call.groups.flatMap((group) => group.reports));
+  assert.deepEqual(registrations[0], { accountUuid: 'user-seat-a', organizationUuid: 'ws-business', subscriptionType: 'team' });
+  assert.ok(reports.length > 0);
+  for (const payload of reports) {
+    assert.equal(payload.account_uuid, 'user-seat-a');
+    assert.equal(payload.account_org_uuid, 'ws-business');
+  }
+});
+
 const ANON_KEY = 'ab'.repeat(32);
 const ANON_BLOCK = { tenantId: null, kinds: { repos: true, branches: true, sessions: true, hosts: true, accounts: true }, key: ANON_KEY, machineName: null };
 

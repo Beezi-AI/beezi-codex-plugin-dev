@@ -1,5 +1,13 @@
 # Beezi plugin release notes
 
+## 0.28.6 (2026-11-20) — Each Business seat is its own subscription
+
+### Fixed
+- **Business and Team seats are told apart** — two people on one ChatGPT Business workspace no longer show up as one subscription carrying one person's email. Each seat now reports as its own account, under the shared workspace.
+- **Seats are read from Codex itself** — the seat comes from Codex, not only from its sign-in file, so a machine that keeps its Codex sign-in in the system keychain can be told apart too. The first session after the update asks Codex once.
+
+Sessions reported before this version move to each person's own seat once Beezi has the matching update.
+
 ## 0.28.5 (2026-11-19) — A long upload shows it is still working
 
 ### Improved

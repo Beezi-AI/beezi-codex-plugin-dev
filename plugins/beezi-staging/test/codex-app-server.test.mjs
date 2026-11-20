@@ -63,7 +63,7 @@ const INIT_RESULT = {
 
 // The shape measured against codex-cli 0.154.0 on 2026-09-14. `account/read` carries NO accountId —
 // only `account/rateLimits/read` does, which is why both calls are made rather than one.
-function scriptedServer({ account, rateLimits, accountError, rateLimitsError } = {}) {
+function scriptedServer({ account, rateLimits, accountError, rateLimitsError, sessions } = {}) {
   return (message) => {
     if (message.method === 'initialize') {
       return [JSON.stringify({ id: message.id, result: INIT_RESULT }) + '\n'];
@@ -79,7 +79,26 @@ function scriptedServer({ account, rateLimits, accountError, rateLimitsError } =
       if (rateLimitsError) return [JSON.stringify({ id: message.id, error: rateLimitsError }) + '\n'];
       return [JSON.stringify({ id: message.id, result: rateLimits || {} }) + '\n'];
     }
+    if (message.method === 'accountSession/list' && sessions) {
+      return [JSON.stringify({ id: message.id, result: sessions }) + '\n'];
+    }
+    // MEASURED against codex-cli 0.167.0: an unknown method, or an experimental one the client did
+    // not opt into, is answered with a JSON-RPC error rather than left unanswered.
+    if (message.id !== undefined) {
+      return [JSON.stringify({ id: message.id, error: { code: -32600, message: 'Invalid request' } }) + '\n'];
+    }
     return null;
+  };
+}
+
+// accountSession/list as codex-cli 0.167.0 answers it under the experimentalApi capability.
+function sessionList({ userId = 'user-seat-a', workspace = 'eb76c91d-9f94-4807-99aa-ed350b779ecd' } = {}) {
+  return {
+    activeSessionId: userId,
+    sessions: [
+      { sessionId: 'user-other', userId: 'user-other', isActive: false, selectedWorkspaceAccountId: workspace },
+      { sessionId: userId, userId, email: 'user@example.com', isActive: true, selectedWorkspaceAccountId: workspace },
+    ],
   };
 }
 
@@ -115,14 +134,40 @@ test('sends initialize, then the initialized notification, then both account cal
     .filter((l) => l.trim() !== '')
     .map((l) => JSON.parse(l));
   assert.deepEqual(sent.map((m) => m.method), [
-    'initialize', 'initialized', 'account/read', 'account/rateLimits/read',
+    'initialize', 'initialized', 'account/read', 'account/rateLimits/read', 'accountSession/list',
   ]);
+  // accountSession/list is experimental: without the capability Codex refuses it.
+  assert.deepEqual(sent[0].params.capabilities, { experimentalApi: true });
   // The notification carries no id; every request does, and they must be distinct or the reader
   // cannot tell the two answers apart.
   assert.equal(sent[1].id, undefined);
   const ids = sent.filter((m) => m.id !== undefined).map((m) => m.id);
   assert.equal(new Set(ids).size, ids.length);
   assert.equal(sent[2].params.refreshToken, false);
+});
+
+test('reads the seat user id from the active account session when its workspace is the account id', async () => {
+  const spawn = fakeSpawn(scriptedServer({ account: CHATGPT_ACCOUNT, rateLimits: RATE_LIMITS, sessions: sessionList() }));
+  const result = await run(spawn);
+  assert.equal(result.accountId, 'eb76c91d-9f94-4807-99aa-ed350b779ecd');
+  assert.equal(result.userId, 'user-seat-a');
+});
+
+test('no seat user id when the active session sits on another workspace than the account id', async () => {
+  const spawn = fakeSpawn(scriptedServer({
+    account: CHATGPT_ACCOUNT, rateLimits: RATE_LIMITS, sessions: sessionList({ workspace: 'ws-other' }),
+  }));
+  const result = await run(spawn);
+  assert.equal(result.userId, null);
+});
+
+test('an error on accountSession/list costs the seat user id only', async () => {
+  const spawn = fakeSpawn(scriptedServer({ account: CHATGPT_ACCOUNT, rateLimits: RATE_LIMITS }));
+  const result = await run(spawn);
+  assert.equal(result.ok, true);
+  assert.equal(result.plan, 'plus');
+  assert.equal(result.accountId, 'eb76c91d-9f94-4807-99aa-ed350b779ecd');
+  assert.equal(result.userId, null);
 });
 
 test('closes stdin and kills the child once both answers are in', async () => {
@@ -401,6 +446,24 @@ test('a live answer that names no account id keeps the one auth.json knows', () 
   assert.equal(merged.accountId, 'from-auth-json');
   assert.equal(merged.email, 'stale@example.com');
 });
+
+test('mergeAccounts — the live seat user id outranks the one auth.json knows', () => {
+  const live = { ok: true, authType: 'chatgpt', plan: 'team', subscriptionType: 'team', accountId: 'from-auth-json', userId: 'user-live', email: null };
+  const merged = mergeAccounts(live, { ...FILE_ACCOUNT, userId: 'user-file' });
+  assert.equal(merged.userId, 'user-live');
+});
+
+const liveTeam = (accountId) => ({ ok: true, authType: 'chatgpt', plan: 'team', subscriptionType: 'team', accountId, userId: null, email: null });
+const seatCases = [
+  { name: 'auth.json fills the seat user id for the same workspace', live: liveTeam('from-auth-json'), want: 'user-file' },
+  { name: 'auth.json does not fill the seat user id for another workspace', live: liveTeam('ws-other'), want: null },
+  { name: 'a failed probe keeps the auth.json seat user id', live: { ok: false, reason: 'timeout' }, want: 'user-file' },
+];
+for (const c of seatCases) {
+  test(`mergeAccounts — ${c.name}`, () => {
+    assert.equal(mergeAccounts(c.live, { ...FILE_ACCOUNT, userId: 'user-file' }).userId, c.want);
+  });
+}
 
 test('nothing known at all merges to null', () => {
   assert.equal(mergeAccounts({ ok: false, reason: 'unavailable' }, null), null);

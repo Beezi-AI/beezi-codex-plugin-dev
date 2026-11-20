@@ -412,8 +412,8 @@ sync and the past-sessions upload print how many. Each line is
   `~/.beezi-codex/usage-observations.json`, and drained to `/me/codex/usage` at turn end. Each row
   is stamped with the *record's* timestamp rather than wall-clock now, so re-scanning a rollout
   reproduces it exactly and the server's `(account, fetched_at)` key collapses the replay for
-  the same account. Uploads include `account_uuid` and `account_email` from the local Beezi
-  `billing.json` (`accountId` and `email`), falling back to Codex auth identity when needed.
+  the same account. Uploads include `account_uuid`, `account_org_uuid` and `account_email` from the local Beezi
+  `billing.json` (the seat, the workspace and `email` — see "One subscription per seat"), falling back to Codex auth identity when needed.
   This also enriches queued readings without identifiers; any identity already on a row is
   preserved. For unidentified historical readings, these identifiers describe the account
   configured at upload time.
@@ -543,8 +543,10 @@ and the account id are ever captured — **no token ever leaves the machine**, a
    process speaking line-delimited JSON-RPC on stdin/stdout: `initialize`, the `initialized`
    notification, then `account/read` (`{ account: { type, email, planType } }`) and
    `account/rateLimits/read`. Both calls are made because **`account/read` carries no account id** —
-   measured against codex-cli 0.154.0; only the rate-limit answer does. Neither starts a
-   conversation or a model turn.
+   measured against codex-cli 0.154.0; only the rate-limit answer does. A third call,
+   `accountSession/list` (experimental, so `initialize` sends `capabilities: { experimentalApi: true }`),
+   gives the seat — see "One subscription per seat" below. An older Codex answers it with an
+   error, which costs the seat and nothing else. None of them starts a conversation or a model turn.
 
    This tier exists because auth.json is not where every machine's credentials live: Codex may hold
    them in the OS keychain or only in its own memory, and such a machine has no plan in auth.json at
@@ -575,6 +577,28 @@ and the account id are ever captured — **no token ever leaves the machine**, a
 The account id and email are persisted into `billing.json` alongside the plan, and read back from
 there first (`lib/chatgpt-identity.mjs`, and the account check-in). Without that the id would exist
 only for the one session that happened to run the probe. API-key billing carries no plan.
+
+#### One subscription per seat
+
+The ChatGPT account id (`chatgpt_account_id`) is the **workspace**, and on a Business / Team plan
+every seat shares it. Reported alone, two people on one workspace became one subscription on the
+server, carrying whichever address checked in last. So the plugin also reads the **seat**
+(`chatgpt_user_id`): from the `id_token` claim in tier 2, and from `accountSession/list` in tier 1
+— the only source on a machine whose credentials sit in the OS keychain (the usual macOS setup).
+Neither read touches a token: the session list carries ids and an address only.
+
+With a seat known, every report sends the seat as the account and the workspace as its
+organization — `accountUuid` / `organizationUuid` on the check-in, `account_uuid` /
+`account_org_uuid` on session reports, backfill and usage snapshots — the shape the server already
+splits subscriptions on. `subscriptionKey` in `lib/chatgpt-identity.mjs` is the one place that
+decides the pair; a seat is only ever paired with the workspace it was read alongside. Without a seat
+the old workspace-only shape is sent. A `billing.json` written before the seat existed has no `userId`
+key, and `shouldProbeAccount` probes at each session start until a capture writes one; a capture
+that cannot read a seat writes `userId: null`, so the weekly rule applies again from then on.
+
+History reported before 0.28.6 sits on the workspace's shared account row. The server moves each
+person's share of it onto their seat row at that seat's first seat-bearing check-in, and deletes the
+shared row once no seat is left on it.
 
 Codex's own tier names are folded onto those labels (`CODEX_PLAN_ALIASES` in `lib/billing.mjs`),
 because the wire vocabulary is not the pricing vocabulary. The load-bearing case is the 2026-04-09

@@ -41,6 +41,24 @@ test('reads the account ID from the claim, falling back to tokens.account_id, wi
   assert.doesNotMatch(JSON.stringify(undecodable), /SECRET/);
 });
 
+test('reads the seat user id from chatgpt_user_id, a Business workspace id being shared by every seat', () => {
+  const account = readChatgptAuth(authFileWith({
+    [AUTH_CLAIM]: { chatgpt_account_id: 'ws-shared', chatgpt_user_id: 'user-seat-a', user_id: 'user-other' },
+  }));
+  assert.equal(account.accountId, 'ws-shared');
+  assert.equal(account.userId, 'user-seat-a');
+});
+
+test('the seat user id is null when the claim has none or the id_token cannot be decoded', () => {
+  const noClaim = readChatgptAuth(authFileWith({ [AUTH_CLAIM]: { chatgpt_account_id: 'ws-shared' } }));
+  assert.equal(noClaim.userId, null);
+  const undecodable = readChatgptAuth({
+    exists: () => true,
+    readFile: () => JSON.stringify({ tokens: { account_id: 'ws-shared', id_token: 'invalid' } }),
+  });
+  assert.equal(undecodable.userId, null);
+});
+
 test('keeps the account ID even when the subscription has expired', () => {
   const account = readChatgptAuth(authFileWith({
     exp: 1, [AUTH_CLAIM]: { chatgpt_account_id: 'claim-account', chatgpt_plan_type: 'plus' },

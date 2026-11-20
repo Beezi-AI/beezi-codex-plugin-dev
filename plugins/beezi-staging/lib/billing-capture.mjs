@@ -52,6 +52,9 @@ function identityFields(args, existingConfig) {
   const authType = boundedLabel(args.authType, 16);
   return {
     accountId: orDefault(boundedLabel(args.accountId, MAX_ACCOUNT_ID), orDefault(existing.accountId, null)),
+    // The seat inside that workspace (lib/chatgpt-identity.mjs). Always written, null when unknown:
+    // isStale re-captures a config that lacks the key.
+    userId: orDefault(boundedLabel(args.userId, MAX_ACCOUNT_ID), orDefault(existing.userId, null)),
     email: orDefault(boundedLabel(args.email, MAX_ACCOUNT_EMAIL), orDefault(existing.email, null)),
     authType: AUTH_TYPES.indexOf(authType) === -1
       ? orDefault(existing.authType, null)
@@ -254,6 +257,7 @@ export async function captureFromCodexAccount({
       // Persisted with the plan so the account id survives between probes. An expired claim still
       // names the right account — only its PLAN label is untrustworthy.
       accountId: account.accountId,
+      userId: account.userId,
       email: account.email,
       // ONLY from a live reading. From tier 2 it would be a copy of a file the ladder already reads
       // at step 4 — no new information, and a value that would outlive the file it came from.
