@@ -80,6 +80,7 @@ export function readChatgptAuth(deps = {}) {
       plan: null,
       expiresAt: null,
       accountId: tokenAccountId,
+      userId: null,
       email,
     };
   }
@@ -98,6 +99,9 @@ export function readChatgptAuth(deps = {}) {
     plan,
     expiresAt,
     accountId: orDefault(readString(authNs.chatgpt_account_id), tokenAccountId),
+    // The seat. On a Business/Team plan every seat shares chatgpt_account_id (the workspace), so
+    // only this id tells two people on one workspace apart.
+    userId: readString(authNs.chatgpt_user_id),
     email,
   };
 }

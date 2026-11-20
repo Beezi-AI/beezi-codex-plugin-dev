@@ -278,9 +278,38 @@ test('an unknown machine probed within the week is not probed again', () => {
 
 test('a subscription machine is probed on exactly the staleness rule the nudge uses', () => {
   const now = Date.now();
-  const fresh = { source: 'subscription', plan: 'plus', capturedAt: new Date(now).toISOString() };
+  const fresh = { source: 'subscription', plan: 'plus', userId: null, capturedAt: new Date(now).toISOString() };
   assert.equal(shouldProbeAccount(fresh, 'subscription', now), false);
   assert.equal(shouldProbeAccount({ source: 'subscription', plan: 'unknown' }, 'subscription', now), true);
+  const { userId, ...preSeat } = fresh;
+  assert.equal(shouldProbeAccount(preSeat, 'subscription', now), true);
+});
+
+// A config written before the seat id existed is probed once, so a keychain machine (no auth.json
+// to decode) learns its seat without waiting out the week. Once captured, a seat that could not be
+// read is recorded as null and the normal window applies again. The plan itself is not stale, so
+// the "could not read your plan" nudge must not fire for it.
+const seatCases = [
+  { name: 'a config that predates the seat user id is probed', over: {}, want: true },
+  { name: 'a captured seat user id is not probed again inside the week', over: { userId: 'user-seat' }, want: false },
+  { name: 'a seat that could not be read is not probed again inside the week', over: { userId: null }, want: false },
+];
+for (const c of seatCases) {
+  test(c.name, () => {
+    const now = 1_000_000_000_000;
+    const cfg = { source: 'subscription', plan: 'team', accountId: 'ws', capturedAt: new Date(now - DAY).toISOString(), ...c.over };
+    assert.equal(shouldProbeAccount(cfg, 'subscription', now), c.want);
+  });
+}
+
+test('a config that predates the seat user id is not stale — its plan is known', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(isStale({ source: 'subscription', plan: 'team', accountId: 'ws', capturedAt: new Date(now - DAY).toISOString() }, now), false);
+});
+
+test('a self-reported config is not probed for a missing seat user id', () => {
+  const now = 1_000_000_000_000;
+  assert.equal(shouldProbeAccount({ source: 'subscription', plan: 'team', selfReported: true, capturedAt: new Date(now).toISOString() }, 'subscription', now), false);
 });
 
 test('an api-key or third-party machine is never probed — it bills no subscription', () => {
@@ -297,7 +326,7 @@ test('the caller isStale seam is honoured, not quietly replaced by the module on
   let seen = 0;
   const injected = () => { seen += 1; return false; };
   assert.equal(
-    shouldProbeAccount({ source: 'subscription', plan: 'unknown' }, 'subscription', Date.now(), { isStale: injected }),
+    shouldProbeAccount({ source: 'subscription', plan: 'unknown', userId: null }, 'subscription', Date.now(), { isStale: injected }),
     false,
   );
   assert.equal(seen, 1);

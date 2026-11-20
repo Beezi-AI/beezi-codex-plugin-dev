@@ -6,6 +6,7 @@ import { readJson, writeJsonSecure } from './fs-store.mjs';
 import { accountSyncStateFile } from './paths.mjs';
 import { readChatgptAuth as _readChatgptAuth } from './chatgpt-auth.mjs';
 import { readBillingConfig as _readBillingConfig } from './billing-config.mjs';
+import { subscriptionKey } from './chatgpt-identity.mjs';
 import { boundedLabel, orDefault, parseTimestampMs } from './compat.mjs';
 import { ANONYMIZATION_KEY_MISSING, hasKind, kindsOf, sessionAnonymization } from './anonymization.mjs';
 import { Kind, anonymizeAccountSync } from './anonymize.mjs';
@@ -47,8 +48,9 @@ export function accountSyncPath() {
 // the only thing that reads or writes it.
 export { accountSyncStateFile };
 
-// The bounds of CliAgentAccountSyncRequestDto ITSELF (@MaxLength 64 / 320 / 50 on accountUuid /
-// email / subscriptionType). Deliberately restated here rather than imported from
+// The bounds of CliAgentAccountSyncRequestDto ITSELF (@MaxLength 320 / 50 on email /
+// subscriptionType; the 64 on accountUuid / organizationUuid is subscriptionKey's, in
+// lib/chatgpt-identity.mjs, which every report shares). Deliberately restated here rather than imported from
 // usage-report-codex.mjs: that module states the bounds of UsageSnapshotRequestDto, a DIFFERENT
 // DTO with a different whitelist, and the two agreeing on two of three numbers today is a
 // coincidence rather than a contract — generalizing from one to the other is exactly the mistake
@@ -56,7 +58,6 @@ export { accountSyncStateFile };
 //
 // The bounds this check-in states. boundedLabel (lib/compat.mjs) enforces them: an oversized value
 // is DROPPED, never truncated, for the reason recorded there.
-const MAX_ACCOUNT_UUID = 64;
 const MAX_ACCOUNT_EMAIL = 320;
 const MAX_SUBSCRIPTION_TYPE = 50;
 
@@ -121,11 +122,11 @@ export function buildAccountSyncPayload({ config = null, account = null, now = D
     source === null || source === undefined ? null : source[key],
     max,
   );
-  const accountUuid = orDefault(
-    field(config, 'accountId', MAX_ACCOUNT_UUID),
-    field(account, 'accountId', MAX_ACCOUNT_UUID),
-  );
-  if (accountUuid !== null) payload.accountUuid = accountUuid;
+  // The same (account, organization) pair the session reports carry, from the one function that
+  // decides it: the server links a session to the account its check-in created, once.
+  const key = subscriptionKey(config, account);
+  if (key.account_uuid !== undefined) payload.accountUuid = key.account_uuid;
+  if (key.account_org_uuid !== undefined) payload.organizationUuid = key.account_org_uuid;
   const email = orDefault(
     field(config, 'email', MAX_ACCOUNT_EMAIL),
     field(account, 'email', MAX_ACCOUNT_EMAIL),

@@ -777,7 +777,7 @@ test('auto-capture does not re-read auth.json when the plan is fresh', async (t)
       fetchImpl,
       gitImpl: noGit,
       resolveSource: () => 'subscription',
-      readBillingConfig: () => ({ version: 1, source: 'subscription', plan: 'pro' }),
+      readBillingConfig: () => ({ version: 1, source: 'subscription', plan: 'pro', userId: null }),
       writeBillingConfig: () => {},
       isStale: () => false,
       readAccountViaAppServer: noAppServer,
@@ -859,6 +859,7 @@ test('an already validated auth.json does not trigger account discovery', async 
         version: 1,
         source: 'subscription',
         plan: 'plus',
+        userId: null,
         capturedAt: new Date().toISOString(),
         authFileMtimeMs: 200,
       }),
@@ -1442,7 +1443,9 @@ test('the plan captured on such a machine survives the next session', async (t) 
     capturedAt: new Date().toISOString(),
     capturedBy: 'session-start',
     authType: 'chatgpt',
+    userId: null,
   };
+  let probes = 0;
   const message = await startAfterWorker(
     { session_id: 's2', cwd: null },
     {
@@ -1452,7 +1455,7 @@ test('the plan captured on such a machine survives the next session', async (t) 
       readBillingConfig: () => existing,
       writeBillingConfig: (c) => written.push(c),
       // The probe must NOT run again — the plan is fresh.
-      readAccountViaAppServer: async () => { throw new Error('the probe must not run'); },
+      readAccountViaAppServer: async () => { probes += 1; throw new Error('the probe must not run'); },
       readChatgptAuth: () => null,
       syncAccount: async () => ({ synced: false }),
     },
@@ -1460,6 +1463,32 @@ test('the plan captured on such a machine survives the next session', async (t) 
   const reverted = written.find((c) => c.source === 'unknown');
   assert.equal(reverted, undefined, 'syncBillingSource must not overwrite the captured source');
   assert.equal(message, banner('a@b.c'), 'and no nudge — the machine knows what it bills');
+  assert.equal(probes, 0);
+});
+
+test('a config from before the seat id is probed once, and a failed probe raises no plan nudge', async (t) => {
+  withCodexAuth(t, null);
+  tmpHome(t);
+  const { fetchImpl } = router();
+  let probes = 0;
+  const message = await startAfterWorker(
+    { session_id: 's3', cwd: null },
+    {
+      ...linked(),
+      fetchImpl,
+      gitImpl: noGit,
+      readBillingConfig: () => ({
+        version: 1, source: 'subscription', subscriptionType: 'team', plan: 'team',
+        capturedAt: new Date().toISOString(), capturedBy: 'session-start', authType: 'chatgpt', accountId: 'ws',
+      }),
+      writeBillingConfig: () => {},
+      readAccountViaAppServer: async () => { probes += 1; return { ok: false, reason: 'timeout' }; },
+      readChatgptAuth: () => null,
+      syncAccount: async () => ({ synced: false }),
+    },
+  );
+  assert.equal(probes, 1);
+  assert.equal(message, banner('a@b.c'), 'the plan is known, so no "could not read your plan" line');
 });
 
 test('a machine that neither Codex nor auth.json can name is still nudged, not guessed at', async (t) => {

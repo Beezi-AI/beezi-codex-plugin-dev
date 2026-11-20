@@ -263,6 +263,40 @@ test('the drain preserves captured identity and enriches unidentified rows', asy
   assert.equal(h.calls[0].body.five_hour_pct, 1, 'the observation must not be overwritten');
 });
 
+test('a Business seat is reported as its own account under the shared workspace', (t) => {
+  withCodexAuth(t, { auth_mode: 'chatgpt' });
+  const f = usageIdentityFields({
+    readChatgptAuth: () => account({ accountId: 'ws-business', userId: 'user-seat-a' }),
+    readBillingConfig: () => ({ ...subscriptionBilling, accountId: 'ws-business', userId: 'user-seat-a' }),
+    env: {},
+  });
+  assert.equal(f.account_uuid, 'user-seat-a');
+  assert.equal(f.account_org_uuid, 'ws-business');
+});
+
+test('the live plan still fills a stale plan when the seat sits on the same workspace', (t) => {
+  withCodexAuth(t, { auth_mode: 'chatgpt' });
+  const f = usageIdentityFields({
+    readChatgptAuth: () => account({ accountId: 'ws-business', userId: 'user-seat-a', plan: 'team', subscriptionType: 'team' }),
+    readBillingConfig: () => ({ source: 'subscription', plan: 'unknown', subscriptionType: null, rateLimitTier: null, accountId: 'ws-business', userId: 'user-seat-a' }),
+    readObservedPlan: () => null,
+    env: {},
+  });
+  assert.equal(f.subscription_plan, 'team');
+});
+
+test('a queued row with its own identity is not given the current organization', async () => {
+  const h = harness([{ ...ROW(1), account_uuid: 'captured-account' }, ROW(2)], [200, 200]);
+  await drainRateLimitSnapshots(KEY, SESSION, {
+    ...h.deps,
+    usageIdentityFields: () => ({ account_uuid: 'user-seat-a', account_org_uuid: 'ws-business', account_email: 'a@example.com' }),
+  });
+  assert.equal(h.calls[0].body.account_uuid, 'captured-account');
+  assert.equal('account_org_uuid' in h.calls[0].body, false);
+  assert.equal(h.calls[1].body.account_uuid, 'user-seat-a');
+  assert.equal(h.calls[1].body.account_org_uuid, 'ws-business');
+});
+
 test('an unrecognised plan is omitted rather than reported as the literal "unknown"', () => {
   const f = usageIdentityFields({
     readChatgptAuth: () => account({ plan: 'unknown', subscriptionType: null }),

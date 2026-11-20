@@ -127,7 +127,9 @@ export function usageIdentityFields(deps = {}) {
   // the live account does not contradict the resolved identity. A real plan on disk still wins,
   // and so does the observed plan above.
   const stated = fields.subscription_plan;
-  const sameAccount = !out.account_uuid || !(chatgptAccount || {}).accountId || out.account_uuid === chatgptAccount.accountId;
+  // The workspace is account_org_uuid once a seat is known (lib/chatgpt-identity.mjs), else account_uuid.
+  const workspace = orDefault(out.account_org_uuid, out.account_uuid);
+  const sameAccount = !workspace || !(chatgptAccount || {}).accountId || workspace === chatgptAccount.accountId;
   if ((stated == null || stated === 'unknown') && fields.billing_source === 'subscription' && sameAccount) {
     const livePlan = chatgptAccount == null ? null : chatgptAccount.plan;
     if (livePlan != null && livePlan !== 'unknown') {
@@ -207,7 +209,9 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
   const capMs = orDefault(deps.timeoutMs, null);
   // Enrich unidentified readings using the billing-first identity, including existing queues.
   // Keep a captured identity together so a later sign-in cannot supply another account's email.
-  const { account_uuid, account_email, ...identity } = (deps.usageIdentityFields || usageIdentityFields)(deps);
+  const { account_uuid, account_org_uuid, account_email, ...identity } = (deps.usageIdentityFields || usageIdentityFields)(deps);
+  const accountIdentity = { account_uuid, account_email };
+  if (account_org_uuid !== undefined) accountIdentity.account_org_uuid = account_org_uuid;
 
   let posted = 0;
   let stopped = null;
@@ -227,7 +231,7 @@ export async function drainRateLimitSnapshots(key, session, deps = {}) {
       // The row last, so a stored observation can never be overwritten by an identity field.
       const row = pending[i];
       const rowIdentity = row.account_uuid != null || row.account_email != null
-        ? {} : { account_uuid, account_email };
+        ? {} : accountIdentity;
       const body = { ...identity, ...rowIdentity, ...row };
       res = await postJson(url, session, anonymized ? anonymizeUsage(body, block.key, kindsOf(block)) : body, postOpts);
     } catch (e) {

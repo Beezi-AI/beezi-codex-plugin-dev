@@ -297,6 +297,30 @@ test('the account id and address are persisted with the plan', async () => {
   });
 });
 
+test('the seat user id is persisted with the workspace id, with no auth.json on disk', async () => {
+  await underCodexAuth(null, async () => {
+    const { config } = await captureFromCodexAccount({
+      via: 'session-start',
+      env: {},
+      deps: { readAccountViaAppServer: liveProbe({ userId: 'user-seat-a' }), readChatgptAuth: () => null },
+    });
+    assert.equal(config.accountId, 'live-uuid');
+    assert.equal(config.userId, 'user-seat-a');
+  });
+});
+
+test('a capture that cannot read a seat records it as null, so it is not re-captured every session', async () => {
+  await underCodexAuth(null, async () => {
+    const { config } = await captureFromCodexAccount({
+      via: 'session-start',
+      env: {},
+      deps: { readAccountViaAppServer: liveProbe(), readChatgptAuth: () => null },
+    });
+    assert.equal(Object.prototype.hasOwnProperty.call(config, 'userId'), true);
+    assert.equal(config.userId, null);
+  });
+});
+
 test('a capture that learns no identity keeps the one already recorded', async () => {
   await underCodexAuth(null, async () => {
     const existing = { version: 1, source: 'subscription', accountId: 'known-uuid', email: 'known@example.com' };

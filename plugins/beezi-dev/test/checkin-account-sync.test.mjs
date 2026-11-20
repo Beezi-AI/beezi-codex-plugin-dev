@@ -89,6 +89,28 @@ test('payload — carries exactly the DTO keys, and never a null', () => {
   });
 });
 
+test('payload — a Business seat checks in as its own account under the shared workspace', () => {
+  const payload = buildAccountSyncPayload({
+    config: { ...CONFIG, accountId: 'ws-business', userId: 'user-seat-a', email: 'a@acme.com' },
+    account: null,
+  });
+  assert.deepEqual(payload, {
+    accountUuid: 'user-seat-a',
+    organizationUuid: 'ws-business',
+    email: 'a@acme.com',
+    subscriptionType: 'plus',
+  });
+});
+
+test('payload — a seat in auth.json for another workspace is not paired with billing.json’s', () => {
+  const payload = buildAccountSyncPayload({
+    config: { ...CONFIG, accountId: 'ws-business', email: 'a@acme.com' },
+    account: { accountId: 'ws-other', userId: 'user-seat-b' },
+  });
+  assert.equal(payload.accountUuid, 'ws-business');
+  assert.equal('organizationUuid' in payload, false);
+});
+
 test('payload — omits (never nulls) an unknown accountUuid / email / subscriptionType', () => {
   const payload = buildAccountSyncPayload({
     config: { subscriptionType: null },
@@ -211,9 +233,13 @@ test('route — the request carries the bearer token and the codex agent header'
 
 test('route — the body carries ONLY whitelisted keys, and no credential, token or path', async () => {
   const fetchImpl = recordingFetch(async () => ({ status: 200 }));
-  await syncAccountIfNeeded(KEY, accountSession(KEY, 'super-secret-token'), { force: true, via: 'session-start' }, deps({ fetchImpl }));
+  await syncAccountIfNeeded(KEY, accountSession(KEY, 'super-secret-token'), { force: true, via: 'session-start' }, deps({
+    fetchImpl,
+    readBillingConfig: () => ({ ...CONFIG, accountId: 'ws-business', userId: 'user-seat-a' }),
+  }));
   const body = JSON.parse(fetchImpl.calls[0].opts.body);
-  const allowed = ['accountUuid', 'email', 'subscriptionType', 'rateLimitTier', 'keys'];
+  assert.equal(body.organizationUuid, 'ws-business');
+  const allowed = ['accountUuid', 'organizationUuid', 'email', 'subscriptionType', 'rateLimitTier', 'keys'];
   for (const key of Object.keys(body)) {
     assert.ok(allowed.includes(key), `unknown key '${key}' would 400 the whole check-in`);
   }

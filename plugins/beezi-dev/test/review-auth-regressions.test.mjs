@@ -145,6 +145,31 @@ test('F13: live sessions and quota identity agree; explicit history does not gue
   assert.equal(payloads[1].account_uuid, undefined);
 });
 
+test('a Business seat session report and its quota identity name the seat under the workspace', async t => {
+  const dir = home(t);
+  const claims = Buffer.from(JSON.stringify({
+    email: 'seat-a@example.invalid',
+    'https://api.openai.com/auth': { chatgpt_account_id: 'ws-business', chatgpt_user_id: 'user-seat-a' },
+  })).toString('base64url');
+  fs.writeFileSync(path.join(process.env.CODEX_HOME, 'auth.json'), JSON.stringify({ auth_mode: 'chatgpt', tokens: { account_id: 'ws-business', id_token: `e30.${claims}.signature` } }));
+  const file = path.join(dir, 'rollout.jsonl');
+  const rows = [
+    { type: 'session_meta', timestamp: '2026-01-01T00:00:00Z', payload: { id: 'seat-session', cwd: dir } },
+    { type: 'turn_context', timestamp: '2026-01-01T00:00:01Z', payload: { cwd: dir, model: 'gpt-5.2-codex' } },
+    { type: 'event_msg', timestamp: '2026-01-01T00:00:02Z', payload: { type: 'token_count', info: { total_token_usage: { input_tokens: 10, output_tokens: 5, total_tokens: 15, cached_input_tokens: 0 } } } },
+  ];
+  fs.writeFileSync(file, rows.map(JSON.stringify).join('\n') + '\n');
+  const deps = { linkedSessions: async () => [SESSION], env: {}, gitImpl: () => null,
+    resolveTranscript: () => ({ sessionId: 'seat-session', transcriptPath: file }), readAgents: () => ({}), findSubagentRollouts: () => [] };
+  const payloads = [];
+  await runCheckpoint({ session_id: 'seat-session', cwd: dir }, deps, { skipFlush: true, drainRateLimits: false, sink: p => payloads.push(p) });
+  assert.equal(payloads[0].account_uuid, 'user-seat-a');
+  assert.equal(payloads[0].account_org_uuid, 'ws-business');
+  const usage = usageIdentityFields({ env: {} });
+  assert.equal(usage.account_uuid, 'user-seat-a');
+  assert.equal(usage.account_org_uuid, 'ws-business');
+});
+
 test('F14: rate-limited diagnostics survive and can be delivered by a later drain', async t => {
   home(t);
   diagnostics.grantConsent();

@@ -844,7 +844,9 @@ async function runAuditLocked(lockHandle, deps, options, prepared) {
   try { billingConfig = readBillingConfig(); } catch { /* best-effort */ }
   const registration = buildAccountSyncPayload({ config: billingConfig, account, now: now() });
   const accountUuid = orDefault(registration.accountUuid, null);
+  // The report form of the pair just registered, so history links to the account the check-in made.
   const subscriptionIdentity = accountUuid ? { account_uuid: accountUuid } : {};
+  if (registration.organizationUuid) subscriptionIdentity.account_org_uuid = registration.organizationUuid;
 
   if (accountUuid) {
     const registrationBody = checkInBody(registration, session);
